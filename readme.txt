@@ -13,7 +13,7 @@ TODO:
 - Complete strictness overhaul of ETCS language
 - Fix deadlock/complete bilateral module & loader handshake
 - Import merkle hash chain from the completed version in other instance of project
-- Persistence tag within DatabaseProvider
+- Persistence tag within DatabaseProvider & merge Local/Remote Database ontology types
 - RenderProvider and its associated ontology types
 
 
