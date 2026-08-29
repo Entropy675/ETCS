@@ -1,5 +1,8 @@
 Entity Tag Context System (ETCS)
 
+ETCS (Entity Tag Component System) is a C++ substrate in which type identity, ABI contract, capability boundary, and causal graph are one compile-time artifact rather than four that must be kept in agreement.
+See https://anticurrententropy.com/whitepaper.html for details.
+
 Currently building on linux, targeting ARM and x64
 
 Tools & Modules
