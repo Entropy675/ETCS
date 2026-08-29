@@ -1,5 +1,7 @@
 Entity Tag Context System (ETCS)
 
+Currently building on linux, targeting ARM and x64
+
 Tools & Modules
 - https://github.com/Entropy675/ACE-Build-Tools 
 - https://github.com/Entropy675/ETCS-Commons 
