@@ -1,0 +1,37 @@
+# ETCS build dependencies -- Debian family (debian, ubuntu, raspbian)
+#
+# FORMAT:  <package-name>   <probe>   [# comment]
+#
+# The PACKAGE NAME is the only distro-specific thing on each line. The
+# PROBE is distro-independent -- it tests whether the thing is actually
+# usable, not whether some package manager believes it is installed. That
+# split is the whole point of this format: porting to Fedora means copying
+# this file to linux-fedora.txt and changing the left column only.
+#
+# PROBES:
+#   pkgconfig:NAME   pkg-config --exists NAME
+#   binary:NAME      found on PATH
+#   header:PATH      found under a standard include dir
+#   none             no probe available; presence is assumed, never checked
+#
+# Probes answer "is it here", NOT "will this tree compile here" -- see
+# `ace deps arch` for the second question. A machine can pass every probe
+# below and still fail to run ETCS (io_uring disabled by sysctl, ld.gold
+# removed from the distro, wrong page size). Keep the two separate.
+
+# --- Toolchain ---------------------------------------------------------
+build-essential   binary:g++            # g++, make, libc headers
+pkg-config        binary:pkg-config     # every probe below leans on this
+binutils-gold     binary:ld.gold        # loaders/Makefile passes -fuse-ld=gold
+cmake             binary:cmake          # widely used build system in modules
+python3           binary:python3        # same as above
+python3-jsonschema none                 # same as above
+
+# --- Runtime libraries -------------------------------------------------
+liburing-dev      pkgconfig:liburing    # ThreadPool.h
+libsqlite3-dev    pkgconfig:sqlite3     # database scripting layer
+libmbedtls-dev    header:mbedtls/ssl.h  # MbedTLSContext (no .pc file on 2.x)
+
+# --- Development ------------------------------------------------------
+gdb               binary:gdb
+lldb              binary:lldb

@@ -1,0 +1,1 @@
+Header only libs allowed here, ensure that that their license permits them to be embedded.

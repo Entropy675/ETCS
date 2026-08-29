@@ -1,0 +1,4 @@
+xxx.h = definition of a interface
+xxxBase.h = definition of a concrete type (leaf CRTP)
+
+Where xxx.h can include any other xxx.h compositionally, creating super type hierarchy of constraints.
