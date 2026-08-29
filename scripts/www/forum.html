@@ -31,7 +31,7 @@
   #me { background:none; border:none; padding:2px 4px; color:var(--sel);
         cursor:pointer; font:inherit; letter-spacing:.04em; }
   #me:hover { text-decoration:underline; background:none; color:var(--sel); }
-  #record { color:var(--dim); font-size:11px; }
+  #record, #lock { color:var(--dim); font-size:11px; }
   main { padding:20px 16px; max-width:900px; margin:0 auto; }
   .hidden { display:none !important; }
   .bar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:14px; }
@@ -73,7 +73,10 @@
   <a href="/" class="brand">ACE FORUM</a>
   <button id="me" title="back to the index">-</button>
   <span id="record"></span>
+  <span id="lock"></span>
   <span class="spacer"></span>
+  <input id="rename" placeholder="name" size="12">
+  <button id="renameBtn">set</button>
   <button id="verifyBtn" title="recompute every hash on the server and report">verify</button>
 </header>
 
@@ -107,6 +110,7 @@
     <div class="bar">
       <button id="back">&larr; index</button>
       <span id="ttitle" class="key grow"></span>
+      <button id="lockBtn">lock</button>
     </div>
     <div id="chainline"></div>
     <div id="posts"></div>
@@ -147,6 +151,7 @@ if (!TOKEN) {
   TOKEN = 'anon' + Math.random().toString(36).slice(2, 8);
   setCookie(COOKIE, TOKEN);
 }
+let LOCKED = false;
 
 // ── The wire ─────────────────────────────────────────────────────────────────
 // Every response opens with a cursor header line:
@@ -226,7 +231,7 @@ async function loadIndex() {
     tb.appendChild(tr);
   }
 
-  const sl = lines(await walk(url('selves'));
+  const sl = lines(await walk(url('selves')));
   const sb = $('selves'); sb.innerHTML = '';
   for (const line of sl) {
     const p = line.split(/\s+/);
@@ -234,7 +239,7 @@ async function loadIndex() {
     const tr = document.createElement('tr');
     for (let i = 0; i < 4; i++) {
       const td = document.createElement('td');
-      td.textContent = i === 0 ? p[0] : p[i === 3 ? 4 : i;
+      td.textContent = i === 0 ? p[0] : p[i === 3 ? 4 : i];
       if (i === 0 && p[0] === TOKEN) td.className = 'key';
       tr.appendChild(td);
     }
@@ -244,9 +249,9 @@ async function loadIndex() {
 
 // ── One thread ───────────────────────────────────────────────────────────────
 // Render shape:
-//   #<tkey> <title> <op> open|locked> <n> <head16> <readers>
+//   #<tkey> <title> <op> open|locked <n> <head16> <readers>
 //   <seq> <author> <made> <chash16> <ihash16> <body>
-// A tombstoneed post keeps its line and its BOTH hashes, with "!tomb" where the
+// A tombstoned post keeps its line and its BOTH hashes, with "!tomb" where the
 // body was. That is deliberate and shown as such: the chain still verifies
 // across a removal, so the reader can see that content of a known hash was here
 // and is gone -- which is a different claim from "nothing was ever here".
@@ -258,7 +263,7 @@ async function loadThread() {
 
   const h = ls[0].slice(1).split(/\s+/);
   const title = h[1], op = h[2], state = h[3], head = h[5], here = h[6];
-  $('ttitle').textContent = (title === '-' ? room : title) + ' (' + room + ')';
+  $('ttitle').textContent = (title === '-' ? room : title) + '  (' + room + ')';
   $('tlink').textContent = location.origin + '/?t=' + room;
   $('lockBtn').textContent = state === 'locked' ? 'unlock' : 'lock';
   $('lockBtn').disabled = (op !== TOKEN);
@@ -272,7 +277,7 @@ async function loadThread() {
     cl.innerHTML = '<span class="st-bad">head moved with no new post: ' +
       lastHead + ' &rarr; ' + head + '</span>';
   } else {
-    cl.innerHTML = '<span class="st-ok">head</span> <span id="hd">' + head + 
+    cl.innerHTML = '<span class="st-ok">head</span> <span id="hd">' + head +
       '</span> &middot; ' + n + ' posts &middot; ' + here + ' here &middot; ' +
       (state === 'locked' ? '<span class="st-warn">locked</span>' : 'open');
   }
@@ -281,11 +286,12 @@ async function loadThread() {
   const box = $('posts'); box.innerHTML = '';
   for (let i = 1; i < ls.length; i++) {
     const p = ls[i].split(/\s+/);
+    if (p.length < 6) continue;
     const [seq, who, made, chash, ihash] = p;
     const body = ls[i].split(/\s+/).slice(5).join(' ');
     const tomb = body === '!tomb';
     const d = document.createElement('div');
-    d.className = 'post' + (tomb ? ' tomb' : 'body');
+    d.className = 'post' + (tomb ? ' tomb' : '');
     const meta = document.createElement('div'); meta.className = 'meta';
     const w = document.createElement('span'); w.className = 'who'; w.textContent = who;
     const when = document.createElement('span');
@@ -310,11 +316,58 @@ async function loadThread() {
 }
 let lastCount = -1;
 
-// ── Actions ──────────────────────────────────────────────────────────────────
- $('me').onclick   = () => go('');
- $('back').onclick = () => go('');
+// ── Identity strip ───────────────────────────────────────────────────────────
+async function loadMe() {
+  const p = (await fetchText(url(TOKEN, 'me'))).trim().split(/\s+/);
+  if (p.length < 5) return;
+  $('me').textContent = TOKEN;
+  $('record').textContent = p[1] + ' posts in ' + p[2] + ' threads';
+  LOCKED = (p[3] === 'locked');
+  $('lock').textContent = LOCKED ? 'name locked by a post' : '';
+  $('rename').disabled = LOCKED;
+  $('renameBtn').disabled = LOCKED;
+}
 
- $('verifyBtn').onclick = async () => {
+async function refresh() {
+  try {
+    await loadMe();
+    if (room) { show('thread'); await loadThread(); }
+    else      { show('home');   await loadIndex(); }
+  } catch (e) { /* a dropped poll is not worth a visible error */ }
+}
+
+// ── Actions ──────────────────────────────────────────────────────────────────
+$('me').onclick   = () => go('');
+$('back').onclick = () => go('');
+
+$('renameBtn').onclick = () => {
+  const v = $('rename').value.trim();
+  if (!v || LOCKED) return;
+  TOKEN = v.slice(0, 48); setCookie(COOKIE, TOKEN);
+  $('rename').value = ''; refresh();
+};
+
+$('newBtn').onclick = async () => {
+  const t = $('newTitle').value.trim();
+  const r = (await fetchText(url(TOKEN, 'new', t || 'untitled'))).trim();
+  $('newTitle').value = '';
+  if (/^t\d+$/.test(r)) go(r); else refresh();
+};
+
+$('lockBtn').onclick = async () => { await fetchText(url(TOKEN, room, 'lock')); refresh(); };
+
+$('sayBtn').onclick = async () => {
+  const t = $('say').value.trim();
+  if (!t) return;
+  $('say').value = '';
+  // Newlines are flattened to spaces server-side; say so rather than letting
+  // the user discover it after posting.
+  const r = (await fetchText(url(TOKEN, room, 'post', t))).trim();
+  if (r.indexOf('OK ') !== 0) $('sayNote').textContent = r;
+  refresh();
+};
+
+$('verifyBtn').onclick = async () => {
   const out = lines(await walk(url('verify')));
   const bad = out.filter(l => l.indexOf(' BAD ') > 0);
   alert(bad.length
