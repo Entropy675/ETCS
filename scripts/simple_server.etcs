@@ -1,6 +1,11 @@
-#!/media/user/Data/ACE/ETCS/bin/etcs
+#!/usr/bin/env etcs
 
-NetworkProvider
-HTTPParser server
-Listen server 8080
-TestPage server
+spawn NetworkProvider::HttpServer server
+server.SetPort(8080)
+
+server.spawn(NetworkProvider::StaticHtmlPage page)
+page.SetHtmlRaw('Hello from ETCS!')
+
+server.AddHandler(@server Serve)
+server.Start()
+server.IsStarted()

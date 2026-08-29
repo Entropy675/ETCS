@@ -11,7 +11,6 @@ I do not recommend working on this substrate until the below todo's are complete
 
 TODO:
 
-- Complete strictness overhaul of ETCS language
 - Fix deadlock/complete bilateral module & loader handshake
 - Import merkle hash chain from the completed version in other instance of project
 - Persistence tag within DatabaseProvider & merge Local/Remote Database ontology types

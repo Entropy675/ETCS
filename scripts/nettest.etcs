@@ -1,10 +1,12 @@
 #!/usr/bin/env etcs
 
+spawn NetworkProvider::HttpServer web
+web.SetPort(8080)
 
-NetworkProvider
-HttpServer web
-SetPort 8080
-web.add(FileHtmlPage tree)
-LoadFromDisk ./www
-context NetworkProvider::HttpServer web
-Start
+web.spawn(NetworkProvider::FileHtmlPage tree)
+tree.LoadFromDisk(./www)
+tree.ListPaths()
+
+web.AddHandler(@web Serve)
+web.Start()
+web.IsStarted()

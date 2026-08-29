@@ -136,8 +136,28 @@ int main(int argc, char* argv[])
             size_t end;
             unsigned long long rid = std::stoull(rid_str, &end);
             if (end != rid_str.size()) throw std::invalid_argument("trailing chars");
-            script_ctx.bind(name, static_cast<ETCS::RID>(rid));
-            ETCS_LOG("ETCS", "Injected: " << name << " -> RID:" << rid);
+            
+            // Resolved HERE, not deferred. A binding carries its
+            // Module::Tag now (action lines no longer state one), and
+            // an injected RID is the one place that pair is not
+            // already known -- so it is recovered from the entity
+            // itself, which also settles liveness at capture time.
+            ETCS::Entity* e = ETCS::resolve_entity_anywhere(static_cast<ETCS::RID>(rid));
+            if (!e)
+            {
+                std::cerr << COLOR_WARN << "etcs: RID " << rid
+                          << " (for '" << name << "') does not resolve to a "
+                             "live entity." << COLOR_RESET << "\n";
+                return drive_main_loop_then_exit(ctx, 1);
+            }
+            script_ctx.bind(name, ETCS::NameBinding{
+                static_cast<ETCS::RID>(rid), 
+                e->getSourceModule().toString(), 
+                e->getSourceTag().toString()
+            });
+            ETCS_LOG("ETCS", "Injected: " << name << " -> RID:" << rid
+                     << " (" << e->getSourceModule().toString()
+                     << "::" << e->getSourceTag().toString() << ")");
         }
         catch (...) {
             std::cerr << COLOR_WARN << "etcs: invalid RID '" << rid_str

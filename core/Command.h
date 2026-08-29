@@ -1,354 +1,391 @@
 #ifndef COMMAND_H__
 #define COMMAND_H__
-
 // Command.h - parsing only, no ETCS event calls
 // Produces Command values from raw input lines.
 // The executor (CommandExecutor.h) consumes these.
-
+//
+// ---------------------------------------------------------------------------
+// THE GRAMMAR, IN FULL
+//
+// Every line is one of exactly two shapes.
+//
+//   BARE      requires <name> [Tag, ...]      -- must already exist and qualify
+//             spawn    Module::Tag <name>     -- always creates
+//             attach   Module::Tag <name>     -- binds an existing one, or refuses
+//             ensure   Module::Tag <name>     -- binds an existing one, or creates
+//             detach   <script> [k=v ...]     -- launch and continue
+//             run      <script> [k=v ...]     -- launch and wait
+//             exit
+//
+//   DOTTED    <name>.Action(payload)          -- module action, TitleCase
+//             <name>.spawn(Module::Tag <n>)   -- runtime operation, lowercase
+//             <name>.attach(Module::Tag <n>)
+//             <name>.ensure(Module::Tag <n>)
+//             <name>.kill(<label> [index])
+//             <name>.unflag(<flag>)
+//             <a>.Produce(p) -> <b>.Consume(p)   -- stream, one line, both ends
+//
+// Nothing else is a line.
+//
+// NOTE THE SIGNATURE OF parse_line BELOW: it takes no ExecutionContext.
+// That is the whole design stated as a type. Under the previous grammar the
+// same text parsed as a tag declaration, an action, or a payload depending on
+// what a previous line had left in context -- so the parser needed the
+// context, and a line could not be read without replaying everything before
+// it. Every one of those ambiguities is gone, so the parameter is gone with
+// them. A line means one thing, forever, in isolation, and the parser is the
+// proof.
+// ---------------------------------------------------------------------------
 #include <string>
 #include <variant>
 #include <optional>
 #include <sstream>
 #include <cstring>
+#include <cstdint>
 #include <memory>
 #include <mutex>
+#include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include "ETCS_API.h"
 #include "Entity.h"
 #include "DynamicLoader.h"
 
 namespace ETCS {
 
-struct PendingStream
-{
-    ETCS::RID   producer_rid = 0;
-    std::string module;
-    std::string tag;
-    std::string produce_action;
-    std::string payload;
-};
-
 // ---------------------------------------------------------------------------
-// PersistentNames — process-lifetime name -> (RID, module, tag) registry,
-// deliberately separate from ExecutionContext::names (which is scoped to
-// exactly one execution and discarded the moment that script/detach/run
-// ends). This is what lets a script re-run later -- a fresh
-// ExecutionContext, a fresh Root, no memory of anything the FIRST run
-// bound -- still recognize and retarget the SAME named entities the
-// first run created, rather than spawning duplicates every single time.
+// NameBinding — what a name means. A RID plus the Module::Tag it was acquired
+// under.
 //
-// Global, flat, name-keyed -- same shape ExecutionContext::names already
-// has (a name means one thing everywhere, matching how "root" is already
-// a single reserved name rather than something scoped per module).
-// module/tag are stored alongside the RID so a lookup can verify "does
-// this name's existing binding actually fit what THIS script is asking
-// for" before ever reusing it -- a name bound against one module/tag is
-// never silently handed back to a DIFFERENT module/tag asking for the
-// same string; see find()'s own comment.
+// module/tag are carried alongside the RID rather than re-derived on every
+// use because they are what an action line no longer states. Under the old
+// grammar every action carried its own `Module::Tag.Action`, and the context
+// carried a second copy; now `web.Start()` names only the receiver, so the
+// pair has to come from the binding.
 //
-// No entry is ever proactively removed when its entity dies -- find()
-// callers already re-verify liveness (get_entity_by_rid) before ever
-// reusing a match, so a stale entry is harmless: just a few accumulated
-// bytes for a name string, bounded by how many DISTINCT names a person
-// has ever actually typed, not by how many times a script has run. If
-// this ever needs active pruning, the natural hook is EntityUnloadEvent's
-// own processing -- not added here yet.
+// For a name this script acquired itself (spawn/attach/ensure) the pair is
+// known at acquisition. For a name INJECTED as a detach/run binding only the
+// RID crosses the boundary -- module/tag are recovered once, at injection, by
+// resolving the entity and reading Entity::getSourceModule()/getSourceTag().
+// Left empty only if that entity is already dead, which the injection path
+// treats as an unmet binding rather than a usable name.
 // ---------------------------------------------------------------------------
-struct PersistentNameEntry
+struct NameBinding
 {
     ETCS::RID   rid = 0;
     std::string module;
     std::string tag;
 };
 
-struct PersistentNames
+// ---------------------------------------------------------------------------
+// GlobalNames — the names introduced by the ROOT script, and nothing else.
+//
+// This replaces PersistentNames, and occupies its structural slot (one
+// process-level, name-keyed, mutex-guarded table) with materially different
+// write rules -- which is the entire point, so the difference is worth
+// stating precisely:
+//
+//   PersistentNames was written by EVERY bind() anywhere, at any depth, in
+//   any script, and never cleared. That is what let a name introduced in one
+//   script silently retarget a spawn in an unrelated one, and what let a
+//   second run of the same file bind onto the first run's entities. Sharing
+//   happened because two scripts happened to pick the same word.
+//
+//   GlobalNames is written ONLY by the root executor (ctx.is_root), only for
+//   names the root script itself introduced, and is cleared when the root
+//   script ends. A leaf script's names never appear here at all, so two
+//   leaves picking the same word never see each other -- they see the root's,
+//   or nothing.
+//
+// Reads are open to every script in the tree: that is the "global" half of
+// the two-scope rule (local closure + root globals, no ancestor chain).
+// A read is never a guarantee of liveness -- callers re-verify before use,
+// same as before.
+// ---------------------------------------------------------------------------
+struct GlobalNames
 {
     std::mutex mutex_;
-    std::unordered_map<std::string, PersistentNameEntry> entries_;
+    std::unordered_map<std::string, NameBinding> entries_;
 
-    void record(const std::string& name, ETCS::RID rid,
-                const std::string& module, const std::string& tag)
+    void record(const std::string& name, const NameBinding& b)
     {
-        if (name.empty() || module.empty() || tag.empty()) return;
+        if (name.empty() || b.rid == 0) return;
         std::lock_guard<std::mutex> lock(mutex_);
-        entries_[name] = PersistentNameEntry{rid, module, tag};
+        entries_[name] = b;
     }
 
-    // Returns the entry only if `name` is bound AND its recorded
-    // module/tag match what's being asked for -- a name bound under a
-    // different module/tag never matches here, so the caller falls
-    // through to an ordinary fresh spawn rather than getting back
-    // something that doesn't fit the script's own requirements.
-    std::optional<PersistentNameEntry> find(const std::string& name,
-                                             const std::string& module,
-                                             const std::string& tag)
+    std::optional<NameBinding> find(const std::string& name)
     {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = entries_.find(name);
         if (it == entries_.end()) return std::nullopt;
-        if (it->second.module != module || it->second.tag != tag) return std::nullopt;
         return it->second;
     }
 
-    // For REPL/browsing visibility -- every persisted name currently
-    // recorded under a given module (any tag), regardless of whether
-    // it's still alive. The caller (repl_shell_tag_loop) is the one that
-    // actually checks liveness before display, same as it already does
-    // for ordinary RIDListHandle entries.
-    std::vector<std::pair<std::string, PersistentNameEntry>> forModule(const std::string& module)
+    // Cleared when the root script ends -- a global's lifetime is the root's
+    // lifetime, which for the root script IS the runtime's lifetime. Exists
+    // so a runtime that runs a root script, finishes, and runs another does
+    // not leak the first one's names into the second.
+    void clear()
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        std::vector<std::pair<std::string, PersistentNameEntry>> out;
-        for (const auto& [name, entry] : entries_)
-            if (entry.module == module) out.emplace_back(name, entry);
-        return out;
+        entries_.clear();
     }
 
-    static PersistentNames& getInstance()
+    std::vector<std::pair<std::string, NameBinding>> snapshot()
     {
-        static PersistentNames instance;
+        std::lock_guard<std::mutex> lock(mutex_);
+        return {entries_.begin(), entries_.end()};
+    }
+
+    static GlobalNames& getInstance()
+    {
+        static GlobalNames instance;
         return instance;
     }
 };
 
 struct ExecutionContext
 {
-    std::string module_name;
-    std::string tag_name;
-    ETCS::RID   active_rid = 0;
-    SignalContext* sig = nullptr;
+    SignalContext*      sig = nullptr;
     ETCS::LifetimeOwner root_entity;
-    
+
     // The entity or Root serving as "root" for this execution — any
-    // entity/Root works (see Entity::getRootAncestor()); being
-    // specifically tagged Root::TAG only matters to attachModule's own
-    // claim-and-hand-off logic, not to anything here. Inherited from a
-    // parent script's own ExecutionContext for detach/run children (same
-    // value, valid as long as whatever it points to is still alive -- see
-    // CmdDetach/CmdRun, CommandExecutor.h, both of which now construct
-    // their OWN fresh Root for the child rather than reusing the
-    // parent's); a genuine top-level entry point (run_socket_repl, a
-    // freshly started .etcs file) allocates its own fresh Root on its own
-    // stack instead, since there's nothing to inherit from.
+    // entity/Root works (see Entity::getRootAncestor()); being specifically
+    // tagged Root::TAG only matters to attachModule's own claim-and-hand-off
+    // logic. Each detach/run child constructs its OWN fresh Root rather than
+    // inheriting the parent's (see CmdDetach/CmdRun, CommandExecutor.h); a
+    // genuine top-level entry point allocates its own.
+    ExecutionContext(ETCS::LifetimeOwner root = {}, SignalContext* s = nullptr)
+        : sig(s), root_entity(root) {}
+
+    // This script's own names: what it introduced, plus what it was passed.
+    // NOT the globals -- those are consulted as a second, separate lookup
+    // (see resolve/resolve_binding below), never merged in here, so a script
+    // can always tell its own names from the root's.
+    std::unordered_map<std::string, NameBinding> names;
+
+    // ---------------------------------------------------------------------
+    // The liveness watch set — every RID this script spawned, attached,
+    // ensured, or was passed. "Its closure," in the language doc's terms.
     //
-    // LifetimeOwner, not a bare Entity* -- in current practice this is
-    // always a Root (every actual call site in this codebase constructs
-    // one), but the field's own contract has always been "any root-level
-    // anchor," and LifetimeOwner is what lets that stay true without
-    // requiring Root to masquerade as an Entity the way it used to.
-    
-    ExecutionContext(ETCS::LifetimeOwner root = {}, SignalContext* s = nullptr) : sig(s), root_entity(root) {};
+    // Provenance, not a sweep: a RID that vanishes and is never named again
+    // is not this script's problem, and a script that deletes its own entity
+    // and moves on is not in error. What is in error is NAMING a receiver
+    // this script depends on, after that entity has stopped resolving --
+    // checked at the reference, which under mandatory receivers is exactly
+    // one place per line.
+    // ---------------------------------------------------------------------
+    std::unordered_set<ETCS::RID> owned_;
 
+    // Set by the executor when an owned RID fails to resolve at a reference.
+    // run_script checks it after each line and stops with Vanished.
+    ETCS::RID lost_rid = 0;
 
-    std::unordered_map<std::string, ETCS::RID> names;
-    std::string pending_name;
-    std::optional<PendingStream> pending_stream;
-
-    // True for the root executor — owns DetachedRegistry::join_all() on exit.
-    // Detached child executors set this false so they never join themselves.
+    // True for the root executor — owns DetachedRegistry::join_all() on exit,
+    // and owns GlobalNames: only a root executor publishes into it, and only
+    // a root executor clears it.
     bool is_root = true;
 
-    bool has_module()       const { return !module_name.empty(); }
-    bool has_tag()          const { return !tag_name.empty(); }
-    bool has_entity()       const { return active_rid != 0; }
-    bool has_pending_name() const { return !pending_name.empty(); }
+    void own(ETCS::RID rid)        { if (rid) owned_.insert(rid); }
+    bool owns(ETCS::RID rid) const { return owned_.count(rid) > 0; }
+    void note_lost(ETCS::RID rid)  { lost_rid = rid; }
 
-    // Also mirrors into PersistentNames -- see that struct's own comment
-    // for why. This is the single chokepoint every existing bind path
-    // (as, flush_pending_name, a direct call) already goes through, so
-    // hooking it here covers all of them uniformly rather than needing a
-    // second, separately-maintained call at each site. Only records when
-    // module_name/tag_name are actually populated -- an empty pair means
-    // whatever called bind() hasn't established real module/tag context
-    // yet, and PersistentNames::record itself already no-ops on empty
-    // strings regardless, so this is a documentation note more than a
-    // second guard.
-    void bind(const std::string& name, ETCS::RID rid)
+    // Introduce a name. Publishes to GlobalNames only from the root script --
+    // see that struct's comment for why that restriction is the whole
+    // difference between this and the name table it replaces.
+    void bind(const std::string& name, const NameBinding& b)
     {
-        names[name] = rid;
-        PersistentNames::getInstance().record(name, rid, module_name, tag_name);
+        names[name] = b;
+        own(b.rid);
+        if (is_root) GlobalNames::getInstance().record(name, b);
+    }
+
+    void bind(const std::string& name, ETCS::RID rid,
+              const std::string& module, const std::string& tag)
+    {
+        bind(name, NameBinding{rid, module, tag});
+    }
+
+    bool introduced(const std::string& name) const { return names.count(name) > 0; }
+
+    // Local first, then globals. The two-scope rule, in one function: a
+    // script's own names shadow the root's, and there is nothing in between
+    // -- no parent chain, no ancestor walk, no depth-dependent resolution.
+    std::optional<NameBinding> lookup(const std::string& name) const
+    {
+        auto it = names.find(name);
+        if (it != names.end()) return it->second;
+        return GlobalNames::getInstance().find(name);
     }
 
     ETCS::RID resolve_name(const std::string& name) const
     {
-        auto it = names.find(name);
-        return it != names.end() ? it->second : 0;
+        auto b = lookup(name);
+        return b ? b->rid : 0;
     }
 
-    bool has_name(const std::string& name) const { return names.count(name) > 0; }
-
-    void flush_pending_name(ETCS::RID rid, bool overwrite = false)
-    {
-        if (pending_name.empty()) return;
-        if (overwrite || !has_name(pending_name))
-            bind(pending_name, rid);
-        pending_name.clear();
-    }
+    bool has_name(const std::string& name) const { return lookup(name).has_value(); }
 
     std::string describe() const
     {
-        if (!has_module()) return "(no context)";
-        std::string s = module_name;
-        if (has_tag()) { s += "::" + tag_name; }
-        if (has_entity())
+        std::string s = "names[" + std::to_string(names.size()) + "]";
+        for (const auto& [n, b] : names)
         {
-            s += " RID:" + std::to_string(active_rid);
-            for (const auto& [n, r] : names)
-                if (r == active_rid) { s += " (" + n + ")"; break; }
+            s += " " + n + "->RID:" + std::to_string(b.rid);
+            if (!b.tag.empty()) s += "(" + b.module + "::" + b.tag + ")";
         }
-        if (!pending_name.empty())
-            s += " [name pending: " + pending_name + "]";
-        if (pending_stream.has_value())
-            s += " [stream pending: " + pending_stream->produce_action + "]";
         return s;
     }
-
-    void set_module(const std::string& m)
-    {
-        module_name = m;
-        tag_name.clear();
-        active_rid = 0;
-        pending_name.clear();
-    }
-
-    void set_tag(const std::string& t)
-    {
-        tag_name = t;
-        active_rid = 0;
-    }
-
-    void set_entity(ETCS::RID rid) { active_rid = rid; }
-
-    void clear()
-    {
-        module_name.clear();
-        tag_name.clear();
-        active_rid = 0;
-        pending_name.clear();
-        pending_stream.reset();
-    }
 };
 
+// ---------------------------------------------------------------------------
 // Command types
+// ---------------------------------------------------------------------------
 
-struct CmdPrintContext {};
+// The three script-resolved acquisition verbs. One struct rather than three,
+// because they carry identical fields and differ in exactly one thing: what
+// happens when the closure does not already hold that name. Splitting them
+// into three types would duplicate the struct, the parse, and the whole
+// executor branch to express a difference that is one enum wide.
+//
+//   Spawn   -- always creates. Never looks at the closure at all.
+//   Attach  -- binds the closure's entity. Refuses if there isn't one.
+//   Ensure  -- binds the closure's entity, or creates one.
+//
+// `requires` is deliberately NOT in this enum: it is not script-resolved. It
+// names something the caller must already have supplied (or that the root
+// published as a global), it takes no Module::Tag, and it can carry a tag
+// constraint none of these three can. Different inputs, different outputs,
+// its own command type.
+enum class AcquireVerb { Spawn, Attach, Ensure };
 
-struct CmdSetModule { std::string module; std::string pending_name; };
-
-struct CmdSetTag { std::string module; std::string tag; std::string pending_name; };
-
-struct CmdSetEntity
+inline const char* acquire_verb_name(AcquireVerb v)
 {
+    switch (v)
+    {
+        case AcquireVerb::Spawn:  return "spawn";
+        case AcquireVerb::Attach: return "attach";
+        case AcquireVerb::Ensure: return "ensure";
+    }
+    return "?";
+}
+
+// requires <name> [Tag1, Tag2, ...]
+//
+// No Module::Tag, ever -- see the language document's own reasoning. The
+// optional bracket constrains by SLOT rather than type: every tag listed must
+// be present on whatever entity gets bound.
+//
+// Two kinds of tag can appear in that list and both are checked identically
+// here (Entity::hasTag routes both to the same map):
+//
+//   Bare        Deletable, Gate, Parser -- the is-a markers ETCS_MAKE_INSTANCE's
+//               generated constructor adds via addTypeTag, fixed at
+//               construction, never reachable by anything a script can do.
+//   Origin-affixed  NetworkProvider::TLSContext -- the record that this entity
+//               has had a child of that type spawned or attached onto it. A
+//               fact about this entity's own causal history, not about its
+//               type: two entities of the same concrete type can differ here.
+//
+// That difference is invisible to the check and decisive for its TIMING --
+// bare tags are knowable from the resolved type at load, origin-affixed ones
+// only once execution has actually reached this script. See the executor.
+//
+// `unflag` cannot reach either: it operates on the lowercase flags_ map,
+// which is a different set entirely (Entity::hasTag routes on case).
+struct CmdRequires
+{
+    std::string              name;
+    std::vector<std::string> tags;   // empty == any live entity qualifies
+};
+
+// spawn/attach/ensure Module::Tag <name>
+struct CmdAcquire
+{
+    AcquireVerb verb;
     std::string module;
     std::string tag;
-    ETCS::RID   rid;
     std::string name;
-    bool        is_new;
 };
 
-struct CmdSpawn { std::string module; std::string tag; std::string name; };
-
-struct CmdList { std::string module; std::string tag; };
-
-struct CmdSelect { size_t index; };
-
-struct CmdBind { std::string name; };
-
-// unflag <name> — removes a flag from the entity currently in context,
-// via Entity::removeTag(Buffer). Deliberately a top-level verb, not
-// folded into CmdAction: it's not a dispatch call at all (no module
-// action table involved), just a direct tag-list mutation, same
-// category as `as` (CmdBind) rather than an ordinary action. Routing it
-// through Entity::removeTag means it goes through the SAME
-// TagModifyEvent / Scope::interruptOne path any other tag removal
-// already does -- if `name` happens to be an active_scope_* label
-// (see ScopeTag, Bundles.h), this is what actually reaches in and
-// interrupts that stream call's own SignalContext, not merely removes
-// bookkeeping.
-struct CmdUnflag { std::string flag; };
-
-// kill <label> [index] — interrupts in-flight work on the entity currently
-// in context. Omitting the index interrupts EVERY live call carrying that
-// label; supplying one targets a single call by its position among the live
-// entries sharing that label, in creation order (see Scope, Bundles.h).
+// <parent>.spawn/attach/ensure( Module::Tag <name> )
 //
-// The no-index form is exactly what removing the shared "active_scope_<label>"
-// flag already does, and this is deliberately a second way to reach it: the
-// flag is bookkeeping the shell can see, while `kill Listen` says what it
-// means. A script author should never need to know the flag exists.
+// Replaces `.add()` entirely. `.add()` could only ever create, so a script
+// wanting to reuse a parent's existing child had no way to say so and built a
+// second one -- which is exactly the duplicate-`tree` bug the strict-form
+// transform surfaced across three files.
 //
-// Deliberately a top-level verb, like CmdUnflag rather than CmdAction: it
-// dispatches nothing, consults no module action table, and touches only the
-// entity's own scope registry. It is also the reason this belongs in the
-// LANGUAGE and not only in the REPL -- a script that starts a long-running
-// stream currently has no way to stop it short of destroying the entity that
-// owns it.
+// The parent is part of the match for Attach/Ensure, not merely the search
+// order: a child of some OTHER parent carrying the same name never binds
+// here.
+struct CmdChildAcquire
+{
+    AcquireVerb verb;
+    std::string parent_name;
+    std::string module;
+    std::string tag;
+    std::string name;
+};
+
+// <name>.Action(payload)
+// <a>.Produce(payload) -> <b>.Consume(payload)
 //
-// has_index rather than a sentinel value: 0 is a perfectly valid index (the
-// oldest live call of that label), so it cannot double as "unspecified".
+// No module, no tag, no fully_qualified flag, no target_rid. The receiver's
+// name is the address, and its Module::Tag comes from the binding -- so the
+// eight fields the old CmdAction needed to describe "which entity, maybe, and
+// how to find it if not" collapse into one string.
+struct CmdAction
+{
+    std::string receiver;
+    std::string action;
+    std::string payload;
+
+    bool        is_stream = false;
+    std::string consumer_receiver;
+    std::string consumer_action;
+    std::string consumer_payload;
+};
+
+// <name>.kill(<label> [index])
+//
+// Interrupts in-flight work on the named entity. Omitting the index
+// interrupts EVERY live call carrying that label; supplying one targets a
+// single call by position among the live entries sharing that label, in
+// creation order (see Scope, Bundles.h).
+//
+// has_index rather than a sentinel: 0 is a valid index (the oldest live call
+// of that label), so it cannot double as "unspecified".
 struct CmdKill
 {
+    std::string receiver;
     std::string label;
     size_t      index     = 0;
     bool        has_index = false;
 };
 
-// <name>.add( <line> ) — attach a typed child to an already-bound entity.
+// <name>.unflag(<flag>)
 //
-// The parenthesised argument is a NESTING BOUNDARY, not punctuation: what's
-// inside is a complete, ordinary .etcs line, parsed by the same parse_line
-// everything else goes through. That is why there's no bespoke argument
-// syntax to keep in sync -- whatever declares a type today declares one
-// inside add() tomorrow, automatically.
+// Removes a FLAG -- the freely-mutable lowercase set. Routed through
+// Entity::removeTag, which means it goes through the same TagModifyEvent /
+// Scope::interruptOne path any other flag removal does: if `flag` names an
+// active_scope_* label (ScopeTag, Bundles.h), this reaches in and interrupts
+// that stream call's own SignalContext rather than merely removing
+// bookkeeping.
 //
-// The interior is parsed with the TAG cleared from the surrounding context,
-// deliberately. `FileHtmlPage tree` parses as a tag declaration only while no
-// tag is set; with one already in context the same text parses as an ACTION
-// named FileHtmlPage. Clearing it makes the interior read as the declaration
-// it visibly is, independent of whatever line preceded it.
-//
-// Unambiguous against Tag.Action by the naming rules this runtime enforces at
-// the marketplace boundary: `add` is lowercase and action names are TitleCase,
-// so no action can be spelled `add`, and nothing else in the language uses
-// parentheses at all. Same structural (not probabilistic) guarantee that makes
-// back/up/kill safe as shell verbs.
-//
-// The receiver is a NAME, not a context reference -- the parent is stated at
-// the call, so a script can attach to something bound many lines ago without
-// re-navigating to it.
-struct AttachedCommand;   // completed below Command -- recursive variant needs
-                          // indirection, and shared_ptr keeps Command copyable
-                          // (ShellREPL constructs Command{cmd} by value).
-
-struct CmdAttach
+// It cannot touch the upper-case tag set a `requires` bracket tests. That is
+// enforced one level down by Entity::hasTag/removeTag's own case routing, not
+// here -- but it is the reason a bracketed `requires` is a stable assertion
+// rather than something a later line could quietly invalidate.
+struct CmdUnflag
 {
-    std::string parent_name;
-    std::shared_ptr<AttachedCommand> inner;
-};
-
-struct CmdAction
-{
-    std::string module;
-    std::string tag;
-    std::string action;
-    std::string payload;
-
-    std::string target_module;
-    std::string target_tag;
-    ETCS::RID   target_rid  = 0;
-    std::string target_name;
-
-    bool fully_qualified = false;
-
-    bool        is_inline_stream  = false;
-    std::string consumer_action;
-    std::string consumer_tag;
-    std::string consumer_name;
+    std::string receiver;
+    std::string flag;
 };
 
 struct CmdDetach
 {
-    std::string                                  script;
+    std::string                                     script;
     std::vector<std::pair<std::string,std::string>> bindings;
 };
 
@@ -358,69 +395,30 @@ struct CmdRun
     std::vector<std::pair<std::string,std::string>> bindings;
 };
 
-struct CmdJobs {};
-
-struct CmdSignal
-{
-    uint64_t id;
-    bool     terminate;
-};
-
 struct CmdExit {};
-
 struct CmdError { std::string message; };
 
-
 using Command = std::variant<
-    CmdPrintContext,
-    CmdSetModule,
-    CmdSetTag,
-    CmdSetEntity,
-    CmdSpawn,
-    CmdList,
-    CmdSelect,
-    CmdBind,
-    CmdUnflag,
-    CmdAttach,
+    CmdRequires,
+    CmdAcquire,
+    CmdChildAcquire,
     CmdAction,
     CmdKill,
+    CmdUnflag,
     CmdDetach,
     CmdRun,
-    CmdJobs,
-    CmdSignal,
     CmdExit,
     CmdError
 >;
 
-
-// Completed here, now that Command is a complete type. Only ever constructed
-// via make_shared at a point where this definition is visible, so the
-// shared_ptr's deleter is captured correctly despite the forward declaration
-// above.
-struct AttachedCommand { Command cmd; };
-
 namespace detail {
 
-inline bool split_module_tag(const std::string& s,
-                              std::string& module, std::string& tag)
+inline std::string trim(const std::string& s)
 {
-    auto pos = s.find("::");
-    if (pos == std::string::npos) return false;
-    module = s.substr(0, pos);
-    tag    = s.substr(pos + 2);
-    return !module.empty() && !tag.empty();
-}
-
-inline bool split_qualified_action(const std::string& s,
-                                    std::string& module,
-                                    std::string& tag,
-                                    std::string& action)
-{
-    auto dot = s.rfind('.');
-    if (dot == std::string::npos) return false;
-    std::string scope = s.substr(0, dot);
-    action = s.substr(dot + 1);
-    return split_module_tag(scope, module, tag) && !action.empty();
+    size_t b = s.find_first_not_of(" \t");
+    if (b == std::string::npos) return "";
+    size_t e = s.find_last_not_of(" \t");
+    return s.substr(b, e - b + 1);
 }
 
 inline bool is_uppercase_start(const std::string& s)
@@ -428,538 +426,492 @@ inline bool is_uppercase_start(const std::string& s)
     return !s.empty() && std::isupper((unsigned char)s[0]);
 }
 
-inline bool is_rid(const std::string& s, ETCS::RID& out)
+inline bool is_lowercase_start(const std::string& s)
 {
-    if (s.empty()) return false;
-    try {
-        size_t end;
-        unsigned long long v = std::stoull(s, &end);
-        if (end != s.size()) return false;
-        out = static_cast<ETCS::RID>(v);
-        return true;
-    } catch (...) { return false; }
+    return !s.empty() && std::islower((unsigned char)s[0]);
+}
+
+inline bool split_module_tag(const std::string& s,
+                             std::string& module, std::string& tag)
+{
+    auto pos = s.find("::");
+    if (pos == std::string::npos) return false;
+    module = s.substr(0, pos);
+    tag    = s.substr(pos + 2);
+    return !module.empty() && !tag.empty()
+        && is_uppercase_start(module) && is_uppercase_start(tag)
+        && tag.find("::") == std::string::npos;
 }
 
 inline bool is_valid_local_name(const std::string& s)
 {
     if (s.empty()) return false;
-    // Reserved — always refers to whatever entity/Root is serving as
-    // root for the current execution (see ExecutionContext::root_entity,
-    // and Entity::getRootAncestor() for how deeper code reaches one
-    // without any global lookup). Never user-bindable via `as`, `spawn
-    // <name>`, or a detach/run k=v binding — it's injected automatically
-    // into every detach/run child instead (see resolve_run_bindings,
-    // CommandExecutor.h), the same way ctx/sig propagate through the
-    // executor machinery without needing to be named explicitly every
-    // time.
+    // Reserved — always refers to whatever entity/Root is serving as root for
+    // the current execution (see ExecutionContext::root_entity, and
+    // Entity::getRootAncestor()). Never user-bindable; injected automatically
+    // into every detach/run child (see resolve_run_bindings,
+    // CommandExecutor.h).
     if (s == "root") return false;
-    if (s.find("::") != std::string::npos) return false;
-    if (s.find('.')  != std::string::npos) return false;
     for (char c : s)
         if (!std::isalnum((unsigned char)c) && c != '_') return false;
     return true;
 }
 
-inline bool parse_stream_target(const std::string& payload,
-                                 std::string& t_module, std::string& t_tag,
-                                 ETCS::RID& t_rid, std::string& t_name)
+// A tag as it may appear inside a `requires` bracket: either a bare is-a
+// marker (Gate) or an origin-affixed one (NetworkProvider::TLSContext). Both
+// are upper-case leading, which is what separates them from the lowercase
+// flag namespace `unflag` operates on.
+inline bool is_valid_requires_tag(const std::string& s)
 {
-    if (payload.empty()) return false;
-    if (!is_uppercase_start(payload)) return false;
-    if (payload.find("::") == std::string::npos) return false;
-
-    size_t sp = payload.find_first_of(" \t");
-    std::string scope    = (sp == std::string::npos) ? payload : payload.substr(0, sp);
-    std::string id_token = (sp == std::string::npos) ? "" : payload.substr(sp + 1);
-    size_t rs = id_token.find_first_not_of(" \t");
-    if (rs != std::string::npos) id_token = id_token.substr(rs); else id_token.clear();
-
-    if (!split_module_tag(scope, t_module, t_tag)) return false;
-
-    t_rid  = 0;
-    t_name.clear();
-    if (!id_token.empty())
+    if (!is_uppercase_start(s)) return false;
+    auto sep = s.find("::");
+    if (sep == std::string::npos)
     {
-        if (!is_rid(id_token, t_rid))
-            t_name = id_token;
+        for (char c : s)
+            if (!std::isalnum((unsigned char)c) && c != '_') return false;
+        return true;
+    }
+    std::string m, t;
+    return split_module_tag(s, m, t);
+}
+
+// -------------------------------------------------------------------------
+// find_closing_bracket — the matching ')' for the '(' at `open`, by depth
+// count, QUOTE-AWARE.
+//
+// Payloads nest (SQL is full of parentheses) and payloads quote. A depth
+// counter alone breaks on `ExecuteRaw(SELECT ')' FROM x)`; a quote check
+// alone breaks on nested calls. Both together handle every payload this
+// language can carry, and a payload with unbalanced parens OUTSIDE quotes has
+// to be quoted -- there is no escape character, deliberately, because one
+// would put a second parsing rule inside a span whose whole contract is that
+// it is handed to the work function untouched.
+// -------------------------------------------------------------------------
+inline size_t find_closing_bracket(const std::string& s, size_t open)
+{
+    int  depth     = 0;
+    bool in_single = false, in_double = false;
+    for (size_t i = open; i < s.size(); ++i)
+    {
+        char ch = s[i];
+        if (ch == '\'' && !in_double) { in_single = !in_single; continue; }
+        if (ch == '"'  && !in_single) { in_double = !in_double; continue; }
+        if (in_single || in_double) continue;
+        if (ch == '(') ++depth;
+        else if (ch == ')' && --depth == 0) return i;
+    }
+    return std::string::npos;
+}
+
+// The stream arrow, at bracket depth 0 and outside quotes. An `->` inside a
+// payload (a SQL string, a path) is payload text and must not split the line.
+inline size_t find_stream_arrow(const std::string& s)
+{
+    int  depth     = 0;
+    bool in_single = false, in_double = false;
+    for (size_t i = 0; i + 1 < s.size(); ++i)
+    {
+        char ch = s[i];
+        if (ch == '\'' && !in_double) { in_single = !in_single; continue; }
+        if (ch == '"'  && !in_single) { in_double = !in_double; continue; }
+        if (in_single || in_double) continue;
+        if (ch == '(') { ++depth; continue; }
+        if (ch == ')') { --depth; continue; }
+        if (depth == 0 && ch == '-' && s[i + 1] == '>') return i;
+    }
+    return std::string::npos;
+}
+
+// One dotted call: `<receiver>.<member>( <payload> )`.
+struct DottedCall
+{
+    std::string receiver;
+    std::string member;
+    std::string payload;
+};
+
+inline bool parse_dotted(const std::string& s, DottedCall& out, std::string& err)
+{
+    size_t open = s.find('(');
+    if (open == std::string::npos)
+    {
+        err = "expected '(' -- every action takes a bracketed argument list, "
+              "'()' when it takes none";
+        return false;
+    }
+    size_t dot = s.find('.');
+    if (dot == std::string::npos || dot > open)
+    {
+        err = "expected <name>.Action(...) -- every action names the entity it "
+              "acts on";
+        return false;
+    }
+
+    out.receiver = trim(s.substr(0, dot));
+    out.member   = trim(s.substr(dot + 1, open - dot - 1));
+
+    if (!is_valid_local_name(out.receiver))
+    {
+        err = "'" + out.receiver + "' is not a valid name";
+        return false;
+    }
+    if (out.member.empty())
+    {
+        err = "expected an action name between '.' and '('";
+        return false;
+    }
+    for (char c : out.member)
+        if (!std::isalnum((unsigned char)c) && c != '_')
+        {
+            err = "'" + out.member + "' is not a valid action name";
+            return false;
+        }
+
+    size_t close = find_closing_bracket(s, open);
+    if (close == std::string::npos)
+    {
+        err = "unbalanced parentheses -- quote a payload carrying unmatched "
+              "brackets; a line never continues onto the next";
+        return false;
+    }
+    for (size_t i = close + 1; i < s.size(); ++i)
+        if (!std::isspace((unsigned char)s[i]))
+        {
+            err = "unexpected content after ')'";
+            return false;
+        }
+
+    out.payload = trim(s.substr(open + 1, close - open - 1));
+    return true;
+}
+
+// The interior of a receiver-scoped spawn/attach/ensure: `Module::Tag <name>`.
+inline bool parse_typed_declaration(const std::string& s,
+                                    std::string& module, std::string& tag,
+                                    std::string& name, std::string& err)
+{
+    size_t sp = s.find_first_of(" \t");
+    if (sp == std::string::npos)
+    {
+        err = "expected 'Module::Tag <name>' -- every acquisition names a name";
+        return false;
+    }
+    std::string scope = trim(s.substr(0, sp));
+    name              = trim(s.substr(sp + 1));
+
+    if (!split_module_tag(scope, module, tag))
+    {
+        err = "expected Module::Tag, got '" + scope + "'";
+        return false;
+    }
+    if (!is_valid_local_name(name))
+    {
+        err = "'" + name + "' is not a valid name";
+        return false;
     }
     return true;
 }
 
-inline bool parse_inline_stream(const std::string& rest,
-                                 const std::string& ambient_module,
-                                 std::string& producer_name,
-                                 std::string& cons_module,
-                                 std::string& cons_tag,
-                                 std::string& cons_action,
-                                 std::string& consumer_name)
+// k=v bindings shared by detach and run.
+inline bool parse_bindings(std::istringstream& iss, const char* verb,
+                           std::vector<std::pair<std::string,std::string>>& out,
+                           std::string& err)
 {
-    const std::string arrow = " -> ";
-    size_t arrow_pos = rest.find(arrow);
-    if (arrow_pos == std::string::npos) return false;
-
-    std::string lhs = rest.substr(0, arrow_pos);
-    std::string rhs = rest.substr(arrow_pos + arrow.size());
-
-    size_t ls = lhs.find_first_not_of(" \t");
-    size_t le = lhs.find_last_not_of(" \t");
-    producer_name = (ls == std::string::npos) ? "" : lhs.substr(ls, le - ls + 1);
-
-    size_t rs = rhs.find_first_not_of(" \t");
-    if (rs != std::string::npos) rhs = rhs.substr(rs); else rhs.clear();
-    if (rhs.empty()) return false;
-
-    size_t sp = rhs.find_first_of(" \t");
-    std::string cons_verb    = (sp == std::string::npos) ? rhs : rhs.substr(0, sp);
-    std::string cons_id_rest = (sp == std::string::npos) ? "" : rhs.substr(sp + 1);
-    size_t ci = cons_id_rest.find_first_not_of(" \t");
-    if (ci != std::string::npos) cons_id_rest = cons_id_rest.substr(ci); else cons_id_rest.clear();
-    consumer_name = cons_id_rest;
-
-    auto dot = cons_verb.rfind('.');
-    if (dot == std::string::npos) return false;
-    cons_action = cons_verb.substr(dot + 1);
-    std::string scope = cons_verb.substr(0, dot);
-
-    std::string m, t;
-    if (split_module_tag(scope, m, t))
+    std::string token;
+    while (iss >> token)
     {
-        cons_module = m;
-        cons_tag    = t;
+        auto eq = token.find('=');
+        if (eq == std::string::npos)
+        {
+            err = std::string(verb) + ": invalid binding '" + token
+                + "', expected name=name";
+            return false;
+        }
+        std::string child_name  = token.substr(0, eq);
+        std::string parent_name = token.substr(eq + 1);
+        if (!is_valid_local_name(child_name))
+        {
+            err = std::string(verb) + ": '" + child_name + "' is not a valid name";
+            return false;
+        }
+        if (!is_valid_local_name(parent_name))
+        {
+            err = std::string(verb) + ": '" + parent_name + "' is not a valid name";
+            return false;
+        }
+        out.emplace_back(child_name, parent_name);
     }
-    else
-    {
-        cons_module = ambient_module;
-        cons_tag    = scope;
-    }
+    return true;
+}
 
-    return !cons_action.empty() && !cons_tag.empty() && !cons_module.empty();
+// Removed constructs, reported by name rather than as "unknown command".
+// Every one of these was valid in the previous grammar and appears in scripts
+// still on disk, so the migration deserves a sentence rather than a shrug.
+inline std::optional<std::string> removed_construct(const std::string& verb)
+{
+    if (verb == "context")
+        return "the ambient context is gone -- every line names its own "
+               "receiver. Use 'spawn/attach/ensure Module::Tag <name>' to "
+               "introduce a name, then '<name>.Action(...)'.";
+    if (verb == "as")
+        return "'as' is gone -- names come from requires/spawn/attach/ensure "
+               "only, each of which names its name on the line that acquires it.";
+    if (verb == "list" || verb == "select")
+        return "'" + verb + "' is a browse operation, not a script line. The "
+               "navigator lists and selects; a script names what it means.";
+    if (verb == "jobs" || verb == "signal")
+        return "'" + verb + "' is a control operation on the running runtime, "
+               "reachable from a session on the control socket -- not a line in a "
+               "trace. A script launches work with detach/run; it does not "
+               "administer it afterward.";
+    return std::nullopt;
 }
 
 } // namespace detail
 
-inline Command parse_line(const std::string& raw,
-                           const ExecutionContext& ctx,
-                           bool is_first_line = false)
+// ---------------------------------------------------------------------------
+// parse_line — text to Command. No context, by design (see the header note).
+// ---------------------------------------------------------------------------
+inline Command parse_line(const std::string& raw)
 {
-    size_t start = raw.find_first_not_of(" \t");
-    if (start == std::string::npos) return CmdError{"empty line"};
-    std::string line = raw.substr(start);
-    while (!line.empty() && (line.back() == ' ' || line.back() == '\t'))
-        line.pop_back();
+    std::string line = detail::trim(raw);
+    if (line.empty()) return CmdError{"empty line"};
 
-    // Checked BEFORE the verb split below -- that splits on whitespace, and
-    // the interior line contains spaces. Falls through silently (rather than
-    // erroring) when the text before ".add(" isn't a valid local name, so a
-    // payload that happens to contain the sequence is left alone.
+    // ---- Stream: two dotted calls, one line, arrow between them ----------
+    //
+    // Checked before the verb split, since both halves contain dots, brackets
+    // and spaces. There is no two-line form: a produce whose consumer is on
+    // the next line is state held between lines, and a file could end mid-pair
+    // in a way no single line revealed.
     {
-        size_t add_pos = line.find(".add(");
-        std::string receiver = (add_pos == std::string::npos) ? "" : line.substr(0, add_pos);
-        if (add_pos != std::string::npos && detail::is_valid_local_name(receiver))
+        size_t arrow = detail::find_stream_arrow(line);
+        if (arrow != std::string::npos)
         {
-            size_t open  = add_pos + 4;   // index of '(' within ".add("
-            int    depth = 0;
-            size_t close = std::string::npos;
-            for (size_t i = open; i < line.size(); ++i)
-            {
-                if (line[i] == '(') ++depth;
-                else if (line[i] == ')' && --depth == 0) { close = i; break; }
-            }
-            if (close == std::string::npos)
-                return CmdError{"add: unbalanced parentheses in '" + line + "'"};
-            for (size_t i = close + 1; i < line.size(); ++i)
-                if (!std::isspace((unsigned char)line[i]))
-                    return CmdError{"add: unexpected content after ')'"};
+            std::string lhs = detail::trim(line.substr(0, arrow));
+            std::string rhs = detail::trim(line.substr(arrow + 2));
+            if (lhs.empty() || rhs.empty())
+                return CmdError{"stream: expected <a>.Produce(...) -> <b>.Consume(...)"};
 
-            std::string interior = line.substr(open + 1, close - open - 1);
-            size_t is = interior.find_first_not_of(" \t");
-            size_t ie = interior.find_last_not_of(" \t");
-            if (is == std::string::npos)
-                return CmdError{"add: expected a type declaration inside ()"};
-            interior = interior.substr(is, ie - is + 1);
+            detail::DottedCall prod, cons;
+            std::string err;
+            if (!detail::parse_dotted(lhs, prod, err))
+                return CmdError{"stream producer: " + err};
+            if (!detail::parse_dotted(rhs, cons, err))
+                return CmdError{"stream consumer: " + err};
 
-            // Tag cleared, entity cleared -- see CmdAttach's own comment for
-            // why the interior must parse as a declaration regardless of what
-            // context the surrounding script happens to be in.
-            ExecutionContext inner_ctx = ctx;
-            inner_ctx.tag_name.clear();
-            inner_ctx.active_rid = 0;
-            inner_ctx.pending_name.clear();
-            Command inner = parse_line(interior, inner_ctx, false);
+            // Both ends are module actions. A reserved operation is not a
+            // stream end -- spawn/attach/ensure/kill/unflag produce and
+            // consume nothing.
+            if (!detail::is_uppercase_start(prod.member)
+             || !detail::is_uppercase_start(cons.member))
+                return CmdError{"stream: both ends must be module actions "
+                                "(TitleCase); reserved operations cannot stream"};
 
-            if (std::holds_alternative<CmdError>(inner))
-                return inner;   // propagate the interior parser's own message
-            if (!std::holds_alternative<CmdSpawn>(inner)
-                && !std::holds_alternative<CmdSetTag>(inner))
-                return CmdError{"add: '" + interior + "' is not a type declaration -- "
-                                "expected 'Tag name' or 'spawn Module::Tag name'"};
-
-            CmdAttach cmd;
-            cmd.parent_name = receiver;
-            cmd.inner       = std::make_shared<AttachedCommand>(AttachedCommand{std::move(inner)});
+            CmdAction cmd;
+            cmd.receiver          = prod.receiver;
+            cmd.action            = prod.member;
+            cmd.payload           = prod.payload;
+            cmd.is_stream         = true;
+            cmd.consumer_receiver = cons.receiver;
+            cmd.consumer_action   = cons.member;
+            cmd.consumer_payload  = cons.payload;
             return cmd;
         }
     }
 
+    // ---- Dotted line: <name>.something( ... ) -----------------------------
+    //
+    // Tested before the bare-verb split so a receiver never has to avoid
+    // colliding with a keyword: `spawn.Start()` is an action on an entity
+    // named `spawn`, unambiguously, because the dot comes before any space.
+    {
+        size_t dot = line.find('.');
+        size_t sp  = line.find_first_of(" \t");
+        if (dot != std::string::npos && (sp == std::string::npos || dot < sp))
+        {
+            detail::DottedCall call;
+            std::string err;
+            if (!detail::parse_dotted(line, call, err))
+                return CmdError{err};
+
+            // After the dot: lowercase is a runtime operation, TitleCase is a
+            // module action. The same split the top level uses, in the same
+            // place -- and structural rather than probabilistic, because the
+            // marketplace boundary already enforces TitleCase action names, so
+            // no module action can ever be spelled `spawn` or `kill`.
+            if (detail::is_lowercase_start(call.member))
+            {
+                if (call.member == "spawn" || call.member == "attach"
+                 || call.member == "ensure")
+                {
+                    CmdChildAcquire cmd;
+                    cmd.verb = (call.member == "spawn")  ? AcquireVerb::Spawn
+                             : (call.member == "attach") ? AcquireVerb::Attach
+                                                         : AcquireVerb::Ensure;
+                    cmd.parent_name = call.receiver;
+                    if (!detail::parse_typed_declaration(call.payload, cmd.module,
+                                                         cmd.tag, cmd.name, err))
+                        return CmdError{call.member + ": " + err};
+                    return cmd;
+                }
+                if (call.member == "kill")
+                {
+                    if (call.payload.empty())
+                        return CmdError{"kill: expected a work-function label, "
+                                        "e.g. 'web.kill(Listen)' or 'web.kill(Listen 1)'"};
+                    CmdKill cmd;
+                    cmd.receiver = call.receiver;
+                    size_t s2 = call.payload.find_first_of(" \t");
+                    cmd.label = (s2 == std::string::npos) ? call.payload
+                                                          : call.payload.substr(0, s2);
+                    std::string idx = (s2 == std::string::npos) ? ""
+                                    : detail::trim(call.payload.substr(s2 + 1));
+                    if (!idx.empty())
+                    {
+                        try {
+                            size_t end;
+                            unsigned long long v = std::stoull(idx, &end);
+                            if (end != idx.size()) throw std::invalid_argument("trailing");
+                            cmd.index     = static_cast<size_t>(v);
+                            cmd.has_index = true;
+                        } catch (...) {
+                            return CmdError{"kill: invalid index '" + idx + "'"};
+                        }
+                    }
+                    return cmd;
+                }
+                if (call.member == "unflag")
+                {
+                    if (call.payload.empty())
+                        return CmdError{"unflag: expected a flag name"};
+                    return CmdUnflag{call.receiver, call.payload};
+                }
+                return CmdError{"'" + call.member + "' is not a runtime operation. "
+                                "Lowercase after the dot is reserved (spawn, attach, "
+                                "ensure, kill, unflag); a module action is TitleCase."};
+            }
+
+            CmdAction cmd;
+            cmd.receiver = call.receiver;
+            cmd.action   = call.member;
+            cmd.payload  = call.payload;
+            return cmd;
+        }
+    }
+
+    // ---- Bare line: a verb, and what it acquires or launches --------------
     size_t sp = line.find_first_of(" \t");
     std::string verb = (sp == std::string::npos) ? line : line.substr(0, sp);
-    std::string rest = (sp == std::string::npos) ? "" : line.substr(sp + 1);
-    size_t rs = rest.find_first_not_of(" \t");
-    if (rs != std::string::npos) rest = rest.substr(rs);
-    else rest.clear();
+    std::string rest = (sp == std::string::npos) ? "" : detail::trim(line.substr(sp + 1));
 
     if (verb == "exit" || verb == "quit") return CmdExit{};
 
-    if (verb == "as")
+    if (verb == "requires")
     {
         if (rest.empty())
-            return CmdError{"as: expected a name"};
-        if (!detail::is_valid_local_name(rest))
-            return CmdError{"as: '" + rest + "' is not a valid local name"};
-        return CmdBind{rest};
-    }
+            return CmdError{"requires: expected a name"};
 
-    if (verb == "unflag")
-    {
-        if (rest.empty())
-            return CmdError{"unflag: expected a flag name"};
-        return CmdUnflag{rest};
-    }
-    
-    if (verb == "kill")
-    {
-        if (rest.empty())
-            return CmdError{"kill: expected a work-function label, e.g. 'kill Listen' or 'kill Listen 1'"};
+        std::string name = rest;
+        std::vector<std::string> tags;
 
-        size_t sp2 = rest.find_first_of(" \t");
-        std::string label   = (sp2 == std::string::npos) ? rest : rest.substr(0, sp2);
-        std::string idx_str = (sp2 == std::string::npos) ? "" : rest.substr(sp2 + 1);
-        size_t rs2 = idx_str.find_first_not_of(" \t");
-        if (rs2 != std::string::npos) idx_str = idx_str.substr(rs2); else idx_str.clear();
-
-        CmdKill cmd;
-        cmd.label = label;
-        if (!idx_str.empty())
+        size_t open = rest.find('[');
+        if (open != std::string::npos)
         {
-            try {
-                size_t end;
-                unsigned long long v = std::stoull(idx_str, &end);
-                if (end != idx_str.size()) throw std::invalid_argument("trailing");
-                cmd.index     = static_cast<size_t>(v);
-                cmd.has_index = true;
-            } catch (...) {
-                return CmdError{"kill: invalid index '" + idx_str + "'"};
+            size_t close = rest.find(']', open);
+            if (close == std::string::npos)
+                return CmdError{"requires: unbalanced '[' in tag list"};
+            for (size_t i = close + 1; i < rest.size(); ++i)
+                if (!std::isspace((unsigned char)rest[i]))
+                    return CmdError{"requires: unexpected content after ']'"};
+
+            name = detail::trim(rest.substr(0, open));
+
+            std::string body = rest.substr(open + 1, close - open - 1);
+            std::stringstream ss(body);
+            std::string item;
+            while (std::getline(ss, item, ','))
+            {
+                std::string t = detail::trim(item);
+                if (t.empty()) continue;
+                if (!detail::is_valid_requires_tag(t))
+                    return CmdError{"requires: '" + t + "' is not a tag. A tag is "
+                                    "either a bare is-a marker (Gate) or an "
+                                    "origin-affixed one (Module::Tag); lowercase "
+                                    "flags are not testable here."};
+                tags.push_back(t);
             }
+            if (tags.empty())
+                return CmdError{"requires: empty tag list -- omit the brackets to "
+                                "accept any live entity"};
         }
+
+        if (name.find("::") != std::string::npos)
+            return CmdError{"requires: '" + name + "' is a type, and requires takes a "
+                            "name -- what the caller must hand in. What the entity has "
+                            "to be able to DO goes in the tag list instead: "
+                            "'requires <name> [" + name + "]' if that is a tag it "
+                            "carries."};
+        if (!detail::is_valid_local_name(name))
+            return CmdError{"requires: '" + name + "' is not a valid name"};
+
+        return CmdRequires{name, std::move(tags)};
+    }
+
+    if (verb == "spawn" || verb == "attach" || verb == "ensure")
+    {
+        CmdAcquire cmd;
+        cmd.verb = (verb == "spawn")  ? AcquireVerb::Spawn
+                 : (verb == "attach") ? AcquireVerb::Attach
+                                      : AcquireVerb::Ensure;
+        std::string err;
+        if (!detail::parse_typed_declaration(rest, cmd.module, cmd.tag, cmd.name, err))
+            return CmdError{verb + ": " + err};
         return cmd;
     }
 
-    if (verb == "context")
-    {
-        if (rest.empty()) return CmdPrintContext{};
-
-        size_t sp2 = rest.find_first_of(" \t");
-        std::string scope  = (sp2 == std::string::npos) ? rest : rest.substr(0, sp2);
-        std::string id_str = (sp2 == std::string::npos) ? "" : rest.substr(sp2 + 1);
-        size_t rs2 = id_str.find_first_not_of(" \t");
-        if (rs2 != std::string::npos) id_str = id_str.substr(rs2); else id_str.clear();
-
-        std::string module, tag;
-        if (detail::split_module_tag(scope, module, tag))
-        {
-            if (!id_str.empty())
-            {
-                ETCS::RID rid = 0;
-                if (detail::is_rid(id_str, rid))
-                    return CmdSetEntity{module, tag, rid, "", false};
-                bool known = ctx.has_name(id_str);
-                return CmdSetEntity{module, tag, 0, id_str, !known};
-            }
-            return CmdSetTag{module, tag, ""};
-        }
-        else
-        {
-            if (!detail::is_uppercase_start(scope))
-                return CmdError{"context: expected Module or Module::Tag, got '" + scope + "'"};
-            return CmdSetModule{scope, ""};
-        }
-    }
-
-    if (verb == "spawn")
+    if (verb == "detach" || verb == "run")
     {
         if (rest.empty())
-            return CmdSpawn{ctx.module_name, ctx.tag_name, ""};
-
-        if (rest.find("::") == std::string::npos && detail::is_valid_local_name(rest))
-            return CmdSpawn{ctx.module_name, ctx.tag_name, rest};
-
-        size_t sp2 = rest.find_first_of(" \t");
-        std::string scope   = (sp2 == std::string::npos) ? rest : rest.substr(0, sp2);
-        std::string name_tk = (sp2 == std::string::npos) ? "" : rest.substr(sp2 + 1);
-        size_t rs2 = name_tk.find_first_not_of(" \t");
-        if (rs2 != std::string::npos) name_tk = name_tk.substr(rs2); else name_tk.clear();
-
-        std::string module, tag;
-        if (!detail::split_module_tag(scope, module, tag))
-            return CmdError{"spawn: expected Module::Tag [name], got '" + rest + "'"};
-
-        if (!name_tk.empty() && !detail::is_valid_local_name(name_tk))
-            return CmdError{"spawn: '" + name_tk + "' is not a valid local name"};
-
-        return CmdSpawn{module, tag, name_tk};
-    }
-
-    if (verb == "list")
-    {
-        if (rest.empty()) return CmdList{ctx.module_name, ctx.tag_name};
-        std::string module, tag;
-        if (!detail::split_module_tag(rest, module, tag))
-            return CmdError{"list: expected Module::Tag, got '" + rest + "'"};
-        return CmdList{module, tag};
-    }
-
-    if (verb == "detach")
-    {
-        if (rest.empty())
-            return CmdError{"detach: expected a script filename"};
-
+            return CmdError{verb + ": expected a script filename"};
         std::istringstream iss(rest);
         std::string script_tok;
         iss >> script_tok;
 
-        CmdDetach cmd;
-        cmd.script = script_tok;
+        std::vector<std::pair<std::string,std::string>> bindings;
+        std::string err;
+        if (!detail::parse_bindings(iss, verb.c_str(), bindings, err))
+            return CmdError{err};
 
-        std::string token;
-        while (iss >> token)
-        {
-            auto eq = token.find('=');
-            if (eq == std::string::npos)
-                return CmdError{"detach: invalid binding '" + token + "', expected name=name"};
-            std::string child_name  = token.substr(0, eq);
-            std::string parent_name = token.substr(eq + 1);
-            if (!detail::is_valid_local_name(child_name))
-                return CmdError{"detach: '" + child_name + "' is not a valid name"};
-            if (!detail::is_valid_local_name(parent_name))
-                return CmdError{"detach: '" + parent_name + "' is not a valid name"};
-            cmd.bindings.emplace_back(child_name, parent_name);
-        }
-        return cmd;
-    }
-    
-    if (verb == "run")
-    {
-        if (rest.empty())
-            return CmdError{"run: expected a script filename"};
-
-        std::istringstream iss(rest);
-        std::string script_tok;
-        iss >> script_tok;
-
-        CmdRun cmd;
-        cmd.script = script_tok;
-
-        std::string token;
-        while (iss >> token)
-        {
-            auto eq = token.find('=');
-            if (eq == std::string::npos)
-                return CmdError{"run: invalid binding '" + token + "', expected name=name"};
-            std::string child_name  = token.substr(0, eq);
-            std::string parent_name = token.substr(eq + 1);
-            if (!detail::is_valid_local_name(child_name))
-                return CmdError{"run: '" + child_name + "' is not a valid name"};
-            if (!detail::is_valid_local_name(parent_name))
-                return CmdError{"run: '" + parent_name + "' is not a valid name"};
-            cmd.bindings.emplace_back(child_name, parent_name);
-        }
-        return cmd;
-    }
-    
-    if (verb == "jobs") return CmdJobs{};
-
-    if (verb == "signal")
-    {
-        if (rest.empty())
-            return CmdError{"signal: expected an id, e.g. 'signal 3' or 'signal 3 interrupt'"};
-
-        size_t sp2 = rest.find_first_of(" \t");
-        std::string id_str = (sp2 == std::string::npos) ? rest : rest.substr(0, sp2);
-        std::string mode    = (sp2 == std::string::npos) ? "" : rest.substr(sp2 + 1);
-        size_t rs2 = mode.find_first_not_of(" \t");
-        if (rs2 != std::string::npos) mode = mode.substr(rs2); else mode.clear();
-
-        uint64_t id = 0;
-        try {
-            size_t end;
-            id = std::stoull(id_str, &end);
-            if (end != id_str.size()) throw std::invalid_argument("trailing");
-        } catch (...) {
-            return CmdError{"signal: invalid id '" + id_str + "'"};
-        }
-
-        bool term = true;
-        if (!mode.empty())
-        {
-            if (mode == "interrupt" || mode == "int")           term = false;
-            else if (mode == "terminate" || mode == "term")     term = true;
-            else return CmdError{"signal: unknown mode '" + mode + "', expected 'terminate' or 'interrupt'"};
-        }
-
-        return CmdSignal{id, term};
+        if (verb == "detach") return CmdDetach{script_tok, std::move(bindings)};
+        return CmdRun{script_tok, std::move(bindings)};
     }
 
-    {
-        bool all_digits = !verb.empty();
-        for (char c : verb) if (!std::isdigit((unsigned char)c)) { all_digits = false; break; }
-        if (all_digits)
-        {
-            try { return CmdSelect{std::stoul(verb)}; }
-            catch (...) { return CmdError{"invalid index: " + verb}; }
-        }
-    }
+    if (auto why = detail::removed_construct(verb))
+        return CmdError{"'" + verb + "' is no longer a line: " + *why};
 
-    {
-        std::string module, tag, action;
-        if (detail::split_qualified_action(verb, module, tag, action))
-        {
-            std::string prod_name, c_module, c_tag, c_action, c_name;
-            if (detail::parse_inline_stream(rest, module,
-                                            prod_name, c_module, c_tag, c_action, c_name))
-            {
-                CmdAction cmd;
-                cmd.module           = module;
-                cmd.tag              = tag;
-                cmd.action           = action;
-                cmd.target_name      = prod_name;
-                cmd.target_module    = c_module;
-                cmd.target_tag       = c_tag;
-                cmd.fully_qualified  = true;
-                cmd.is_inline_stream = true;
-                cmd.consumer_action  = c_action;
-                cmd.consumer_tag     = c_tag;
-                cmd.consumer_name    = c_name;
-                return cmd;
-            }
+    // Bracketed, but with nothing before the dot to act on -- `Start()`, or
+    // the old fully-qualified `Module::Tag.Action(...)`. Both are actions
+    // missing the one thing every action now states, so say that rather than
+    // falling through to the bare-declaration message below, which would send
+    // the author looking for a spawn they do not need.
+    if (line.find('(') != std::string::npos)
+        return CmdError{"'" + line + "': an action names the entity it acts on. "
+                        "Write '<name>." + verb.substr(0, verb.find('(')) + "(...)', "
+                        "where <name> was introduced by requires, spawn, attach or "
+                        "ensure."};
 
-            std::string t_module, t_tag, t_name;
-            ETCS::RID t_rid = 0;
-            if (detail::parse_stream_target(rest, t_module, t_tag, t_rid, t_name))
-                return CmdAction{module, tag, action, "", t_module, t_tag, t_rid, t_name, true, false, "", "", ""};
-            return CmdAction{module, tag, action, rest, "", "", 0, "", true, false, "", "", ""};
-        }
-    }
-
+    // A bare TitleCase token used to declare a module or a tag, or dispatch an
+    // action against whatever was in context. All three are gone, and the
+    // error says which of the four verbs the author probably wanted rather
+    // than reporting an unknown command -- this is the single most common
+    // shape in every script written against the previous grammar.
     if (detail::is_uppercase_start(verb))
-    {
-        auto dot = verb.find('.');
-        if (dot != std::string::npos)
-        {
-            std::string tag    = verb.substr(0, dot);
-            std::string action = verb.substr(dot + 1);
-            if (!action.empty())
-            {
-                std::string module = ctx.module_name;
-                if (module.empty())
-                    return CmdError{"'" + verb + "': no module in context, use Module::Tag.Action"};
-
-                std::string prod_name, c_module, c_tag, c_action, c_name;
-                if (detail::parse_inline_stream(rest, module,
-                                                prod_name, c_module, c_tag, c_action, c_name))
-                {
-                    CmdAction cmd;
-                    cmd.module           = module;
-                    cmd.tag              = tag;
-                    cmd.action           = action;
-                    cmd.target_name      = prod_name;
-                    cmd.target_module    = c_module;
-                    cmd.target_tag       = c_tag;
-                    cmd.fully_qualified  = false;
-                    cmd.is_inline_stream = true;
-                    cmd.consumer_action  = c_action;
-                    cmd.consumer_tag     = c_tag;
-                    cmd.consumer_name    = c_name;
-                    return cmd;
-                }
-
-                std::string t_module, t_tag, t_name;
-                ETCS::RID t_rid = 0;
-                if (detail::parse_stream_target(rest, t_module, t_tag, t_rid, t_name))
-                    return CmdAction{module, tag, action, "", t_module, t_tag, t_rid, t_name, false, false, "", "", ""};
-                return CmdAction{module, tag, action, rest, "", "", 0, "", false, false, "", "", ""};
-            }
-        }
-
-        if (!ctx.has_module() || is_first_line)
-        {
-            std::string pname;
-            if (!rest.empty() && detail::is_valid_local_name(rest))
-                pname = rest;
-            return CmdSetModule{verb, pname};
-        }
-        else if (!ctx.has_tag())
-        {
-            std::string pname;
-            if (!rest.empty() && detail::is_valid_local_name(rest))
-                pname = rest;
-            return CmdSetTag{ctx.module_name, verb, pname};
-        }
-        else
-        {
-            std::string prod_name, c_module, c_tag, c_action, c_name;
-            if (detail::parse_inline_stream(rest, ctx.module_name,
-                                            prod_name, c_module, c_tag, c_action, c_name))
-            {
-                CmdAction cmd;
-                cmd.module           = ctx.module_name;
-                cmd.tag              = ctx.tag_name;
-                cmd.action           = verb;
-                cmd.target_name      = prod_name;
-                cmd.target_module    = c_module;
-                cmd.target_tag       = c_tag;
-                cmd.fully_qualified  = false;
-                cmd.is_inline_stream = true;
-                cmd.consumer_action  = c_action;
-                cmd.consumer_tag     = c_tag;
-                cmd.consumer_name    = c_name;
-                return cmd;
-            }
-
-            std::string t_module, t_tag, t_name;
-            ETCS::RID t_rid = 0;
-            if (detail::parse_stream_target(rest, t_module, t_tag, t_rid, t_name))
-                return CmdAction{ctx.module_name, ctx.tag_name, verb, "", t_module, t_tag, t_rid, t_name, false, false, "", "", ""};
-            return CmdAction{ctx.module_name, ctx.tag_name, verb, rest, "", "", 0, "", false, false, "", "", ""};
-        }
-    }
-
-    if (ctx.has_module() && ctx.has_tag())
-    {
-        std::string prod_name, c_module, c_tag, c_action, c_name;
-        if (detail::parse_inline_stream(rest, ctx.module_name,
-                                        prod_name, c_module, c_tag, c_action, c_name))
-        {
-            CmdAction cmd;
-            cmd.module           = ctx.module_name;
-            cmd.tag              = ctx.tag_name;
-            cmd.action           = verb;
-            cmd.target_name      = prod_name;
-            cmd.target_module    = c_module;
-            cmd.target_tag       = c_tag;
-            cmd.fully_qualified  = false;
-            cmd.is_inline_stream = true;
-            cmd.consumer_action  = c_action;
-            cmd.consumer_tag     = c_tag;
-            cmd.consumer_name    = c_name;
-            return cmd;
-        }
-
-        std::string t_module, t_tag, t_name;
-        ETCS::RID t_rid = 0;
-        if (detail::parse_stream_target(rest, t_module, t_tag, t_rid, t_name))
-            return CmdAction{ctx.module_name, ctx.tag_name, verb, "", t_module, t_tag, t_rid, t_name, false, false, "", "", ""};
-        return CmdAction{ctx.module_name, ctx.tag_name, verb, rest, "", "", 0, "", false, false, "", "", ""};
-    }
+        return CmdError{"'" + line + "': a bare type name declares nothing. Write "
+                        "'spawn Module::Tag <name>' (always new), 'attach "
+                        "Module::Tag <name>' (must already exist), 'ensure "
+                        "Module::Tag <name>' (either), or 'requires <name>' "
+                        "(supplied by the caller). An action is "
+                        "'<name>.Action(...)'."};
 
     return CmdError{"unknown command: '" + verb + "'"};
 }

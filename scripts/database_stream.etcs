@@ -1,4 +1,4 @@
-#!/media/user/Data/ACE/ETCS/bin/etcs
+#!/usr/bin/env etcs
 # ETCS Causal Stream Demo: Cross-Instance Database Teleportation
 # This script demonstrates moving structured data across isolated SQLite instances
 # strictly through the LMAX causal buffer, with zero serializers or variables.
@@ -10,31 +10,24 @@
 # start to finish. As a consequence, this script is no longer safe to
 # run standalone with unbound roles (see accompanying note).
 
-DatabaseProvider
-LocalDatabase source
+requires source
+requires target
 
 # --- Phase 1: Use the already-open source connection ---
-ExecuteRaw PRAGMA journal_mode=WAL;
-InitializeSchema CREATE TABLE IF NOT EXISTS players(id INTEGER PRIMARY KEY, name TEXT, level INTEGER);
-ExecuteTransaction DELETE FROM players;INSERT INTO players (name, level) VALUES('Lux', 99), ('Sibte', 100), ('Entropy', 0);
-ExecuteRaw PRAGMA wal_checkpoint(FULL);
+source.ExecuteRaw(PRAGMA journal_mode=WAL;)
+source.InitializeSchema(CREATE TABLE IF NOT EXISTS players(id INTEGER PRIMARY KEY, name TEXT, level INTEGER);)
+source.ExecuteTransaction(DELETE FROM players;INSERT INTO players (name, level) VALUES('Lux', 99), ('Sibte', 100), ('Entropy', 0);)
+source.ExecuteRaw(PRAGMA wal_checkpoint(FULL);)
 
 # --- Phase 2: Use the already-open target connection ---
-context DatabaseProvider::LocalDatabase target
-ExecuteRaw PRAGMA journal_mode=WAL;
+target.ExecuteRaw(PRAGMA journal_mode=WAL;)
 # Notice we DO NOT initialize the 'players' table here.
 # The causal stream will instantiate the schema on the target automatically.
 
 # --- Phase 3: The Causal Stream ---
-# Shift context back to source, produce the rows into the LMAX buffer
-context DatabaseProvider::LocalDatabase source
-QueryProduce SELECT * FROM players
-
-# Shift context to target, consume the rows directly from the buffer
-context DatabaseProvider::LocalDatabase target
-RowConsume
+# Produce rows from source directly into the target's consumer.
+source.QueryProduce(SELECT * FROM players) -> target.RowConsume()
 
 # --- Phase 4: intentionally no-op ---
 # source/target stay open and connected. The caller (gdata_server.etcs)
 # disconnects and closes both, once, after every borrower is finished.
-

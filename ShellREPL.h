@@ -1,5 +1,6 @@
 #ifndef SHELLREPL_H__
 #define SHELLREPL_H__
+
 #include <iostream>
 #include <string>
 #include <vector>
@@ -34,8 +35,7 @@
 
 // NOTE on ETCS_LOG: the macro expands to a bare `if`, so an unbraced
 // ETCS_LOG as an if/else branch body swallows the following `else`. Every
-// use in a branch position below is braced for that reason. (Fixing it at
-// the source -- do { } while(0) in Log.h -- would retire the convention.)
+// use in a branch position below is braced for that reason.
 
 // ---------------------------------------------------------------------------
 // THE GATING SPLIT
@@ -43,22 +43,36 @@
 // Navigation is a RUNTIME CAPABILITY, gated on ETCS_LOADER. The terminal is
 // one INPUT SOURCE for it, gated on ETCS_REPL_SHELL.
 //
-// Previously the two were the same thing: the module/tag/instance/action
-// loops lived inside the ETCS_REPL_SHELL block, so a headless build did not
-// compile them at all and a socket session could only ever reach the bare
-// parse_line/execute_command surface. That made the navigator look like a
-// property of having a tty, which it never was -- it renders a graph this
-// process already holds, and stdin was only ever how the questions arrived.
+// The loops take a ReplLineSource and know nothing about where lines come
+// from. Raw-mode input, history and tab completion stay terminal-only;
+// everything that reads the entity graph is available wherever ETCS_LOADER
+// is. A remote session is handed the SAME navigator the local console uses,
+// rendered by the side that actually has the entity graph -- no proxying, no
+// mirrored surface, because the process answering the questions is the one
+// holding the answers.
 //
-// So the loops now take a ReplLineSource and know nothing about where lines
-// come from. Raw-mode input, history and tab completion stay terminal-only
-// below; everything that reads the entity graph is available wherever
-// ETCS_LOADER is.
+// ---------------------------------------------------------------------------
+// THE BROWSE / SCRIPT SPLIT
 //
-// The practical consequence is that a remote session can be handed the SAME
-// navigator the local console uses, rendered by the side that actually has
-// the entity graph -- no proxying, no mirrored surface, because the process
-// answering the questions is the one holding the answers.
+// This file is the BROWSE surface, and it no longer executes .etcs lines.
+// A session used to be able to type raw trace lines at a prompt and have them
+// interpreted by the same parser a file goes through. That is gone, and its
+// absence is what makes the script grammar affordable.
+//
+// The two surfaces want opposite things. A script is written by someone who
+// already knows the types, is read long after it ran, and benefits from a
+// grammar that refuses everything it cannot resolve statically. Someone at a
+// prompt is doing the opposite -- finding out what exists -- and every rule
+// that makes a trace trustworthy makes exploration worse: naming a receiver
+// you are still looking for, bracketing arguments to an action you have not
+// found yet, declaring a type before you know which one you want.
+//
+// So the navigator keeps its own input vocabulary, which was never script
+// syntax anyway: bare numbers select, `back`/`up` move, `c0` descends into a
+// child, `s0` interrupts by position, and a bare action name dispatches. It
+// builds Command values DIRECTLY and hands them to execute_command. What the
+// two surfaces share is execution -- one implementation of what an action
+// does -- not a parser for two grammars with different jobs.
 // ---------------------------------------------------------------------------
 
 // prompt in, line out. Returns false when the source is finished (peer
@@ -94,9 +108,10 @@ namespace fs = std::filesystem;
 // ---------------------------------------------------------------------------
 // Terminal input source -- raw mode, history, tab completion. Everything in
 // this block is genuinely tty-specific and stays compiled out of a drain
-// build; the navigator above does not reference any of it.
+// build; the navigator does not reference any of it.
 // ---------------------------------------------------------------------------
 #ifdef ETCS_REPL_SHELL
+
 #if defined(_WIN32) || defined(_WIN64)
     #include <conio.h>
     #include <windows.h>
@@ -117,6 +132,7 @@ namespace fs = std::filesystem;
     #include <thread>
     #include <chrono>
     #define GETCH repl_shell_get_char_unix
+
     // Non-TTY branch polls with a timeout instead of blocking on read().
     // Deliberately local rather than clearing SA_RESTART process-wide --
     // other blocking calls (network I/O inside a `run` script) depend on
@@ -124,9 +140,9 @@ namespace fs = std::filesystem;
     // than aborting on the first EINTR. A TTY never needed this: its line
     // discipline already wakes a blocked read on SIGINT.
     //
-    // Returns 0 on timeout AND on read failure/closed pipe (the sleep
-    // avoids spinning on a dead pipe, which poll() reports ready forever
-    // via POLLHUP). Callers treat 0 as "no character, re-check signals".
+    // Returns 0 on timeout AND on read failure/closed pipe (the sleep avoids
+    // spinning on a dead pipe, which poll() reports ready forever via
+    // POLLHUP). Callers treat 0 as "no character, re-check signals".
     inline char repl_shell_get_char_unix() {
         char buf = 0;
         if (!isatty(STDIN_FILENO)) {
@@ -160,10 +176,10 @@ inline std::vector<std::string> g_session_history;
 inline const std::string HISTORY_FILE = ".etcs_history";
 static constexpr size_t MAX_HISTORY_BYTES = 16 * 1024;
 
-// These are ETCS::SignalFlag (std::atomic), so `g_sig_int = 0` compiles as
-// a seq_cst store and `if (g_sig_int)` as a seq_cst load -- correct but
-// stronger than needed, and silently so. Named once instead of spelling
-// the ordering out at each site.
+// These are ETCS::SignalFlag (std::atomic), so `g_sig_int = 0` compiles as a
+// seq_cst store and `if (g_sig_int)` as a seq_cst load -- correct but
+// stronger than needed, and silently so. Named once instead of spelling the
+// ordering out at each site.
 inline void repl_clear_signal_flags()
 {
     g_sig_int .store(0, std::memory_order_release);
@@ -179,8 +195,7 @@ inline bool repl_sigint_raised()
 inline void repl_shell_prune_history()
 {
     size_t total = 0;
-    for (const auto& line : g_session_history)
-        total += line.size() + 1;
+    for (const auto& line : g_session_history) total += line.size() + 1;
     size_t drop_from_front = 0;
     while (total > MAX_HISTORY_BYTES && drop_from_front < g_session_history.size())
     {
@@ -189,7 +204,7 @@ inline void repl_shell_prune_history()
     }
     if (drop_from_front > 0)
         g_session_history.erase(g_session_history.begin(),
-                                 g_session_history.begin() + static_cast<long>(drop_from_front));
+                                g_session_history.begin() + static_cast<long>(drop_from_front));
 }
 
 inline void repl_shell_load_history()
@@ -213,20 +228,24 @@ inline std::string repl_shell_get_input(const std::string& prompt, ETCS::SignalC
 {
     std::string input;
     std::cout << prompt << std::flush;
+
     std::vector<std::string> current_matches;
     int cycle_index   = -1;
     int history_index = static_cast<int>(g_session_history.size());
     std::string original_partial, prefix_before_partial;
+
     auto refresh_line = [&](const std::string& new_text) {
         std::cout << "\r" << std::string(prompt.size() + input.size() + 5, ' ') << "\r";
         std::cout << prompt << new_text << std::flush;
         input = new_text;
     };
+
     while (true)
     {
         if (ctx.isInterrupted() || ctx.isTerminated()) break;
         int c = GETCH();
         if (ctx.isInterrupted() || ctx.isTerminated()) break;
+
 #if defined(_WIN32)
         if (c == 0 || c == 224)
         {
@@ -265,6 +284,7 @@ inline std::string repl_shell_get_input(const std::string& prompt, ETCS::SignalC
         // failure -- never a keystroke. Looping back re-checks the signals at
         // the top; falling through would append a NUL on every idle cycle.
         if (c == 0) continue;
+
         if (c == '\r' || c == '\n')
         {
             std::cout << std::endl;
@@ -298,8 +318,7 @@ inline std::string repl_shell_get_input(const std::string& prompt, ETCS::SignalC
                         std::string name = entry.path().filename().string();
                         std::string cand = entry.is_directory()
                             ? name + "/"
-                            : (repl_is_module(entry)
-                                ? entry.path().stem().string() : name);
+                            : (repl_is_module(entry) ? entry.path().stem().string() : name);
                         if (cand.size() >= original_partial.size()
                             && cand.substr(0, original_partial.size()) == original_partial)
                             exact.push_back(cand);
@@ -313,6 +332,7 @@ inline std::string repl_shell_get_input(const std::string& prompt, ETCS::SignalC
             }
             else
                 cycle_index = (cycle_index + 1) % static_cast<int>(current_matches.size());
+
             if (cycle_index != -1)
             {
                 size_t word_len = input.size() - prefix_before_partial.size();
@@ -342,6 +362,7 @@ inline ReplLineSource repl_tty_line_source(ETCS::SignalContext& sig)
         return !(sig.isInterrupted() || sig.isTerminated());
     };
 }
+
 #endif // ETCS_REPL_SHELL
 
 // ---------------------------------------------------------------------------
@@ -349,6 +370,63 @@ inline ReplLineSource repl_tty_line_source(ETCS::SignalContext& sig)
 // terminal dependency of its own.
 // ---------------------------------------------------------------------------
 #ifdef ETCS_LOADER
+
+// Names published by the ROOT SCRIPT, filtered to one module.
+//
+// This replaces what used to read PersistentNames, and shows strictly less,
+// on purpose. PersistentNames accumulated every name every script had ever
+// bound, at any depth, for the life of the process -- so this display was a
+// history of everything anyone had ever called anything. GlobalNames holds
+// only the names the root script itself introduced, which is the only set a
+// navigator can meaningfully offer: they are exactly the names any script in
+// the tree can reach by `attach` or `ensure`.
+//
+// Liveness is verified here rather than trusted -- nothing prunes an entry
+// when its entity dies, so a name whose target is gone is skipped instead of
+// shown as reachable.
+inline std::vector<std::pair<std::string, ETCS::NameBinding>>
+repl_live_globals_for_module(const std::string& mod_name)
+{
+    std::vector<std::pair<std::string, ETCS::NameBinding>> out;
+    auto& ridMap = ETCS::EventNode::getInstance().ridMap;
+    for (auto& [name, b] : ETCS::GlobalNames::getInstance().snapshot())
+    {
+        if (b.module != mod_name) continue;
+        ETCS::Buffer key;
+        key.writeString((b.module + ":" + b.tag).c_str());
+        auto it = ridMap.find(key);
+        if (it != ridMap.end() && it->second.invoke_contains(b.rid))
+            out.emplace_back(name, b);
+    }
+    std::sort(out.begin(), out.end(),
+              [](const auto& a, const auto& c) { return a.first < c.first; });
+    return out;
+}
+
+// An ExecutionContext for one navigator dispatch.
+//
+// is_root is FALSE, always. The navigator must never publish into
+// GlobalNames: those are the root script's names, and a name invented here to
+// address a selected entity is a fixture of this menu, not part of any
+// script's closure. Defaulting to true (which ExecutionContext does, for
+// scripts) would leak `self` into every tree launched afterward.
+//
+// The selected entity is bound under a fixed name so the Command values below
+// have a receiver to carry -- every command now names one, and the navigator
+// is not exempt just because a menu makes the target obvious.
+inline ETCS::ExecutionContext repl_nav_context(const std::string& mod_name,
+                                               const std::string& tag_name,
+                                               ETCS::RID rid,
+                                               ETCS::Root& nav_root,
+                                               ETCS::SignalContext& sig)
+{
+    ETCS::ExecutionContext ctx;
+    ctx.sig         = &sig;
+    ctx.root_entity = &nav_root;
+    ctx.is_root     = false;
+    ctx.bind("self", ETCS::NameBinding{rid, mod_name, tag_name});
+    return ctx;
+}
 
 inline void repl_shell_print_dir(std::vector<std::string>& mods)
 {
@@ -386,16 +464,16 @@ inline void repl_shell_print_dir(std::vector<std::string>& mods)
 // module you can jump to belongs above any single entity.
 //
 // Reads LoaderStream::module_registry directly, hence the ETCS_LOADER gate.
-// Skips null values: vacancy is a null VALUE there, never row erasure, and
-// a vacant entry re-bootstraps exactly like a never-seen name would.
+// Skips null values: vacancy is a null VALUE there, never row erasure, and a
+// vacant entry re-bootstraps exactly like a never-seen name would.
 //
 // Appends onto the same all_mods vector repl_shell_print_dir filled, so
-// numeric selection keeps working unchanged -- there's just more at the
-// higher indices.
+// numeric selection keeps working unchanged.
 inline void repl_shell_print_live_modules(std::vector<std::string>& all_mods)
 {
     std::unordered_set<std::string> already(all_mods.begin(), all_mods.end());
     std::vector<std::string> live_only;
+
     auto& registry = ETCS::EventNode::getInstance().stream.module_registry;
     for (const auto& [name, mod_ptr] : registry)
     {
@@ -405,6 +483,7 @@ inline void repl_shell_print_live_modules(std::vector<std::string>& all_mods)
     }
     std::sort(live_only.begin(), live_only.end());
     if (live_only.empty()) return;
+
     ETCS_LOG("ShellREPL", COLOR_LIB
              << "  --- Live modules (loaded, not in this directory) ---" << COLOR_RESET);
     for (size_t i = 0; i < live_only.size(); ++i)
@@ -415,27 +494,29 @@ inline void repl_shell_print_live_modules(std::vector<std::string>& all_mods)
     for (auto& m : live_only) all_mods.push_back(std::move(m));
 }
 
-// ── Action loop ───────────────────────────────────────────────────────────────
+// ── Action loop ─────────────────────────────────────────────────────────────
 // nav_root is the navigation scope's own Root (repl_shell_loop_with), threaded
-// down purely as a bootstrap anchor for whatever a dispatched action needs
-// to resolve -- never as "the module e belongs to".
+// down purely as a bootstrap anchor for whatever a dispatched action needs to
+// resolve -- never as "the module e belongs to".
 //
-// `e` is valid only until the next blocking read. This loop waits on input,
-// so another thread (a detached script running `Window.Delete main`) can
-// destroy the entity mid-wait. resolve_self() is the single re-resolution
-// point; nothing touches `e` past a read without it. That was true of a
-// human at a keyboard and is no less true of a remote session -- the wait is
-// what matters, not what is being waited on.
+// `e` is valid only until the next blocking read. This loop waits on input, so
+// another thread (a detached script deleting this entity) can destroy it
+// mid-wait. resolve_self() is the single re-resolution point; nothing touches
+// `e` past a read without it. That was true of a human at a keyboard and is no
+// less true of a remote session -- the wait is what matters, not what is being
+// waited on.
 inline void repl_shell_action_loop(ETCS::Entity* e, ETCS::Root& nav_root,
-                                    ETCS::SignalContext& sig, ReplLineSource& in)
+                                   ETCS::SignalContext& sig, ReplLineSource& in)
 {
     ETCS::ExecSource src{"(interactive)", 0};
+
     // Derived from the entity, never passed in -- getSourceModule/Tag are
     // already the authoritative identity (setModuleSource at attach time).
     const std::string mod_name = e->getSourceModule().toString();
     const std::string tag_name = e->getSourceTag().toString();
-    // e->module_.catalog(), not nav_root's: every live entity carries its
-    // own attached module_ token from construction.
+
+    // e->module_.catalog(), not nav_root's: every live entity carries its own
+    // attached module_ token from construction.
     auto& catalog = e->module_.catalog();
     auto cat_it = catalog.find(tag_name);
     if (cat_it == catalog.end())
@@ -445,11 +526,14 @@ inline void repl_shell_action_loop(ETCS::Entity* e, ETCS::Root& nav_root,
         return;
     }
     const ETCS::ModuleBundle& bundle = cat_it->second;
+
     std::vector<std::pair<ETCS::Buffer, ETCS::WorkBundle>> action_list;
     for (const auto& pair : bundle.actions)
         action_list.emplace_back(pair.first, pair.second);
+
     // RID is the stable identity; the pointer is not.
     const ETCS::RID target_rid = e->getRID();
+
     // Replaces the old still_alive() bool -- returning the pointer means a
     // caller can't keep using the stale one after a successful check.
     auto resolve_self = [&]() -> ETCS::Entity*
@@ -461,6 +545,7 @@ inline void repl_shell_action_loop(ETCS::Entity* e, ETCS::Root& nav_root,
         if (it == ridMap.end()) return nullptr;
         return it->second.invoke_get(target_rid);
     };
+
     auto resolve_other = [](const std::string& m, const std::string& t,
                             ETCS::RID rid) -> ETCS::Entity*
     {
@@ -471,6 +556,7 @@ inline void repl_shell_action_loop(ETCS::Entity* e, ETCS::Root& nav_root,
         if (it == ridMap.end()) return nullptr;
         return it->second.invoke_get(rid);
     };
+
     while (true)
     {
         ETCS_LOG("ShellREPL", "\n--- Actions for " << COLOR_DIR << tag_name
@@ -482,6 +568,7 @@ inline void repl_shell_action_loop(ETCS::Entity* e, ETCS::Root& nav_root,
                 << tag_name << "." << action_name.toString()
                 << (work.isStream ? "  [stream]" : "") << COLOR_RESET);
         }
+
         // Identity, not pointer -- `parent` goes stale across the read below
         // exactly like `e` does, and the `up` branch dereferences it after.
         std::string  parent_mod, parent_tag;
@@ -495,6 +582,7 @@ inline void repl_shell_action_loop(ETCS::Entity* e, ETCS::Root& nav_root,
                 << parent_mod << "::" << parent_tag
                 << " [RID:" << COLOR_RID << parent_rid << COLOR_RESET << "]");
         }
+
         std::vector<std::pair<ETCS::Buffer, ETCS::RID>> children;
         e->getTypedChildren(children);
         if (!children.empty())
@@ -507,23 +595,24 @@ inline void repl_shell_action_loop(ETCS::Entity* e, ETCS::Root& nav_root,
                     << children[i].second << COLOR_RESET << "]");
             }
         }
+
         // Live in-flight work functions, in creation order -- the only
         // explicit record of the causal sequence that produced them (see
         // Scope, Bundles.h). Two ways to act on what's listed:
         //
         //   s<n>                 -- flat, positional against THIS listing.
-        //                            Addresses a display nothing else prints,
-        //                            so it is a navigator affordance rather
-        //                            than a language verb. Fast for a handful.
-        //   kill <label> [index] -- the real language verb, identical to what
-        //                            a .etcs script would write. Works without
-        //                            reading the list, which is what matters
-        //                            once an entity carries enough concurrent
-        //                            work that scanning stops being how you
-        //                            find anything.
+        //                           Addresses a display nothing else prints,
+        //                           so it is a navigator affordance. Fast for
+        //                           a handful.
+        //   kill <label> [index] -- by name, without reading the list, which
+        //                           is what matters once an entity carries
+        //                           enough concurrent work that scanning stops
+        //                           being how you find anything.
         //
         // Both build a CmdKill and go through execute_command, so the
-        // navigator and scripts cannot drift in behavior.
+        // navigator and scripts cannot drift in behavior. Neither is script
+        // syntax -- a script writes `<name>.kill(Listen)`, because a script
+        // has a name for its entity and this menu has a selection.
         std::vector<ETCS::Scope::View> scopes;
         e->collectScopes(scopes);
         if (!scopes.empty())
@@ -538,13 +627,14 @@ inline void repl_shell_action_loop(ETCS::Entity* e, ETCS::Root& nav_root,
             ETCS_LOG("ShellREPL",
                 "  [s<n>] Interrupt by position   [kill <label> [index]] Interrupt directly");
         }
+
         std::string a_in;
         if (!in(tag_name + " Act> ", a_in)) break;
         if (a_in == "back")                   { break; }
         if (a_in == "exit" || a_in == "quit") { return; }
         if (sig.isInterrupted() || sig.isTerminated()) break;
-        // Re-resolve before touching `e` again -- everything below was
-        // previously operating on a possibly-freed pointer.
+
+        // Re-resolve before touching `e` again.
         e = resolve_self();
         if (!e)
         {
@@ -553,6 +643,7 @@ inline void repl_shell_action_loop(ETCS::Entity* e, ETCS::Root& nav_root,
                    "instance list." << COLOR_RESET);
             return;
         }
+
         if (a_in == "up")
         {
             ETCS::Entity* parent = parent_rid
@@ -579,6 +670,7 @@ inline void repl_shell_action_loop(ETCS::Entity* e, ETCS::Root& nav_root,
             }
             continue;
         }
+
         if (a_in.size() > 1 && a_in[0] == 'c' && std::isdigit((unsigned char)a_in[1]))
         {
             try {
@@ -586,7 +678,8 @@ inline void repl_shell_action_loop(ETCS::Entity* e, ETCS::Root& nav_root,
                 if (idx < children.size())
                 {
                     // getTypedChild is a RID lookup -- re-resolved already.
-                    ETCS::Entity* child = e->getTypedChild(children[idx].first, children[idx].second);
+                    ETCS::Entity* child = e->getTypedChild(children[idx].first,
+                                                           children[idx].second);
                     if (child)
                     {
                         repl_shell_action_loop(child, nav_root, sig, in);
@@ -612,11 +705,13 @@ inline void repl_shell_action_loop(ETCS::Entity* e, ETCS::Root& nav_root,
             }
             continue;
         }
+
         // s<n> -- translated back to (label, index) from the SAME snapshot
         // that was displayed, so what gets interrupted is what was shown on
         // that line, not whatever now occupies that position. `scopes` was
         // collected before the blocking read, so an entry may have finished
         // since; execute_command reports that rather than failing silently.
+        //
         // Unambiguous by ABI, not by convention: action names are TitleCase as
         // a structural rule of this runtime (enforced at the marketplace
         // boundary the same way the type structure is), so no action can ever
@@ -629,13 +724,10 @@ inline void repl_shell_action_loop(ETCS::Entity* e, ETCS::Root& nav_root,
                 size_t idx = std::stoul(a_in.substr(1));
                 if (idx < scopes.size())
                 {
-                    ETCS::ExecutionContext kctx;
-                    kctx.module_name = mod_name;
-                    kctx.tag_name    = tag_name;
-                    kctx.set_entity(target_rid);
-                    kctx.sig         = &sig;
-                    kctx.root_entity = &nav_root;
+                    ETCS::ExecutionContext kctx =
+                        repl_nav_context(mod_name, tag_name, target_rid, nav_root, sig);
                     ETCS::CmdKill kcmd;
+                    kcmd.receiver  = "self";
                     kcmd.label     = scopes[idx].label;
                     kcmd.index     = scopes[idx].index;
                     kcmd.has_index = true;
@@ -652,23 +744,64 @@ inline void repl_shell_action_loop(ETCS::Entity* e, ETCS::Root& nav_root,
             }
             continue;
         }
-        // kill <label> [index] -- parsed by parse_line exactly as a script
-        // would write it, rather than hand-parsed here. Keeps one parser for
-        // one verb; a change to the syntax lands in Command.h alone.
+
+        // kill <label> [index] -- built here rather than routed through
+        // parse_line. The navigator's input is not the script grammar and no
+        // longer pretends to be: `kill Listen` is a menu command against the
+        // current selection, while a script writes `<name>.kill(Listen)`
+        // because a script has a name and this menu has a selection. What is
+        // shared is execute_command -- the behavior -- not the syntax.
         if (a_in.rfind("kill", 0) == 0
             && (a_in.size() == 4 || a_in[4] == ' ' || a_in[4] == '\t'))
         {
-            ETCS::ExecutionContext kctx;
-            kctx.module_name = mod_name;
-            kctx.tag_name    = tag_name;
-            kctx.set_entity(target_rid);
-            kctx.sig         = &sig;
-            kctx.root_entity = &nav_root;
+            std::string rest = (a_in.size() > 4) ? a_in.substr(5) : "";
+            size_t rb = rest.find_first_not_of(" \t");
+            rest = (rb == std::string::npos) ? "" : rest.substr(rb);
+            if (rest.empty())
+            {
+                repl_err() << COLOR_WARN
+                           << "kill: expected a work-function label, e.g. 'kill Listen'"
+                           << COLOR_RESET << "\n";
+                continue;
+            }
+            ETCS::CmdKill kcmd;
+            kcmd.receiver = "self";
+            size_t sp2 = rest.find_first_of(" \t");
+            kcmd.label = (sp2 == std::string::npos) ? rest : rest.substr(0, sp2);
+            if (sp2 != std::string::npos)
+            {
+                std::string idx_str = rest.substr(sp2 + 1);
+                size_t ib = idx_str.find_first_not_of(" \t");
+                idx_str = (ib == std::string::npos) ? "" : idx_str.substr(ib);
+                if (!idx_str.empty())
+                {
+                    try {
+                        size_t end;
+                        kcmd.index = static_cast<size_t>(std::stoull(idx_str, &end));
+                        if (end != idx_str.size()) throw std::invalid_argument("trailing");
+                        kcmd.has_index = true;
+                    } catch (...) {
+                        repl_err() << COLOR_WARN << "kill: invalid index '" << idx_str
+                                   << "'" << COLOR_RESET << "\n";
+                        continue;
+                    }
+                }
+            }
+            ETCS::ExecutionContext kctx =
+                repl_nav_context(mod_name, tag_name, target_rid, nav_root, sig);
             repl_out() << COLOR_EXEC;
-            ETCS::execute_command(ETCS::parse_line(a_in, kctx), kctx, src);
+            ETCS::execute_command(ETCS::Command{kcmd}, kctx, src);
             repl_out() << COLOR_RESET;
             continue;
         }
+
+        // An action: a name or an index, then everything after the first
+        // space as the payload. Unbracketed, deliberately -- this is the
+        // browse surface, where you are picking an action off a menu you are
+        // looking at, not writing a line someone reads back later. The
+        // brackets exist in the script grammar to remove an ambiguity about
+        // where a payload starts; here there is no selector to confuse it
+        // with, because the selection is the menu.
         std::string action_str = a_in;
         std::string payload_str;
         size_t sp = a_in.find(' ');
@@ -685,18 +818,15 @@ inline void repl_shell_action_loop(ETCS::Entity* e, ETCS::Root& nav_root,
                     action_str = action_list[idx].first.toString();
             } catch (...) {}
         }
-        ETCS::ExecutionContext ctx;
-        ctx.module_name = mod_name;
-        ctx.tag_name    = tag_name;
-        ctx.set_entity(target_rid);
-        ctx.sig         = &sig;
-        ctx.root_entity = &nav_root;
+
+        ETCS::ExecutionContext ctx =
+            repl_nav_context(mod_name, tag_name, target_rid, nav_root, sig);
+
         ETCS::CmdAction cmd;
-        cmd.module          = mod_name;
-        cmd.tag             = tag_name;
-        cmd.action          = action_str;
-        cmd.payload         = payload_str;
-        cmd.fully_qualified = false;
+        cmd.receiver = "self";
+        cmd.action   = action_str;
+        cmd.payload  = payload_str;
+
 #ifdef ETCS_REPL_SHELL
         repl_clear_signal_flags();
 #endif
@@ -704,6 +834,7 @@ inline void repl_shell_action_loop(ETCS::Entity* e, ETCS::Root& nav_root,
         ETCS::ExecuteResult result = ETCS::execute_command(ETCS::Command{cmd}, ctx, src);
         repl_out() << COLOR_RESET;
         if (result.status == ETCS::ExecuteStatus::Fatal) return;
+
 #ifdef ETCS_REPL_SHELL
         if (repl_sigint_raised())
         {
@@ -722,15 +853,17 @@ inline void repl_shell_action_loop(ETCS::Entity* e, ETCS::Root& nav_root,
     }
 }
 
-// ── Instance loop ─────────────────────────────────────────────────────────────
+// ── Instance loop ───────────────────────────────────────────────────────────
 inline void repl_shell_instance_loop(const std::string& mod_name, const std::string& tag_name,
-                                      ETCS::Root& nav_root, ETCS::SignalContext& sig,
-                                      ReplLineSource& in)
+                                     ETCS::Root& nav_root, ETCS::SignalContext& sig,
+                                     ReplLineSource& in)
 {
     ETCS::ExecSource src{"(interactive)", 0};
+
     while (true)
     {
         if (sig.isInterrupted() || sig.isTerminated()) break;
+
         ETCS::Buffer key;
         key.writeString((mod_name + ":" + tag_name).c_str());
         auto& ridMap = ETCS::EventNode::getInstance().ridMap;
@@ -741,11 +874,14 @@ inline void repl_shell_instance_loop(const std::string& mod_name, const std::str
             ETCS_LOG("ShellREPL", COLOR_WARN << " Tag is invalid!" << COLOR_RESET);
             return;
         }
+
         std::vector<ETCS::RID> live_rids;
         handle->invoke_collect_rids(live_rids);
+
         ETCS_LOG("ShellREPL", "\n--- Live instances of " << COLOR_LIB << tag_name
             << COLOR_RESET << " in " << COLOR_DIR << mod_name << COLOR_RESET
             << " [" << COLOR_RID << live_rids.size() << COLOR_RESET << " active] ---");
+
         if (live_rids.empty())
         {
             ETCS_LOG("ShellREPL",
@@ -753,14 +889,13 @@ inline void repl_shell_instance_loop(const std::string& mod_name, const std::str
         }
         else
         {
-            // Once, not per-instance: forModule() locks and copies every
-            // entry for this module.
-            auto named_here = ETCS::PersistentNames::getInstance().forModule(mod_name);
+            // Once, not per-instance.
+            auto named_here = repl_live_globals_for_module(mod_name);
             for (size_t i = 0; i < live_rids.size(); ++i)
             {
                 std::string alias;
-                for (auto& [name, entry] : named_here)
-                    if (entry.tag == tag_name && entry.rid == live_rids[i])
+                for (auto& [name, b] : named_here)
+                    if (b.tag == tag_name && b.rid == live_rids[i])
                         { alias = " (" + name + ")"; break; }
                 ETCS_LOG("ShellREPL", COLOR_RID << "  [" << i
                     << "] RID:" << live_rids[i] << COLOR_RESET << alias);
@@ -768,23 +903,26 @@ inline void repl_shell_instance_loop(const std::string& mod_name, const std::str
         }
         ETCS_LOG("ShellREPL",
             "  [n] Select instance by index   [spawn] Create new   [back] Return");
+
         std::string i_in;
         if (!in(tag_name + " Inst> ", i_in)) break;
         if (i_in == "back")                   { break; }
         if (i_in == "exit" || i_in == "quit") { return; }
+
         if (i_in == "spawn")
         {
             ETCS::ExecutionContext ctx;
-            ctx.module_name = mod_name;
-            ctx.tag_name    = tag_name;
-            ctx.sig         = &sig;
+            ctx.sig     = &sig;
+            ctx.is_root = false;
             // Module is already anchored, so loadImpl's vacant branch never
-            // runs here -- this only satisfies spawn_entity's non-null guard.
+            // runs here -- this satisfies spawn_entity's non-null guard and
+            // gives resolve_module/verify_tag something to work against.
             ctx.root_entity = &nav_root;
             ETCS::Entity* e = ETCS::spawn_entity(mod_name, tag_name, ctx, src);
             if (e) { repl_shell_action_loop(e, nav_root, sig, in); }
             continue;
         }
+
         if (!i_in.empty() && std::isdigit((unsigned char)i_in[0]))
         {
             try {
@@ -809,16 +947,18 @@ inline void repl_shell_instance_loop(const std::string& mod_name, const std::str
     }
 }
 
-// ── Tag loop ──────────────────────────────────────────────────────────────────
+// ── Tag loop ────────────────────────────────────────────────────────────────
 // nav_root's module_ is already bound by repl_shell_loop_with before this runs.
 inline void repl_shell_tag_loop(const std::string& mod_name, ETCS::Root& nav_root,
-                                  ETCS::SignalContext& sig, ReplLineSource& in)
+                                ETCS::SignalContext& sig, ReplLineSource& in)
 {
     bool detach_module = false;
     const std::vector<ETCS::Buffer>& tags = nav_root.module_.getTags();
+
     while (true)
     {
         if (sig.isInterrupted() || sig.isTerminated()) break;
+
         ETCS_LOG("ShellREPL", "\n--- Tags in " << COLOR_LIB << mod_name << COLOR_RESET << " ---");
         for (size_t i = 0; i < tags.size(); ++i)
         {
@@ -830,42 +970,35 @@ inline void repl_shell_tag_loop(const std::string& mod_name, ETCS::Root& nav_roo
             ETCS_LOG("ShellREPL", COLOR_LIB << "  [" << i << "] " << tags[i].toString()
                 << COLOR_RESET << "  (" << COLOR_RID << live_count << " live" << COLOR_RESET << ")");
         }
-        // Names from this run or an earlier one (PersistentNames outlives
-        // any single ExecutionContext). Liveness verified here rather than
-        // trusted: PersistentNames never prunes dead entries, so a name
-        // whose target is gone is skipped instead of shown as reachable.
+
+        // The root script's own names -- the globals every script in its tree
+        // can reach by attach or ensure. Empty when no root script is running,
+        // which is correct rather than a gap: with nothing composing, there is
+        // no shared vocabulary to show.
         {
-            auto named = ETCS::PersistentNames::getInstance().forModule(mod_name);
-            std::vector<std::pair<std::string, ETCS::PersistentNameEntry>> alive_named;
-            auto& ridMap = ETCS::EventNode::getInstance().ridMap;
-            for (auto& [name, entry] : named)
-            {
-                ETCS::Buffer key;
-                key.writeString((entry.module + ":" + entry.tag).c_str());
-                auto it = ridMap.find(key);
-                if (it != ridMap.end() && it->second.invoke_contains(entry.rid))
-                    alive_named.emplace_back(name, entry);
-            }
+            auto alive_named = repl_live_globals_for_module(mod_name);
             if (!alive_named.empty())
             {
                 ETCS_LOG("ShellREPL", COLOR_DIR
-                    << "  --- Named instances (recognized from this or an earlier run) ---"
+                    << "  --- Root script names (reachable by attach/ensure) ---"
                     << COLOR_RESET);
-                for (auto& [name, entry] : alive_named)
+                for (auto& [name, b] : alive_named)
                 {
                     ETCS_LOG("ShellREPL", COLOR_RID << "  " << name << COLOR_RESET
-                        << " -> " << entry.tag << " RID:" << COLOR_RID << entry.rid << COLOR_RESET);
+                        << " -> " << b.tag << " RID:" << COLOR_RID << b.rid << COLOR_RESET);
                 }
             }
         }
-        ETCS_LOG("ShellREPL",
-            "  [back] Return   [detach] Detach   [exit] Quit");
+
+        ETCS_LOG("ShellREPL", "  [back] Return   [detach] Detach   [exit] Quit");
+
         std::string t_in;
         if (!in(mod_name + " Tag> ", t_in)) break;
         if (t_in.empty()) continue;
         if (t_in == "back")   { break; }
         if (t_in == "detach") { detach_module = true; break; }
         if (t_in == "exit" || t_in == "quit") { return; }
+
         std::string tag_name = t_in;
         try {
             if (!t_in.empty() && std::isdigit((unsigned char)t_in[0]))
@@ -874,40 +1007,47 @@ inline void repl_shell_tag_loop(const std::string& mod_name, ETCS::Root& nav_roo
                 if (idx < tags.size()) tag_name = tags[idx].toString();
             }
         } catch (...) {}
+
         repl_shell_instance_loop(mod_name, tag_name, nav_root, sig, in);
     }
+
     if (detach_module)
     {
         ETCS_LOG("ShellREPL",
             "Detaching module: " << mod_name << " (leaving live entities running).");
     }
 }
+
 #endif // ETCS_LOADER
 
 #if defined(ETCS_REPL_SHELL) && defined(__linux__)
 // Defined below, after repl_shell_loop -- the root loop's `attach` branch
 // reaches it, and the attach relay in turn borrows repl_shell_get_input, so
-// one of the two has to be forward-declared. This one, since the root loop
-// is the shared entry point and belongs earlier.
+// one of the two has to be forward-declared. This one, since the root loop is
+// the shared entry point and belongs earlier.
 inline void repl_shell_attach_loop(const std::string& path, ETCS::SignalContext& sig);
 #endif
 
-// ── Root loop ─────────────────────────────────────────────────────────────────
+// ── Root loop ───────────────────────────────────────────────────────────────
 // A FRESH nav_root per module navigation, popped when repl_shell_tag_loop
 // returns. That is what keeps attachModule's "one module per entity/Root"
 // guard from biting: nav_root is never reused across two resolutions, so
 // there's no stale binding to collide with. If nothing was spawned, its
 // destruction unloads the module (sibling-Root search first, see
-// changeModuleImpl); if something was, ownership already transferred to
-// that entity and the destruction is a no-op.
+// changeModuleImpl); if something was, ownership already transferred to that
+// entity and the destruction is a no-op.
 //
-// Takes its input source rather than reading stdin, so the same loop serves
-// a local terminal and a socket session. Nothing below knows which it is --
-// that is the whole point of the split described at the top of this file.
+// Takes its input source rather than reading stdin, so the same loop serves a
+// local terminal and a socket session. Nothing below knows which it is.
 //
 // The directory listing and `cd` are the SERVER's filesystem when this runs
 // under a session, which is correct: that is where its scripts and modules
 // live, and a remote operator wanting to run one wants to see them.
+//
+// `jobs` and `signal` live HERE and nowhere else now. They were briefly also
+// script verbs, which was always wrong: a script launches work with
+// detach/run, it does not administer it afterward. Administration is what a
+// prompt is for.
 inline void repl_shell_loop_with(ETCS::SignalContext& sig, ReplLineSource& in)
 {
     while (!(sig.isInterrupted() || sig.isTerminated()))
@@ -918,10 +1058,12 @@ inline void repl_shell_loop_with(ETCS::SignalContext& sig, ReplLineSource& in)
         repl_shell_print_live_modules(available_mods);
 #endif
         ETCS_LOG("ShellREPL", "--------------------------------------------------------");
+
         std::string mod_input;
         if (!in("Root> ", mod_input)) break;
         if (mod_input == "exit" || mod_input == "quit") break;
         if (mod_input.empty()) continue;
+
         if (mod_input.substr(0, 3) == "cd ")
         {
             try { fs::current_path(mod_input.substr(3)); }
@@ -929,6 +1071,7 @@ inline void repl_shell_loop_with(ETCS::SignalContext& sig, ReplLineSource& in)
                 { repl_err() << COLOR_WARN << "CD Error: " << e.what() << COLOR_RESET << "\n"; }
             continue;
         }
+
         if (mod_input == "jobs")
         {
             auto jobs = ETCS::DetachedRegistry::getInstance().list();
@@ -946,12 +1089,13 @@ inline void repl_shell_loop_with(ETCS::SignalContext& sig, ReplLineSource& in)
             }
             continue;
         }
+
         if (mod_input.rfind("signal ", 0) == 0)
         {
             std::string rest = mod_input.substr(7);
             size_t sp = rest.find_first_of(" \t");
             std::string id_str = (sp == std::string::npos) ? rest : rest.substr(0, sp);
-            std::string mode    = (sp == std::string::npos) ? "" : rest.substr(sp + 1);
+            std::string mode   = (sp == std::string::npos) ? "" : rest.substr(sp + 1);
             uint64_t id = 0;
             bool ok = true;
             try {
@@ -961,12 +1105,13 @@ inline void repl_shell_loop_with(ETCS::SignalContext& sig, ReplLineSource& in)
             } catch (...) { ok = false; }
             if (!ok)
             {
-                repl_err() << COLOR_WARN << "signal: invalid id '" << id_str << "'" << COLOR_RESET << "\n";
+                repl_err() << COLOR_WARN << "signal: invalid id '" << id_str << "'"
+                           << COLOR_RESET << "\n";
                 continue;
             }
-            bool term = (mode != "interrupt" && mode != "int");
+            bool term  = (mode != "interrupt" && mode != "int");
             bool found = term ? ETCS::DetachedRegistry::getInstance().terminate(id)
-                               : ETCS::DetachedRegistry::getInstance().interrupt(id);
+                              : ETCS::DetachedRegistry::getInstance().interrupt(id);
             if (found)
             {
                 ETCS_LOG("ShellREPL", COLOR_LIB << (term ? "Terminating" : "Interrupting")
@@ -974,10 +1119,12 @@ inline void repl_shell_loop_with(ETCS::SignalContext& sig, ReplLineSource& in)
             }
             else
             {
-                repl_err() << COLOR_WARN << "signal: no job with id " << id << COLOR_RESET << "\n";
+                repl_err() << COLOR_WARN << "signal: no job with id " << id
+                           << COLOR_RESET << "\n";
             }
             continue;
         }
+
 #if defined(ETCS_REPL_SHELL) && defined(__linux__)
         // Terminal-only: the attach relay borrows this process's own line
         // editor, which a session driving us does not have to lend.
@@ -993,16 +1140,18 @@ inline void repl_shell_loop_with(ETCS::SignalContext& sig, ReplLineSource& in)
                 continue;
             }
             repl_shell_attach_loop(apath.substr(as, ae - as + 1), sig);
-            // Clear so a Ctrl+C aimed at the remote session doesn't also
-            // exit this REPL -- same reason the script path clears it.
+            // Clear so a Ctrl+C aimed at the remote session doesn't also exit
+            // this REPL -- same reason the script path clears it.
             g_sig_int.store(0, std::memory_order_release);
             continue;
         }
 #endif
+
         // Separate the module/script target from any injection arguments.
         std::istringstream iss(mod_input);
         std::string target_str;
         iss >> target_str;
+
         std::string mod_name = target_str;
         try {
             if (!target_str.empty() && std::isdigit((unsigned char)target_str[0]))
@@ -1011,21 +1160,24 @@ inline void repl_shell_loop_with(ETCS::SignalContext& sig, ReplLineSource& in)
                 if (idx < available_mods.size()) mod_name = available_mods[idx];
             }
         } catch (...) {}
-        // ── Script execution mode ────────────────────────────────────────────
+
+        // ── Script execution mode ──────────────────────────────────────────
+        //
+        // Goes through run_root_script, which PREFLIGHTS the whole tree --
+        // every detach and run target, recursively -- and refuses to start
+        // anything if the graph does not resolve. That is the one place the
+        // check belongs: preflight is a property of an invocation, and this is
+        // where invocations begin.
         if (mod_name.length() >= 5 && mod_name.substr(mod_name.length() - 5) == ".etcs")
         {
-            std::ifstream file(mod_name);
-            if (!file.is_open())
-            {
-                repl_err() << COLOR_WARN << "ShellREPL: cannot open script file '"
-                           << mod_name << "'" << COLOR_RESET << "\n";
-                continue;
-            }
+#ifdef ETCS_LOADER
             // Fresh Root scoped to this script execution.
             ETCS::Root script_root(sig);
             ETCS::ExecutionContext script_ctx;
-            script_ctx.sig = &sig;
+            script_ctx.sig         = &sig;
             script_ctx.root_entity = &script_root;
+            script_ctx.is_root     = true;   // its names become the globals
+
             std::string arg;
             bool args_valid = true;
             while (iss >> arg)
@@ -1041,36 +1193,65 @@ inline void repl_shell_loop_with(ETCS::SignalContext& sig, ReplLineSource& in)
                 }
                 std::string name    = arg.substr(0, eq);
                 std::string rid_str = arg.substr(eq + 1);
-                bool valid_name = true;
+
+                bool valid_name = !name.empty() && name != "root";
                 for (char c : name)
                     if (!std::isalnum((unsigned char)c) && c != '_') { valid_name = false; break; }
-                if (!valid_name || name.empty())
+                if (!valid_name)
                 {
                     repl_err() << COLOR_WARN << "ShellREPL: invalid name '" << name
-                               << "' in injection argument '" << arg << "'" << COLOR_RESET << "\n";
+                               << "' in injection argument '" << arg << "'"
+                               << COLOR_RESET << "\n";
                     args_valid = false;
                     break;
                 }
                 try {
                     size_t end;
-                    unsigned long long rid = std::stoull(rid_str, &end);
+                    unsigned long long rid_v = std::stoull(rid_str, &end);
                     if (end != rid_str.size()) throw std::invalid_argument("trailing chars");
-                    script_ctx.bind(name, static_cast<ETCS::RID>(rid));
-                    ETCS_LOG("ShellREPL", "Injected: " << name << " -> RID:" << rid);
+                    ETCS::RID rid = static_cast<ETCS::RID>(rid_v);
+
+                    // Resolved HERE, not deferred. A binding carries its
+                    // Module::Tag now (action lines no longer state one), and
+                    // an injected RID is the one place that pair is not
+                    // already known -- so it is recovered from the entity
+                    // itself, which also settles liveness at capture time.
+                    ETCS::Entity* e = ETCS::resolve_entity_anywhere(rid);
+                    if (!e)
+                    {
+                        repl_err() << COLOR_WARN << "ShellREPL: RID " << rid
+                                   << " (for '" << name << "') does not resolve to a "
+                                      "live entity." << COLOR_RESET << "\n";
+                        args_valid = false;
+                        break;
+                    }
+                    script_ctx.bind(name, ETCS::NameBinding{
+                        rid, e->getSourceModule().toString(), e->getSourceTag().toString()});
+                    ETCS_LOG("ShellREPL", "Injected: " << name << " -> RID:" << rid
+                             << " (" << e->getSourceModule().toString()
+                             << "::" << e->getSourceTag().toString() << ")");
                 }
-                catch (...) {
+                catch (const std::exception&) {
                     repl_err() << COLOR_WARN << "ShellREPL: invalid RID '" << rid_str
-                               << "' in injection argument '" << arg << "'" << COLOR_RESET << "\n";
+                               << "' in injection argument '" << arg << "'"
+                               << COLOR_RESET << "\n";
                     args_valid = false;
                     break;
                 }
             }
             if (!args_valid) continue;
-            ETCS::run_script(file, mod_name, script_ctx);
+
+            ETCS::run_root_script(mod_name, script_ctx);
+
             // Clear so a Ctrl+C aimed at the script doesn't also exit the REPL.
             g_sig_int.store(0, std::memory_order_release);
+#else
+            repl_err() << COLOR_WARN
+                       << "ShellREPL: script execution needs the loader." << COLOR_RESET << "\n";
+#endif
             continue;
         }
+
 #ifdef ETCS_LOADER
         try {
             ETCS::Root nav_root(sig);
@@ -1092,8 +1273,7 @@ inline void repl_shell_loop_with(ETCS::SignalContext& sig, ReplLineSource& in)
 }
 
 #ifdef ETCS_REPL_SHELL
-// The local console's entry point -- unchanged in behavior, now expressed
-// as "the navigator, driven by the tty".
+// The local console's entry point -- "the navigator, driven by the tty".
 inline void repl_shell_loop(ETCS::SignalContext& sig)
 {
     repl_shell_load_history();
@@ -1102,25 +1282,25 @@ inline void repl_shell_loop(ETCS::SignalContext& sig)
 }
 
 #ifdef __linux__
-// ── Attach ────────────────────────────────────────────────────────────────
+// ── Attach ──────────────────────────────────────────────────────────────────
 // attach <socket> -- drive ANOTHER runtime's control socket from this one.
 //
-// The far end is an `etcs --listen <socket>` process; what arrives there
-// goes through the same parse_line/execute_command path a local terminal
-// uses, so every command behaves identically. Typing `shell` over the link
-// hands that session the far runtime's OWN navigator -- rendered there,
-// where the entity graph is, and sent here as text.
+// The far end is an `etcs --listen <socket>` process. A session there IS the
+// navigator, from the moment it connects -- there is no line-interpreter mode
+// to opt out of any more, because the browse surface no longer executes trace
+// lines at all. So what arrives over this link is that runtime's own menus,
+// rendered where the entity graph is and sent here as text.
 //
 // FOREGROUND, one at a time. It borrows this terminal's line editor, so it
 // cannot be a background job the way a detached script can -- the prompt
 // itself is the thing being lent out.
 //
-// The REMOTE's prompt is displayed; this side prints none of its own. The
-// far runtime's context is the authority on where commands are landing, and
-// a local prompt would be describing the wrong process.
+// The REMOTE's prompt is displayed; this side prints none of its own. The far
+// runtime's position in its own menus is the authority on where input is
+// landing, and a local prompt would be describing the wrong process.
 //
-// Local escape word is `detach`. Everything else forwards verbatim,
-// including `exit`, which ends the REMOTE session rather than this one.
+// Local escape word is `detach`. Everything else forwards verbatim, including
+// `exit`, which ends the REMOTE session rather than this one.
 inline void repl_shell_attach_loop(const std::string& path, ETCS::SignalContext& sig)
 {
     int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
@@ -1153,8 +1333,8 @@ inline void repl_shell_attach_loop(const std::string& path, ETCS::SignalContext&
         return;
     }
 
-    // Same 300ms wake-up run_socket_repl uses on its own side, for the same
-    // reason: a quiet peer must not park this loop past a Ctrl+C.
+    // Same 300ms wake-up the far side uses, for the same reason: a quiet peer
+    // must not park this loop past a Ctrl+C.
     struct timeval tv { 0, 300000 };
     ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
@@ -1170,12 +1350,11 @@ inline void repl_shell_attach_loop(const std::string& path, ETCS::SignalContext&
         return true;
     };
 
-    // Waits for the remote's PROMPT, not merely for the socket to go quiet.
-    // A slow command emits output in bursts with gaps between them, and
-    // stopping at the first gap would print half a response and then hand
-    // back an input line the remote isn't ready for -- with the rest of its
-    // output arriving on top of whatever you typed next. Returns false when
-    // the peer closes.
+    // Waits for the remote's PROMPT, not merely for the socket to go quiet. A
+    // slow command emits output in bursts with gaps between them, and stopping
+    // at the first gap would print half a response and then hand back an input
+    // line the remote isn't ready for -- with the rest of its output arriving
+    // on top of whatever you typed next. Returns false when the peer closes.
     auto pump_until_prompt = [&]() -> bool
     {
         std::string acc;
@@ -1199,8 +1378,7 @@ inline void repl_shell_attach_loop(const std::string& path, ETCS::SignalContext&
     };
 
     ETCS_LOG("ShellREPL", COLOR_LIB << "attached to " << path << COLOR_RESET
-             << " -- 'detach' returns here, 'shell' opens the remote navigator, "
-                "'exit' ends the remote session.");
+             << " -- 'detach' returns here, 'exit' ends the remote session.");
 
     if (!pump_until_prompt())
     {
@@ -1239,30 +1417,34 @@ inline void repl_shell_attach_loop(const std::string& path, ETCS::SignalContext&
 
 #ifdef __linux__
 // ---------------------------------------------------------------------------
-// repl_session_navigator — the navigator, driven by a socket instead of a
-// tty. Installed into ETCS::g_session_navigator by shell_startup() and
-// reached when a session types `shell`.
+// repl_session_navigator — the navigator, driven by a socket instead of a tty.
+// Installed into ETCS::g_session_navigator by shell_startup() and handed EVERY
+// accepted control session, immediately.
+//
+// It used to be reached only when a session typed `shell`, because the default
+// was a line interpreter running raw .etcs through parse_line. That default is
+// gone: the strict grammar is for files, and a prompt is for navigating. So
+// there is no mode to select any more -- connect and you are in the navigator.
 //
 // Output accumulates into a LogSinkGuard-backed buffer and is flushed at
 // exactly the moment input is requested, which is what a terminal does
-// implicitly: render, then wait. That also keeps the flush points aligned
-// with the prompts, so a client reading until "> " sees whole screens.
+// implicitly: render, then wait. That also keeps the flush points aligned with
+// the prompts, so a client reading until "> " sees whole screens.
 //
-// Deliberately does NOT capture asynchronous output. log_sink is
-// thread_local (Log.h), so work that hops to a ThreadPool worker logs
-// wherever that thread points -- the server's own console. A navigator
-// session shows you what your own commands produced, not the runtime's
-// background traffic; that stays on the service's stdout, which is the
-// right place for it to be tailed.
+// Deliberately does NOT capture asynchronous output. log_sink is thread_local
+// (Log.h), so work that hops to a ThreadPool worker logs wherever that thread
+// points -- the server's own console. A navigator session shows you what your
+// own commands produced, not the runtime's background traffic; that stays on
+// the service's stdout, which is the right place for it to be tailed.
 // ---------------------------------------------------------------------------
 inline void repl_session_navigator(int fd, ETCS::SignalContext& sig)
 {
     std::ostringstream sink_buf;
     std::string accum;
 
-    // MSG_NOSIGNAL as well as the process-wide SIG_IGN in shell_startup:
-    // belt and braces, and it keeps the guarantee local to the call rather
-    // than dependent on startup order.
+    // MSG_NOSIGNAL as well as the process-wide SIG_IGN in shell_startup: belt
+    // and braces, and it keeps the guarantee local to the call rather than
+    // dependent on startup order.
     auto send_all = [fd](const std::string& s) -> bool
     {
         size_t off = 0;
@@ -1284,8 +1466,8 @@ inline void repl_session_navigator(int fd, ETCS::SignalContext& sig)
         if (!pending.empty() && !send_all(pending)) return false;
         if (!prompt.empty() && !send_all(prompt))   return false;
 
-        // One line, possibly spanning several reads, possibly already
-        // buffered from a previous one.
+        // One line, possibly spanning several reads, possibly already buffered
+        // from a previous one.
         while (true)
         {
             size_t nl = accum.find('\n');
@@ -1297,6 +1479,7 @@ inline void repl_session_navigator(int fd, ETCS::SignalContext& sig)
                 return true;
             }
             if (sig.isInterrupted() || sig.isTerminated()) return false;
+
             char buf[4096];
             ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
             if (n == 0) return false;                       // peer closed
@@ -1313,8 +1496,8 @@ inline void repl_session_navigator(int fd, ETCS::SignalContext& sig)
     ETCS::LogSinkGuard sink_guard(&sink_buf);
     repl_shell_loop_with(sig, in);
 
-    // Whatever the last screen produced has no prompt following it to
-    // trigger a flush, so it goes out here.
+    // Whatever the last screen produced has no prompt following it to trigger
+    // a flush, so it goes out here.
     std::string tail = sink_buf.str();
     if (!tail.empty()) send_all(tail);
 }
@@ -1329,8 +1512,8 @@ inline void shell_startup()
     // A write to a socket whose peer has gone must be an ERROR, not a death.
     // Default SIGPIPE disposition terminates the process, which for a server
     // means any client hanging up mid-write takes the runtime with it -- a
-    // debug session closed at the wrong instant, a dropped connection, a
-    // pane killed. Every send_all in this codebase already ends with
+    // debug session closed at the wrong instant, a dropped connection, a pane
+    // killed. Every send_all in this codebase already ends with
     // `if (n <= 0) return false;`, written to unwind exactly this case; the
     // signal was killing us before that line could run.
     //
@@ -1340,8 +1523,8 @@ inline void shell_startup()
     ::signal(SIGPIPE, SIG_IGN);
 
     // Installed here rather than at static-init: main() calls this before
-    // anything can accept a session, and an explicit assignment beats
-    // ordering games between translation units.
+    // anything can accept a session, and an explicit assignment beats ordering
+    // games between translation units.
     ETCS::g_session_navigator = &repl_session_navigator;
 #endif
 #ifdef ETCS_REPL_SHELL
@@ -1349,12 +1532,12 @@ inline void shell_startup()
     repl_shell_load_history();
 #endif
 }
-
+ 
 // control_socket, when non-empty, replaces the drain wait with a control
 // listener -- the headless build's substitute for stdin. Empty keeps the
-// existing drain-until-finished behavior, which is still the correct mode
-// for genuine batch work (run a script, wait for what it detached, exit).
-// Ignored entirely by an interactive build, which already has a stream.
+// existing drain-until-finished behavior, which is still the correct mode for
+// genuine batch work (run a script, wait for what it detached, exit). Ignored
+// entirely by an interactive build, which already has a stream.
 //
 // Either branch runs shutdown_detached_executors() and
 // PendingUnloadRegistry::join_all() exactly once before returning.
@@ -1365,7 +1548,7 @@ inline void shell_startup()
 // own still-running workers. An empty registry (the common case) costs
 // nothing.
 inline int drive_main_loop_then_exit(ETCS::SignalContext& ctx, int code,
-                                      const std::string& control_socket = "")
+                                     const std::string& control_socket = "")
 {
 #ifdef ETCS_REPL_SHELL
     (void)control_socket;
@@ -1385,5 +1568,6 @@ inline int drive_main_loop_then_exit(ETCS::SignalContext& ctx, int code,
     ETCS::PendingUnloadRegistry::getInstance().join_all();
     return code;
 }
-
+ 
 #endif // SHELLREPL_H__
+ 

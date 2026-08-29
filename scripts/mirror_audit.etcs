@@ -1,6 +1,6 @@
-#!/media/user/Data/ACE/ETCS/bin/etcs
-DatabaseProvider
-LocalDatabase from
-QueryProduce SELECT * FROM audit
-context DatabaseProvider::LocalDatabase to
-RowConsume
+#!/usr/bin/env etcs
+
+requires from
+requires to
+
+from.QueryProduce(SELECT * FROM audit) -> to.RowConsume()

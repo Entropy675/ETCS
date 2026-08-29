@@ -1,34 +1,20 @@
 #!/usr/bin/env etcs
 #IMPORT ACE_ROOT/scripts
 
-ForumWebsiteProvider
-ForumNode node
-spawn node
-Mount node forum
+spawn ForumWebsiteProvider::ForumNode node
+node.Mount(forum)
 
-context DatabaseProvider::LocalDatabase forumdb
-spawn forumdb
-Connect ./forum.db
+spawn DatabaseProvider::LocalDatabase forumdb
+forumdb.Connect(./forum.db)
 
-context ForumWebsiteProvider::ForumNode node
-Db node @forumdb
-InitDb node
+node.Db(@forumdb)
+node.InitDb()
 
-context DatabaseProvider::LocalDatabase forumdb
-RowProduce SELECT * FROM forum_thread
-context ForumWebsiteProvider::ForumNode node
-LoadRows
+forumdb.RowProduce(SELECT * FROM forum_thread) -> node.LoadRows()
+forumdb.RowProduce(SELECT * FROM forum_post)   -> node.LoadRows()
+forumdb.RowProduce(SELECT * FROM forum_body)   -> node.LoadRows()
 
-context DatabaseProvider::LocalDatabase forumdb
-RowProduce SELECT * FROM forum_post
-context ForumWebsiteProvider::ForumNode node
-LoadRows
-
-context DatabaseProvider::LocalDatabase forumdb
-RowProduce SELECT * FROM forum_body
-context ForumWebsiteProvider::ForumNode node
-LoadRows
-
-Verify node
+node.Index()
+node.Verify()
 
 detach forum_web.etcs forum=node
