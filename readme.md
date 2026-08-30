@@ -32,7 +32,11 @@ ace make modules
 ace make module XxxProvider
 ```
 
-There are many example scripts in the /scripts/ folder, once you have compiled the modules, run etcs and enter the scripts repo, run them randomly... this side is in active development.
+There are many example scripts in the /scripts/ folder, once you have compiled the modules, run etcs and enter the scripts repo, run them randomly... this side is in active development. You will likely want to use this most often for large modifications:
+```
+ace make modules && ace make loader
+```
+
 
 TODO:
 
