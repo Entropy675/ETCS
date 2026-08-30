@@ -81,6 +81,8 @@ main.Run(600, 600, 'GraphicalLoader Test GUI')
 main.Delete()
 ```
 
+Notice how the above script uses the detached window_events.etcs script targeting the same main window to create a stream, from the event producing pump to the windows own event consuming buffer, which others can subscribe to for a event stream. The instance in WindowProvider is currently implemented via GLFW, the first detached script is the first thread of the loader so it's a valid event pump - for programs that are windowed and want input you must detach window_events.etcs first so that the input pump captures the first thread, this is an OS requirement... will not be a limitation within future ETCS kernel. Useful place to learn about the thread affinity ordering though, in case it matters to you.
+
 Copyright (C) 2026 Sibte Kazmi
 
 This library is free software; you can redistribute it and/or
