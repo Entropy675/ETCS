@@ -83,6 +83,10 @@ main.Delete()
 
 Notice how the above script uses the detached window_events.etcs script targeting the same main window to create a stream, from the event producing pump to the windows own event consuming buffer, which others can subscribe to for a event stream. The instance in WindowProvider is currently implemented via GLFW, the first detached script is the first thread of the loader so it's a valid event pump - for programs that are windowed and want input you must detach window_events.etcs first so that the input pump captures the first thread, this is an OS requirement... will not be a limitation within future ETCS kernel. Useful place to learn about the thread affinity ordering though, in case it matters to you.
 
+The best way to think about the ETCS scripting language is as a schema for the structure of your control threads. The actual work occurs within the work functions (hence the name), ETCS scripts are called on state transitions via work functions to trigger control flow changes in the event graph. Scripts are not general programs: they declare how work functions attach to entities and how control moves on the event graph—bindings, ordering, and streaming links such as Produce -> Consume.
+ETCS scripts are a non-Turing-complete description of the nameable environment under the modules currently loadable on the substrate. They are not primarily meant to be written by hand as large control-flow programs. They are meant to be assembled by naming fragments, including fragments auto-generated in bulk by causal exhaustion on the ACE build server (Target — see the whitepaper). Human authorship sits mainly at the construction layer: which pieces to attach, under which names.
+Boundaries are explicit (export horizon, MirrorBuffer, one content channel). The exhaustive resolver that generates the full fragment set is work in progress.
+
 Copyright (C) 2026 Sibte Kazmi
 
 This library is free software; you can redistribute it and/or
