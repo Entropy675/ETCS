@@ -23,7 +23,7 @@ Then you can build the main etcs loader via:
 ace make loaders
 ace make loader
 ```
-Make 
+Make sure to run 'ace make loader' explicitly if you want the shell, 'ace make loaders' makes etcs without the debug flag.
 
 You can make all the modules or a target module via:
 
