@@ -1,4 +1,5 @@
-ETCS (Entity Tag Component System) is a C++ substrate in which type identity, ABI contract, capability boundary, and causal graph are one compile-time artifact rather than four that must be kept in agreement.
+ETCS (Entity Tag Component System) is a C++ substrate for defining types, ABI contracts, capabilities, and causal relationships as one compile-time artifact. It uses ontology-compliant wrappers and MirrorBuffer boundaries to connect locally or across processes without requiring application code to duplicate the same contract in multiple systems. Functioning effectively like an operating system/virtual machine.
+
 See https://anticurrententropy.com/whitepaper.html for details.
 
 Currently building on linux, targeting ARM and x64
@@ -9,6 +10,25 @@ Tools & Modules
 
 I do not recommend working on this substrate until the below todo's are complete, as they can change the active surface.
 
+To write an ETCS provider, you effectively have to introduce yourself to the ETCS runtime via a thin ontology compliant wrapper. See ChessProvider in ETCS-Commons repo (https://github.com/Entropy675/ETCS-Commons/tree/main/ChessProvider) for a bare bones example. Once your types speak over the ETCS scripting language, you can act across the arbitrary MirrorBuffer boundary, which is the function call boundary for stream functions or streams you negotiate yourself (less recommended unless you know what you are doing - I'll make a video). The stream work function contract is an explicit lifetime: the consume stream function holds open the lifetime of the connection and is blocking; the produce side is non-blocking and expected to output continuously over the MirrorBuffer they share, which wraps/unwraps via the Wrapper_ based types owned by either side. A connection drop or otherwise failure to set up a MirrorBuffer ends the connection, logging it as a failure on both sides. If one side cannot assemble the same Wrapper_ based types required to generate a valid MirrorBuffer to a target type, stream calls fail. Since all scripts are run locally remote connections have to be brokered via a name server equivalent domain (See ChessNode from ChessProvider). MirrorBuffer covers quite literally every physical boundary from LMAX within process local buffers to sockets, the local EventNode's EventStream negotiates the provenience of local memory with the most local loader separately from the identity of the code, all entities' origin is local in every way (RIDs are runtime deterministic sequences). It's maximized for decreasing arbitrary pattern replication via the ontology, the CRTP layer reduces that pattern match to static casts. An ontology compliant wrapper of existing code gains distribution over all platforms ETCS supports, including the ETCS kernel when it releases, unless platform specific types are declared in the modules type contract declaration (the auto generated header via ace tool's module setup, Contract_XXXXXProvider.h where you can typecast unify your types for every supported system).
+
+To build, pull ACE-Build-Tools in one folder. Pull ETCS in another folder. Pull ETCS-Commons as 'modules' folder in the ETCS folder (it's going to be a git sub-project soon, sorry for my laziness). Run:
+
+sudo python3 ace_install.py install
+
+That will install all the required packages, you may have to run it twice or install a missing package for some modules...
+Then you can build the main etcs loader via:
+
+ace make loader
+ace make loaders
+
+You can make all the modules or a target module via:
+
+ace make module XxxProvider
+ace make modules
+
+There are many example scripts in the /scripts/ folder, once you have compiled the modules, run etcs and enter the scripts repo, run them randomly... this side is in active development.
+
 TODO:
 
 - Fix deadlock/complete bilateral module & loader handshake
@@ -16,6 +36,39 @@ TODO:
 - Persistence tag within DatabaseProvider & merge Local/Remote Database ontology types
 - RenderProvider and its associated ontology types
 
+Example graphical_script.etcs:
+#!/usr/bin/env etcs
+
+spawn WindowProvider::Window main
+
+detach window_events.etcs window=main
+main.Run(600, 600, 'GraphicalLoader Test GUI') 
+main.Delete()
+
+Where window_events.etcs:
+#!/usr/bin/env etcs
+
+requires window [Window]
+
+window.ProduceEvents() -> window.ConsumeEvents()
+window.Close()
+
+You can use 'ace script print xxx.etcs' to get an expanded script printed like:
+#!/usr/bin/env etcs
+
+spawn WindowProvider::Window main
+
+detach window_events.etcs window=main
+{
+	#!/usr/bin/env etcs
+	
+	requires window [Window]
+	
+	window.ProduceEvents() -> window.ConsumeEvents()
+	window.Close()
+}
+main.Run(600, 600, 'GraphicalLoader Test GUI') 
+main.Delete()
 
 
 Copyright (C) 2026 Sibte Kazmi
