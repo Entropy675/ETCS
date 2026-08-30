@@ -42,8 +42,10 @@ TODO:
 
 - Fix deadlock/complete bilateral module & loader handshake
 - Import merkle hash chain from the completed version in other instance of project
+- Identity system / binary signage (dependent on above)
+- Test Wrapper_ & MirrorBuffer interaction thoroughly (I suspect a bug in shared memory path)
 - Persistence tag within DatabaseProvider & merge Local/Remote Database ontology types
-- RenderProvider and its associated ontology types
+- RenderProvider and its associated ontology types (Vulkan instance, 2D target first)
 
 Example graphical_script.etcs:
 ```
