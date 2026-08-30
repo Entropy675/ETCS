@@ -19,13 +19,17 @@ sudo python3 ace_install.py install
 That will install all the required packages, you may have to run it twice or install a missing package for some modules...
 Then you can build the main etcs loader via:
 
+```
 ace make loaders
 ace make loader
+```
 
 You can make all the modules or a target module via:
 
+```
 ace make modules
 ace make module XxxProvider
+```
 
 There are many example scripts in the /scripts/ folder, once you have compiled the modules, run etcs and enter the scripts repo, run them randomly... this side is in active development.
 
@@ -37,6 +41,7 @@ TODO:
 - RenderProvider and its associated ontology types
 
 Example graphical_script.etcs:
+```
 #!/usr/bin/env etcs
 
 spawn WindowProvider::Window main
@@ -44,16 +49,20 @@ spawn WindowProvider::Window main
 detach window_events.etcs window=main
 main.Run(600, 600, 'GraphicalLoader Test GUI') 
 main.Delete()
+```
 
 Where window_events.etcs:
+```
 #!/usr/bin/env etcs
 
 requires window [Window]
 
 window.ProduceEvents() -> window.ConsumeEvents()
 window.Close()
+```
 
 You can use 'ace script print xxx.etcs' to get an expanded script printed like:
+```
 #!/usr/bin/env etcs
 
 spawn WindowProvider::Window main
@@ -69,7 +78,7 @@ detach window_events.etcs window=main
 }
 main.Run(600, 600, 'GraphicalLoader Test GUI') 
 main.Delete()
-
+```
 
 Copyright (C) 2026 Sibte Kazmi
 
