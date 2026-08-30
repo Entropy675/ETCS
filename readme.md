@@ -86,6 +86,8 @@ Notice how the above script uses the detached window_events.etcs script targetin
 The best way to think about the ETCS scripting language is as a schema for the structure of your control threads. The actual work occurs within the work functions (hence the name), ETCS scripts are called on state transitions via work functions to trigger control flow changes in the event graph. Scripts are not general programs: they declare how work functions attach to entities and how control moves on the event graph—bindings, ordering, and streaming links such as Produce -> Consume.
 ETCS scripts are a non-Turing-complete description of the nameable environment under the modules currently loadable on the substrate. They are not primarily meant to be written by hand as large control-flow programs. They are meant to be assembled by naming fragments, including fragments auto-generated in bulk by causal exhaustion on the ACE build server (Target — see the whitepaper). Human authorship sits mainly at the construction layer: which pieces to attach, under which names. Where to call them, how to order the execution of scripts. Boundaries are explicit (export horizon, MirrorBuffer, one content channel). The exhaustive resolver that generates the full fragment set is work in progress.
 
+Example: window.ProduceEvents() → window.ConsumeEvents() is not a loop in the script; it is a standing control-thread edge between two work functions.
+
 Copyright (C) 2026 Sibte Kazmi
 
 This library is free software; you can redistribute it and/or
