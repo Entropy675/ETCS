@@ -125,12 +125,20 @@ have content only where the address slot holds a name instead.
 The bracket is also a **choice of how much to assert**. `requires db [Database]` and
 `requires db [LocalDatabase]` are different claims, and the narrower one is the stronger. A script
 that only uses the `Database` part of an interface says so with the wider tag, and then serves any
-concrete type in that family. What the wider tag does *not* promise is a complete interface — a
-type that forwards only part of its ontology contract still carries the family tag, and calls into
-the unforwarded part are refused at the line that makes them. That refusal is deterministic (same
-binding, same failure, same place) and, since a failed action is not a stop, it is recorded rather
-than fatal. The tag asserts family membership; the trace reports what that family member actually
-does.
+concrete type in that family.
+
+What a family tag promises is membership, not a callable surface. Every method a family declares
+exists on every type claiming it — the CRTP proxy makes it a pure virtual, so a leaf that skipped
+one would not compile. What varies is how much of it a type **exports as work functions**, and
+that is the only thing a script's reach depends on. A method that is not exported is not missing:
+it is C++-only, reached by whatever code holds the concrete type, and reached from a trace by
+handing the RID to a work function that uses it — which is how `run_tls_website.etcs` drives
+parsers and TLS contexts without ever naming one of their constraint methods.
+
+So a tagged `requires` gates on what the entity *is*; the actions the script writes are what
+determine what it needs to be able to *call*. Where those disagree the failure is deterministic —
+same binding, same line — and, since a failed action is not a stop, recorded rather than fatal.
+`ace abi` prints both surfaces per type, which is where the correspondence is worth reading.
 
 A tag list can mix both kinds from **Tags, and the two kinds** above, freely:
 
