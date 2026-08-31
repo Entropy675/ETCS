@@ -6,7 +6,11 @@ int main()
 
 
     ETCS::Entity* http = ETCS::spawn_entity("NetworkProvider", "HTTPParser", env, loader);
-    if (http == nullptr) return 0;
+    if (http == nullptr)
+    {
+        ETCS_LOG("NetworkServerLoader", "Failed to load NetworkProvider:HTTPParser");
+        return 1;
+    }
 
     ETCS_LOG("NetworkServerLoader", "Loaded NetworkProvider:HTTPParser... ");
 
