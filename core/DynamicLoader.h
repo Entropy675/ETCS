@@ -95,57 +95,14 @@ struct PendingUnloadRegistry
  * (new: needs the shared survivor-search logic below for its one special
  * case).
  */
+// Thin wrapper over the shared, symmetric comparison (Bundles.h) -- this is
+// the LOADER's own half; RegisterDynamicLoader below runs the same check on
+// the module's side, against the loader's manifest.
 bool ETCS::Module::validateManifest(Manifest* dllManifest)
 {
-    auto& host_manifest = ETCS::Entity::getManifest();
-    bool mismatch_found = false;
-    ETCS_LOG("DynamicLoader:Module", "--- [DynamicLoader:Module] Manifest Comparison: " << name << " ---");
-    ETCS_LOG("DynamicLoader:Module", std::left << std::setw(40) << "Key"
-        << std::setw(12) << "Host(8)" << std::setw(12) << "DLL(8)" << "Status");
-    ETCS_LOG("DynamicLoader:Module", std::string(75, '-'));
-    for (auto const& [key_c, dll_hash_c] : *dllManifest)
-    {
-        std::string key(key_c);
-        std::string dll_hash(dll_hash_c);
-        bool is_contract = (key.rfind("ONTOLOGY:", 0) == 0 || key.rfind("HEADER:", 0) == 0);
-        std::stringstream row;
-        row << std::left << std::setw(40) << key;
-        if (host_manifest.count(key_c))
-        {
-            std::string h_short = std::string(host_manifest[key_c]).substr(0, 8);
-            std::string d_short = dll_hash.substr(0, 8);
-            row << std::setw(12) << h_short << std::setw(12) << d_short;
-            if      (h_short == d_short) row << "[ OK ]";
-            else if (is_contract)      { row << "[ FAIL ]"; mismatch_found = true; }
-            else                         row << "[ DIFF ]";
-        }
-        else
-        {
-            row << std::setw(12) << "N/A" << std::setw(12) << dll_hash.substr(0, 8) << "[INFO]";
-        }
-        ETCS_LOG("DynamicLoader:Module", row.str());
-    }
-    ETCS_LOG("DynamicLoader:Module", std::string(75, '-'));
-    if (mismatch_found)
-    {
-        for (auto const& [key_c, dll_hash_c] : *dllManifest)
-        {
-            std::string key(key_c);
-            if (key.rfind("ONTOLOGY:", 0) == 0 || key.rfind("HEADER:", 0) == 0)
-            {
-                if (host_manifest.count(key_c) && host_manifest[key_c] != std::string(dll_hash_c))
-                {
-                    ETCS_LOG("FATAL", "Interface Mismatch in " << name << "\n"
-                        << "  Key: "      << key                  << "\n"
-                        << "  Expected: " << host_manifest[key_c] << "\n"
-                        << "  Found:    " << dll_hash_c);
-                    return true;
-                }
-            }
-        }
-    }
-    ETCS_LOG("DynamicLoader:Module", name << " integrity verified.");
-    return false;
+    bool mismatch = ETCS::compareManifests(ETCS::Entity::getManifest(), dllManifest, name);
+    ETCS_LOG("DynamicLoader:Module", name << (mismatch ? " FAILED integrity check." : " integrity verified."));
+    return mismatch;
 }
 /*
  * Takes EventNode& st so registerLoader can absorb the module's ridMap
@@ -155,6 +112,25 @@ bool ETCS::Module::validateManifest(Manifest* dllManifest)
 bool ETCS::Module::registerLoader(EventNode& st)
 {
 #ifdef ETCS_LOADER
+    /*
+ * Validate BEFORE calling into the module at all. discoverTags() only
+ * needs a dlsym'd manifest-returning symbol -- it doesn't touch the
+ * module's own EventNode/ThreadPool, so a mismatch is caught here with
+ * nothing on the module side ever started. Throws ManifestMismatchException
+ * on a HEADER:/ONTOLOGY: disagreement (attachModule handles that
+ * distinctly from an ordinary load failure); tags is filled either way.
+ *
+ * This is the loader's own independent half of the check. The module ran
+ * its own half already -- at dlopen()'s static-init time, before dlopen()
+ * even returned to attachModule, so before registerLoader (this function)
+ * was ever entered (see ETCS_MODULE_EXPORT_MAIN's static-init block, ETCS_API.h, and
+ * ETCS_GetLoaderManifest just above). Neither side waits on the other's
+ * result or on call ordering between them; the one thing both are
+ * guaranteed to precede is RegisterDynamicLoader below actually completing
+ * -- that return is the real sync point.
+ */
+    discoverTags(tags);
+
     using RegisterLoaderFunc = ETCS::EventNode* (*)(void*);
     void* funcPtr = getTagFunction("RegisterDynamicLoader");
     if (funcPtr)
@@ -212,7 +188,6 @@ bool ETCS::Module::registerLoader(EventNode& st)
             "Module missing 'RegisterRootSignalContext' export -- "
             "module will not receive live global signal authority.");
     }
-    discoverTags(tags);
     ETCS_LOG("DynamicLoader:Module", "tags! " << tags.size());
     validBinary = true;
     return validBinary;
@@ -1434,6 +1409,50 @@ bool ETCS::EventNode::LoaderStream::attachModule(
             ETCS_LOG("DynamicLoader", "Module '" << module_name
                      << "' bootstrapped (global, permanent instance).");
         }
+        catch (const ETCS::ManifestMismatchException& mex)
+        {
+            /*
+ * A HEADER:/ONTOLOGY: disagreement, not an ordinary load failure -- see
+ * this function's own comment above (the paragraph distinguishing this
+ * from "module doesn't exist"). No caller gets a graceful bool for this
+ * one; determinism is already violated the moment two builds that
+ * disagree on the contract both keep running.
+ *
+ * cleanupModule() first, defensively, in case the module's own threads
+ * were ever started before this was caught -- discoverTags() now runs
+ * inside registerLoader() BEFORE RegisterDynamicLoader is called (see
+ * that reordering there), so nothing reaches this catch with threads
+ * actually running today, but stays correct if that ordering changes.
+ * cleanupModule() itself no-ops when validBinary is still false.
+ */
+            global_mod->cleanupModule();
+            if (handle)
+            {
+#ifdef _WIN32
+                FreeLibrary(handle);
+#else
+                dlclose(handle);
+#endif
+                global_mod->library_handle = nullptr;
+            }
+            /*
+ * TODO(recovery): before giving up, re-fetch whichever of {this loader
+ * binary, this module} is older from anticurrententropy.com and retry once.
+ * This is a SECURITY boundary, not just a determinism one -- the fetch must
+ * be over TLS with the cert chain signed by the ACE root key on both the
+ * binary and its source, not the plain LetsEncrypt cert the site uses
+ * today (that still needs to be issued/wired up on the site side). An
+ * unverified replacement binary is strictly worse than aborting. Not
+ * wired in yet -- pending both that signing infrastructure and the
+ * release-serving protocol itself -- so every mismatch goes straight to
+ * shutdown rather than fetching-and-trusting something unverifiable, or
+ * silently continuing on a build that already can't be trusted.
+ */
+            std::cerr << "FATAL: '" << module_name << "' -- " << mex.what()
+                      << " -- loader and module were not built for the same "
+                         "epoch. Shutting down." << std::endl;
+            std::abort();
+        }
         catch (const std::exception& ex)
         {
             /*
@@ -2346,8 +2365,32 @@ inline const bool _core_init = []() {
     dynamicLoader.node = &ETCS::EventNode::getInstance();
     return true;
 }();
+
+/*
+ * ETCS_GetLoaderManifest - the loader's half of the manifest check, exported
+ * with default visibility specifically so a dlopen'd module's own
+ * static-init can dlsym(RTLD_DEFAULT, ...) it back independently, without
+ * the loader calling into the module first. See ETCS_MODULE_EXPORT_MAIN's static-init
+ * block (ETCS_API.h) for the module's half -- the two no longer wait on
+ * each other; each runs at its own natural moment (this one already ran,
+ * as part of the loader's own process start, long before any dlopen;
+ * the module's runs the instant dlopen() maps it). Deliberately not
+ * declared with ETCS_API: that macro is empty in loader builds (it exists
+ * for a module's own DLL exports), and this needs default visibility
+ * regardless of -fvisibility=hidden.
+ */
+extern "C"
+#ifdef _WIN32
+__declspec(dllexport)
+#else
+__attribute__((visibility("default")))
 #endif
- 
+void* ETCS_GetLoaderManifest()
+{
+    return static_cast<void*>(&ETCS::Entity::getManifest());
+}
+#endif // ETCS_LOADER
+
 /*
  * RegisterDynamicLoader - the module-side entry point the loader calls
  * immediately after dlopen, handing this module a pointer to the loader's
@@ -2376,6 +2419,19 @@ inline const bool _core_init = []() {
  * repeatedly in a tight cycle; doing so risks racing the OS's own
  * asynchronous post-dlclose teardown, and the crash here is what makes
  * that impossible to do silently rather than merely slow.
+ *
+ * The manifest check is no longer done here. It used to run as this
+ * function's first statement, fed a loader manifest pointer passed in as a
+ * second argument -- moved to a static-init lambda in ETCS_MODULE
+ * (ETCS_API.h) instead, which dlsym(RTLD_DEFAULT)s ETCS_GetLoaderManifest
+ * back on its own the instant dlopen() maps this library. That runs before
+ * this function is ever called (dlopen's static-init completes before
+ * dlopen() itself returns to the loader), so by the time control reaches
+ * here the module has already independently verified the loader, and
+ * Module::registerLoader has already independently verified the module
+ * (its own discoverTags()/validateManifest() call, before it ever gets to
+ * calling this function) -- neither side waited on the other's result, only
+ * on dlopen() being the one thing both must have already happened by.
  */
 extern "C" ETCS_API ETCS::EventNode* RegisterDynamicLoader(void* ptr)
 {

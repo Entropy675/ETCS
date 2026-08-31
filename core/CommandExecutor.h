@@ -318,6 +318,9 @@ inline std::optional<ResolvedName> resolve_receiver(const std::string& name,
     }
 
     ETCS::Entity* e = resolve_bound_entity(*b);
+    // Retract a dead global here too, so the next line sees the name as free
+    // rather than as something that resolves to nothing.
+    if (!e && !ctx.introduced(name)) GlobalNames::getInstance().forget(name);
     if (!e)
     {
         if (ctx.owns(b->rid))
@@ -347,6 +350,39 @@ inline std::optional<ResolvedName> resolve_receiver(const std::string& name,
         out.binding.tag    = e->getSourceTag().toString();
     }
     return out;
+}
+
+// lookup_live — resolve a name through the closure, evicting a dead GLOBAL.
+//
+// A global whose entity is gone is a false claim, and the first lookup that
+// discovers it is the right place to retract it: otherwise the name stays
+// permanently spoken-for and a fresh spawn under it reads as clobbering
+// something that does not exist.
+//
+// Locals are left alone. A dead local is this script's own closure vanishing,
+// which is the Vanished rule's business, not a stale-row problem -- and if a
+// name is both local and global they are different entities, so the local
+// dying says nothing about the global.
+inline std::optional<NameBinding> live_global(const std::string& name)
+{
+    auto g = GlobalNames::getInstance().find(name);
+    if (!g) return std::nullopt;
+    if (resolve_bound_entity(*g)) return g;
+
+    GlobalNames::getInstance().forget(name);
+    ETCS_LOG("CommandExecutor", "global '" << name << "' (RID:" << g->rid
+             << ") no longer resolves -- forgetting it.");
+    return std::nullopt;
+}
+
+inline std::optional<NameBinding> lookup_live(ExecutionContext& ctx,
+                                              const std::string& name)
+{
+    auto local = ctx.names.find(name);
+    if (local != ctx.names.end())
+        return resolve_bound_entity(local->second)
+             ? std::optional<NameBinding>(local->second) : std::nullopt;
+    return live_global(name);
 }
 
 // substitute_name_tokens — @name becomes its RID; everything else is
@@ -1074,7 +1110,7 @@ inline bool resolve_run_bindings(const std::vector<std::pair<std::string,std::st
             exec_warn(src, "run/detach: 'root' is reserved and cannot be rebound.");
             return false;
         }
-        auto b = ctx.lookup(parent_key);
+        auto b = ETCS::lookup_live(ctx, parent_key);
         if (!b)
         {
             exec_warn(src, "run/detach: '" + parent_key + "' is not a name this script has.");
@@ -1130,21 +1166,17 @@ inline bool check_requirements(const std::vector<ScriptLine>& lines,
         if (!r) continue;
 
         ExecSource src{origin, sl.number};
-        auto b = ctx.lookup(r->name);
+        auto b = ETCS::lookup_live(ctx, r->name);
         if (!b)
         {
             unmet.push_back("'" + r->name + "' (line " + std::to_string(sl.number)
                 + ") was not passed in, and no root global provides it");
             continue;
         }
+        // lookup_live already established this resolves; it only did not
+        // hand back the Entity*.
         ETCS::Entity* e = resolve_bound_entity(*b);
-        if (!e)
-        {
-            unmet.push_back("'" + r->name + "' (line " + std::to_string(sl.number)
-                + ") is bound to RID:" + std::to_string(b->rid)
-                + ", which no longer resolves");
-            continue;
-        }
+        if (!e) continue;
 
         std::vector<std::string> missing;
         for (const auto& tag : r->tags)
@@ -1226,7 +1258,7 @@ inline ExecuteResult execute_command(const Command& cmd,
                 // already answers to something was almost certainly meant to
                 // reach it. The scope is named because the fix differs -- a
                 // local clash is a contradiction, a global one is composition.
-                if (auto clash = ctx.lookup(c.name))
+                if (auto clash = ETCS::lookup_live(ctx, c.name))
                 {
                     const bool local = ctx.introduced(c.name);
                     std::string what = clash->tag.empty()
@@ -1248,7 +1280,7 @@ inline ExecuteResult execute_command(const Command& cmd,
 
             // attach / ensure both begin by asking the closure. The ONLY
             // difference between them is what happens when the answer is no.
-            auto existing = ctx.lookup(c.name);
+            auto existing = ETCS::lookup_live(ctx, c.name);
             if (existing)
             {
                 ETCS::Entity* e = ETCS::resolve_bound_entity(*existing);
@@ -1292,7 +1324,7 @@ inline ExecuteResult execute_command(const Command& cmd,
             // too, and the ambiguity is the same whoever's child it is.
             if (c.verb == AcquireVerb::Spawn)
             {
-                if (auto clash = ctx.lookup(c.name))
+                if (auto clash = ETCS::lookup_live(ctx, c.name))
                 {
                     const bool local = ctx.introduced(c.name);
                     return {ExecuteStatus::Error,
@@ -1315,7 +1347,7 @@ inline ExecuteResult execute_command(const Command& cmd,
             // same-named child of some OTHER parent never binds here.
             if (c.verb != AcquireVerb::Spawn)
             {
-                auto existing = ctx.lookup(c.name);
+                auto existing = ETCS::lookup_live(ctx, c.name);
                 if (existing)
                 {
                     ETCS::Entity* prior = ETCS::resolve_bound_entity(*existing);

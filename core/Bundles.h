@@ -13,6 +13,8 @@
 #include <unordered_map>
 #include <cstdint>
 #include <type_traits>
+#include <stdexcept>
+#include <iomanip>
 #include "MemoryArena.h"
 // Every path here goes through ETCS_API.h first (it includes Bundles.h;
 // Entity.h and EventNode.h reach it ahead of this). Asserted rather than
@@ -205,6 +207,60 @@ struct FlatMap {
     }
 };
 using Manifest = FlatMap<ETCS::Buffer, ETCS::Buffer>; // dependent headers -> hashes
+
+// A HEADER:/ONTOLOGY: entry disagreed -- loader and module built for
+// different epochs. Never an ordinary load failure (missing .so, missing
+// export): attachModule (DynamicLoader.h) handles this one distinctly.
+struct ManifestMismatchException : std::runtime_error
+{
+    using std::runtime_error::runtime_error;
+};
+
+// Logs `theirs` against `ours` row by row and returns true iff a
+// HEADER:/ONTOLOGY: (contract) key disagrees -- a plain [DIFF] on any other
+// key is informational only. Symmetric by construction: pass your own
+// manifest as `ours` regardless of which side you're on. Both the loader
+// (Module::validateManifest) and a module's own RegisterDynamicLoader
+// handshake (DynamicLoader.h) call this independently against the other
+// side's manifest, so a bad build can't slip through by only one side
+// checking.
+inline bool compareManifests(Manifest& ours, Manifest* theirs, const std::string& label)
+{
+    bool mismatch_found = false;
+    ETCS_LOG("ManifestCheck", "--- Manifest comparison: " << label << " ---");
+    ETCS_LOG("ManifestCheck", std::left << std::setw(40) << "Key"
+        << std::setw(12) << "Ours(8)" << std::setw(12) << "Theirs(8)" << "Status");
+    for (auto const& [key_c, their_hash_c] : *theirs)
+    {
+        std::string key(key_c);
+        std::string their_hash(their_hash_c);
+        bool is_contract = (key.rfind("ONTOLOGY:", 0) == 0 || key.rfind("HEADER:", 0) == 0);
+        std::stringstream row;
+        row << std::left << std::setw(40) << key;
+        if (ours.count(key_c))
+        {
+            std::string o_short = std::string(ours[key_c]).substr(0, 8);
+            std::string t_short = their_hash.substr(0, 8);
+            row << std::setw(12) << o_short << std::setw(12) << t_short;
+            if      (o_short == t_short) row << "[ OK ]";
+            else if (is_contract)      { row << "[ FAIL ]"; mismatch_found = true; }
+            else                         row << "[ DIFF ]";
+        }
+        else
+            row << std::setw(12) << "N/A" << std::setw(12) << their_hash.substr(0, 8) << "[INFO]";
+        ETCS_LOG("ManifestCheck", row.str());
+    }
+    if (mismatch_found)
+        for (auto const& [key_c, their_hash_c] : *theirs)
+        {
+            std::string key(key_c);
+            bool is_contract = (key.rfind("ONTOLOGY:", 0) == 0 || key.rfind("HEADER:", 0) == 0);
+            if (is_contract && ours.count(key_c) && ours[key_c] != their_hash_c)
+                ETCS_LOG("FATAL", "Interface mismatch (" << label << ") -- Key: " << key
+                    << "  Ours: " << ours[key_c] << "  Theirs: " << their_hash_c);
+        }
+    return mismatch_found;
+}
 using MakeFunc = ETCS::Entity*(*)(ETCS::Buffer&); // constructs child through referent entity*
 using MakeChildFunc = ETCS::Entity*(*)(ETCS::Entity*);
 using WorkFunc = void(*)(ETCS::Entity*, ETCS::Buffer&, ETCS::SignalContext);
@@ -751,7 +807,7 @@ struct Module
         if (!hashes)
             throw std::runtime_error("Discover tags on " + name + " failed to provide a valid Manifest.");
         if (validateManifest(hashes))
-            throw std::runtime_error("Validate manifest on " + name + " did not match.");
+            throw ManifestMismatchException("manifest mismatch loading " + name);
         std::stringstream ss(buff.toString());
         std::string tag_string;
         ETCS_LOG("DynamicLoader:Module", "Discovering tags provided by " << name);

@@ -397,6 +397,8 @@ repl_live_globals_for_module(const std::string& mod_name)
         auto it = ridMap.find(key);
         if (it != ridMap.end() && it->second.invoke_contains(b.rid))
             out.emplace_back(name, b);
+        else
+            ETCS::GlobalNames::getInstance().forget(name);   // dead: retract it
     }
     std::sort(out.begin(), out.end(),
               [](const auto& a, const auto& c) { return a.first < c.first; });
@@ -948,7 +950,10 @@ inline void repl_shell_instance_loop(const std::string& mod_name, const std::str
             }
             // Same refusal a script's `spawn` gets. No `attach` to suggest
             // here -- the equivalent is selecting the existing instance.
-            if (auto prior = ETCS::GlobalNames::getInstance().find(sname))
+            // live_global, not find: a global whose entity was deleted is
+            // retracted on this first miss, so the name frees up instead of
+            // staying spoken-for by something that no longer exists.
+            if (auto prior = ETCS::live_global(sname))
             {
                 repl_err() << COLOR_WARN << "spawn: clobbering global '" << sname
                            << "' (" << prior->module << "::" << prior->tag
@@ -1267,7 +1272,7 @@ inline void repl_shell_loop_with(ETCS::SignalContext& sig, ReplLineSource& in)
                 // Needed ONLY to RENAME: if the script says `requires node`, a
                 // global `node` satisfies it with no argument at all.
                 ETCS::NameBinding nb{};
-                if (auto g = ETCS::GlobalNames::getInstance().find(rid_str))
+                if (auto g = ETCS::live_global(rid_str))
                 {
                     nb = *g;
                 }
