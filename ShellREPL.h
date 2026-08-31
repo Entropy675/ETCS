@@ -902,15 +902,62 @@ inline void repl_shell_instance_loop(const std::string& mod_name, const std::str
             }
         }
         ETCS_LOG("ShellREPL",
-            "  [n] Select instance by index   [spawn] Create new   [back] Return");
+            "  [n] Select   [spawn <name>] Create and name   [back] Return");
 
         std::string i_in;
         if (!in(tag_name + " Inst> ", i_in)) break;
         if (i_in == "back")                   { break; }
         if (i_in == "exit" || i_in == "quit") { return; }
 
-        if (i_in == "spawn")
+        // spawn <name> -- the name is REQUIRED, and goes into GlobalNames.
+        //
+        // An unnamed entity can only be passed by reading its RID out of a log
+        // and retyping it, which is what "no RIDs in the script itself" exists
+        // to prevent; the prompt does not get to be where that leaks.
+        //
+        // GlobalNames, not a table of the navigator's own -- there is no third
+        // scope. When no root script is running the prompt is what populates
+        // the runtime, so the prompt publishes its names, and a script reaches
+        // them by attach/ensure/requires with no binding threaded down.
+        if (i_in == "spawn" || i_in.rfind("spawn ", 0) == 0)
         {
+            std::string sname = (i_in.size() > 5) ? i_in.substr(6) : "";
+            size_t nb = sname.find_first_not_of(" \t");
+            size_t ne = sname.find_last_not_of(" \t");
+            sname = (nb == std::string::npos) ? "" : sname.substr(nb, ne - nb + 1);
+
+            if (sname.empty())
+            {
+                repl_err() << COLOR_WARN
+                           << "spawn: expected a name -- 'spawn <name>'. The name is how "
+                              "anything else reaches it: @name in a payload, or a script's "
+                              "own attach/ensure/requires."
+                           << COLOR_RESET << "\n";
+                continue;
+            }
+            // Same rules a script's names obey. `self` is reserved because
+            // every navigator dispatch binds the selection under it.
+            bool valid = (sname != "root" && sname != "self");
+            for (char c : sname)
+                if (!std::isalnum((unsigned char)c) && c != '_') { valid = false; break; }
+            if (!valid)
+            {
+                repl_err() << COLOR_WARN << "spawn: '" << sname
+                           << "' is not a usable name." << COLOR_RESET << "\n";
+                continue;
+            }
+            // Same refusal a script's `spawn` gets. No `attach` to suggest
+            // here -- the equivalent is selecting the existing instance.
+            if (auto prior = ETCS::GlobalNames::getInstance().find(sname))
+            {
+                repl_err() << COLOR_WARN << "spawn: clobbering global '" << sname
+                           << "' (" << prior->module << "::" << prior->tag
+                           << " RID:" << prior->rid << "). Select that instance instead, "
+                              "or pick another name."
+                           << COLOR_RESET << "\n";
+                continue;
+            }
+
             ETCS::ExecutionContext ctx;
             ctx.sig     = &sig;
             ctx.is_root = false;
@@ -919,7 +966,15 @@ inline void repl_shell_instance_loop(const std::string& mod_name, const std::str
             // gives resolve_module/verify_tag something to work against.
             ctx.root_entity = &nav_root;
             ETCS::Entity* e = ETCS::spawn_entity(mod_name, tag_name, ctx, src);
-            if (e) { repl_shell_action_loop(e, nav_root, sig, in); }
+            if (e)
+            {
+                ETCS::GlobalNames::getInstance().record(
+                    sname, ETCS::NameBinding{e->getRID(), mod_name, tag_name});
+                ETCS_LOG("ShellREPL", COLOR_LIB << "spawned '" << sname << "' -> RID:"
+                         << e->getRID() << COLOR_RESET
+                         << " -- reachable as a global by any script from here.");
+                repl_shell_action_loop(e, nav_root, sig, in);
+            }
             continue;
         }
 
@@ -1187,7 +1242,7 @@ inline void repl_shell_loop_with(ETCS::SignalContext& sig, ReplLineSource& in)
                 if (eq == std::string::npos || eq == 0 || eq == arg.size() - 1)
                 {
                     repl_err() << COLOR_WARN << "ShellREPL: invalid injection argument '"
-                               << arg << "' -- expected name=RID" << COLOR_RESET << "\n";
+                               << arg << "' -- expected name=globalname or name=RID" << COLOR_RESET << "\n";
                     args_valid = false;
                     break;
                 }
@@ -1205,39 +1260,55 @@ inline void repl_shell_loop_with(ETCS::SignalContext& sig, ReplLineSource& in)
                     args_valid = false;
                     break;
                 }
-                try {
-                    size_t end;
-                    unsigned long long rid_v = std::stoull(rid_str, &end);
-                    if (end != rid_str.size()) throw std::invalid_argument("trailing chars");
-                    ETCS::RID rid = static_cast<ETCS::RID>(rid_v);
-
-                    // Resolved HERE, not deferred. A binding carries its
-                    // Module::Tag now (action lines no longer state one), and
-                    // an injected RID is the one place that pair is not
-                    // already known -- so it is recovered from the entity
-                    // itself, which also settles liveness at capture time.
-                    ETCS::Entity* e = ETCS::resolve_entity_anywhere(rid);
-                    if (!e)
-                    {
-                        repl_err() << COLOR_WARN << "ShellREPL: RID " << rid
-                                   << " (for '" << name << "') does not resolve to a "
-                                      "live entity." << COLOR_RESET << "\n";
+                // A global NAME first, a raw RID only as fallback --
+                // `script.etcs game=node` is what a detach line already looks
+                // like, so the prompt is not where that becomes a number.
+                //
+                // Needed ONLY to RENAME: if the script says `requires node`, a
+                // global `node` satisfies it with no argument at all.
+                ETCS::NameBinding nb{};
+                if (auto g = ETCS::GlobalNames::getInstance().find(rid_str))
+                {
+                    nb = *g;
+                }
+                else
+                {
+                    try {
+                        size_t end;
+                        unsigned long long rid_v = std::stoull(rid_str, &end);
+                        if (end != rid_str.size()) throw std::invalid_argument("trailing");
+                        nb.rid = static_cast<ETCS::RID>(rid_v);
+                    } catch (...) {
+                        repl_err() << COLOR_WARN << "ShellREPL: '" << rid_str
+                                   << "' (in '" << arg << "') is neither a global name "
+                                      "nor a RID." << COLOR_RESET << "\n";
                         args_valid = false;
                         break;
                     }
-                    script_ctx.bind(name, ETCS::NameBinding{
-                        rid, e->getSourceModule().toString(), e->getSourceTag().toString()});
-                    ETCS_LOG("ShellREPL", "Injected: " << name << " -> RID:" << rid
-                             << " (" << e->getSourceModule().toString()
-                             << "::" << e->getSourceTag().toString() << ")");
                 }
-                catch (const std::exception&) {
-                    repl_err() << COLOR_WARN << "ShellREPL: invalid RID '" << rid_str
-                               << "' in injection argument '" << arg << "'"
-                               << COLOR_RESET << "\n";
+
+                // Resolved HERE, not deferred. A binding carries its
+                // Module::Tag now (action lines no longer state one), and a
+                // bare RID is the one place that pair is not already known --
+                // so it is recovered from the entity itself, which also
+                // settles liveness at capture time.
+                ETCS::Entity* e = ETCS::resolve_bound_entity(nb);
+                if (!e)
+                {
+                    repl_err() << COLOR_WARN << "ShellREPL: '" << rid_str
+                               << "' (for '" << name << "') does not resolve to a live "
+                                  "entity." << COLOR_RESET << "\n";
                     args_valid = false;
                     break;
                 }
+                if (nb.tag.empty())
+                {
+                    nb.module = e->getSourceModule().toString();
+                    nb.tag    = e->getSourceTag().toString();
+                }
+                script_ctx.bind(name, nb);
+                ETCS_LOG("ShellREPL", "Injected: " << name << " -> RID:" << nb.rid
+                         << " (" << nb.module << "::" << nb.tag << ")");
             }
             if (!args_valid) continue;
 

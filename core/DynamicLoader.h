@@ -410,6 +410,25 @@ ETCS::Module::~Module()
 
         interrupt.store(1, std::memory_order_release);
         terminate.store(1, std::memory_order_release);
+
+        /*
+ * Same purge requestUnloadImpl does -- see its comment. This is the
+ * process-exit path, so little runs after it, but "little" is not
+ * "none": other ~Module calls, join_all, and draining detached threads
+ * all outlive this one. Repeating it keeps the invariant unconditional
+ * on which unload path ran.
+ */
+        if (ETCS::EventNode* node = &ETCS::EventNode::getInstance())
+        {
+            const std::string prefix = std::string(name) + ":";
+            for (auto it = node->ridMap.begin(); it != node->ridMap.end(); )
+            {
+                const std::string key = it->first.toString();
+                if (key.compare(0, prefix.size(), prefix) == 0) it = node->ridMap.erase(it);
+                else ++it;
+            }
+        }
+
         cleanupModule();
         ETCS_LOG("DynamicLoader:Module", "Unloading library: " << getFilename() << " ...");
 #ifdef _WIN32
@@ -1773,7 +1792,40 @@ void ETCS::EventNode::LoaderStream::requestUnloadImpl(ETCS::Module* target)
     module_registry.erase(module_name);
     module_arena_registry.erase(module_name);
     type_catalog_registry.erase(module_name);
- 
+
+    /*
+ * ...and the ridMap rows this module contributed, which the three erases
+ * above do not cover. registerLoader absorbs a module's ridMap under
+ * "<module>:<tag>" keys, and each handle wraps a RIDList in the MODULE's
+ * image. Per-ENTITY removal already happens (deleteEntity takes each RID
+ * out as it dies), but that empties the lists without unlinking the rows,
+ * so after dlclose every remaining handle's thunks point into unmapped
+ * memory.
+ *
+ * Before cleanupModule/dlclose, not after: otherwise the rows are
+ * reachable while the code behind them is gone, and this consumer is not
+ * the only reader. Prefix match rather than a tag list -- the tags are
+ * what is about to become unreadable.
+ */
+    if (owner)
+    {
+        const std::string prefix = module_name + ":";
+        size_t purged = 0;
+        for (auto it = owner->ridMap.begin(); it != owner->ridMap.end(); )
+        {
+            const std::string key = it->first.toString();
+            if (key.compare(0, prefix.size(), prefix) == 0)
+            {
+                it = owner->ridMap.erase(it);
+                ++purged;
+            }
+            else ++it;
+        }
+        if (purged)
+            ETCS_LOG("DynamicLoader", "Purged " << purged << " ridMap row(s) for '"
+                     << module_name << "' -- their RIDLists are about to be unmapped.");
+    }
+
     target->cleanupModule();
 #ifdef _WIN32
     FreeLibrary(target->library_handle);

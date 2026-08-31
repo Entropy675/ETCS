@@ -255,7 +255,8 @@ struct ExecutionContext
 //
 // `requires` is deliberately NOT in this enum: it is not script-resolved. It
 // names something the caller must already have supplied (or that the root
-// published as a global), it takes no Module::Tag, and it can carry a tag
+// published as a global), its address slot takes a name rather than a
+// Module::Tag (a type can still appear, in the bracket), and it can carry a tag
 // constraint none of these three can. Different inputs, different outputs,
 // its own command type.
 enum class AcquireVerb { Spawn, Attach, Ensure };
@@ -483,9 +484,13 @@ inline bool is_valid_requires_tag(const std::string& s)
 // counter alone breaks on `ExecuteRaw(SELECT ')' FROM x)`; a quote check
 // alone breaks on nested calls. Both together handle every payload this
 // language can carry, and a payload with unbalanced parens OUTSIDE quotes has
-// to be quoted -- there is no escape character, deliberately, because one
-// would put a second parsing rule inside a span whose whole contract is that
-// it is handed to the work function untouched.
+// to be quoted.
+//
+// Inside a quoted span a backslash escapes the next character, matching
+// TBuffer's own operator>>(std::string&) (Buffer.h). The two layers have to
+// agree where a quoted span ends or they disagree where the PAYLOAD ends:
+// `db.Q('it\'s')` is the line that tells them apart. Skipped, never
+// interpreted -- consuming the backslash is the extractor's job.
 // -------------------------------------------------------------------------
 inline size_t find_closing_bracket(const std::string& s, size_t open)
 {
@@ -494,6 +499,7 @@ inline size_t find_closing_bracket(const std::string& s, size_t open)
     for (size_t i = open; i < s.size(); ++i)
     {
         char ch = s[i];
+        if ((in_single || in_double) && ch == '\\') { ++i; continue; }  // escaped -- see note above
         if (ch == '\'' && !in_double) { in_single = !in_single; continue; }
         if (ch == '"'  && !in_single) { in_double = !in_double; continue; }
         if (in_single || in_double) continue;
@@ -512,6 +518,7 @@ inline size_t find_stream_arrow(const std::string& s)
     for (size_t i = 0; i + 1 < s.size(); ++i)
     {
         char ch = s[i];
+        if ((in_single || in_double) && ch == '\\') { ++i; continue; }  // escaped -- see note above
         if (ch == '\'' && !in_double) { in_single = !in_single; continue; }
         if (ch == '"'  && !in_single) { in_double = !in_double; continue; }
         if (in_single || in_double) continue;

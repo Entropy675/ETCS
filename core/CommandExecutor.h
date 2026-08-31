@@ -196,9 +196,13 @@ inline ETCS::Entity* get_entity_by_rid(const std::string& module,
     return handle->invoke_get(rid);
 }
 
-// resolve_entity_anywhere — Entity* from a bare RID, no module/tag needed.
-// Sound because RIDs are runtime-unique: at most one list can ever hold a
-// given RID, so the first hit is the only hit. Loader-side only.
+// resolve_entity_anywhere — Entity* from a bare RID. Sound because RIDs are
+// runtime-unique, so the first hit is the only hit.
+//
+// USE ONLY WHEN THE Module::Tag IS UNKNOWN. This walks every absorbed handle
+// in the loader's ridMap, and a handle wraps a RIDList in its module's image.
+// requestUnloadImpl now purges those rows, but a targeted get_handle touches
+// one row instead of all of them -- prefer resolve_bound_entity below.
 inline ETCS::Entity* resolve_entity_anywhere(ETCS::RID rid)
 {
     if (rid == 0) return nullptr;
@@ -208,17 +212,21 @@ inline ETCS::Entity* resolve_entity_anywhere(ETCS::RID rid)
     return nullptr;
 }
 
-// ---------------------------------------------------------------------------
-// spawn_entity — always creates. No name table consulted, no retarget, no
-// fallback.
-//
-// The old version began by asking PersistentNames whether the pending name
-// already meant something of this module and tag, and silently rebound onto
-// that instead of spawning. That behavior is what let two unrelated scripts
-// share an HttpServer by both happening to call it `web`, and it is gone: a
-// script that wants the closure's entity says `attach` or `ensure`, and this
-// function only ever does the thing its name says.
-// ---------------------------------------------------------------------------
+// resolve_bound_entity — targeted; the one to reach for.
+inline ETCS::Entity* resolve_bound_entity(const NameBinding& b)
+{
+    if (b.rid == 0) return nullptr;
+    if (!b.module.empty() && !b.tag.empty())
+    {
+        const ETCS::RIDListHandle* handle = get_handle(b.module, b.tag);
+        return handle ? handle->invoke_get(b.rid) : nullptr;
+    }
+    return resolve_entity_anywhere(b.rid);
+}
+
+// spawn_entity — always creates. No name table consulted, no retarget.
+// PersistentNames' silent rebind-onto-a-matching-name is gone; a script that
+// wants the closure's entity says attach or ensure.
 inline ETCS::Entity* spawn_entity(const std::string& module, const std::string& tag,
                                   ExecutionContext& ctx, const ExecSource& src)
 {
@@ -285,23 +293,12 @@ inline ETCS::Entity* make_typed_child(const std::string& module, const std::stri
     }
 }
 
-// ---------------------------------------------------------------------------
-// resolve_receiver — the ONE place a name becomes an entity.
+// resolve_receiver — the ONE place a name becomes an entity, and so the one
+// liveness check site (the old grammar had three: cursor, pending-stream
+// producer, payload-resolved name).
 //
-// Under the previous grammar liveness had to be checked in three places (the
-// ambient cursor, the pending-stream producer, and a name resolved out of a
-// payload), each with its own slightly different idea of what "the entity in
-// question" was. Mandatory receivers collapse all three into this: a dotted
-// line names exactly one entity, so there is exactly one thing to resolve and
-// exactly one place to notice it is gone.
-//
-// The liveness rule, precisely: a RID that vanishes and is never named again
-// is not this script's problem. What stops a script is NAMING something it
-// depends on -- something in its own closure, meaning it spawned, attached,
-// ensured, or was passed it -- after that entity has stopped resolving. A RID
-// this script never owned (a global some other script has since deleted, say)
-// is an ordinary unresolvable reference, not a Vanished.
-// ---------------------------------------------------------------------------
+// Vanished only for a RID in this script's own closure. A RID it never owned
+// is an ordinary unresolvable reference.
 struct ResolvedName
 {
     ETCS::Entity* entity = nullptr;
@@ -320,7 +317,7 @@ inline std::optional<ResolvedName> resolve_receiver(const std::string& name,
         return std::nullopt;
     }
 
-    ETCS::Entity* e = resolve_entity_anywhere(b->rid);
+    ETCS::Entity* e = resolve_bound_entity(*b);
     if (!e)
     {
         if (ctx.owns(b->rid))
@@ -352,16 +349,10 @@ inline std::optional<ResolvedName> resolve_receiver(const std::string& name,
     return out;
 }
 
-// substitute_name_tokens — replaces every @name token in a payload with the
-// RID that name is bound to, leaving everything else byte-identical.
-//
-// The sigil is deliberate rather than substituting any token that happens to
-// match a bound name: payloads legitimately carry paths, titles and raw text
-// that could collide, and a silent numeric substitution there would be
-// near-impossible to spot. An unresolved @name is left as written so the
-// receiving work function's own guard reports it.
-//
-// Quoted spans are skipped entirely: 'a @b c' is a string, not a reference.
+// substitute_name_tokens — @name becomes its RID; everything else is
+// byte-identical. The sigil is required because payloads carry paths and free
+// text that could collide with a name. An unresolved @name is left as written.
+// Quoted spans are skipped: 'a @b c' is a string.
 inline std::string substitute_name_tokens(const std::string& payload,
                                           ExecutionContext& ctx)
 {
@@ -372,6 +363,15 @@ inline std::string substitute_name_tokens(const std::string& payload,
     while (i < payload.size())
     {
         char ch = payload[i];
+        // Escape-aware, matching find_closing_bracket and TBuffer: `\'` inside
+        // a quote is a literal apostrophe, not a boundary.
+        if ((in_single || in_double) && ch == '\\' && i + 1 < payload.size())
+        {
+            out += ch;
+            out += payload[i + 1];
+            i += 2;
+            continue;
+        }
         if (ch == '\'' && !in_double) { in_single = !in_single; out += ch; ++i; continue; }
         if (ch == '"'  && !in_single) { in_double = !in_double; out += ch; ++i; continue; }
         if (ch != '@' || in_single || in_double) { out += ch; ++i; continue; }
@@ -503,20 +503,9 @@ inline std::string format_duration_ns(long long ns)
     return oss.str();
 }
 
-// ---------------------------------------------------------------------------
-// Reading a script into commands, once.
-//
-// run_script parses the whole file before executing any of it, rather than
-// line by line, for a reason the language forces: `requires` is collected
-// across the WHOLE file before line one runs. Placement is a readability
-// choice, not a positional rule, so the last line of a file can carry a
-// requirement that stops the first line from executing -- which is only
-// knowable by reading all of it first.
-//
-// This is affordable precisely because there is no branching. A .etcs file is
-// its own complete execution plan; holding it in memory costs what the file
-// costs.
-// ---------------------------------------------------------------------------
+// Read the whole file before executing any of it: `requires` is collected
+// across the WHOLE file, so the last line can stop the first from running.
+// Affordable because there is no branching -- the file IS the execution plan.
 struct ScriptLine
 {
     size_t  number = 0;
@@ -546,11 +535,9 @@ inline bool read_script(std::istream& in, std::vector<ScriptLine>& out)
 // recursively -- reads all of it, and checks it. Nothing executes until that
 // passes.
 //
-// This rejects nothing that would otherwise have worked, and that is not a
-// hope, it is a consequence: because no line is conditional, the set of lines
-// that COULD run and the set that WILL run are the same set. "Reachable"
-// means "will execute". So a check that is sound for the whole file is sound
-// for the run, and moving a failure earlier is the only thing it does.
+// Rejects nothing that would otherwise have worked -- a consequence, not a
+// hope: with no branching, "reachable" means "will execute", so a check sound
+// for the file is sound for the run. It only moves failure earlier.
 //
 // WHAT IS CHECKED HERE (static, no module loading required -- every fact
 // below is stated on the line itself):
@@ -568,27 +555,20 @@ inline bool read_script(std::istream& in, std::vector<ScriptLine>& out)
 //
 // WHAT IS DELIBERATELY NOT CHECKED HERE:
 //
-//   `requires` TAG LISTS. Testing whether an entity carries `Gate` needs the
-//   entity, and the two kinds of tag are knowable at different times: a bare
-//   is-a marker comes from the concrete type's CRTP ancestry and would need a
-//   per-type query the module ABI does not export, while an origin-affixed
-//   tag (NetworkProvider::TLSContext) is a fact about one entity's own causal
-//   history and is not knowable before that history has happened. Both are
-//   therefore checked live, together, at the moment the requiring script would
-//   start -- which is a point the runtime already stops at to verify the
-//   binding resolves at all, so it costs no new machinery. See
-//   check_requirements.
+//   `requires` TAG LISTS -- a bare is-a marker needs a per-type query the
+//   module ABI does not export, and an origin-affixed one is a fact about an
+//   entity's own history, unknowable before that history happens. Both are
+//   checked live in check_requirements, at a point the runtime already stops
+//   at for the binding itself.
 //
-//   PAYLOAD CONTENTS. SQL, file paths, cert paths, port numbers: free text,
-//   handed to the work function untouched. The strictness here is about the
-//   entity graph -- what exists, who owns what, what a name may mean -- and
-//   has nothing to say about what is inside the parentheses.
+//   PAYLOAD CONTENTS -- free text, handed to the work function untouched. The
+//   strictness here is about the entity graph, not what is in the brackets.
 // ===========================================================================
 struct PreflightName
 {
     std::string module;
     std::string tag;
-    bool        typed = false;   // false for a `requires` name: no Module::Tag stated
+    bool        typed = false;   // false for a `requires` name: no type in the address slot
 };
 
 using PreflightScope = std::unordered_map<std::string, PreflightName>;
@@ -672,14 +652,14 @@ inline void preflight_one(const std::string& path,
         return nullptr;
     };
 
-    // mismatch_reported is true for attach/ensure, which compare against the
-    // name they are RESOLVING and state a type mismatch themselves, in their
-    // own terms ("that attach could never resolve"). Only the duplicate
-    // PROBLEM is suppressed -- the same-type shadow NOTE is still emitted,
-    // because that annotation is about composition rather than about the verb,
-    // and a leaf reusing the root's `web` is exactly what it should say.
+    // mismatch_reported -- attach/ensure state a type mismatch themselves;
+    //   only the duplicate PROBLEM is suppressed, the same-type shadow NOTE
+    //   still fires, since a leaf reusing the root's `web` is worth saying.
+    // shadow_is_the_problem -- spawn, where any clash is already refused; the
+    //   note would repeat it.
     auto introduce = [&](const std::string& n, const PreflightName& pn, size_t line,
-                         bool mismatch_reported = false)
+                         bool mismatch_reported = false,
+                         bool shadow_is_the_problem = false)
     {
         if (!introduced_here.insert(n).second)
         {
@@ -692,7 +672,8 @@ inline void preflight_one(const std::string& path,
         // (two scripts reaching for an obvious name for an obvious thing) and
         // is annotated rather than refused.
         auto g = scope_globals.find(n);
-        if (g != scope_globals.end() && pn.typed && g->second.typed)
+        if (!shadow_is_the_problem
+            && g != scope_globals.end() && pn.typed && g->second.typed)
         {
             const bool differs = (g->second.module != pn.module || g->second.tag != pn.tag);
             if (differs && !mismatch_reported)
@@ -742,14 +723,21 @@ inline void preflight_one(const std::string& path,
         if (const CmdAcquire* a = std::get_if<CmdAcquire>(&sl.cmd))
         {
             PreflightName pn{a->module, a->tag, true};
-            if (a->verb == AcquireVerb::Attach)
+            if (a->verb == AcquireVerb::Spawn)
+            {
+                // The static half of the runtime refusal above -- caught for
+                // the whole tree before anything runs, rather than at the line.
+                if (const PreflightName* clash = visible(a->name))
+                    rep.problems.push_back(where(path, sl.number) + ": spawn '"
+                        + a->name + "' clobbers " + type_of(*clash)
+                        + " already in scope. Did you mean attach/ensure instead?");
+            }
+            else if (a->verb == AcquireVerb::Attach)
             {
                 const PreflightName* have = visible(a->name);
                 if (!have)
                     rep.problems.push_back(where(path, sl.number) + ": attach '"
-                        + a->name + "' -- nothing in scope to attach to. attach never "
-                          "creates; use ensure if this script should also work "
-                          "standalone.");
+                        + a->name + "' -- nothing in scope. Did you mean ensure?");
                 else if (have->typed && (have->module != a->module || have->tag != a->tag))
                     rep.problems.push_back(where(path, sl.number) + ": attach '"
                         + a->name + "' as " + a->module + "::" + a->tag
@@ -764,16 +752,26 @@ inline void preflight_one(const std::string& path,
                         + a->name + "' as " + a->module + "::" + a->tag
                         + " but it is already " + type_of(*have) + ".");
             }
-            introduce(a->name, pn, sl.number, a->verb != AcquireVerb::Spawn);
+            introduce(a->name, pn, sl.number, a->verb != AcquireVerb::Spawn,
+                      a->verb == AcquireVerb::Spawn);
         }
         else if (const CmdChildAcquire* ca = std::get_if<CmdChildAcquire>(&sl.cmd))
         {
             need_receiver(ca->parent_name);
+            if (ca->verb == AcquireVerb::Spawn)
+            {
+                if (const PreflightName* clash = visible(ca->name))
+                    rep.problems.push_back(where(path, sl.number) + ": "
+                        + ca->parent_name + ".spawn '" + ca->name + "' clobbers "
+                        + type_of(*clash) + " already in scope. Did you mean "
+                        + ca->parent_name + ".attach/.ensure instead?");
+            }
             if (ca->verb == AcquireVerb::Attach && !visible(ca->name))
                 rep.problems.push_back(where(path, sl.number) + ": " + ca->parent_name
                     + ".attach '" + ca->name + "' -- nothing in scope to attach to.");
             introduce(ca->name, PreflightName{ca->module, ca->tag, true},
-                      sl.number, ca->verb != AcquireVerb::Spawn);
+                      sl.number, ca->verb != AcquireVerb::Spawn,
+                      ca->verb == AcquireVerb::Spawn);
         }
         else if (const CmdAction* act = std::get_if<CmdAction>(&sl.cmd))
         {
@@ -1083,7 +1081,7 @@ inline bool resolve_run_bindings(const std::vector<std::pair<std::string,std::st
             return false;
         }
         NameBinding nb = *b;
-        ETCS::Entity* e = resolve_entity_anywhere(nb.rid);
+        ETCS::Entity* e = resolve_bound_entity(nb);
         if (!e)
         {
             exec_warn(src, "run/detach: '" + parent_key + "' (RID:"
@@ -1139,7 +1137,7 @@ inline bool check_requirements(const std::vector<ScriptLine>& lines,
                 + ") was not passed in, and no root global provides it");
             continue;
         }
-        ETCS::Entity* e = resolve_entity_anywhere(b->rid);
+        ETCS::Entity* e = resolve_bound_entity(*b);
         if (!e)
         {
             unmet.push_back("'" + r->name + "' (line " + std::to_string(sl.number)
@@ -1193,6 +1191,8 @@ inline ExecuteResult execute_command(const Command& cmd,
                                      ExecutionContext& ctx,
                                      const ExecSource& src)
 {
+    (void)ctx;   // every arm touching it is #ifdef ETCS_LOADER; a module build reads none
+
     return std::visit([&](auto&& c) -> ExecuteResult
     {
         using T = std::decay_t<decltype(c)>;
@@ -1220,6 +1220,24 @@ inline ExecuteResult execute_command(const Command& cmd,
 
             if (c.verb == AcquireVerb::Spawn)
             {
+                // Overwriting globals is a real mechanism (one runtime, one
+                // table, later writes win). What is refused is doing it BY
+                // ACCIDENT: `spawn` means "make a new one", so a word that
+                // already answers to something was almost certainly meant to
+                // reach it. The scope is named because the fix differs -- a
+                // local clash is a contradiction, a global one is composition.
+                if (auto clash = ctx.lookup(c.name))
+                {
+                    const bool local = ctx.introduced(c.name);
+                    std::string what = clash->tag.empty()
+                        ? std::string("RID:") + std::to_string(clash->rid)
+                        : clash->module + "::" + clash->tag
+                          + " RID:" + std::to_string(clash->rid);
+                    return {ExecuteStatus::Error,
+                        "spawn '" + c.name + "': clobbering " + (local ? "local" : "global")
+                        + " '" + c.name + "' (" + what + "). Did you mean attach/ensure instead?"};
+                }
+
                 ETCS::Entity* e = ETCS::spawn_entity(c.module, c.tag, ctx, src);
                 if (!e) return {ExecuteStatus::Error, "spawn failed."};
                 ctx.bind(c.name, e->getRID(), c.module, c.tag);
@@ -1233,7 +1251,7 @@ inline ExecuteResult execute_command(const Command& cmd,
             auto existing = ctx.lookup(c.name);
             if (existing)
             {
-                ETCS::Entity* e = ETCS::resolve_entity_anywhere(existing->rid);
+                ETCS::Entity* e = ETCS::resolve_bound_entity(*existing);
                 if (e)
                 {
                     const std::string have_mod = existing->module.empty()
@@ -1256,9 +1274,7 @@ inline ExecuteResult execute_command(const Command& cmd,
 
             if (c.verb == AcquireVerb::Attach)
                 return {ExecuteStatus::Unmet,
-                    "attach '" + c.name + "': nothing in scope to attach to. attach "
-                    "never creates -- use ensure if this script should also work "
-                    "standalone."};
+                    "attach '" + c.name + "': nothing in scope. Did you mean ensure?"};
 
             ETCS::Entity* e = ETCS::spawn_entity(c.module, c.tag, ctx, src);
             if (!e) return {ExecuteStatus::Error, "ensure: spawn failed."};
@@ -1272,7 +1288,21 @@ inline ExecuteResult execute_command(const Command& cmd,
         if constexpr (std::is_same_v<T, CmdChildAcquire>)
         {
 #ifdef ETCS_LOADER
-            if (ctx.introduced(c.name))
+            // Same rule as top-level spawn -- a child spawn introduces a name
+            // too, and the ambiguity is the same whoever's child it is.
+            if (c.verb == AcquireVerb::Spawn)
+            {
+                if (auto clash = ctx.lookup(c.name))
+                {
+                    const bool local = ctx.introduced(c.name);
+                    return {ExecuteStatus::Error,
+                        c.parent_name + ".spawn '" + c.name + "': clobbering "
+                        + (local ? "local" : "global") + " '" + c.name + "' (RID:"
+                        + std::to_string(clash->rid) + "). Did you mean "
+                        + c.parent_name + ".attach/.ensure instead?"};
+                }
+            }
+            else if (ctx.introduced(c.name))
                 return {ExecuteStatus::Error,
                     "'" + c.name + "' is already introduced in this script."};
 
@@ -1281,17 +1311,14 @@ inline ExecuteResult execute_command(const Command& cmd,
                 return {ctx.lost_rid ? ExecuteStatus::Vanished : ExecuteStatus::Error,
                         "parent '" + c.parent_name + "' unavailable."};
 
-            // attach/ensure on a receiver: the parent is part of the MATCH,
-            // not merely the search order. A same-named entity of the right
-            // type belonging to some OTHER parent never binds here -- which
-            // is the difference between composing onto the server this script
-            // is holding and silently adopting an unrelated one.
+            // The parent is part of the MATCH, not the search order: a
+            // same-named child of some OTHER parent never binds here.
             if (c.verb != AcquireVerb::Spawn)
             {
                 auto existing = ctx.lookup(c.name);
                 if (existing)
                 {
-                    ETCS::Entity* prior = ETCS::resolve_entity_anywhere(existing->rid);
+                    ETCS::Entity* prior = ETCS::resolve_bound_entity(*existing);
                     if (prior && prior->getParent() == parent->entity)
                     {
                         const std::string have_tag = prior->getSourceTag().toString();
@@ -1308,9 +1335,8 @@ inline ExecuteResult execute_command(const Command& cmd,
                 }
                 if (c.verb == AcquireVerb::Attach)
                     return {ExecuteStatus::Unmet,
-                        c.parent_name + ".attach '" + c.name + "': that parent has no "
-                        "such child. attach never creates -- use ensure to create one "
-                        "when it is absent."};
+                        c.parent_name + ".attach '" + c.name + "': no such child. Did you "
+                        "mean " + c.parent_name + ".ensure?"};
             }
 
             if (!ETCS::resolve_module(c.module, src, ctx.root_entity))
@@ -1416,25 +1442,16 @@ inline ExecuteResult execute_command(const Command& cmd,
                     return {ctx.lost_rid ? ExecuteStatus::Vanished : ExecuteStatus::Error,
                             "consumer '" + c.consumer_receiver + "' unavailable."};
 
-                // The consuming end takes no payload, and that is a property of
-                // what a stream IS, not a limit of this implementation. The
-                // channel the produce/consume pair opens is the only route to
-                // the consumer; a payload written on that side assumes the
-                // consumer is reachable OUTSIDE the channel, which is exactly
-                // what it is not. Whatever the consuming end needs travels as
-                // part of what the producer sends -- so configuration belongs
-                // on the producing end, where the one config buffer goes.
-                //
-                // Refused rather than dropped: quietly discarding something
-                // someone wrote is the failure mode the bracket rule exists to
-                // end.
+                // A property of what a stream IS, not a limit here: the pair's
+                // channel is the only route to the consumer, so a payload on
+                // that side assumes it is reachable outside the channel. What
+                // it needs travels in what the producer sends. Refused rather
+                // than dropped.
                 if (!c.consumer_payload.empty())
                     return {ExecuteStatus::Error,
-                        "stream: the consuming end takes no payload. '"
-                        + c.consumer_payload + "' assumes '" + c.consumer_receiver
-                        + "' is reachable outside the channel this pair opens, "
-                          "which it is not -- whatever it needs has to arrive "
-                          "through what the producer sends."};
+                        "stream: the consuming end takes no payload -- '"
+                        + c.consumer_payload + "' would have to arrive through what the "
+                        "producer sends."};
 
                 ETCS::Buffer prod_buf, cons_buf, config;
                 prod_buf.write((r->binding.tag + "." + c.action).c_str());
@@ -1543,7 +1560,7 @@ inline ExecuteResult execute_command(const Command& cmd,
                 // do -- tested for liveness AT CAPTURE, which is also what
                 // keeps "root" out of it without special-casing the name.
                 for (const auto& [n, b] : child_ctx.names)
-                    if (ETCS::resolve_entity_anywhere(b.rid)) child_ctx.own(b.rid);
+                    if (ETCS::resolve_bound_entity(b)) child_ctx.own(b.rid);
  
                 run_script(in, script_path, child_ctx);
                 exec->finished.store(true, std::memory_order_release);
@@ -1584,7 +1601,7 @@ inline ExecuteResult execute_command(const Command& cmd,
             child_ctx.root_entity = &run_root;
             child_ctx.is_root     = false;
             for (const auto& [n, b] : child_ctx.names)
-                if (ETCS::resolve_entity_anywhere(b.rid)) child_ctx.own(b.rid);
+                if (ETCS::resolve_bound_entity(b)) child_ctx.own(b.rid);
  
             ETCS_LOG("CommandExecutor", "run: " << script_path << " (blocking)");
             auto t0 = std::chrono::steady_clock::now();

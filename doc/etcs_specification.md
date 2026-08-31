@@ -84,7 +84,7 @@ type name is not a declaration, and acting on a name that was never acquired is 
 invitation to conjure something.
 
 ```etcs
-requires <name> [Tag1, Tag2, ...]   # must already exist and qualify -- no Module::Tag, ever
+requires <name> [Tag, ...]          # must already exist and qualify -- name here, type in the bracket
 spawn    Module::Tag <name>         # always creates a new entity
 attach   Module::Tag <name>         # the closure's existing entity -- refused if there isn't one
 ensure   Module::Tag <name>         # the closure's entity, or a new one if there isn't
@@ -109,21 +109,28 @@ Declares that this script needs something already in scope answering to the name
 `server`), and, if a bracket is given, that it also answers to every tag listed. No spawn, no
 create, no fallback of any kind. If nothing qualifies, the script does not run at all.
 
-`requires` never takes a `Module::Tag`, and that is still deliberate: a script that declares
-`requires game` states that it needs *something* named `game`, and everything it then does with
-that entity — an action, a route registration, a `@game` substitution — is the real statement of
-what it needs the entity to be able to do. Naming one exact concrete type would say more than the
-script means; two callers passing differently-typed things that both answer the same actions are
-the same script with a different binding.
+Where the other three verbs take a `Module::Tag`, `requires` takes a **name**. A type can still
+appear — it just appears in the bracket, as something the binding must satisfy, rather than in the
+address slot, as something to create or find:
 
-What `requires` *can* name, without naming a type, is the entity's **slot** — what it is
-preconfigured to be able to do, right now, as a specific already-built thing. That is exactly why
-this is a `requires`-only capability rather than something `spawn`/`attach`/`ensure` could also
-carry: those three already name an exact `Module::Tag`, which is strictly more specific than any
-tag list could be. Naming the type already tells you every bare tag that type will ever carry, so
-a tag list next to a `Module::Tag` can never actually discriminate anything — it is either always
-satisfied (redundant) or never satisfiable (caught the moment the type is named, whether or not
-`requires` is even involved). Tags have content only in the one place a type isn't already pinned.
+```etcs
+requires window [Window, WindowProvider::GLFWWindow]
+```
+
+That is why the bracket is a `requires`-only capability. The other three pin their type in the
+address slot already, so a tag list beside it could never discriminate anything: naming the type
+tells you every tag that type carries, making the list either redundant or unsatisfiable. Tags
+have content only where the address slot holds a name instead.
+
+The bracket is also a **choice of how much to assert**. `requires db [Database]` and
+`requires db [LocalDatabase]` are different claims, and the narrower one is the stronger. A script
+that only uses the `Database` part of an interface says so with the wider tag, and then serves any
+concrete type in that family. What the wider tag does *not* promise is a complete interface — a
+type that forwards only part of its ontology contract still carries the family tag, and calls into
+the unforwarded part are refused at the line that makes them. That refusal is deterministic (same
+binding, same failure, same place) and, since a failed action is not a stop, it is recorded rather
+than fatal. The tag asserts family membership; the trace reports what that family member actually
+does.
 
 A tag list can mix both kinds from **Tags, and the two kinds** above, freely:
 
@@ -179,6 +186,11 @@ spawn NetworkProvider::HttpServer web
 
 Always creates. Never reuses, never retargets, never finds something that already exists. If you
 want the entity to be new, this is the only verb that guarantees it.
+
+**Refused if the name is already in scope** — local or global. Overwriting a global is a real
+mechanism (one runtime, one table, later writes win); doing it by accident is not. `spawn` means
+"make a new one", so a word that already answers to something was almost certainly meant to reach
+it, and the refusal says `attach`/`ensure`. Applies to `<parent>.spawn(...)` the same way.
 
 ### `attach` — the closure's entity, strictly
 
@@ -310,8 +322,13 @@ payloads legitimately carry paths, titles and free text that could collide.
 **Matching the closing bracket.** Payloads nest — SQL is full of parentheses — so the closer is
 found by depth counting, and the counter is **quote-aware**: parentheses inside a `'…'` or `"…"`
 span are literal text and are not counted. `t.ExecuteRaw(SELECT ')' FROM x)` therefore works. A
-payload carrying unbalanced parentheses outside quotes has to be quoted; there is no escape
-character.
+payload carrying unbalanced parentheses outside quotes has to be quoted.
+
+Inside a quoted span a backslash escapes the next character, so `\'` is a literal apostrophe and
+does not close the quote — matching what `TBuffer::operator>>(std::string&)` does when a work
+function extracts a quoted argument. The parser skips the escape without interpreting it; what
+reaches the work function is byte-for-byte what was written between the brackets. That agreement
+is what makes `db.Q('it\'s')` one argument rather than a truncated payload.
 
 Nothing but whitespace may follow the closing bracket, and an action is one line. A payload does
 not continue across a newline even if its brackets are unbalanced at the end of one — a trace is
@@ -429,9 +446,11 @@ Refused at load:
   at all, or one exists but is a different type. Both are refused the same way; there is no longer
   a difference between "missing" and "wrong kind" for this verb, because `attach` never falls back
   to creating either way.
-- **Name collisions across the tree** where a local shadows a global of a *different* type. A
-  same-type shadow is annotated rather than refused: independent scripts reaching for an obvious
-  name for an obvious thing is what locals are for.
+- **A `spawn` over a name already in scope**, at either scope level. See `spawn` above.
+- **Name collisions across the tree** where a local shadows a global of a *different* type. For
+  `attach`/`ensure` a same-type shadow is annotated rather than refused: independent scripts
+  reaching for an obvious name for an obvious thing is what locals are for. For `spawn` any clash
+  is refused, since that verb does not resolve to what is already there.
 - **Cycles** — `a.etcs` launching `b.etcs` launching `a.etcs`. With no branching there is no base
   case, so a cycle is never anything but a bug.
 
@@ -500,8 +519,8 @@ by anything here.
 
 | Concept | Mechanism |
 |---|---|
-| Required input | `requires <name> [Tags]` — no `Module::Tag`, optional tag-set constraint, resolves through the same closure lookup as `attach`, checked before the script runs |
-| New entity | `spawn Module::Tag <name>` — always creates |
+| Required input | `requires <name> [Tags]` — name in the address slot, type constraints in the bracket; resolves through the same closure lookup as `attach`, checked before the script runs |
+| New entity | `spawn Module::Tag <name>` — always creates; refused if the name is taken |
 | Closure entity, strictly | `attach Module::Tag <name>` — binds an existing one, refuses otherwise |
 | Closure entity or new | `ensure Module::Tag <name>` — binds the closure's, else creates |
 | New typed child | `<parent>.spawn( Module::Tag <name> )` |
@@ -555,6 +574,10 @@ Removed outright:
   the runtime's globals for as long as that root is running, and that is the whole of it.
 
 Refined, not removed:
+
+- **`spawn` refuses a name already in scope**, and the parser honours backslash escapes inside
+  quoted spans, matching `TBuffer`'s own extractor. Both close gaps where two layers disagreed
+  about the same text: one about what a name meant, one about where a payload ended.
 
 - **`attach` split into `attach` and `ensure`.** `attach` used to be the only verb with two
   outcomes — bind the closure's entity, or create one if there wasn't one — and that ambiguity was
