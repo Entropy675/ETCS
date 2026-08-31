@@ -632,7 +632,45 @@ struct LifetimeOwner
 struct Module
 {
     std::string      name           = "";
+private:
+    /*
+ * PRIVATE so it cannot be closed from outside. Every dlclose/FreeLibrary
+ * for a module goes through unmapLibrary() below -- that is the invariant,
+ * and this access specifier is what enforces it rather than a convention
+ * four call sites each had to remember (three did).
+ */
     library_handle_t library_handle = nullptr;
+public:
+    bool hasLibrary() const { return library_handle != nullptr; }
+    // The one way a freshly dlopen'd handle becomes this Module's. Asserts
+    // nothing is already mapped: overwriting would leak the old mapping AND
+    // strand whatever threads it started.
+    void adoptLibrary(library_handle_t h)
+    {
+        if (library_handle && library_handle != h)
+            ETCS_LOG("DynamicLoader:Module",
+                "adoptLibrary on '" << name << "' with a handle already mapped -- "
+                "the previous mapping is being dropped without unmapLibrary().");
+        library_handle = h;
+    }
+    /*
+ * THE teardown path for a mapped module, and the only place a library
+ * handle is ever closed. Every step exists because skipping it broke
+ * something real, and the order is load-bearing:
+ *   1. raise this module's own flags, so work it spawned observes the stop
+ *      while its code is still mapped
+ *   2. purge ridMap rows keyed "<name>:" -- their RIDLists live in THIS
+ *      module's image, so a later bare-RID scan walks unmapped memory.
+ *      Before the close, not after: the rows must not stay reachable once
+ *      the code behind them is gone
+ *   3. _Cleanup -- stops the module's ordering thread and drains its pool.
+ *      Skip it and dlclose runs the DSO's static dtors, where ~EventStream
+ *      joins a thread nobody told to stop: a hang, not a crash
+ *   4. close, and null the handle so a second close is impossible
+ * Defined in DynamicLoader.h (needs EventNode complete). `node` may be null
+ * only when no EventNode exists to purge from.
+ */
+    void unmapLibrary(EventNode* node);
     std::string      filename       = "";
     std::vector<ETCS::Buffer> tags;
     bool validBinary = false;

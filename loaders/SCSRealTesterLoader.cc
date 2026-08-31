@@ -1,6 +1,37 @@
 #include "../ETCS.h"
 #include "../core/LMAXSequentialSharedPage.h"
+/*
+ * This loader drives NetworkProvider's REAL SocketConnectionState, so it
+ * needs that module's own headers -- it is the one loader in this directory
+ * that reaches into a module's source tree (its .loader.json declares
+ * inherits_modules: [NetworkProvider]). Without modules/NetworkProvider
+ * checked out and built, a bare #include failed the WHOLE `make loaders`
+ * run on a missing-header error that named a path but not the reason.
+ *
+ * Guarded so the absence is a legible skip rather than a build break: the
+ * stub main below says exactly what to check out and build. The guard tests
+ * the same path the include uses, so it can never disagree with it.
+ */
+#if __has_include("../modules/NetworkProvider/NetworkProvider/SocketConnectionState.h")
+#define ETCS_SCSREAL_HAVE_NETWORKPROVIDER 1
 #include "../modules/NetworkProvider/NetworkProvider/SocketConnectionState.h"
+#endif
+
+#ifndef ETCS_SCSREAL_HAVE_NETWORKPROVIDER
+#include <iostream>
+int main()
+{
+    std::cerr <<
+        "SCSRealTesterLoader: skipped -- NetworkProvider's sources are not present.\n"
+        "  This loader tests the real SocketConnectionState, not a stand-in, so it\n"
+        "  needs modules/NetworkProvider checked out and built:\n"
+        "      ace make module NetworkProvider\n"
+        "  Then rebuild:  make -C loaders FILE=SCSRealTesterLoader\n"
+        "  For the accounting-only sweep that needs no module, run scstest\n"
+        "  (SCSTesterLoader) instead.\n";
+    return 77;   // conventional "skipped", not a failure
+}
+#else
 #include <thread>
 #include <vector>
 #include <deque>
@@ -1115,3 +1146,4 @@ int main(int argc, char* argv[])
 
     return s_failed == 0 ? 0 : 1;
 }
+#endif // ETCS_SCSREAL_HAVE_NETWORKPROVIDER

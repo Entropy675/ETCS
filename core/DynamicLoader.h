@@ -367,51 +367,89 @@ void ETCS::Module::promoteOrVacate(LifetimeOwner survivor)
  * other. hosting_entity.asRoot() below asserts this invariant rather
  * than silently guessing.
  */
+/*
+ * unmapLibrary - see its declaration comment (Bundles.h) for the four steps
+ * and why their order is load-bearing. Defined here because steps 1-3 need
+ * EventNode complete.
+ *
+ * This is the whole sequence ~Module and requestUnloadImpl used to open-code
+ * separately (each carrying a "same as the other one" comment), and that
+ * attachModule's own failure paths did NOT: its generic catch closed the
+ * handle bare, skipping both the _Cleanup that stops the module's ordering
+ * thread (a hang at dlclose's static-dtor join) and the ridMap purge (rows
+ * absorbed by registerLoader left pointing into unmapped memory).
+ */
+void ETCS::Module::unmapLibrary(ETCS::EventNode* node)
+{
+#ifdef ETCS_LOADER
+    if (!library_handle) return;
+    ETCS_LOG("DynamicLoader:Module", "Unmapping module: [" << name << "::" << library_handle << "]");
+
+    /*
+ * 1. Raise this Module's OWN authority before anything else touches the
+ *    library. Every entity ever spawned from it has a passive edge
+ *    terminating at one of this module's ModuleBundle ctxs (a root-level
+ *    entity's provider is set in attachModule; an addTag<T> child's walks
+ *    up to one), so this reaches them -- and ONLY them, which is the point.
+ *    A module unload is not a process-wide event: Ctrl+C raises the global
+ *    flags and stops everything, while this must stop exactly the work
+ *    whose CODE is about to be unmapped.
+ *
+ *    These flags live on the Module itself, which outlives the close (it is
+ *    loader-arena allocated; only the LIBRARY is unmapped), so a work
+ *    function reading its ctx one last time during teardown reads a live
+ *    flag rather than freed memory. Release, matching
+ *    global_signal_handler's store and paired with SignalContext::raised's
+ *    acquire.
+ */
+    interrupt.store(1, std::memory_order_release);
+    terminate.store(1, std::memory_order_release);
+
+    // 2. registerLoader absorbs a module's ridMap under "<module>:<tag>"
+    //    keys, each handle wrapping a RIDList in the MODULE's image.
+    //    Per-entity removal empties those lists without unlinking the rows.
+    if (node)
+    {
+        const std::string prefix = name + ":";
+        size_t purged = 0;
+        for (auto it = node->ridMap.begin(); it != node->ridMap.end(); )
+        {
+            const std::string key = it->first.toString();
+            if (key.compare(0, prefix.size(), prefix) == 0) { it = node->ridMap.erase(it); ++purged; }
+            else ++it;
+        }
+        if (purged)
+            ETCS_LOG("DynamicLoader:Module", "Purged " << purged << " ridMap row(s) for '"
+                     << name << "' -- their RIDLists are about to be unmapped.");
+    }
+
+    // 3-4. Cleanup then close. Nulled so a second close is impossible.
+    cleanupModule();
+    ETCS_LOG("DynamicLoader:Module", "Unloading library: " << getFilename() << " ...");
+#ifdef _WIN32
+    FreeLibrary(library_handle);
+#else
+    dlclose(library_handle);
+#endif
+    library_handle = nullptr;
+#else
+    (void)node;
+#endif
+}
+
 ETCS::Module::~Module()
 {
 #ifdef ETCS_LOADER
-    if (library_handle != nullptr)
+    if (hasLibrary())
     {
-        ETCS_LOG("DynamicLoader:Module", "Cleaning up module: [" << name << "::" << library_handle << "]");
         /*
- * Same signal-before-unmap discipline requestUnloadImpl uses -- see
- * its own comment. This is the path where nobody ever triggered an
- * explicit unload and the process is simply exiting, so the global
- * flags may or may not already be raised (an ordinary main() return
- * never sets them; only a signal or shutdown_detached_executors
- * does). Raising this module's own is what makes the entities it
- * spawned observe the stop in the return-normally case too.
+ * Process-exit path: nobody triggered an explicit unload, so the global
+ * flags may or may not already be raised (an ordinary main() return never
+ * sets them; only a signal or shutdown_detached_executors does).
+ * unmapLibrary raises this module's own either way, which is what makes
+ * the entities it spawned observe the stop in the return-normally case.
  */
-
-        interrupt.store(1, std::memory_order_release);
-        terminate.store(1, std::memory_order_release);
-
-        /*
- * Same purge requestUnloadImpl does -- see its comment. This is the
- * process-exit path, so little runs after it, but "little" is not
- * "none": other ~Module calls, join_all, and draining detached threads
- * all outlive this one. Repeating it keeps the invariant unconditional
- * on which unload path ran.
- */
-        if (ETCS::EventNode* node = &ETCS::EventNode::getInstance())
-        {
-            const std::string prefix = std::string(name) + ":";
-            for (auto it = node->ridMap.begin(); it != node->ridMap.end(); )
-            {
-                const std::string key = it->first.toString();
-                if (key.compare(0, prefix.size(), prefix) == 0) it = node->ridMap.erase(it);
-                else ++it;
-            }
-        }
-
-        cleanupModule();
-        ETCS_LOG("DynamicLoader:Module", "Unloading library: " << getFilename() << " ...");
-#ifdef _WIN32
-        FreeLibrary(library_handle);
-#else
-        dlclose(library_handle);
-#endif
-        library_handle = nullptr;
+        unmapLibrary(&ETCS::EventNode::getInstance());
     }
     else if (parent && hosting_entity.kind == LifetimeOwner::Kind::Root)
     {
@@ -1368,7 +1406,7 @@ bool ETCS::EventNode::LoaderStream::attachModule(
             if (!handle)
                 throw std::runtime_error(std::string("Failed to load SO: ") + dlerror());
 #endif
-            global_mod->library_handle = handle;
+            global_mod->adoptLibrary(handle);
             if (!global_mod->registerLoader(*owner)) return false;
             auto arena_it = module_arena_registry.find(module_name);
             if (arena_it != module_arena_registry.end())
@@ -1418,23 +1456,13 @@ bool ETCS::EventNode::LoaderStream::attachModule(
  * one; determinism is already violated the moment two builds that
  * disagree on the contract both keep running.
  *
- * cleanupModule() first, defensively, in case the module's own threads
- * were ever started before this was caught -- discoverTags() now runs
- * inside registerLoader() BEFORE RegisterDynamicLoader is called (see
- * that reordering there), so nothing reaches this catch with threads
- * actually running today, but stays correct if that ordering changes.
- * cleanupModule() itself no-ops when validBinary is still false.
+ * unmapLibrary rather than a bare close: discoverTags() runs inside
+ * registerLoader() BEFORE RegisterDynamicLoader (see that reordering),
+ * so nothing reaches this catch with module threads actually running
+ * today -- but the full teardown stays correct if that ever changes,
+ * and its steps no-op cleanly when nothing was started.
  */
-            global_mod->cleanupModule();
-            if (handle)
-            {
-#ifdef _WIN32
-                FreeLibrary(handle);
-#else
-                dlclose(handle);
-#endif
-                global_mod->library_handle = nullptr;
-            }
+            global_mod->unmapLibrary(owner);
             /*
  * TODO(recovery): before giving up, re-fetch whichever of {this loader
  * binary, this module} is older from anticurrententropy.com and retry once.
@@ -1469,22 +1497,19 @@ bool ETCS::EventNode::LoaderStream::attachModule(
  * LoadLibrary itself succeeded before a LATER step threw
  * (registerLoader's own discoverTags, or catalogTypes' own
  * discoverActions), `handle` is a real, open library handle
- * that must be closed here -- and global_mod->library_handle
- * (already set, above) must be nulled out afterward, or
+ * that must be torn down here, and the handle nulled, or
  * ~Module() eventually running on this abandoned instance at
- * process teardown would try to close it AGAIN (a double
- * dlclose) and would call cleanupModule()'s own dlsym against
- * an already-closed handle first -- both undefined behavior.
+ * process teardown would close it AGAIN.
+ *
+ * unmapLibrary, not a bare close: reaching this catch from
+ * catalogTypes/discoverActions means registerLoader ALREADY
+ * completed, so the module's ordering thread is running and its
+ * ridMap rows are already absorbed. Closing bare stranded the
+ * thread (dlclose then hangs joining it in ~EventStream) and left
+ * those rows pointing into unmapped memory. A missing _Make or
+ * _List export on a declared tag is enough to get here.
  */
-            if (handle)
-            {
-#ifdef _WIN32
-                FreeLibrary(handle);
-#else
-                dlclose(handle);
-#endif
-                global_mod->library_handle = nullptr;
-            }
+            global_mod->unmapLibrary(owner);
             ETCS_LOG("DynamicLoader", "attachModule: failed to load module '"
                      << module_name << "' -- " << ex.what());
             return false;
@@ -1785,73 +1810,21 @@ void ETCS::EventNode::LoaderStream::requestUnloadImpl(ETCS::Module* target)
     ETCS_LOG("DynamicLoader", "Module '" << module_name
         << "' RequestUnload recheck: still vacant after the delay -- "
            "unloading now.");
-    /*
- * Raise this Module's OWN authority before anything below touches the
- * library. Every entity ever spawned from it has a passive edge
- * terminating at one of this module's own ModuleBundle ctxs (a
- * root-level entity's provider is set in attachModule; an addTag<T>
- * child's walks up to one), so this is what reaches them -- and it
- * reaches ONLY them, which is the point. A module unload is not a
- * process-wide event: Ctrl+C raises the global flags and stops
- * everything, while this must stop exactly the work whose CODE is
- * about to be unmapped and nothing else.
- *
- * These flags live on the Module object itself, which outlives the
- * dlclose below (it's arena-allocated from the loader's own arena, and
- * only the LIBRARY is unmapped here, not this bookkeeping), so a work
- * function that reads its ctx one last time during teardown reads a
- * live flag rather than freed memory.
- *
- * Release, matching global_signal_handler's own store and paired with
- * the acquire in SignalContext::raised -- everything a stopping thread
- * does after observing this must be ordered after the observation.
- */
-    target->interrupt.store(1, std::memory_order_release);
-    target->terminate.store(1, std::memory_order_release);
+    // Loader-side bookkeeping first: nothing new can find this module while
+    // its mapping is being torn down. (The signal-raise that used to sit here
+    // is unmapLibrary's step 1 now -- see its comment for why it is
+    // module-scoped rather than process-wide.)
     module_registry.erase(module_name);
     module_arena_registry.erase(module_name);
     type_catalog_registry.erase(module_name);
 
     /*
- * ...and the ridMap rows this module contributed, which the three erases
- * above do not cover. registerLoader absorbs a module's ridMap under
- * "<module>:<tag>" keys, and each handle wraps a RIDList in the MODULE's
- * image. Per-ENTITY removal already happens (deleteEntity takes each RID
- * out as it dies), but that empties the lists without unlinking the rows,
- * so after dlclose every remaining handle's thunks point into unmapped
- * memory.
- *
- * Before cleanupModule/dlclose, not after: otherwise the rows are
- * reachable while the code behind them is gone, and this consumer is not
- * the only reader. Prefix match rather than a tag list -- the tags are
- * what is about to become unreadable.
+ * The ridMap purge, _Cleanup and close that used to be open-coded here are
+ * now unmapLibrary's steps 2-4 (Bundles.h) -- same sequence, one copy, so
+ * attachModule's failure paths get it too. The registry erases above stay
+ * here: they are the LOADER's bookkeeping, not the module's mapping.
  */
-    if (owner)
-    {
-        const std::string prefix = module_name + ":";
-        size_t purged = 0;
-        for (auto it = owner->ridMap.begin(); it != owner->ridMap.end(); )
-        {
-            const std::string key = it->first.toString();
-            if (key.compare(0, prefix.size(), prefix) == 0)
-            {
-                it = owner->ridMap.erase(it);
-                ++purged;
-            }
-            else ++it;
-        }
-        if (purged)
-            ETCS_LOG("DynamicLoader", "Purged " << purged << " ridMap row(s) for '"
-                     << module_name << "' -- their RIDLists are about to be unmapped.");
-    }
-
-    target->cleanupModule();
-#ifdef _WIN32
-    FreeLibrary(target->library_handle);
-#else
-    dlclose(target->library_handle);
-#endif
-    target->library_handle = nullptr;
+    target->unmapLibrary(owner);
 }
  
 /*

@@ -258,7 +258,11 @@ int main(int argc, char** argv)
     // Page tree, attached the same way `web.add(FileHtmlPage tree)` does in
     // run_website.etcs -- BEFORE Start, per HttpServer.h: "Added by a script
     // BEFORE Start ... Serve walks them in attach order."
-    ETCS::Entity* pages = ETCS::attach_child("NetworkProvider", "FileHtmlPage", httpserver);
+    // make_typed_child, not addTag<FileHtmlPage>: the concrete type is not
+    // compiled into this binary at all, so the child is built through the
+    // module's own dlsym'd "<Tag>_MakeChild" export. See its comment in
+    // CommandExecutor.h.
+    ETCS::Entity* pages = ETCS::make_typed_child("NetworkProvider", "FileHtmlPage", httpserver, loader);
     if (!pages)
     {
         std::cerr << "Failed to attach FileHtmlPage to HttpServer\n";
