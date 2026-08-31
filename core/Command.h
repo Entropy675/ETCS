@@ -122,6 +122,17 @@ struct GlobalNames
         return it->second;
     }
 
+    // Drop a name. Called the first time a lookup finds its RID no longer
+    // resolves (lookup_live, CommandExecutor.h): a global is a claim that a
+    // name means something, and it stops being true the moment the entity is
+    // gone. Holding the row would make the name permanently unusable -- a
+    // spawn under it reads as a clobber of something that no longer exists.
+    void forget(const std::string& name)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        entries_.erase(name);
+    }
+
     // Cleared when the root script ends -- a global's lifetime is the root's
     // lifetime, which for the root script IS the runtime's lifetime. Exists
     // so a runtime that runs a root script, finishes, and runs another does
