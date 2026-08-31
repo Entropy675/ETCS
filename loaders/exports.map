@@ -1,0 +1,15 @@
+# Explicit symbol export whitelist for the loader executable itself --
+# same discipline modules already apply via their own exports.map
+# (see ACE-Build-Tools' ace_manifest.py, module "produces.exports"), now
+# extended to the loader side because -rdynamic alone exports every
+# non-hidden symbol in the binary, and "non-hidden" should never be an
+# implicit, unaudited set. Everything not listed under `global:` is
+# forced `local:` (i.e. NOT visible to a module's own
+# dlsym(RTLD_DEFAULT, ...)), regardless of what -fvisibility=hidden left
+# as default-visibility by omission.
+ETCS_LOADER_1.0 {
+    global:
+        ETCS_GetLoaderManifest;
+    local:
+        *;
+};

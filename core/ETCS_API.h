@@ -736,6 +736,22 @@ namespace ETCS
         }
         return longest;
     }
+    // Looks up the loader's exported manifest getter (ETCS_GetLoaderManifest,
+    // DynamicLoader.h) in the process's global symbol scope -- a plain
+    // function so ETCS_MODULE_EXPORT_MAIN's macro body doesn't need a raw
+    // #ifdef _WIN32 inside its backslash-continued expansion. Null when no
+    // loader is in this process (dlsym/GetProcAddress miss), not an error --
+    // the module's own manifest check treats that as "nothing to compare
+    // against" rather than a mismatch.
+    inline void* etcs_find_loader_manifest_getter()
+    {
+#ifdef _WIN32
+        return reinterpret_cast<void*>(
+            GetProcAddress(GetModuleHandleA(nullptr), "ETCS_GetLoaderManifest"));
+#else
+        return dlsym(RTLD_DEFAULT, "ETCS_GetLoaderManifest");
+#endif
+    }
 }
 /**
  * ETCS_MODULE_EXPORT_MAIN
@@ -779,6 +795,51 @@ namespace ETCS
         std::string tok; \
         while (ss >> tok) ordered_tags.push_back(tok); \
         ETCS::EventNode::getInstance().RegisterTagBitIndex(ordered_tags); \
+        return true; \
+    }(); \
+    /* This module's own half of the loader/module manifest check -- runs \
+     * at static-init time, i.e. during dlopen(), before dlopen() itself \
+     * returns to the loader and so before RegisterDynamicLoader (the \
+     * loader's first call INTO this module) is ever reached. Reaches the \
+     * loader's manifest via dlsym(RTLD_DEFAULT, ...) against \
+     * ETCS_GetLoaderManifest (DynamicLoader.h, loader build only, exported \
+     * with default visibility and -rdynamic specifically so this lookup \
+     * works) rather than waiting for the loader to hand it over -- neither \
+     * side's check depends on the other having run, or on which order they \
+     * run in; both only need to finish by the time RegisterDynamicLoader \
+     * completes, which they structurally do. A dlsym miss (no loader in \
+     * the process -- e.g. this module linked into a standalone test \
+     * binary) is not itself a mismatch: nothing to compare against. \
+     * Depends on ETCS_MODULE_EXPORT_MAIN being invoked after every header \
+     * whose HEADER:/ONTOLOGY: hash should be checked has already been \
+     * included in this translation unit -- true of every module as \
+     * written today (this macro goes last), but now load-bearing rather \
+     * than just eventually-true, since this runs mid-static-init instead \
+     * of at the loader's first runtime call into Name(). */ \
+    static const bool Name##_loader_manifest_checked_ = []() { \
+        void* getterAddr = ETCS::etcs_find_loader_manifest_getter(); \
+        if (!getterAddr) return true; \
+        using LoaderManifestGetter = void* (*)(); \
+        void* loaderManifestPtr = reinterpret_cast<LoaderManifestGetter>(getterAddr)(); \
+        if (!loaderManifestPtr) return true; \
+        auto* loaderManifest = static_cast<ETCS::Manifest*>(loaderManifestPtr); \
+        if (ETCS::compareManifests(ETCS::Entity::getManifest(), loaderManifest, #Name)) { \
+            std::cerr << "FATAL: module '" #Name "' and the loader disagree on " \
+                         "HEADER:/ONTOLOGY: hashes -- built for different epochs. " \
+                         "Refusing to run." << std::endl; \
+            /* TODO(recovery): re-fetch whichever of {this module, the \
+             * loader} is older from anticurrententropy.com and retry once \
+             * before aborting. A SECURITY boundary as much as a \
+             * determinism one -- requires the fetch to be over TLS with \
+             * the cert chain signed by the ACE root key on both the \
+             * binary and its source, not the plain LetsEncrypt cert the \
+             * site uses today. Not wired in yet -- pending that signing \
+             * infrastructure and the release-serving protocol -- so this \
+             * goes straight to abort() rather than trusting an \
+             * unverifiable replacement, or running as one that already \
+             * disagrees with the loader. */ \
+            std::abort(); \
+        } \
         return true; \
     }(); \
     extern "C" ETCS_API HASH_TYPE Name##_GetHash() { \

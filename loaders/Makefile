@@ -56,7 +56,7 @@ CXXFLAGS := -std=c++17 \
             $(SANITIZE)
 
 ifeq ($(UNAME_S),Linux)
-    LDFLAGS := -ldl -Wl,--no-as-needed -pthread -luring -Wl,--as-needed -fuse-ld=gold -Wl,--threads -Wl,--thread-count,$(NPROC)
+    LDFLAGS := -ldl -Wl,--no-as-needed -pthread -luring -Wl,--as-needed -fuse-ld=gold -Wl,--threads -Wl,--thread-count,$(NPROC) -rdynamic -Wl,--version-script=exports.map
 else ifeq ($(UNAME_S),Windows_NT)
     LDFLAGS := -lws2_32
 else
