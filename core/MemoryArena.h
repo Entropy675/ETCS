@@ -1280,23 +1280,14 @@ public:
                             }
                             else
                             {
-                                // reparentChildrenTo already redirects
-                                // every child's own addressing past e
-                                // before this runs -- nothing dangling
-                                // depends on e's own address surviving,
-                                // so its outer shell is just as reclaimable
-                                // here as in the cascade case above, even
-                                // though e's own local_arena_ ("coyote
-                                // time") deliberately stays alive to keep
-                                // hosting those now-reparented children's
-                                // own underlying memory. No post-reclaim
-                                // read of e here, so no capture needed --
-                                // this branch was never affected.
-                                // Capture BEFORE reclaimEntity zeroes e's shell
-                                // (same reason the two branches above capture it
-                                // early -- local_arena_ lives in those bytes).
+                                // reparentChildrenTo redirects every child's own
+                                // addressing past e, so nothing dangling depends on
+                                // e's own address surviving and its outer shell is
+                                // as reclaimable here as in the cascade case above.
+                                // Capture own_arena BEFORE reclaimEntity zeroes that
+                                // shell -- local_arena_ lives in those bytes (same
+                                // reason the two branches above capture it early).
                                 MemoryArena* own_arena = &e->getArena();
-                                e->reparentChildrenTo(e->getParent());
 
                                 // "Coyote time" -- keeping this entity's own arena
                                 // alive after the entity itself is gone -- exists
@@ -1311,16 +1302,38 @@ public:
                                 // connection never addTag<T>s anything) -- invisible
                                 // per request, tens of MB over a day of polling.
                                 //
-                                // Checked AFTER the reparent, not before: what
-                                // matters is whether anything still depends on this
-                                // arena once the migration has happened, and a child
-                                // that failed to migrate (no make_in factory -- see
-                                // reparentChildrenTo's own log) is still hosted here
-                                // and still needs it.
-                                std::vector<std::pair<ETCS::Buffer, ETCS_RID_SIZE>> remaining;
-                                e->getTypedChildren(remaining);
+                                // Checked BEFORE the reparent, not after. The
+                                // question is "does any entity still have STORAGE
+                                // inside this arena", and reparenting does not move
+                                // storage: reparentChildrenTo rewrites parent_ and
+                                // mints a fresh RIDList in newParent's arena, but
+                                // every child's own shell and local_arena_ stay
+                                // physically here -- which is the entire reason that
+                                // method's own comment says this arena "does survive
+                                // as coyote time".
+                                //
+                                // Asking AFTER inverted it. A SUCCESSFUL migration
+                                // empties typed_children_, so the arena hosting those
+                                // now-migrated children was reclaimed out from under
+                                // them (their shells destructed with it -- a live
+                                // grandparent left holding RIDs into freed memory).
+                                // A migration that FAILED left its children behind
+                                // and kept the arena -- alive for the one case that
+                                // no longer needed reachable children. Exactly
+                                // backwards, and reachable from any
+                                // deleteEntity(middle, false) on a three-level tree.
+                                //
+                                // Before the reparent, "had children at all" answers
+                                // it for both kinds at once: migrated and orphaned
+                                // children are hosted here alike. The children == 0
+                                // case this check exists for (SocketConnectionState,
+                                // which never addTag<T>s anything) is untouched --
+                                // it has nothing hosted here either way.
+                                std::vector<std::pair<ETCS::Buffer, ETCS_RID_SIZE>> hosted;
+                                e->getTypedChildren(hosted);
+                                e->reparentChildrenTo(e->getParent());
                                 parentArena.reclaimEntity(e, sizeof(T), alignof(T));
-                                if (remaining.empty())
+                                if (hosted.empty())
                                     parentArena.reclaimArena(own_arena);
                             }
                         });

@@ -1,3 +1,17 @@
 /modules/
 .etcs_history
 .db
+
+# Loader build outputs -- mirrors loaders/Makefile's own `clean` target
+# (Run_*Loader, etcs, *.o) so the two can't drift apart. This is what
+# `2508dbe` committed by accident: a `git add .` after a build stages
+# these unless they're ignored in both the dir they're built in and the
+# dir copy_loaders moves them to.
+loaders/Run_*Loader
+loaders/etcs
+loaders/*.o
+bin/Run_*Loader
+bin/etcs
+bin/*.so
+*_hashes.h
+*db

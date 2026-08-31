@@ -18,9 +18,9 @@
 // see etcs.cc's own Makefile target for the authoritative flags; this is
 // a best-effort reconstruction, not verified against it):
 //
-//   g++ -std=c++17 -fvisibility=hidden -Wall -Wextra -O0 -g \
-//       -DETCS_LOADER -DETCS_MODULE_NAME=\"MemoryArenaTester\" \
-//       -I. -I.. -pipe -pthread -fuse-ld=gold -ldl \
+//   g++ -std=c++17 -fvisibility=hidden -Wall -Wextra -O0 -g
+//       -DETCS_LOADER -DETCS_MODULE_NAME=\"MemoryArenaTester\"
+//       -I. -I.. -pipe -pthread -fuse-ld=gold -ldl
 //       MemoryArenaTesterLoader.cc -o MemoryArenaTesterLoader
 //
 // Run under LLDB:
@@ -209,8 +209,11 @@ static void test_repeated_cycles()
         arena.deleteEntity(p, false);
     }
 
+    bool first_slot_reused = false;
+    for (void* s : seen) if (s == first_addr) { first_slot_reused = true; break; }
     std::cout << "  " << kCycles << " cycles touched " << distinct_addresses
-              << " distinct address(es)\n";
+              << " distinct address(es); first slot "
+              << (first_slot_reused ? "was" : "was NOT") << " among them\n";
     // A handful of distinct addresses is fine (free-list is a stack, not
     // guaranteed to hand back the SAME slot every time if anything else
     // interleaves) -- what matters is this number staying small and

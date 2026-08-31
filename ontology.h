@@ -16,6 +16,9 @@
 #include "ontology/ConnectionStateBase.h"
 #include "ontology/HtmlPageBase.h"
 #include "ontology/WindowBase.h"
+#include "ontology/InputSourceBase.h"
+#include "ontology/ResizableBase.h"
+#include "ontology/TargetBase.h"
 
 // these ones may be turned into just Database with a flag:
 #include "ontology/LocalDatabaseBase.h"
