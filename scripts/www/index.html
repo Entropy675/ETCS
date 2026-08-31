@@ -71,7 +71,7 @@
       </p>
       <a href="https://github.com/Entropy675/ETCS">The code is available here (GitHub)</a>
       <a href="https://github.com/Entropy675/ETCS-Commons">LGPL commons available here (GitHub)</a>
-      <a href="github.com/Entropy675/ACE-Build-Tools">Use these build tools to build (GitHub)</a>
+      <a href="https://github.com/Entropy675/ACE-Build-Tools">Use these build tools to build (GitHub)</a>
     </div>
   </div>
   <h2>Running here</h2>
@@ -127,7 +127,7 @@
 (async function () {
   const el = document.getElementById('uptime');
   try {
-    const r = await fetch('/forum/index');
+    const r = await fetch('/');
     el.textContent = r.ok ? 'ETCS runtime up' : 'ETCS runtime unreachable';
     el.style.color = r.ok ? 'var(--ok)' : 'var(--dim)';
   } catch (e) { el.textContent = 'ETCS runtime unreachable'; }

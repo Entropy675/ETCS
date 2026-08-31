@@ -10,6 +10,7 @@ landing.SetHtmlFromFile(./www/index.html)
 
 web.spawn(NetworkProvider::FileHtmlPage tree)
 tree.LoadFromDisk(./www)
+tree.SetDefaultExtension(.html)
 tree.ListPaths()
 
 spawn NetworkProvider::TarpitNode tarpit
