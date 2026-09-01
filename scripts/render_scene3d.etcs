@@ -5,14 +5,16 @@
 #
 #     ./bin/etcs scripts/render_scene3d.etcs
 #
-# and then, with the window focused, hold W/S/A/D/Q/E. From the prompt, while
-# it is still running:
+# and then, with the window focused, hold W/S/A/D/Q/E and move the mouse to
+# look. From the prompt, while it is still running:
 #
 #     Root> RenderProvider                       # read the RIDs back
 #     Root> eye.LookAt(0.0, 12.0, -6.0, 0.0, 0.0, 6.0)   # move the eye
 #     Root> tower_far.SetColor(1.0, 0.2, 0.2, 1.0)       # repaint one box
 #     Root> block.SetVisible(0)                          # hide the occluder
 #     Root> world.DepthAt(@eye, 512, 384)                # how far is the centre
+#     Root> world.Order()                                # energy, heat, ticks
+#     Root> main.CaptureMouse(0)                         # give the cursor back
 #
 # Every one of those takes effect on the next frame, because the frame edge
 # re-walks the tree rather than replaying a list of calls (Surface.Compose,
@@ -88,6 +90,13 @@ world.SetPosition(0.0, 0.0, 0.0)
 # stops, lower it to coast.
 world.SetSpeed(7.0)
 world.SetDamping(6.0)
+world.SetSensitivity(0.0025)
+
+# Heat leaves a point into whatever contains it, and the root's environment is
+# outside the model -- so this is the rate at which the scene's accumulated
+# drag heat stops being the scene's problem (ontology/OrderVector.h). Read the
+# ledger back at any time with world.Order().
+world.SetEmissivity(0.5)
 
 run scene3d.etcs anchor=world
 
@@ -122,6 +131,11 @@ reticle.SetOrder(10)
 # nothing moving costs one DrawInto per node, no projection, and no upload.
 view.Clear(0.02, 0.02, 0.03, 1.0)
 view.Compose(@stage)
+
+# The cursor goes away and pointer deltas stop being bounded by the screen --
+# what a look control needs, and the mode the motion half of the input edge
+# assumes. Release it from the shell with main.CaptureMouse(0).
+main.CaptureMouse(1)
 
 detach scene3d_input.etcs window=main scene=world
 detach render_frames.etcs view=view

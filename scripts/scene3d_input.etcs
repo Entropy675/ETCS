@@ -22,17 +22,33 @@
 # CONTROLS, and the direction is deliberate: the SCENE moves, not the camera.
 # What a projection can see is the relative position of the two, and moving the
 # scene means one translation at the root relocates the whole tree (scene3d.etcs
-# on why). W pushes the scene away, which reads as walking forward.
+# on why).
 #
-#     W / S   further / nearer
-#     A / D   scene left / right   (reads as strafing right / left)
-#     Q / E   scene up / down      (reads as looking down / up)
+#     W / S   forward / back, along the way the camera is facing
+#     A / D   strafe left / right
+#     Q / E   up / down
+#     mouse   look -- yaw and pitch, applied to whichever camera projects
 #
-# The consumer holds a bit per key and integrates on a 16ms tick rather than
-# moving once per event -- see RenderProvider.h's ConsumeInput for why an event
-# ("this key changed") and a motion ("these keys are held") are different
-# questions, and why answering the second from the first is what makes W+A a
-# diagonal instead of a race between two key-repeat timers.
+# The keys are stated as the VIEWER moves, and the scene moves opposite; the
+# direction is relative to the current yaw, so W follows the mouse rather than
+# a world axis. Pitch aims the view and does not lift the feet, which is why
+# Q/E exist.
+#
+# BOTH KINDS ARRIVE ON THIS ONE EDGE. Keys and pointer deltas share a record
+# (ontology/InputSource.h) and one handler, because a look and a step that
+# happened together are one intent and two streams would let them drift apart.
+#
+# The consumer only RECORDS -- a bit per key, two angles for the look. The
+# motion is integrated where it is observed, in the projection, over the
+# interval since the last frame: an event says a key CHANGED, and movement
+# depends on what is HELD, which are different questions. Answering the second
+# from the first is what makes W+A a diagonal rather than a race between two
+# key-repeat timers, and what makes the speed the scene's rather than the
+# keyboard's.
+#
+# Mouse capture is the CALLER's to set (main.CaptureMouse(1), see
+# render_scene3d.etcs): whether the cursor is free is a property of the window
+# and of what else the user is doing with it, not of this edge.
 
 requires window [Window]
 requires scene [Drawable3D]
