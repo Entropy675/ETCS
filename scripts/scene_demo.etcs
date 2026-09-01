@@ -65,13 +65,7 @@ gpu.Create()
 # Surface cannot be built until the window exists -- it takes its VkSurfaceKHR
 # from the window's native handle and its extent from the window's size.
 spawn WindowProvider::Window main
-
-main.Run(1024, 768, 'ETCS scene')
-
-# Input first: ProduceEvents spins on IsActive() before registering an
-# observer, so detaching it before the window is live just burns thread 2
-# waiting.
-detach window_events.etcs window=main
+main.Create(1024, 768, 'ETCS scene')
 
 # Child, not a root spawn: the parent link IS the binding between a surface
 # and the window it draws into.
@@ -103,6 +97,13 @@ backdrop.Blit(@badge, 380, 60, 0, 0, 0.85)
 # Layer onto the screen, on the GPU: same verb, different surface.
 view.Clear(0.03, 0.03, 0.05, 1.0)
 view.Blit(@backdrop, 80, 60, 864, 648, 1.0)
+
+# ── the edges ────────────────────────────────────────────────────────────
+#
+# Input first: ProduceEvents spins on IsActive() before registering an
+# observer, so detaching it before the window is live just burns thread 2
+# waiting.
+detach window_events.etcs window=main
 
 # And the frame pump. This is the last line that starts anything, and after
 # it the script has nothing left to do -- which is the whole point.
