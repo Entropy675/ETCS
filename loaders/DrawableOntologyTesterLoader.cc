@@ -31,6 +31,7 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include <string>
 
 static int g_pass = 0;
 static int g_fail = 0;
@@ -60,6 +61,11 @@ public:
     int32_t     z = 0;
 
     int32_t Order() override { return z; }
+
+    // The ONE comparison Orderable requires. >, <=, >=, == and != are
+    // derived from it by OrderableBase -- there is nothing else to declare
+    // and no way to make the six disagree.
+    bool operator<(const BoxNode& o) const { return z < o.z; }
 
     Rect2D BoundsConcrete() { return rect; }
     bool   ContainsLocalConcrete(int32_t x, int32_t y)
@@ -100,6 +106,8 @@ public:
 
     int32_t Order() override { return z; }
 
+    bool operator<(const TriangleNode& o) const { return z < o.z; }
+
     Rect2D BoundsConcrete() { return rect; }
     // Lower-left half of the box, scaled to its aspect: y*w <= x*h.
     bool ContainsLocalConcrete(int32_t x, int32_t y)
@@ -128,6 +136,10 @@ public:
     Box3D        box{{0.0f, 0.0f, 0.0f}, {1.0f, 1.0f, 1.0f}};
     Drawable2D_* plane       = nullptr;
     int          projections = 0;
+    int32_t      z           = 0;
+
+    int32_t Order() override { return z; }
+    bool operator<(const SceneNode& o) const { return z < o.z; }
 
     Box3D Bounds3DConcrete() { return box; }
     bool  ContainsLocal3DConcrete(Point3D p)
@@ -339,6 +351,98 @@ int main()
 
         ETCS::MemoryArena::getInstance().deleteEntity(scene, true);
         ETCS::MemoryArena::getInstance().deleteEntity(image_plane, true);
+    }
+
+    // -- 7. Orderable: one operator required, five derived ----------------
+    {
+        BoxNode* lo = arena.allocate<BoxNode>();
+        BoxNode* hi = arena.allocate<BoxNode>();
+        lo->z = 1;
+        hi->z = 7;
+
+        check(*lo < *hi,   "operator< is the leaf's own");
+        check(*hi > *lo,   "operator> derived from it");
+        check(*lo <= *hi,  "operator<= derived");
+        check(*hi >= *lo,  "operator>= derived");
+        check(*lo != *hi,  "operator!= derived");
+
+        BoxNode* same = arena.allocate<BoxNode>();
+        same->z = 1;
+        check(*lo == *same,
+              "== is EQUIVALENCE under the ordering -- two distinct entities, equal standing");
+        check(lo->getRID() != same->getRID(),
+              "...and identity is still the RID, which they do not share");
+
+        ETCS::MemoryArena::getInstance().deleteEntity(lo, true);
+        ETCS::MemoryArena::getInstance().deleteEntity(hi, true);
+        ETCS::MemoryArena::getInstance().deleteEntity(same, true);
+    }
+
+    // -- 8. the RIDList orders a homogeneous list by the leaf's operator< --
+    //
+    // Five boxes under one parent, spawned in an order that has nothing to
+    // do with their z. The list they live in is a hash map, so its own
+    // enumeration is arbitrary; the ordered view is not.
+    {
+        BoxNode* stack = arena.allocate<BoxNode>();
+        stack->rect  = Rect2D{0, 0, 400, 400};
+        stack->label = "stack";
+
+        const int32_t zs[] = {40, 10, 50, 20, 30};
+        std::vector<BoxNode*> made;
+        for (int i = 0; i < 5; ++i)
+        {
+            BoxNode* n = stack->addTag<BoxNode>();
+            n->rect  = Rect2D{0, 0, 10, 10};
+            n->z     = zs[i];
+            n->label = "z" + std::to_string(zs[i]);
+            made.push_back(n);
+        }
+
+        std::vector<std::pair<ETCS::Buffer, ETCS::RID>> ordered;
+        stack->getOrderedTypedChildren(ordered);
+        bool ascending = ordered.size() == 5;
+        int32_t prev = -1;
+        for (const auto& e : ordered)
+        {
+            ETCS::Entity* c = stack->getTypedChild(e.first, e.second);
+            if (!c) { ascending = false; break; }
+            int32_t z = static_cast<BoxNode*>(c->getTrueType())->z;
+            if (z < prev) ascending = false;
+            prev = z;
+        }
+        check(ascending, "RIDList orders a homogeneous list by the pointee's operator<");
+
+        // The stale case no container can see: the key moves, membership
+        // does not. Without the explicit seam the view keeps its old answer.
+        made[2]->z = 5;    // was 50, the last; now 5, the first
+        made[2]->Reorder();
+
+        std::vector<std::pair<ETCS::Buffer, ETCS::RID>> after;
+        stack->getOrderedTypedChildren(after);
+        ETCS::Entity* first = after.empty()
+            ? nullptr : stack->getTypedChild(after[0].first, after[0].second);
+        check(first != nullptr
+           && static_cast<BoxNode*>(first->getTrueType())->z == 5,
+              "Reorder() re-establishes position after the key moves under the list");
+
+        // And the seam that needs no cooperation: a push marks it stale by
+        // itself, so a newly attached child lands in the right place.
+        BoxNode* late = stack->addTag<BoxNode>();
+        late->rect  = Rect2D{0, 0, 10, 10};
+        late->z     = -1;
+        late->label = "late";
+
+        std::vector<std::pair<ETCS::Buffer, ETCS::RID>> after_push;
+        stack->getOrderedTypedChildren(after_push);
+        ETCS::Entity* now_first = after_push.empty()
+            ? nullptr : stack->getTypedChild(after_push[0].first, after_push[0].second);
+        check(after_push.size() == 6
+           && now_first != nullptr
+           && static_cast<BoxNode*>(now_first->getTrueType())->z == -1,
+              "an insert marks the view stale by itself -- no Reorder() needed at a seam");
+
+        ETCS::MemoryArena::getInstance().deleteEntity(stack, true);
     }
 
     ETCS::MemoryArena::getInstance().deleteEntity(canvas, true);

@@ -939,6 +939,55 @@ public:
  * the (tag, RID) pair getTypedChildren() above reports it under.
  * nullptr if the tag was never attached, or the RID is no longer live.
  */
+    /*
+ * getOrderedTypedChildren(out) - the same enumeration, with each tag's own
+ * list reporting in ITS order (RIDList::collect_ordered, which sorts by the
+ * pointee's operator< when the concrete type declares one).
+ *
+ * WITHIN a tag, this is a real order. ACROSS tags it is not, and cannot be
+ * from here: children of different concrete types live in different lists,
+ * and two unrelated leaf types have no comparison between them -- that is
+ * what makes operator< on the leaf a safe thing to require in the first
+ * place. Tags come out in first-attachment order, as they always have.
+ *
+ * A caller that needs one order over a MIXED set has to supply the relation
+ * that spans them, which means a scalar every member can answer rather than
+ * a pairwise operator (Drawable_::Order() is exactly that). This function
+ * gives that caller its input already sorted within each group, so the
+ * cross-group step is a stable merge over an almost-sorted sequence instead
+ * of a full sort over an arbitrary one.
+ */
+    void getOrderedTypedChildren(std::vector<std::pair<ETCS::Buffer, RID>>& out) const
+    {
+        std::lock_guard<std::mutex> lock(m_tagMutex);
+        for (const auto& tag : typed_child_order_)
+        {
+            auto it = typed_children_.find(tag);
+            if (it == typed_children_.end()) continue;
+            std::vector<RID> rids;
+            it->second.invoke_collect_rids_ordered(rids);
+            for (RID r : rids) out.emplace_back(tag, r);
+        }
+    }
+    /*
+ * reorderTypedChild(rid) - mark the ordered view of whichever of this
+ * entity's typed-children lists holds `rid` as stale.
+ *
+ * The receiving end of Orderable_::Reorder(): a child whose ordering key
+ * moved tells its PARENT, because the list is the parent's, not the
+ * child's. Searches rather than taking a tag, so a caller that knows only
+ * its own RID -- which is every caller, since an entity does not carry the
+ * key its parent filed it under -- needs nothing it does not have.
+ *
+ * Silent when no list holds it: a root-level entity, or one already
+ * removed. Neither is an error; nothing is holding it in an order.
+ */
+    void reorderTypedChild(RID rid)
+    {
+        std::lock_guard<std::mutex> lock(m_tagMutex);
+        for (auto& entry : typed_children_)
+            if (entry.second.invoke_contains(rid)) { entry.second.invoke_reorder(); return; }
+    }
     Entity* getTypedChild(const ETCS::Buffer& tag, RID rid) const
     {
         std::lock_guard<std::mutex> lock(m_tagMutex);

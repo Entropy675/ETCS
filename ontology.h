@@ -45,6 +45,7 @@
 #include "ontology/GateBase.h"
 #include "ontology/SwitchableBase.h"
 #include "ontology/FilterBase.h"
+#include "ontology/OrderableBase.h"
 
 #define ONTOLOGY_H__VER_0 // maybe we will replace this with a hash of this file
 

@@ -120,7 +120,7 @@ public:
     void collectDrawableChildren(std::vector<Drawable_*>& out)
     {
         std::vector<std::pair<ETCS::Buffer, ETCS::RID>> kids;
-        getTypedChildren(kids);
+        getOrderedTypedChildren(kids);
         out.reserve(kids.size());
         for (const auto& entry : kids)
         {
@@ -143,8 +143,17 @@ protected:
  *
  * Painter's order by Order(), ascending -- see it above for why the
  * child registry's own enumeration order could not supply this.
- * stable_sort, so equal Order keeps whatever order the registry gave,
- * rather than permuting siblings that never asked to be reordered.
+ *
+ * TWO ORDERINGS, one per question, and they compose rather than
+ * compete. getOrderedTypedChildren has each tag's own RIDList already
+ * sorted by the LEAF's operator< (which Orderable requires of every
+ * drawable, OrderableBase.h) -- a real relation, but only within one
+ * concrete type, because two unrelated leaf types have no comparison
+ * between them and requiring one would be requiring a lie. The merge
+ * across tags is the cross-type question, and it needs a scalar every
+ * member can answer whatever it is: Order(). stable_sort, so the
+ * within-tag order the lists already established survives wherever
+ * Order() ties.
  *
  * A child that is not a Drawable is skipped rather than treated as an
  * error. Entities nest for many reasons -- a Surface's Instance, a
