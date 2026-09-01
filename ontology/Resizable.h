@@ -30,8 +30,8 @@ struct WindowSize
 // Size + resize notification -- split out of what used to be
 // Window_ (see Window.h's own comment). Not window-specific: this
 // is "a thing with a 2D size that changes and tells listeners" --
-// RenderProvider::Target composes it at the ontology-family level
-// (TargetBase.h) because swapchain recreation on resize is not an
+// RenderProvider's surfaces compose it at the ontology-family level
+// (SurfaceBase.h) because swapchain recreation on resize is not an
 // optional per-backend concern the way, say, Deletable is.
 
 class Resizable_ : virtual public ETCS::Entity
@@ -54,7 +54,7 @@ protected:
     // Fires every registered listener, not just the size update: pulled
     // out during the Window_ split (was `m_size = newSize;` only, so
     // m_resizeListeners was populated on OnResize but never consulted
-    // again -- a real bug, not just dead code, since RenderProvider::Target
+    // again -- a real bug, not just dead code, since RenderProvider::Surface
     // depends on an ACTUAL resize (not just the initial OnResize call)
     // recreating its swapchain. Fixed here rather than left for whoever
     // first needed post-registration resize delivery to hit it.

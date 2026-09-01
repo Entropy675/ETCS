@@ -12,17 +12,21 @@
 //   10 |     public UnregisteredBase<UserInstance>
 // Wherever your use of it is.
 
-// these ones are a bit more questionable:
+// these ones are a bit more questionable (too general?):
 #include "ontology/ConnectionStateBase.h"
 #include "ontology/HtmlPageBase.h"
 #include "ontology/WindowBase.h"
-#include "ontology/InputSourceBase.h"
-#include "ontology/ResizableBase.h"
-#include "ontology/TargetBase.h"
+#include "ontology/InputSourceBase.h" 
 
 // these ones may be turned into just Database with a flag:
 #include "ontology/LocalDatabaseBase.h"
 #include "ontology/RemoteDatabaseBase.h"
+
+// Lower suspicion graphical/window ontology types (mostly RenderProvider/WindowProvider):
+#include "ontology/ResizableBase.h"
+#include "ontology/SurfaceBase.h"
+#include "ontology/PresentableBase.h"
+#include "ontology/PixelsBase.h"
 
 // standard ontlogy supertype bases:
 #include "ontology/DeletableBase.h"
