@@ -2570,17 +2570,22 @@ inline Entity* spawn(const std::string& module_name, const std::string& tag,
  * bases after this one have not registered their interface pointers yet,
  * and getRID() would be dispatching through a half-formed vtable.
  *
- * WHAT IS STORED is the Entity*, not the interface pointer, even though the
- * list is templated on Family_*: RIDList's storage is Entity* for every
- * list in the runtime (see RIDList.h's MapType -- T is a compile-time tag,
- * not the stored type). Putting an already-adjusted Family_* into a slot
- * that invoke_get hands back as Entity* would make one type-erased handle
- * mean two different things depending on which row it came from, which is
- * the silently-mis-adjusted-pointer hazard ETCS_API.h already warns about
- * for Wrapper_/IWireWrapper. The uniform Base* call surface comes from
- * resolve_in_family below instead, which goes through the interface pointer
- * -- the mechanism built for exactly this, and correct by construction.
+ * WHAT IS STORED is the interface pointer -- the Family_* subobject
+ * address ETCS_MAKE_INSTANCE registered -- because a family aggregate is
+ * RIDList<Family_*> and RIDList is genuinely typed at its own local
+ * provider (RIDList.h). It goes in through insert_iface rather than the
+ * plain insert slot: that one recovers T with getTrueType(), which is the
+ * most-derived address and therefore the WRONG pointer for a base
+ * subobject. Both slots convert inside handle(), the last place T is
+ * known; the handle stays string-keyed and erased on purpose, and what
+ * makes a key trustworthy across that boundary is module verification, not
+ * anything recoverable from the pointer itself.
  */
+// Declared in RIDList.h, where Entity is necessarily incomplete -- see its
+// comment there. Defined here, where the class is complete: it is the one
+// member call RIDList's handle lambdas need and cannot make themselves.
+inline void* etcs_true_type(Entity* e) { return e ? e->getTrueType() : nullptr; }
+
 inline void etcs_supertype_fanout(Entity* e)
 {
     if (!e) return;
@@ -2594,7 +2599,11 @@ inline void etcs_supertype_fanout(Entity* e)
     {
         auto it = ridMap.find(family);
         if (it == ridMap.end()) continue;   // a family this module does not publish
-        it->second.invoke_insert(rid, e);
+        // insert_iface, not insert: this list's T is a base subobject
+        // (Pixels_*, Surface_*), so the pointer it must store is the
+        // adjusted one ETCS_MAKE_INSTANCE registered -- getTrueType(),
+        // which the plain insert slot uses, would be the wrong address.
+        it->second.invoke_insert_iface(rid, e->getInterfacePointer(family));
     }
 }
 
@@ -2619,9 +2628,10 @@ inline Base* resolve_in_family(const char* family, RID rid)
     auto& ridMap = ETCS::EventNode::getInstance().ridMap;
     auto it = ridMap.find(key);
     if (it == ridMap.end()) return nullptr;
-    Entity* e = it->second.invoke_get(rid);
-    if (!e) return nullptr;
-    return static_cast<Base*>(e->getInterfacePointer(key));
+    // Straight out of the list: a family aggregate stores the Base*
+    // itself (RIDList.h), so there is no interface-pointer round trip and
+    // no adjustment happening here -- this is the pointer that was stored.
+    return static_cast<Base*>(it->second.invoke_get_iface(rid));
 }
 
 } // namespace ETCS
