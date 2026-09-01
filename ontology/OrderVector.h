@@ -5,6 +5,7 @@
 #include "../core_defs.h"
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 
 // ---------------------------------------------------------------------------
 // OrderVector — two linearly related rows of four, and the reserved base of a
@@ -66,19 +67,50 @@
 // here to work out how much is owed at an interaction; what an entity's own
 // history is measured in is how many times it has paid.
 //
-// AND THAT IS THE SAME COUNTER A PRNG DRAW ADVANCES. A random number is not a
-// separate mechanism that happens to also need a clock -- it IS an entropy
-// emission, the uncertainty of one boundary crossing written down, so an
-// entity drawing from a substituted PRNG and an entity shedding heat are
-// ticking the one counter for the same reason. Anything that has to be
-// deterministic per entity (a sandbox substituting the generator, a replay
-// that must land on the same draws) indexes off this count rather than a
-// stream position of its own: two clocks would have to be kept in step, and
-// keeping them in step is exactly the thing that cannot be done from inside a
-// sandbox. Reserved here rather than implemented -- the counter is on the
-// bodies (Scene3D::CausalTicks) and the substitution is not written yet -- but
-// the reading is fixed now, because it is the part that decides whether the
-// two mechanisms can ever be one.
+// A PRNG DRAW HAPPENS INSIDE AN EMISSION, IT IS NOT INDEXED BY ONE. This is
+// the distinction the whole reserved design turns on, and getting it backwards
+// is easy: a draw is not a separate event sequenced beside the tick and keyed
+// off its number. The uncertainty of a boundary crossing IS what the emission
+// carries, so a draw READS A PROPERTY OF THE EMISSION -- it occurs within that
+// event, in the same lazy step, not after it.
+//
+// Which is why the step is an AXIS of time rather than a count of it. Where a
+// guard captures and re-emits a generator, the captured event is nested in the
+// emission, so everything settled by one commit is SIMULTANEOUS by
+// construction: order exists between emissions and nowhere inside one. That is
+// the same granularity argument the depth buffer makes about space
+// (Drawable3D.h) -- an emission is the finest grain at which "before" is still
+// a total order, and asking for order below it is asking a question the
+// structure does not have an answer to.
+//
+// It is also what makes the laziness legitimate rather than an optimisation:
+// deferring a commit cannot reorder anything, because nothing inside the
+// deferred interval was ordered against anything else to begin with. And it is
+// what makes a substituted generator deterministic without threading a seed
+// anywhere -- replaying the same emission reproduces the same uncertainty
+// because the uncertainty is derived from the emission's own content, and two
+// clocks that would have to be kept in step never exist. Keeping them in step
+// is precisely what cannot be done from inside a sandbox.
+//
+// AN EMISSION IS ITSELF AN OrderVector, which is the reason this file needs no
+// second struct for one. What crosses a boundary is a quantity of energy AT a
+// place, FROM an identity -- which is rows 0 and 1 exactly, and everything a
+// reader wants is then derived by the same three functions as for any other
+// point rather than restated as fields. It comes out with |O| = 0: emitted
+// entropy is unordered by definition, so all of its energy is heat, and the
+// zero is a statement rather than a default. An emission that ever carried a
+// direction would be radiation pressure, and the representation for it already
+// exists -- it is a non-zero O on the thing that crossed.
+//
+// So a transfer is one vector moving: EmitEvent hands it out, Absorb takes it
+// in, and the receiving point gains the heat and any momentum it came with,
+// through the operations that were already here. There is no separate ledger
+// type that could disagree with the state it describes.
+//
+// Reserved, not implemented: the derivation is below, the count is on the
+// bodies (Scene3D::CausalTicks), and the guard substitution is not written. The
+// reading is fixed now because it is the part that decides whether the two
+// mechanisms can ever be one thing.
 //
 // THE INVARIANT IS STRUCTURAL, not checked. Impulse adds j joules along a unit
 // direction: |K| grows by AT MOST j (triangle inequality) while E grows by
@@ -142,6 +174,24 @@ struct OrderVector
     float oy     = 0.0f;
     float oz     = 0.0f;
     float energy = 0.0f;
+
+    // ── meta: real, and not yet rows ────────────────────────────────────
+    //
+    // Both are properties of the causal step this vector represents, and both
+    // are here rather than in a companion struct because a companion struct is
+    // a second thing that can disagree with the first. They are called meta
+    // only in the sense that the 4x4 has not been cut yet: `interval` is the
+    // span the step settles, which is what row 2's pivot and radius will be
+    // stated over once composition is real, and `uncertainty` is what a draw
+    // nested inside the step reads, which is angular the moment row 3's spinor
+    // exists. Solidifying them means moving them into those rows, not
+    // inventing them then.
+    //
+    // On a BODY they describe its most recent crossing and are current state;
+    // on an EMISSION they describe that emission and are fixed. Same fields,
+    // and the difference is only which of the two the vector is.
+    float    interval    = 0.0f;
+    uint64_t uncertainty = 0;
 
     // ── readings of the relation ────────────────────────────────────────
 
@@ -281,6 +331,48 @@ struct OrderVector
         return q;
     }
 
+    /*
+ * Emit, as the EVENT rather than the number -- the form a guard can nest
+ * inside.
+ *
+ * Same transfer as Emit above, and it returns the scope: the joules that
+ * crossed, the span they settle, whose boundary it was, and the uncertainty
+ * carried by that crossing. Nothing is stored: the emission is handed to the
+ * caller, who is the only one that knows what else belongs inside it.
+ *
+ * The derivation mixes the three facts that make this crossing THIS crossing
+ * -- identity, quantity, span. It is a splitmix-style finaliser over their
+ * bits, which is a hash and not a generator: there is no state to advance,
+ * because a stream position would be the second clock this whole reading
+ * exists to avoid. Quantity and span are taken by their bit patterns rather
+ * than rounded, so an emission that differs at all differs everywhere.
+ *
+ * A zero emission has zero uncertainty and is not an event: nothing crossed,
+ * so there is nothing for anything to be nested in, and a draw at that
+ * moment has no boundary to read.
+ */
+    OrderVector EmitEvent(float joules, float span)
+    {
+        // Row 0 of what leaves is where it left from and whose boundary it
+        // crossed -- the emitter's own row 0, unchanged. An emission has a
+        // place and an identity for the same reason any other point does.
+        OrderVector e;
+        e.x = x; e.y = y; e.z = z;
+        e.rid      = rid;
+        e.interval = span;
+
+        // Row 1: all of it, and none of it ordered. |O| = 0 is the statement
+        // that what crossed was entropy -- see this file's header. The energy
+        // is whatever Emit could actually take, which is capped at the heat
+        // there was.
+        e.energy = Emit(joules);
+        e.ox = e.oy = e.oz = 0.0f;
+        if (!(e.energy > 0.0f)) return e;   // nothing crossed: not an event
+
+        e.uncertainty = derive_uncertainty(e);
+        return e;
+    }
+
     // The receiving end: heat in, motion untouched. An environment absorbing
     // its contents' entropy gets warmer and does not start moving, which is
     // exactly what holding K while raising E says.
@@ -290,6 +382,36 @@ struct OrderVector
         const float kx = ox * energy, ky = oy * energy, kz = oz * energy;
         energy += joules;
         setKinetic(kx, ky, kz);
+    }
+
+    /*
+ * Absorb a whole crossing -- the other half of EmitEvent, and the form a
+ * transfer actually takes: one vector leaves one point and arrives at
+ * another, with nothing converted on the way.
+ *
+ * Its heat lands as heat and its ordered part lands as an impulse, which is
+ * the correct reading and not two cases: energy that arrived with a
+ * direction pushes. Today every emission has |O| = 0 so only the first line
+ * ever fires -- but the second is what radiation pressure would already be,
+ * with no new operation, which is the point of the emission being an
+ * OrderVector rather than a number.
+ *
+ * Absorbing does NOT copy the crossing's meta. interval and uncertainty
+ * belong to the step that PRODUCED it; the receiver's own step is a
+ * different one, and taking them would be claiming somebody else's clock.
+ */
+    void Absorb(const OrderVector& q)
+    {
+        const float heat = q.Heat();
+        if (heat > 0.0f) Absorb(heat);
+
+        const float ke = q.KineticEnergy();
+        if (ke > 0.0f)
+        {
+            float dx, dy, dz;
+            q.Direction(dx, dy, dz);
+            Impulse(dx, dy, dz, ke);
+        }
     }
 
     // Move the point by one step of its own rate row. The linear relation
@@ -310,6 +432,32 @@ struct OrderVector
     // All energy to heat, motion to rest. What a collision with something
     // immovable does, and what a released control eventually reaches.
     void Rest() { ox = oy = oz = 0.0f; }
+
+    /*
+ * The uncertainty a crossing carries, derived from the crossing itself.
+ *
+ * Identity, quantity and span -- the three facts that make this crossing THIS
+ * crossing -- mixed by a splitmix finaliser. A HASH AND NOT A GENERATOR:
+ * there is no state to advance, because a stream position would be the second
+ * clock this whole reading exists to avoid (see the header). Quantity and
+ * span go in by their bit patterns rather than rounded, so two crossings that
+ * differ at all differ everywhere.
+ *
+ * Static and taking the vector, rather than reading members, because it is a
+ * function OF an emission and is worth being able to check against one
+ * without having produced it.
+ */
+    static uint64_t derive_uncertainty(const OrderVector& e)
+    {
+        uint32_t qb, ib;
+        std::memcpy(&qb, &e.energy,   sizeof(qb));
+        std::memcpy(&ib, &e.interval, sizeof(ib));
+        uint64_t h = e.rid ^ (static_cast<uint64_t>(qb) << 32) ^ ib;
+        h ^= h >> 30; h *= 0xbf58476d1ce4e5b9ull;
+        h ^= h >> 27; h *= 0x94d049bb133111ebull;
+        h ^= h >> 31;
+        return h;
+    }
 
 private:
     // O is K scaled by 1/E, which is the whole of the linear relation between
