@@ -1,0 +1,93 @@
+#!/usr/bin/env etcs
+
+# The same shape as scene_demo.etcs, with the scene living in the ENTITY TREE
+# instead of in this file -- which is what PolygonDrawable2D is for.
+#
+#     ./bin/etcs scripts/polygon_scene.etcs
+#
+# and then, from the prompt:
+#
+#     Root> RenderProvider                                  # read the RIDs
+#     Root> scripts/polygon_add.etcs  root=<RID> view=<RID>  # nest a shape, redraw
+#     Root> scripts/polygon_draw.etcs root=<RID> view=<RID>  # redraw as-is
+#
+# WHAT CHANGED FROM scene_demo.etcs. There, adding a layer meant restating the
+# whole composition, because the scene's structure lived in the script and the
+# surface only ever saw a flat list of blits. Here the structure IS the tree:
+# a new shape is a spawn under a parent, and `root.Draw(@view)` replays
+# everything reachable from the root in one call. Nothing to restate.
+
+spawn RenderProvider::Instance gpu
+gpu.Create()
+
+spawn WindowProvider::Window main
+main.Create(1024, 768, 'ETCS polygon scene')
+
+main.spawn(RenderProvider::Surface view)
+view.Create(@gpu, modules/RenderProvider/shaders/)
+
+# ── the scene ────────────────────────────────────────────────────────────
+#
+# The root: a rectangle the size of the frame. It is an ordinary polygon --
+# four corners -- and differs from everything nested inside it only by being
+# the most addressable space there is.
+spawn RenderProvider::PolygonDrawable2D scene
+scene.Create()
+scene.AddPoint(0, 0)
+scene.AddPoint(1024, 0)
+scene.AddPoint(1024, 768)
+scene.AddPoint(0, 768)
+scene.SetFill(0.06, 0.07, 0.11, 1.0)
+
+# A triangle, nested. Its corners are stated in the ROOT's space, because
+# that is the space it lives in -- the child defines its own coordinate
+# system relative to its parent, and its bounding box is where that system
+# starts.
+scene.spawn(RenderProvider::PolygonDrawable2D tri)
+tri.Create()
+tri.AddPoint(120, 120)
+tri.AddPoint(520, 180)
+tri.AddPoint(200, 520)
+tri.SetFill(0.85, 0.72, 0.20, 1.0)
+tri.SetOrder(1)
+
+# A quad nested inside the TRIANGLE, with its corners in the triangle's own
+# space. It draws wherever the triangle is -- move the triangle and this
+# moves with it, because nothing here stores an absolute position.
+tri.spawn(RenderProvider::PolygonDrawable2D badge)
+badge.Create()
+badge.AddPoint(20, 40)
+badge.AddPoint(150, 40)
+badge.AddPoint(150, 110)
+badge.AddPoint(20, 110)
+badge.SetFill(0.90, 0.25, 0.35, 0.85)
+badge.SetOrder(2)
+
+# A second sibling of the triangle, stacked under it.
+scene.spawn(RenderProvider::PolygonDrawable2D pent)
+pent.Create()
+pent.AddPoint(620, 300)
+pent.AddPoint(860, 380)
+pent.AddPoint(800, 620)
+pent.AddPoint(640, 620)
+pent.AddPoint(560, 420)
+pent.SetFill(0.20, 0.65, 0.85, 1.0)
+pent.SetOrder(0)
+
+# One call, whole tree: fill the root, then its children in Order(), then
+# theirs. This is the downward half of the contract doing the work a render
+# list would otherwise have to.
+detach window_events.etcs window=main
+detach render_frames.etcs view=view
+
+# Drawn AFTER the edges are live, deliberately: this is the concurrent case,
+# a thousand-call composition against a 60Hz presenter on another thread, and
+# it is the case that used to lose everything emitted before whichever Present
+# landed in the middle of it. Clear is the boundary now, so the batch is
+# whole whenever the presenter next looks.
+#
+# Clear delimits the composition: it starts a fresh picture, and DrawRect and
+# Blit only ever append to it. Without it the tree would be appended to the
+# previous statement of itself every time.
+view.Clear(0.02, 0.02, 0.03, 1.0)
+scene.Draw(@view)
