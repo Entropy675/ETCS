@@ -27,7 +27,9 @@
 #     W / S   forward / back, along the way the camera is facing
 #     A / D   strafe left / right
 #     Q / E   up / down
-#     mouse   look -- yaw and pitch, applied to whichever camera projects
+#     mouse   look -- composed onto the scene's own row 3 (OrderVector.h)
+#             and applied to whichever camera projects it
+#     ctrl+tab  release the captured cursor
 #
 # The keys are stated as the VIEWER moves, and the scene moves opposite; the
 # direction is relative to the current yaw, so W follows the mouse rather than
@@ -47,8 +49,10 @@
 # keyboard's.
 #
 # Mouse capture is the CALLER's to set (main.CaptureMouse(1), see
-# render_scene3d.etcs): whether the cursor is free is a property of the window
-# and of what else the user is doing with it, not of this edge.
+# render_scene3d.etcs) and the WINDOW's to release (Ctrl+Tab): whether the
+# cursor is free is a property of the window and of what else the user is doing
+# with it, not of this edge -- and the way out must keep working even when this
+# edge does not.
 
 requires window [Window]
 requires scene [Drawable3D]
