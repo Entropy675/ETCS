@@ -164,6 +164,60 @@ public:
     void DrawIntoConcrete(Surface_*) {}
 };
 
+// ---------------------------------------------------------------------------
+// A leaf claiming the three families added alongside the compositor work:
+// Clippable (the arithmetic is the family's, applying it is the backend's),
+// Glyphs (measure and rasterise, split by WHEN each is needed) and Pointer
+// (state, as against InputSource's stream of events).
+//
+// Deliberately trivial implementations -- what is under test is that the
+// families compose, register, and hand a leaf the shared behaviour they
+// promise, not that anyone can rasterise a font.
+// ---------------------------------------------------------------------------
+class Instrument : public ClippableBase<Instrument>,
+                   public GlyphsBase<Instrument>,
+                   public PointerBase<Instrument>
+{
+public:
+    WIRE_TYPE_IDENTITY(Instrument)
+
+    // Every SetScissor the family issued, so the test can read back that the
+    // stack discipline and the intersection happened where they should.
+    struct Scissor { int32_t x, y; uint32_t w, h; };
+    std::vector<Scissor> applied;
+
+    void SetScissorConcrete(int32_t x, int32_t y, uint32_t w, uint32_t h)
+    {
+        applied.push_back(Scissor{x, y, w, h});
+    }
+
+    TextExtent MeasureTextConcrete(const char* text, uint32_t, uint32_t size_px)
+    {
+        uint32_t n = 0;
+        while (text && text[n]) ++n;
+        return TextExtent{ n * (size_px / 2), size_px, (size_px * 3) / 4 };
+    }
+    TextExtent RasterizeTextConcrete(ETCS::RID, const char* text, uint32_t font,
+                                     uint32_t size_px, int32_t, int32_t,
+                                     float, float, float, float)
+    {
+        rasterized = true;
+        return MeasureTextConcrete(text, font, size_px);
+    }
+    bool rasterized = false;
+
+    PointerState state{};
+    PointerState ReadPointerConcrete()
+    {
+        PointerState out = state;
+        state.scroll_x = 0.0f;   // deltas are consumed by reading
+        state.scroll_y = 0.0f;
+        return out;
+    }
+    bool PointerInsideConcrete() { return inside; }
+    bool inside = true;
+};
+
 int main()
 {
     shell_startup();
@@ -443,6 +497,72 @@ int main()
               "an insert marks the view stale by itself -- no Reorder() needed at a seam");
 
         ETCS::MemoryArena::getInstance().deleteEntity(stack, true);
+    }
+
+    // -- 9. Clippable: intersect on push, restore on pop -------------------
+    {
+        Instrument* ins = arena.allocate<Instrument>();
+
+        check(ins->getInterfacePointer(ETCS::Buffer("Clippable")) != nullptr
+           && ins->getInterfacePointer(ETCS::Buffer("Glyphs"))    != nullptr
+           && ins->getInterfacePointer(ETCS::Buffer("Pointer"))   != nullptr,
+              "one leaf, three independent families registered");
+
+        ins->PushClip(100, 100, 200, 200);
+        check(ins->applied.size() == 1
+           && ins->applied[0].x == 100 && ins->applied[0].w == 200,
+              "PushClip applies the requested region when nothing is in effect");
+
+        // Nested: overlaps the first from (200,150), so the intersection is
+        // (200,150)-(300,300) = 100x150. A push can only ever shrink.
+        ins->PushClip(200, 150, 400, 400);
+        check(ins->applied.size() == 2
+           && ins->applied[1].x == 200 && ins->applied[1].y == 150
+           && ins->applied[1].w == 100 && ins->applied[1].h == 150,
+              "a nested PushClip INTERSECTS rather than replaces");
+
+        ins->PopClip();
+        check(ins->applied.size() == 3
+           && ins->applied[2].x == 100 && ins->applied[2].w == 200,
+              "PopClip restores the region the matching push replaced");
+
+        // Disjoint: nothing in common, so the region is empty -- and empty
+        // must stay empty rather than underflowing into enormous.
+        ins->PushClip(1000, 1000, 50, 50);
+        check(ins->applied.back().w == 0 && ins->applied.back().h == 0,
+              "a disjoint clip is EMPTY, not an unsigned underflow");
+
+        ins->PopClip();
+        ins->PopClip();
+        check(!ins->HasClip(), "the stack empties");
+        const size_t before = ins->applied.size();
+        ins->PopClip();
+        check(ins->applied.size() == before,
+              "popping an empty stack is a no-op, not a crash inside a draw loop");
+
+        // -- 10. Glyphs: measure without pixels, rasterise with them -------
+        const TextExtent m = ins->MeasureText("hello", 0, 16);
+        check(m.width == 5 * 8 && m.height == 16 && m.baseline == 12,
+              "MeasureText answers with no surface in sight -- layout can run first");
+        check(!ins->rasterized, "...and measuring rasterised nothing");
+
+        const TextExtent r = ins->RasterizeText(0, "hello", 0, 16, 0, 0, 1, 1, 1, 1);
+        check(ins->rasterized, "RasterizeText produced pixels");
+        check(r.width == m.width && r.height == m.height && r.baseline == m.baseline,
+              "and agreed with what Measure promised -- the property layout depends on");
+
+        // -- 11. Pointer: state, and deltas consumed by reading ------------
+        ins->state = PointerState{ 640, 480, 0x1, 0.0f, -3.0f };
+        const PointerState p1 = ins->ReadPointer();
+        check(p1.x == 640 && p1.y == 480 && (p1.buttons & 0x1) != 0,
+              "Pointer reports position and buttons together, as one value");
+        check(p1.scroll_y == -3.0f, "the scroll delta arrives once");
+        const PointerState p2 = ins->ReadPointer();
+        check(p2.scroll_y == 0.0f && p2.x == 640,
+              "...and reading consumed it, while the POSITION persists");
+        check(ins->PointerInside(), "PointerInside is a separate question from the coordinates");
+
+        ETCS::MemoryArena::getInstance().deleteEntity(ins, true);
     }
 
     ETCS::MemoryArena::getInstance().deleteEntity(canvas, true);

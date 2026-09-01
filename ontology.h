@@ -17,6 +17,7 @@
 #include "ontology/HtmlPageBase.h"
 #include "ontology/WindowBase.h"
 #include "ontology/InputSourceBase.h" 
+#include "ontology/PointerBase.h"
 
 // these ones may be turned into just Database with a flag:
 #include "ontology/LocalDatabaseBase.h"
@@ -24,6 +25,7 @@
 
 // Lower suspicion graphical/window ontology types (mostly RenderProvider/WindowProvider):
 #include "ontology/ResizableBase.h"
+#include "ontology/ClippableBase.h"
 #include "ontology/SurfaceBase.h"
 #include "ontology/PresentableBase.h"
 #include "ontology/PixelsBase.h"
@@ -36,6 +38,7 @@
 #include "ontology/DrawableBase.h"
 #include "ontology/Drawable2DBase.h"
 #include "ontology/Drawable3DBase.h"
+#include "ontology/GlyphsBase.h"
 
 // standard ontlogy supertype bases:
 #include "ontology/DeletableBase.h"
@@ -45,7 +48,6 @@
 #include "ontology/GateBase.h"
 #include "ontology/SwitchableBase.h"
 #include "ontology/FilterBase.h"
-#include "ontology/OrderableBase.h"
 
 #define ONTOLOGY_H__VER_0 // maybe we will replace this with a hash of this file
 
