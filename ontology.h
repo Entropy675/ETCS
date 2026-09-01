@@ -31,13 +31,16 @@
 #include "ontology/PixelsBase.h"
 
 // The Drawable lineage: Surface refined into a node that occupies space in
-// a parent and nests. DrawableBase composes SurfaceBase, and the two leaf
-// bases compose DrawableBase, so the include order below is the lineage
-// order -- and each header includes what it refines anyway, so this list is
-// for visibility (see the ALERT above), not for ordering.
+// a parent and nests. DrawableBase composes SurfaceBase, the two leaf bases
+// compose DrawableBase, and CameraBase composes the 2D leaf -- a camera is
+// a plane like any other, differing only in that a Drawable3D fills it. So
+// the include order below is the lineage order -- and each header includes
+// what it refines anyway, so this list is for visibility (see the ALERT
+// above), not for ordering.
 #include "ontology/DrawableBase.h"
 #include "ontology/Drawable2DBase.h"
 #include "ontology/Drawable3DBase.h"
+#include "ontology/CameraBase.h"
 #include "ontology/GlyphsBase.h"
 
 // standard ontlogy supertype bases:
