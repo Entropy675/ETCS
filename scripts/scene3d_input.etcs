@@ -1,0 +1,45 @@
+#!/usr/bin/env etcs
+
+# The w/a/s/d edge: the window's event stream, consumed by a 3D scene.
+#
+#     detach scene3d_input.etcs window=<Window> scene=<Drawable3D>
+#
+# THE TWO ENDS ARE ON DIFFERENT ENTITIES, in different modules, and neither
+# was written knowing about the other. WindowProvider produces InputEvents
+# because a window is an InputSource; RenderProvider consumes them because a
+# scene wants to be moved. What crosses is the ontology's own event type
+# (ontology/InputSource.h), which is why no compile-time relationship between
+# the two modules exists or is needed. The pair is built on the CONSUMER and
+# the producer is handed in (core/CommandExecutor.h), which is exactly what
+# makes that possible.
+#
+# IT REPLACES window_events.etcs RATHER THAN JOINING IT. ProduceEvents is
+# where PollEvents gets called -- it is the OS message pump as well as the
+# event source -- so this edge is what keeps the window alive, and the cross
+# still ends the closure through it. Run both and you get two observers on the
+# ring, which works, and two pumps, which is a waste.
+#
+# CONTROLS, and the direction is deliberate: the SCENE moves, not the camera.
+# What a projection can see is the relative position of the two, and moving the
+# scene means one translation at the root relocates the whole tree (scene3d.etcs
+# on why). W pushes the scene away, which reads as walking forward.
+#
+#     W / S   further / nearer
+#     A / D   scene left / right   (reads as strafing right / left)
+#     Q / E   scene up / down      (reads as looking down / up)
+#
+# The consumer holds a bit per key and integrates on a 16ms tick rather than
+# moving once per event -- see RenderProvider.h's ConsumeInput for why an event
+# ("this key changed") and a motion ("these keys are held") are different
+# questions, and why answering the second from the first is what makes W+A a
+# diagonal instead of a race between two key-repeat timers.
+
+requires window [Window]
+requires scene [Drawable3D]
+
+window.ProduceEvents() -> scene.ConsumeInput()
+
+# The producer returns when the window closes, which is also when the cross was
+# pressed. Closing here is the same acknowledgement window_events.etcs makes:
+# the closure that opened the window is the one that ends.
+window.Close()
