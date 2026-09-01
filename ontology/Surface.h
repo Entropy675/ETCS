@@ -66,16 +66,19 @@ public:
     virtual void DrawRect(int32_t x, int32_t y, uint32_t w, uint32_t h,
                            float r, float g, float b, float a) = 0;
 
-    // Composite another surface's pixels into this one -- the primitive a
-    // layered 2D editor is built out of, called once per layer in order.
+    // Composite another surface into this one -- the primitive a layered 2D
+    // editor is built out of, called once per layer in order.
     //
-    // The source is addressed as a bare Entity*, not a Surface_*, because
-    // what an implementation actually needs off it is its Pixels_
-    // interface (Pixels.h), reached through getInterfacePointer the same
-    // generic way HttpServer reaches a foreign HtmlPage_. Taking Surface_*
-    // here would name the wrong half of the source's identity and still
-    // require the same lookup.
-    virtual void Blit(ETCS::Entity* source, int32_t x, int32_t y,
+    // The source is a Surface_, not a bare Entity* and not a Pixels_. Every
+    // surface is drawable BY definition -- that is what makes it a surface
+    // -- so the constraint this call places on its source is exactly
+    // "is a surface", stated in the type. What an implementation then needs
+    // to READ off it depends on both sides: today's CPU-backed sources are
+    // read through their Pixels_ (Pixels.h) via getInterfacePointer, and a
+    // future device-side offscreen surface would be read by copying its
+    // image instead, with no CPU bytes anywhere. Naming Pixels_ here would
+    // have frozen the first of those into the contract.
+    virtual void Blit(Surface_* source, int32_t x, int32_t y,
                        uint32_t w, uint32_t h, float opacity) = 0;
 };
 

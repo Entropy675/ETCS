@@ -144,6 +144,13 @@ inline ETCS::TagMask resolvePairModuleMask(const ETCS::Buffer& tag_a,
     return evt.result;
 }
 
+// Defined at the bottom of this file, once EventNode is complete. Declared
+// here because addTagTrampoline calls it on a non-dependent Entity*, so the
+// name has to be visible where that template is defined, not merely where
+// it is instantiated.
+class Entity;
+inline void etcs_supertype_fanout(Entity* e);
+
 class Entity
 {
     /*
@@ -1308,6 +1315,20 @@ public:
         auto it = interface_pointers_.find(family);
         return it != interface_pointers_.end() ? it->second : nullptr;
     }
+    /*
+ * The families this entity actually fulfills. Read off
+ * interface_pointers_ rather than the tags map on purpose: this map is
+ * written by exactly one thing, ETCS_MAKE_INSTANCE's ctor, once per
+ * supertype base -- so it is precisely the set of ontology families the
+ * type composed, with none of the state tags ("active") or concrete tag
+ * names that share the tags map. etcs_supertype_fanout below is its one
+ * caller.
+ */
+    void getInterfaceFamilies(std::vector<ETCS::Buffer>& result) const
+    {
+        std::lock_guard<std::mutex> lock(m_tagMutex);
+        for (auto const& [family, _] : interface_pointers_) result.push_back(family);
+    }
     void getAllActions(std::vector<ETCS::Buffer>& all_actions)
     {
         for (auto const& [tag_name, entry] : tags)
@@ -2042,6 +2063,11 @@ template<typename T>
                 child->module_registry_rid_ = rid;
             }
         }
+
+        // Same fan-in a top-level spawn gets from _make_<T> (ETCS_API.h):
+        // an addTag<T>-created child fulfills exactly the same families and
+        // has to be as findable through them.
+        etcs_supertype_fanout(child);
  
         child->parent_     = parent;
         child->parent_rid_ = rid;
@@ -2523,8 +2549,81 @@ inline Entity* spawn(const std::string& module_name, const std::string& tag,
     return evt();
 }
 #endif
- 
+
+/*
+ * -- etcs_supertype_fanout ------------------------------------------------
+ * Inserts a fully-constructed entity into the aggregate RIDList of every
+ * ontology family it fulfills. ETCS_SUPERTYPE_BASE (ETCS_API.h) publishes
+ * one such list per family under the bare family name; this is what puts
+ * anything IN them.
+ *
+ * Both this file's and DynamicLoader.h's comments have described this
+ * function as existing for a while, and destroyImpl already carries the
+ * matching fan-OUT -- but nothing ever fanned in, so every family aggregate
+ * was permanently empty and that removal loop was dead. Found by trying to
+ * use one: a spawned ImageSurface carries the Pixels type tag and its
+ * interface pointer, and was absent from the "Pixels" list.
+ *
+ * Called post-construction only (_make_/_make_child_/addTagTrampoline).
+ * It cannot run from ETCS_MAKE_INSTANCE's own ctor, which is where the
+ * families are declared: at that point the object is still being built,
+ * bases after this one have not registered their interface pointers yet,
+ * and getRID() would be dispatching through a half-formed vtable.
+ *
+ * WHAT IS STORED is the Entity*, not the interface pointer, even though the
+ * list is templated on Family_*: RIDList's storage is Entity* for every
+ * list in the runtime (see RIDList.h's MapType -- T is a compile-time tag,
+ * not the stored type). Putting an already-adjusted Family_* into a slot
+ * that invoke_get hands back as Entity* would make one type-erased handle
+ * mean two different things depending on which row it came from, which is
+ * the silently-mis-adjusted-pointer hazard ETCS_API.h already warns about
+ * for Wrapper_/IWireWrapper. The uniform Base* call surface comes from
+ * resolve_in_family below instead, which goes through the interface pointer
+ * -- the mechanism built for exactly this, and correct by construction.
+ */
+inline void etcs_supertype_fanout(Entity* e)
+{
+    if (!e) return;
+    std::vector<ETCS::Buffer> families;
+    e->getInterfaceFamilies(families);
+    if (families.empty()) return;
+
+    auto& ridMap = ETCS::EventNode::getInstance().ridMap;
+    const RID rid = e->getRID();
+    for (const ETCS::Buffer& family : families)
+    {
+        auto it = ridMap.find(family);
+        if (it == ridMap.end()) continue;   // a family this module does not publish
+        it->second.invoke_insert(rid, e);
+    }
+}
+
+/*
+ * A RID plus a family name in, a usable Base* out -- the uniform call
+ * surface over a CRTP family. The list lookup finds the entity whoever
+ * built it, and the interface pointer is the correctly-adjusted subobject
+ * address that ETCS_MAKE_INSTANCE registered, so the caller can invoke the
+ * family's contract without knowing the concrete type, which module made
+ * it, or whether that type exposes the same operations as ETCS work
+ * functions -- every implementor satisfies the C++ contract whether or not
+ * it publishes one.
+ *
+ * Returns nullptr if the family is not published here, the RID is not in
+ * it, or the entity somehow lacks the interface pointer.
+ */
+template <typename Base>
+inline Base* resolve_in_family(const char* family, RID rid)
+{
+    if (rid == 0) return nullptr;
+    const ETCS::Buffer key(family);
+    auto& ridMap = ETCS::EventNode::getInstance().ridMap;
+    auto it = ridMap.find(key);
+    if (it == ridMap.end()) return nullptr;
+    Entity* e = it->second.invoke_get(rid);
+    if (!e) return nullptr;
+    return static_cast<Base*>(e->getInterfacePointer(key));
+}
+
 } // namespace ETCS
- 
+
 #endif
- 

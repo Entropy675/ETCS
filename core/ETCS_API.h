@@ -1001,6 +1001,9 @@ namespace ETCS
         Name* handler = ETCS::MemoryArena::getInstance().allocate<Name>(); \
         buf.writeString(""); \
         _ridlist_##Name().insert(handler->getRID(), handler);\
+        /* Into every family aggregate this type composes, now that it is \
+         * fully constructed -- see etcs_supertype_fanout (Entity.h). */ \
+        ETCS::etcs_supertype_fanout(handler); \
         bool success = handler->myTagInto(buf); \
         \
         if (success){ \

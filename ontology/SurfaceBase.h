@@ -37,7 +37,7 @@ ETCS_SUPERTYPE_BASE(Surface), public ResizableBase<Derived>
     ETCS_DISPATCH_METHOD(void, Clear,    (float, r), (float, g), (float, b), (float, a));
     ETCS_DISPATCH_METHOD(void, DrawRect, (int32_t, x), (int32_t, y), (uint32_t, w), (uint32_t, h),
                                           (float, r), (float, g), (float, b), (float, a));
-    ETCS_DISPATCH_METHOD(void, Blit,     (ETCS::Entity*, source), (int32_t, x), (int32_t, y),
+    ETCS_DISPATCH_METHOD(void, Blit,     (Surface_*, source), (int32_t, x), (int32_t, y),
                                           (uint32_t, w), (uint32_t, h), (float, opacity));
 };
 
