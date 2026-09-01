@@ -60,6 +60,7 @@
 #include <sys/time.h>
 #include <unistd.h>
 #include <cerrno>
+#include <cctype>
 #include <cstring>
 #endif
 
@@ -389,6 +390,15 @@ inline std::optional<NameBinding> lookup_live(ExecutionContext& ctx,
 // byte-identical. The sigil is required because payloads carry paths and free
 // text that could collide with a name. An unresolved @name is left as written.
 // Quoted spans are skipped: 'a @b c' is a string.
+//
+// The name ends at the first character that cannot be part of one, rather
+// than at whitespace. A role name is an identifier, and the payload it sits
+// in is an ARGUMENT LIST -- so `f(@gpu, path)` is as ordinary as
+// `f(800, 600, 'title')`, which has always worked. Ending only at space/tab
+// made the name "gpu," there, which resolved to nothing and was passed
+// through verbatim, so the callee read a 0 RID and reported a missing
+// argument -- a comma silently changing what a call means, with the error
+// surfacing one layer away from the cause.
 inline std::string substitute_name_tokens(const std::string& payload,
                                           ExecutionContext& ctx)
 {
@@ -413,14 +423,19 @@ inline std::string substitute_name_tokens(const std::string& payload,
         if (ch != '@' || in_single || in_double) { out += ch; ++i; continue; }
 
         size_t start = i + 1;
-        size_t end   = payload.find_first_of(" \t", start);
-        std::string name = payload.substr(start, (end == std::string::npos)
-                                                 ? std::string::npos : end - start);
+        size_t end   = start;
+        while (end < payload.size()
+               && (std::isalnum(static_cast<unsigned char>(payload[end])) || payload[end] == '_'))
+            ++end;
+
+        std::string name = payload.substr(start, end - start);
         ETCS::RID rid = name.empty() ? 0 : ctx.resolve_name(name);
-        if (rid == 0) out += payload.substr(i, (end == std::string::npos)
-                                               ? std::string::npos : end - i);
+        // Unresolved: emit the sigil and the name exactly as written and
+        // carry on from the delimiter, which the loop copies like any other
+        // byte. No npos case to special-case any more -- end is always a
+        // real index or the payload length.
+        if (rid == 0) out += payload.substr(i, end - i);
         else          out += std::to_string(rid);
-        if (end == std::string::npos) break;
         i = end;
     }
     return out;
