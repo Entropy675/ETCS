@@ -28,6 +28,15 @@
 #include "ontology/PresentableBase.h"
 #include "ontology/PixelsBase.h"
 
+// The Drawable lineage: Surface refined into a node that occupies space in
+// a parent and nests. DrawableBase composes SurfaceBase, and the two leaf
+// bases compose DrawableBase, so the include order below is the lineage
+// order -- and each header includes what it refines anyway, so this list is
+// for visibility (see the ALERT above), not for ordering.
+#include "ontology/DrawableBase.h"
+#include "ontology/Drawable2DBase.h"
+#include "ontology/Drawable3DBase.h"
+
 // standard ontlogy supertype bases:
 #include "ontology/DeletableBase.h"
 #include "ontology/EphemeralBase.h"
