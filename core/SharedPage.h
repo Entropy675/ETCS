@@ -16,6 +16,34 @@ struct SharedPage
     std::atomic<bool>      tombstoned;
     uint64_t    reader_rid;
 
+    /*
+ * PRODUCER LIVENESS -- the one thing about a stream pair that neither
+ * side could previously observe.
+ *
+ * DEFINE_STREAM_FUNC_PRODUCE enqueues its body onto the MODULE's own
+ * ThreadPool and returns immediately, which is what makes a produce
+ * side concurrent at all. The consequence was that nothing anywhere
+ * owned that body's lifetime: the loader's stream call blocks on the
+ * CONSUMER, and the future it got back from the enqueue completes when
+ * the TRAMPOLINE returns, not when the body does. So `the pair is
+ * finished` meant one half of what every caller reads it as, and a
+ * produce body kept running -- still holding `self` -- through the
+ * teardown, the closure drain, and the Deletes that followed.
+ *
+ * This is the flag that makes the other half observable. Raised on the
+ * trampoline's own thread BEFORE the enqueue (so it is already set when
+ * the call proceeds), cleared by a guard around the body (so an
+ * exception counts as leaving). It lives HERE, in the page the two
+ * halves already share, because it must be readable from the loader
+ * while the body runs in a module -- the one piece of memory both sides
+ * hold by construction.
+ *
+ * int, not bool: a fan-in pair may enqueue more than one produce body
+ * against the same page, and `busy` is then the count, not the last
+ * one to leave.
+ */
+    std::atomic<int>       producers_live;
+
     static SharedPage* allocate(MemoryArena& arena, uint64_t reader_rid)
     {
         long long chunk_size  = arena.getChunkSize();
@@ -32,6 +60,7 @@ struct SharedPage
         page->written.store(0, std::memory_order_relaxed);
         page->tombstoned.store(false, std::memory_order_relaxed);
         page->reader_rid      = reader_rid;
+        page->producers_live.store(0, std::memory_order_relaxed);
         return page;
     }
 

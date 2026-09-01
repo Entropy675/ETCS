@@ -48,6 +48,7 @@
 #include <optional>
 #include <mutex>
 #include <chrono>
+#include <thread>
 #include <iomanip>
 #include <cstdio>
 #include <algorithm>
@@ -1745,6 +1746,11 @@ inline bool run_script(std::istream& in,
     }
 #endif
  
+#ifdef ETCS_LOADER
+    // A closure ends once -- see the block below.
+    bool closure_ended = false;
+#endif
+
     for (const auto& sl : lines)
     {
         ExecSource src{origin, sl.number};
@@ -1767,6 +1773,104 @@ inline bool run_script(std::istream& in,
             return false;
         }
  
+#ifdef ETCS_LOADER
+        /*
+ * TOTAL CLOSURE. The rule is on the closure, not on the lines.
+ *
+ * A closure is the set of RIDs one entry-point script granted, plus
+ * everything the scripts it detached were handed out of that set. Validity
+ * comes in exactly that grouping, so the set stops being valid TOGETHER --
+ * and the members that were still using it have to be wound up HERE,
+ * before the rest of this file runs, rather than at process shutdown after
+ * this script has already dissolved the thing they were holding.
+ *
+ * TWO WAYS A CLOSURE ENDS, and both are it ending, not two policies:
+ *
+ *   signalled   the most-global authority on the active chain was raised --
+ *               the cross on a window, an explicit Close, SIGINT at the
+ *               command line, a terminate. SignalContext::raiseClosure is
+ *               how a work function says this; raising *ctx.interrupt says
+ *               something else entirely (it ends the CALL) and cannot
+ *               reach past the frame, which is why the cross used to
+ *               close a window while the frame edge drawing into it kept
+ *               running.
+ *
+ *   dissolved   an RID this script owns stopped resolving. Deleting one is
+ *               a script saying so deliberately, which is why the first
+ *               Delete of a teardown sequence is the end of the closure and
+ *               not merely a line: `overlay.Delete()` invalidates nothing
+ *               a detached member holds, but it proves the script has
+ *               moved on to unmaking what it made, and `main.Delete()`
+ *               three lines later is the one that faults.
+ *
+ * Neither ends THIS script -- the remaining lines are its own teardown and
+ * must still run. Stopping is a separate question, answered by lost_rid
+ * just below: winding up the closure is what a script does, being unable
+ * to name a receiver it depends on is what stops it.
+ *
+ * Once, hence closure_ended. A closure that has been wound up is over; a
+ * `detach` after it opens a new set rather than rejoining a dead one.
+ *
+ * The signal already reaches the members: DetachedRegistry::create parents
+ * every detached local_sig to the process root, ACTIVE edge, precisely so
+ * a detached script sits inside the closure of the entry-point script that
+ * started it. What was missing was raising it where they could see it, and
+ * then waiting for them to notice.
+ *
+ * Cost: the dissolved test is a resolve per owned RID, and it runs only
+ * while the closure actually HAS live detached members -- a script with
+ * nothing detached can invalidate whatever it likes for free, which is
+ * also the only case the old "provenance, not a sweep" note (Command.h)
+ * was protecting.
+ *
+ * Bounded, and a timeout is a warning rather than a hang: a detached member
+ * that ignores its interrupt is a bug in that member, and turning it into
+ * a deadlock here would hide it behind the wrong symptom.
+ */
+        if (ctx.is_root && !closure_ended && !DetachedRegistry::getInstance().all_finished())
+        {
+            const char* why = nullptr;
+            if (ctx.sig && (ctx.sig->isInterrupted() || ctx.sig->isTerminated()))
+                why = "signalled";
+
+            ETCS::RID dissolved = 0;
+            if (!why)
+                for (ETCS::RID rid : ctx.owned_)
+                    if (!ETCS::resolve_entity_anywhere(rid)) { dissolved = rid; why = "dissolved"; break; }
+
+            if (why)
+            {
+                closure_ended = true;
+                ETCS_LOG("CommandExecutor", "closure " << why
+                         << (dissolved ? " (RID:" + std::to_string(dissolved) + " no longer resolves)"
+                                       : std::string())
+                         << " -- winding up detached members before the rest of "
+                         << origin << " runs.");
+
+                // A dissolved closure has not signalled anyone yet -- say so
+                // through the same authority a signalled one used, so the
+                // members stop for the same reason and by the same means.
+                if (dissolved && ctx.sig && !ctx.sig->raiseClosureInterrupt())
+                    exec_warn(src, "closure has no interrupt authority on its active chain -- "
+                                   "its detached members cannot be told to stop.");
+
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                while (!DetachedRegistry::getInstance().all_finished())
+                {
+                    if (std::chrono::steady_clock::now() > deadline)
+                    {
+                        exec_warn(src, "closure drain timed out after 5s -- a detached member is "
+                                       "not observing its interrupt. Continuing, but anything this "
+                                       "script deletes below may still be referenced by it.");
+                        break;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                }
+                DetachedRegistry::getInstance().join_all();
+            }
+        }
+#endif
+
         // Belt and braces: an arm that noticed a lost dependency without
         // returning Vanished still stops the script here rather than letting
         // the next line run against a closure it can no longer trust.
