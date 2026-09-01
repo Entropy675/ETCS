@@ -67,12 +67,63 @@ struct PendingUnloadRegistry
 {
     std::mutex               mutex_;
     std::vector<std::thread> threads_;
+    /*
+ * Set by join_all(): the join barrier has been crossed and no further
+ * recheck may be started. Without this the registry has a second hole
+ * the same shape as the detach() one it was built to close, just at
+ * the other end of the process's life -- see spawn() below.
+ */
+    bool                     closed_ = false;
+
+    /*
+ * Starts a recheck ONLY while there is still someone left to join it.
+ * Returns false once the barrier has passed, and the caller drops the
+ * recheck.
+ *
+ * Reproduced, on pristine main, with any loader that owns a module
+ * outliving its last entity: main() deletes its entities, calls
+ * join_all(), prints, returns -- and THEN static destruction vacates
+ * the module's lifetime_owner, firing one last RequestUnloadEvent.
+ * The thread that fired for it was tracked into a registry nobody
+ * would ever join again, so ~vector<std::thread> destroyed a joinable
+ * thread and the process aborted with "terminate called without an
+ * active exception" AFTER a completely successful run. Loaders were
+ * papering over it by calling join_all() at exactly the right moment,
+ * which is a convention, not a guarantee -- and the one ordering that
+ * defeats it is the one nobody writes down.
+ *
+ * Dropping the recheck at that point loses nothing: its whole job is
+ * to dlclose a module, and the process is already unmapping everything
+ * it owns. The construction happens INSIDE the lock so the decision and
+ * the spawn cannot straddle a concurrent join_all().
+ */
+    bool spawn(std::function<void()> body)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (closed_) return false;
+        threads_.emplace_back(std::move(body));
+        return true;
+    }
     void track(std::thread t)
     {
         std::lock_guard<std::mutex> lock(mutex_);
         threads_.push_back(std::move(t));
     }
     void join_all()
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto& t : threads_)
+            if (t.joinable()) t.join();
+        threads_.clear();
+        closed_ = true;
+    }
+    /*
+ * Belt and braces. With spawn()'s guard nothing can be added after
+ * join_all(), so this loop is empty in every ordering the guard covers
+ * -- it exists so that a future call site reaching for track() directly
+ * still cannot end a run by destroying a joinable thread.
+ */
+    ~PendingUnloadRegistry()
     {
         std::lock_guard<std::mutex> lock(mutex_);
         for (auto& t : threads_)
@@ -1149,7 +1200,11 @@ ETCS::DispatchResult ETCS::EventNode::LoaderStream::on_event(
  * overwhelmingly common case -- joins nothing and costs
  * nothing.
  */
-                PendingUnloadRegistry::getInstance().track(std::thread([target]()
+                // spawn(), not track(): refused once join_all() has run,
+                // which is what keeps a last-gasp vacate during static
+                // destruction from leaving a joinable thread behind. See
+                // PendingUnloadRegistry::spawn's own comment.
+                const bool recheck_started = PendingUnloadRegistry::getInstance().spawn([target]()
                 {
                     std::this_thread::sleep_for(std::chrono::milliseconds(100));
                     /*
@@ -1176,7 +1231,11 @@ ETCS::DispatchResult ETCS::EventNode::LoaderStream::on_event(
  */
                     if (getLoader().stream.enqueue(DLInEventPtr{&recheck_evt}))
                         while (!done.load(std::memory_order_acquire));
-                }));
+                });
+                if (!recheck_started)
+                    ETCS_LOG("DynamicLoader:Module", "Module '" << target
+                             << "' unload recheck skipped -- the process is past its join "
+                                "barrier, so the mapping goes with the exit.");
                 /*
  * This event (the FIRST fire) is still heap-allocated by
  * RequestUnloadEvent::operator()() -- delete it here,
