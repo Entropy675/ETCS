@@ -1,0 +1,110 @@
+#!/usr/bin/env etcs
+
+# A window, its input edge, a scene, and a rendering edge -- then the script
+# ENDS, on purpose, and you land in the ETCS shell with all of it still live.
+#
+# Run it with the interactive build (`ace make loader`, which is the one that
+# gets -DETCS_REPL_SHELL) from the ETCS root:
+#
+#     ./bin/etcs scripts/scene_demo.etcs
+#
+# and you get a `Root>` prompt with a window still on screen and still
+# presenting -- measured at 864 frames in 14.6s, 59.3 fps, while sitting idle
+# at the prompt. From there:
+#
+#     Root> RenderProvider                # navigate: tags, live counts, and
+#                                         #   this script's names with RIDs
+#     Root> jobs                          # the two detached edges, by id
+#     Root> scripts/scene_layer.etcs view=<RID> backdrop=<RID>
+#     Root> scripts/scene_reset.etcs view=<RID> backdrop=<RID>
+#     Root> scripts/scene_pump.etcs  main=<RID>
+#     Root> signal 2 interrupt            # stop the frame edge, keep the shell
+#
+# The RIDs come from the navigator, which prints them under "Root script names
+# (reachable by attach/ensure)". They are handed to the follow-up scripts as
+# INJECTED names rather than attached ones -- see scene_layer.etcs for why a
+# script started from the prompt cannot simply attach a previous root's
+# globals, and why that refusal is correct.
+#
+# WHY THE LAST EDGE IS DETACHED. A script that ends on a blocking call owns
+# the process for as long as it runs -- main.Run() is that, and it is the
+# right shape for an application. This is the other shape: every long-lived
+# thing is handed to a detached member, the script's own lines run out, and
+# the SHELL becomes the outermost scope. That is not the script leaking, it
+# is the closure changing hands: the shell's SignalContext is the global-most
+# authority now, and Ctrl+C at the prompt is what ends the closure the script
+# opened. `jobs` lists its members; `signal <id> interrupt` stops one.
+#
+# THE THREAD LEDGER, and the one caveat worth knowing before you start:
+#
+#   1. this script's thread    -- runs the lines below, then becomes the
+#                                 shell's prompt loop
+#   2. a ThreadPool worker     -- Window.ProduceEvents, held for the window's
+#                                 lifetime
+#   3. a detached thread       -- Window.ConsumeEvents, blocked on the input
+#                                 stream
+#   4. a ThreadPool worker     -- Surface.ProduceFrames, the frame clock
+#   5. a detached thread       -- Surface.ConsumeFrames, every Vulkan call
+#
+# THE CAVEAT: GLFW binds event polling to the thread that created the window,
+# which is thread 1 -- and thread 1 is at the prompt. So nothing is calling
+# glfwPollEvents while you are typing: FRAMES KEEP PRESENTING (that is thread
+# 5, and Vulkan is happy to present from a thread that did not create the
+# window), but keystrokes into the window and the close button do not arrive
+# until something polls. Run
+#
+#     Root> scripts/scene_pump.etcs main=<RID>
+#
+# to service the queue once, from the correct thread. Living with that is the
+# price of having a prompt; main.Run() is the trade in the other direction.
+
+spawn RenderProvider::Instance gpu
+gpu.Create()
+
+# Create, not Run: Run would enter the poll loop and never come back, and the
+# Surface cannot be built until the window exists -- it takes its VkSurfaceKHR
+# from the window's native handle and its extent from the window's size.
+spawn WindowProvider::Window main
+main.Create(1024, 768, 'ETCS scene')
+
+# Child, not a root spawn: the parent link IS the binding between a surface
+# and the window it draws into.
+main.spawn(RenderProvider::Surface view)
+view.Create(@gpu, modules/RenderProvider/shaders/)
+
+# ── the scene ────────────────────────────────────────────────────────────
+#
+# CPU layers, composited on the CPU, then blitted to the screen as one image.
+# Root spawns: a layer has no owner in the scene-graph sense yet -- it is an
+# addressable region of pixels whose RID the thing compositing knows. That
+# changes when the Drawable families get a concrete leaf; until then the
+# scene's structure lives in this file rather than in the entity tree, which
+# is exactly what scene_layer.etcs has to work around.
+spawn RenderProvider::ImageSurface backdrop
+backdrop.Create(640, 480)
+backdrop.Clear(0.10, 0.12, 0.20, 1.0)
+backdrop.DrawRect(40, 40, 240, 140, 0.85, 0.72, 0.20, 1.0)
+backdrop.DrawRect(320, 260, 260, 180, 0.20, 0.65, 0.85, 1.0)
+
+spawn RenderProvider::ImageSurface badge
+badge.Create(160, 160)
+badge.Clear(0.0, 0.0, 0.0, 0.0)
+badge.DrawRect(0, 0, 160, 60, 0.90, 0.25, 0.35, 0.75)
+
+# Layer onto layer, on the CPU.
+backdrop.Blit(@badge, 380, 60, 0, 0, 0.85)
+
+# Layer onto the screen, on the GPU: same verb, different surface.
+view.Clear(0.03, 0.03, 0.05, 1.0)
+view.Blit(@backdrop, 80, 60, 864, 648, 1.0)
+
+# ── the edges ────────────────────────────────────────────────────────────
+#
+# Input first: ProduceEvents spins on IsActive() before registering an
+# observer, so detaching it before the window is live just burns thread 2
+# waiting.
+detach window_events.etcs window=main
+
+# And the frame pump. This is the last line that starts anything, and after
+# it the script has nothing left to do -- which is the whole point.
+detach render_frames.etcs view=view
