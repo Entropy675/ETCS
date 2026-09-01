@@ -1,0 +1,75 @@
+#!/usr/bin/env etcs
+#IMPORT ACE_ROOT/scripts
+
+# streamed_scenes.etcs, with the two emblem regions turned into COMPOSITORS.
+#
+#     ./bin/etcs scripts/composited_scenes.etcs
+#
+# Same picture, same scene scripts, unmodified. The only difference is what
+# the two anchors ARE: there they were polygons, and every frame re-emitted
+# every scanline of every shape beneath them; here they own pixels, so each
+# subtree is rasterised once and reaches the surface as a single Blit.
+#
+# The scene scripts do not know. They spawn children into an anchor and state
+# points in its space, which is true of both kinds -- a compositor is a
+# Drawable2D like any other, and that interchangeability is the whole reason
+# the merge could be introduced without touching them.
+#
+# WHAT TO WATCH. `CompositeDrawable2D::Draw` logs its recomposition count. It
+# goes to 1 for each compositor and then STOPS: every later frame skips the
+# subtree entirely and blits the image it already has. Change something
+# underneath one of them and only that one recomposes -- the sibling's cache
+# is untouched, because a node marks the compositors on its OWN path and
+# nothing else.
+
+spawn RenderProvider::Instance gpu
+gpu.Create()
+
+spawn WindowProvider::Window main
+main.Create(1024, 768, 'ETCS composited scenes')
+
+main.spawn(RenderProvider::Surface view)
+view.Create(@gpu, modules/RenderProvider/shaders/)
+
+# The stage is a compositor too, and at the root it is the one that matters
+# most: everything in the scene merges into this one buffer, so a settled
+# frame is a single cached blit of an image the device already holds. The
+# subtree beneath is not walked at all.
+spawn RenderProvider::CompositeDrawable2D stage
+stage.Create(1024, 768)
+stage.SetPosition(0, 0)
+stage.SetBackground(0.06, 0.07, 0.11, 1.0)
+
+# The two regions, now buffers rather than polygons. Position is in the
+# stage's space, exactly as the polygons' corner points were; the CONTENTS
+# are stated in each compositor's own space, which is what the scene scripts
+# already do.
+stage.spawn(RenderProvider::CompositeDrawable2D left)
+left.Create(400, 400)
+left.SetPosition(60, 200)
+left.SetBackground(0.13, 0.15, 0.22, 1.0)
+left.SetOrder(1)
+
+stage.spawn(RenderProvider::CompositeDrawable2D right)
+right.Create(400, 400)
+right.SetPosition(560, 320)
+right.SetBackground(0.13, 0.15, 0.22, 1.0)
+right.SetOrder(1)
+
+# The same scene scripts, unchanged, against compositors instead of polygons.
+run scene_emblem.etcs anchor=left
+run scene_emblem.etcs anchor=right
+
+run scene_bars.etcs anchor=stage
+
+view.Clear(0.02, 0.02, 0.03, 1.0)
+stage.Draw(@view)
+
+detach window_events.etcs window=main
+detach render_frames.etcs view=view
+
+main.Run(1024, 768, 'ETCS composited scenes')
+
+view.Delete()
+gpu.Delete()
+main.Delete()
