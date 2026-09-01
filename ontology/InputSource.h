@@ -18,15 +18,39 @@
 // ---------------------------------------------------------------
 
 
+// One input event, keyboard or pointer, in ONE record.
+//
+// Two kinds in one struct rather than two rings, because a consumer that
+// wants both wants them IN ORDER -- a look and a step that arrived together
+// are one intent, and two rings would let them separate. The kind is the
+// action field, which already distinguished up from down and now also says
+// "this is not a key at all".
+//
+// dx/dy are RELATIVE, in pixels, and only meaningful for INPUT_MOTION. A
+// delta rather than a position because the thing that moves the view is the
+// movement: an absolute position is unanswerable once the cursor is captured
+// and has no edge of the screen to be near, which is exactly the mode a
+// first-person look runs in.
+//
+// EIGHT BYTES, not four. The ring's slot size and capacity are both derived
+// from sizeof(InputEvent) below, so widening the record halves the ring to 32
+// slots and changes nothing else -- the one place a size assumption could
+// have been written twice, it was written once.
 struct InputEvent
 {
-    uint16_t key;    // supports NUM_KEYS up to 65535
-    uint8_t  action; // 0 = up, 1 = down
+    uint16_t key;    // supports NUM_KEYS up to 65535; 0 for a pointer event
+    uint8_t  action; // INPUT_UP / INPUT_DOWN / INPUT_MOTION
     uint8_t  _pad;   // reserved (mods, scancode, etc.)
+    int16_t  dx;     // pointer delta, INPUT_MOTION only
+    int16_t  dy;
 };
 
-static constexpr uint8_t INPUT_SLOT_SIZE = sizeof(InputEvent); // 4
-static constexpr uint8_t INPUT_RING_CAP  = 256 / INPUT_SLOT_SIZE; // 64 slots, 63 usable
+static constexpr uint8_t INPUT_UP     = 0;
+static constexpr uint8_t INPUT_DOWN   = 1;
+static constexpr uint8_t INPUT_MOTION = 2;
+
+static constexpr uint8_t INPUT_SLOT_SIZE = sizeof(InputEvent); // 8
+static constexpr uint8_t INPUT_RING_CAP  = 256 / INPUT_SLOT_SIZE; // 32 slots, 31 usable
 static constexpr uint8_t INPUT_MAX_OBSERVERS = 16;
 static constexpr uint8_t INPUT_INVALID_OBSERVER = 0xFF;
 
@@ -160,8 +184,18 @@ public:
     const InputState& ViewInput() const { return m_inputSnapshot; }
 
 protected:
-    void pushKeyDown(int key) { pushEvent({ static_cast<uint16_t>(key), 1, 0 }); }
-    void pushKeyUp  (int key) { pushEvent({ static_cast<uint16_t>(key), 0, 0 }); }
+    void pushKeyDown(int key) { pushEvent({ static_cast<uint16_t>(key), INPUT_DOWN, 0, 0, 0 }); }
+    void pushKeyUp  (int key) { pushEvent({ static_cast<uint16_t>(key), INPUT_UP,   0, 0, 0 }); }
+
+    // A pointer movement, as a delta. Key 0 because there is no key: a
+    // consumer switches on the action, and a pointer event that carried a
+    // plausible key code would eventually be read as one.
+    void pushPointerDelta(int dx, int dy)
+    {
+        if (dx == 0 && dy == 0) return;   // not an event
+        pushEvent({ 0, INPUT_MOTION, 0,
+                    static_cast<int16_t>(dx), static_cast<int16_t>(dy) });
+    }
 
 private:
     InputState             m_inputSnapshot;
@@ -182,9 +216,12 @@ private:
         writeSlot(head, ev);
         m_head.store(next, std::memory_order_release);
 
-        // Also apply to local snapshot for viewInput() queries
-        if (ev.action == 1) m_inputSnapshot.applyDown(ev.key);
-        else                m_inputSnapshot.applyUp(ev.key);
+        // Also apply to local snapshot for viewInput() queries. Motion is
+        // excluded rather than mapped to key 0: InputState is a keyboard
+        // snapshot, and feeding it a pointer event would set a held "key"
+        // nothing ever releases.
+        if      (ev.action == INPUT_DOWN) m_inputSnapshot.applyDown(ev.key);
+        else if (ev.action == INPUT_UP)   m_inputSnapshot.applyUp(ev.key);
     }
 
     void writeSlot(uint8_t slot, InputEvent ev)
