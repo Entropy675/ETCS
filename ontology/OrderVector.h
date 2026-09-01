@@ -121,40 +121,52 @@
 // to validate anything.
 //
 // ---------------------------------------------------------------------------
-// RESERVED: the other two rows.
+// ROWS 2 AND 3: where it turns, and how far round it is.
 //
-// This is row 0 and row 1 of a 4x4 that describes ONE SPHERE -- one
-// distinguishable unit of space -- with a constraint set over its rows:
+//     row 2   (Fx, Fy, Fz, -)        rotational pivot
+//     row 3   (Sx, Sy, Sz, theta)    axis and angle
 //
-//     row 2   (Px, Py, Pz, r)        rotational pivot, and the bounding radius
-//     row 3   (Sx, Sy, Sz, phi)      spinor / angle causal relation
+// ROW 2 MAKES ROTATION A RELATION TO A POINT rather than a property of a body.
+// The pivot is stated in this vector's OWN frame -- relative to row 0, the same
+// parent-relative rule the entity tree runs on -- so a sub-unit turning about
+// its parent's pivot holds no copy of it, and moving the parent moves what
+// everything under it turns about, for free. F of zero is the ordinary case: a
+// thing that turns about itself.
 //
-// Row 2 makes rotation a relation to a pivot rather than a property of a body,
-// which is what lets a sub-unit rotate about a parent's pivot without holding a
-// copy of it. Row 3 carries the angular half of what rows 0 and 1 carry
-// linearly, on the same reading: a direction and a fraction, of the same E.
+// ROW 3 IS AN ORIENTATION, axis-angle, and the axis being a VECTOR rather than
+// three Euler angles is the whole reason it is worth the row. Euler angles have
+// an order, gimbal-lock at the poles, and no composition that is not a special
+// case; an axis and an angle compose by one multiplication and degenerate
+// nowhere. That is not a numerical preference -- yaw and pitch as two floats is
+// exactly what was wrong with the look control this replaced.
 //
-// A SPHERE WITH A RADIUS IS ALWAYS AN AGGREGATE. r > 0 means the unit is
-// composed of sub-units, and the recursion bottoms out at leaves with r = 0 --
-// points, which are the only things that are not aggregates of anything. So a
-// radius is not a size, it is a statement about how far down the composition
-// this row has summarised, and every quantity on a sphere with r > 0 is a
-// reduction over its leaves rather than an independent value that could
-// disagree with them.
+// A ZERO AXIS MEANS UNROTATED, which is why the identity needs no sentinel and
+// why theta is meaningless without S beside it. Angular RATE -- the share of E
+// that is rotational, which would be row 3's answer to what O is for row 1 --
+// is deliberately not here yet: the linear constraints are enough to carry
+// causality for now, and adding a rate before there is anything to spin would
+// be fixing the shape of a thing nothing has yet asked for.
 //
-// WHICH IS WHAT MAKES LoD FREE. Several different sphere SETS can be built over
-// the same leaves -- coarse ones with few large spheres, fine ones with many
-// small -- and they are not approximations of each other, they are different
-// reductions of the same points. Picking a set is picking the scope at which
-// causal distance is being checked: a coarse set answers "could these two
-// regions interact at all" in a handful of comparisons, a fine one answers
-// "which leaves actually did", and both are exact at their own scope because
-// both reduce the same leaves.
+// THE FOURTH SLOT OF ROW 2 IS THE RADIUS, and it is what distinguishes an
+// aggregate from a leaf without any second type being involved. r == 0 is a
+// point -- the only kind of thing that is not an aggregate of anything -- and
+// r > 0 says this vector summarises a set, with every other quantity on it
+// being a reduction over that set rather than an independent value that could
+// disagree with it.
 //
-// None of rows 2 and 3 is implemented here. The two rows below are, the
-// invariant they maintain is, and the fourth-column reading the later rows have
-// to honour is -- which is the part that is expensive to change later and free
-// to get right now.
+// THE PRESENCE OF THE CONSTRAINT IS THE DIFFERENCE, not the presence of a
+// field. Splitting the aggregate off into its own struct was the first thing
+// tried here and it is wrong: the rows are a property of what an OrderVector
+// IS, and a parent and a child that could not be handed to the same function
+// would make the reduction impossible to write once. One type, one set of
+// operations, and a leaf is simply the case where the radius is zero -- which
+// is also the case where Reduce over a single member returns it unchanged.
+//
+// ROWS ARE STRUCTURAL EVEN WHERE INERT. A flat node carries rows 2 and 3 and
+// never turns; a still node carries row 1 and never moves. That is not waste,
+// it is what makes one vector describe a thing at any level of the composition
+// and at any dimensionality -- the alternative is a family of nearly-identical
+// records and a conversion between each pair of them.
 // ---------------------------------------------------------------------------
 
 struct OrderVector
@@ -174,6 +186,29 @@ struct OrderVector
     float oy     = 0.0f;
     float oz     = 0.0f;
     float energy = 0.0f;
+
+    // ── row 2: the pivot, and how far this vector reaches ───────────────
+    //
+    // F is in this vector's own frame, so it moves with row 0 and needs no
+    // recomputation when its container moves. Zero is the ordinary case: a
+    // thing that turns about itself.
+    //
+    // The radius is the fourth component and the aggregate/leaf constraint:
+    // zero means a point, positive means this vector summarises a set that
+    // reaches that far from row 0.
+    float fx     = 0.0f;
+    float fy     = 0.0f;
+    float fz     = 0.0f;
+    float radius = 0.0f;
+
+    // ── row 3: the angle ────────────────────────────────────────────────
+    //
+    // S is the axis, unit or zero; theta is the angle about it, in radians.
+    // Zero axis is the identity -- an unrotated thing, with no sentinel.
+    float sx    = 0.0f;
+    float sy    = 0.0f;
+    float sz    = 0.0f;
+    float theta = 0.0f;
 
     // ── meta: real, and not yet rows ────────────────────────────────────
     //
@@ -433,6 +468,204 @@ struct OrderVector
     // immovable does, and what a released control eventually reaches.
     void Rest() { ox = oy = oz = 0.0f; }
 
+    // ── row 2 / row 3 operations ────────────────────────────────────────
+
+    void SetPivot(float px, float py, float pz) { fx = px; fy = py; fz = pz; }
+    bool Oriented() const { return sx != 0.0f || sy != 0.0f || sz != 0.0f; }
+
+    // Set the orientation outright. The axis is normalised on the way in, so
+    // callers may hand over any non-zero vector and the stored row is always
+    // in the form every reader below assumes.
+    void Orient(float ax, float ay, float az, float angle)
+    {
+        const float m = std::sqrt(ax * ax + ay * ay + az * az);
+        if (!(m > 0.0f)) { sx = sy = sz = 0.0f; theta = 0.0f; return; }
+        sx = ax / m; sy = ay / m; sz = az / m;
+        theta = angle;
+    }
+
+    /*
+ * Compose a delta rotation onto this one, through quaternions.
+ *
+ * The delta is applied on the LEFT -- R_new = R_delta * R_current -- which is
+ * what makes a mouse movement mean "turn from where you are now" rather than
+ * "turn in your own local frame", and it is the difference between a look
+ * control that behaves and one that corkscrews as soon as it is pitched.
+ *
+ * Quaternions in the middle and axis-angle at the edges: the composition is
+ * one multiplication with no cases, and the row stays in the form everything
+ * else reads. Nothing degenerates -- a zero delta or a zero current
+ * orientation both fall out as the identity rather than as a division.
+ */
+    void RotateBy(float ax, float ay, float az, float angle)
+    {
+        float qw, qx, qy, qz;
+        toQuat(qw, qx, qy, qz);
+
+        const float m = std::sqrt(ax * ax + ay * ay + az * az);
+        if (!(m > 0.0f) || angle == 0.0f) return;
+        const float h = angle * 0.5f, sh = std::sin(h);
+        const float dw = std::cos(h), dx = (ax / m) * sh, dy = (ay / m) * sh, dz = (az / m) * sh;
+
+        const float rw = dw * qw - dx * qx - dy * qy - dz * qz;
+        const float rx = dw * qx + dx * qw + dy * qz - dz * qy;
+        const float ry = dw * qy - dx * qz + dy * qw + dz * qx;
+        const float rz = dw * qz + dx * qy - dy * qx + dz * qw;
+        fromQuat(rw, rx, ry, rz);
+    }
+
+    // Rotate a direction by this orientation -- Rodrigues, because the row is
+    // already axis-angle and converting to a matrix to use it once is work
+    // nobody needs. Unrotated passes the vector through untouched.
+    void RotateVector(float& vx, float& vy, float& vz) const
+    {
+        if (!Oriented() || theta == 0.0f) return;
+        const float c = std::cos(theta), s2 = std::sin(theta);
+        const float dot = sx * vx + sy * vy + sz * vz;
+        const float cx = sy * vz - sz * vy;
+        const float cy = sz * vx - sx * vz;
+        const float cz = sx * vy - sy * vx;
+        const float rx = vx * c + cx * s2 + sx * dot * (1.0f - c);
+        const float ry = vy * c + cy * s2 + sy * dot * (1.0f - c);
+        const float rz = vz * c + cz * s2 + sz * dot * (1.0f - c);
+        vx = rx; vy = ry; vz = rz;
+    }
+
+    // Rotate a point of this vector's frame about its own pivot. The two
+    // together are what row 2 exists for: an orientation with nowhere to turn
+    // about is only half an answer.
+    void RotateAboutPivot(float& px, float& py, float& pz) const
+    {
+        float rx = px - fx, ry = py - fy, rz = pz - fz;
+        RotateVector(rx, ry, rz);
+        px = fx + rx; py = fy + ry; pz = fz + rz;
+    }
+
+    // ── aggregation: row 2's fourth component, and what it implies ──────
+
+    bool IsLeaf()      const { return radius <= 0.0f; }
+    bool IsAggregate() const { return radius >  0.0f; }
+
+    /*
+ * Reduce a set of members into this vector.
+ *
+ * THE MEMBERS MAY THEMSELVES BE AGGREGATES, which is the whole reason this
+ * lives on OrderVector rather than on a separate type: a zone over zones and
+ * a zone over points are the same call, and the recursion terminates at
+ * members whose radius is zero. A member's own radius extends this one's
+ * reach, so a coarse level built over a fine one is exact rather than a
+ * bounding box of bounding boxes that has quietly lost the guarantee.
+ *
+ * POSITION IS THE ENERGY-WEIGHTED CENTRE and the PIVOT IS THE GEOMETRIC ONE,
+ * which is not a redundancy: where a composition's energy is and where its
+ * shape balances are different questions, and rotation is about the second.
+ * They coincide exactly when the energy is spread evenly, which is the case
+ * that makes the distinction easy to miss.
+ *
+ * ENERGY AND THE KINETIC VECTOR ADD. Summing K and dividing by the summed E
+ * keeps |O| <= 1 through the reduction with no clamping: a sum of vectors
+ * each no longer than its own energy is no longer than the total.
+ *
+ * WHAT IS NOT REDUCED, stated rather than approximated: the orientation.
+ * Members' angles are relative to what contains them, so a parent's own angle
+ * is its own and is not derivable from theirs. The ORBITAL contribution of
+ * members circulating about the pivot is likewise absent -- it is real
+ * angular energy and it needs the rate row that row 3 does not yet carry. A
+ * reduction done today is exact about where, how much and how far, and silent
+ * about spin.
+ */
+    void Reduce(const OrderVector* members, size_t n)
+    {
+        radius = 0.0f;
+        x = y = z = 0.0f;
+        ox = oy = oz = 0.0f;
+        energy = 0.0f;
+        if (!members || n == 0) return;
+
+        float kx = 0.0f, ky = 0.0f, kz = 0.0f;
+        float gx = 0.0f, gy = 0.0f, gz = 0.0f;   // geometric centre
+        for (size_t i = 0; i < n; ++i)
+        {
+            const OrderVector& m = members[i];
+            energy += m.energy;
+            x += m.x * m.energy; y += m.y * m.energy; z += m.z * m.energy;
+            gx += m.x; gy += m.y; gz += m.z;
+            kx += m.ox * m.energy; ky += m.oy * m.energy; kz += m.oz * m.energy;
+        }
+
+        const float inv_n = 1.0f / static_cast<float>(n);
+        gx *= inv_n; gy *= inv_n; gz *= inv_n;
+
+        if (energy > 0.0f) { x /= energy; y /= energy; z /= energy; }
+        else               { x = gx; y = gy; z = gz; }   // no energy: shape is all there is
+
+        SetPivot(gx - x, gy - y, gz - z);
+
+        if (energy > 0.0f) { ox = kx / energy; oy = ky / energy; oz = kz / energy; }
+
+        Cover(members, n);
+    }
+
+    /*
+ * Set just the radius, about whatever position this vector already has.
+ *
+ * The half of Reduce that is wanted on its own whenever the parent's position
+ * is fixed by something other than its contents -- a scene root placed by a
+ * script, or moved by input, whose reach still has to cover what is under it.
+ * Reducing the position there would move the thing every time its contents
+ * shifted, which is the opposite of what a container is for.
+ */
+    void Cover(const OrderVector* members, size_t n)
+    {
+        radius = 0.0f;
+        if (!members || n == 0) return;
+        for (size_t i = 0; i < n; ++i)
+        {
+            const float dx = members[i].x - x;
+            const float dy = members[i].y - y;
+            const float dz = members[i].z - z;
+            const float reach = std::sqrt(dx * dx + dy * dy + dz * dz) + members[i].radius;
+            if (reach > radius) radius = reach;
+        }
+    }
+
+    // Is that point inside this vector's reach at all? The coarse question,
+    // answered in one comparison -- which is the whole reason a coarse level
+    // exists. Always false for a leaf, which is correct: a point encloses
+    // nothing, including itself.
+    bool Encloses(float px, float py, float pz) const
+    {
+        const float dx = px - x, dy = py - y, dz = pz - z;
+        return dx * dx + dy * dy + dz * dz <= radius * radius;
+    }
+
+    /*
+ * Could anything under this vector have interacted with anything under that
+ * one?
+ *
+ * Centre distance minus both radii: negative or zero means the two overlap
+ * and the question has to be asked of their members; positive is the GAP, and
+ * a positive gap is a proof about every pair inside, obtained without looking
+ * at any of them. That asymmetry -- cheap certainty about absence, referral on
+ * presence -- is what a causal-distance check is for, and it works unchanged
+ * between two leaves, two aggregates, or one of each, because the radius of a
+ * leaf is zero and the arithmetic does not care.
+ *
+ * WHICH IS WHAT MAKES LoD FREE. Several different aggregate SETS can be built
+ * over the same leaves -- coarse ones with few large reaches, fine ones with
+ * many small -- and they are not approximations of each other, they are
+ * different reductions of the same points. Picking a set is picking the scope
+ * at which causal distance is being checked, and both are exact at their own
+ * scope because both reduce the same leaves. Nothing is rebuilt to change
+ * scope, because nothing was approximated to build either.
+ */
+    float GapTo(const OrderVector& other) const
+    {
+        const float dx = other.x - x, dy = other.y - y, dz = other.z - z;
+        return std::sqrt(dx * dx + dy * dy + dz * dz) - radius - other.radius;
+    }
+    bool MayInteractWith(const OrderVector& other) const { return GapTo(other) <= 0.0f; }
+
     /*
  * The uncertainty a crossing carries, derived from the crossing itself.
  *
@@ -460,6 +693,26 @@ struct OrderVector
     }
 
 private:
+    void toQuat(float& w, float& x, float& y, float& z) const
+    {
+        if (!Oriented() || theta == 0.0f) { w = 1.0f; x = y = z = 0.0f; return; }
+        const float h = theta * 0.5f, sh = std::sin(h);
+        w = std::cos(h); x = sx * sh; y = sy * sh; z = sz * sh;
+    }
+    void fromQuat(float w, float x, float y, float z)
+    {
+        const float n = std::sqrt(w * w + x * x + y * y + z * z);
+        if (!(n > 0.0f)) { sx = sy = sz = 0.0f; theta = 0.0f; return; }
+        w /= n; x /= n; y /= n; z /= n;
+        if (w >  1.0f) w =  1.0f;
+        if (w < -1.0f) w = -1.0f;
+        const float half = std::acos(w);
+        const float s2   = std::sqrt(1.0f - w * w);
+        if (!(s2 > 1e-7f)) { sx = sy = sz = 0.0f; theta = 0.0f; return; }  // identity
+        sx = x / s2; sy = y / s2; sz = z / s2;
+        theta = half * 2.0f;
+    }
+
     // O is K scaled by 1/E, which is the whole of the linear relation between
     // the fraction and the energy. E of zero has no direction to record, so the
     // point comes to rest rather than dividing.
