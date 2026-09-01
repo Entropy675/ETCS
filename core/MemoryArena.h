@@ -78,12 +78,54 @@ namespace ETCS
 // stores/returns/compares it — so an incomplete type is sufficient.
 class Entity;
 
-std::string formatBytesToString(uint64_t bytes)
+/*
+ * NO DESTRUCTIBLE STATIC IN HERE, and that is a hard requirement rather than
+ * a style preference -- this function is called from memoryTeardown(), which
+ * is called from ~MemoryArena(), which runs during static destruction:
+ * __cxa_finalize on dlclose for a module arena, __run_exit_handlers at
+ * process exit for the loader's.
+ *
+ * It used to hold `static const std::vector<std::string> units`. A
+ * function-local static is registered for destruction on its FIRST CALL, and
+ * destroyed in reverse order of registration -- so `units` was registered
+ * when something first logged a byte count, which is strictly LATER than the
+ * arena's own construction, and therefore destroyed strictly EARLIER than the
+ * arena. Every teardown log after that point read a freed vector and streamed
+ * a freed std::string.
+ *
+ * Reproduced under ASAN on both exit paths, from the current dev branch:
+ *
+ *   heap-use-after-free ... READ of size 8
+ *     formatBytesToString  MemoryArena.h:90
+ *     MemoryArena::memoryTeardown  MemoryArena.h:1676
+ *     ~MemoryArena  MemoryArena.h:903
+ *     __cxa_finalize                     <- module unloaded mid-run
+ *
+ *   heap-use-after-free ... READ of size 2
+ *     ... same three frames ...
+ *     __run_exit_handlers                <- ordinary process exit
+ *
+ * Whether that fault is visible depends on whether the freed block still
+ * happens to hold intact string data, which is why it presented as an
+ * INTERMITTENT segfault at the end of a run rather than a reliable one, and
+ * why which scripts hit it looked arbitrary: it is decided by the order in
+ * which arenas happen to tear down relative to the first byte-count log.
+ *
+ * String literals have static storage duration and no destructor at all, so
+ * there is nothing left to destroy early. constexpr makes that checkable
+ * rather than merely true.
+ *
+ * inline, too: this is a header, and a non-inline free function here is one
+ * multi-TU module away from a duplicate symbol.
+ */
+inline std::string formatBytesToString(uint64_t bytes)
 {
-    static const std::vector<std::string> units = {"B", "KB", "MB", "GB", "TB"};
+    static constexpr const char* units[] = {"B", "KB", "MB", "GB", "TB"};
+    static constexpr int unit_count = static_cast<int>(sizeof(units) / sizeof(units[0]));
     if (bytes == 0) return "0B";
     int magnitude = static_cast<int>(std::log2(bytes) / 10);
-    if (magnitude >= static_cast<int>(units.size())) magnitude = units.size() - 1;
+    if (magnitude >= unit_count) magnitude = unit_count - 1;
+    if (magnitude < 0)           magnitude = 0;
     double value = static_cast<double>(bytes) / std::pow(1024, magnitude);
     std::ostringstream out;
     if (magnitude == 0) out << bytes << units[0];
