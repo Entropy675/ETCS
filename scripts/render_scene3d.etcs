@@ -114,6 +114,28 @@ eye.SetScene(@world)
 # family exists for: the 3D view is the main surface and the 2D tree is what
 # sits on top of it, with no adapter between the two because there is no
 # difference between the two.
+# A live frame counter over the 3D view -- a Glyphs leaf nested in the camera
+# exactly like the reticle below, so it is drawn after the projection and
+# clipped to the frame. "%f" is substituted at draw time from the surface named
+# by BindFps, because the rate is a property of the frame loop and a script
+# cannot run per frame (TextLabel::BindFps).
+#
+# IT COSTS FRAMES, and that is not a bug to hide: a label whose text changes
+# every frame is a self-animating node, so it answers yes to Animating() and
+# keeps every compositor above it recomposing. A settled scene with the counter
+# on runs at roughly two thirds of what it runs at with the counter off --
+# which is the honest price of watching the number, and the reason to take it
+# off once you have read it.
+eye.spawn(RenderProvider::TextLabel hud)
+hud.Create(24)
+hud.SetText(%f fps -- wasd move / mouse look / ctrl+tab)
+hud.SetPosition(16, 16)
+hud.SetColor(0.6, 1.0, 0.7, 1.0)
+hud.SetBackground(0.0, 0.0, 0.0, 0.45)
+hud.SetPadding(6)
+hud.SetOrder(11)
+hud.BindFps(@view)
+
 eye.spawn(RenderProvider::PolygonDrawable2D reticle)
 reticle.Create()
 reticle.AddPoint(506, 378)
