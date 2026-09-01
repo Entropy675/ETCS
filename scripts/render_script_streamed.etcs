@@ -1,0 +1,48 @@
+#!/usr/bin/env etcs
+
+# The shape rendering should actually have: graphical_script.etcs with one
+# more detach. The window keeps the first OS thread and its poll loop; the
+# renderer is handed off to a stream edge exactly like input already is.
+#
+# REQUIRES the Surface ProduceFrames/ConsumeFrames pair (see
+# render_frames.etcs). Not runnable against main today -- render_script.etcs
+# is the version that is.
+#
+# THREAD LEDGER once that lands -- five threads, each doing one thing:
+#
+#   1. this script's thread    main.Run()              poll loop (GLFW affinity)
+#   2. pool worker             Window.ProduceEvents    input ring -> stream
+#   3. detached thread         Window.ConsumeEvents    input stream drain
+#   4. pool worker             Surface.ProduceFrames   acquire + frame timing
+#   5. detached thread         Surface.ConsumeFrames   record, submit, present
+#
+# Two long-lived pool workers is the cost to watch here: produce bodies are
+# enqueued, and both of these loop for the window's lifetime rather than
+# passing through, so they hold their workers rather than borrowing them.
+# On a small pool that is the thing that starves first, and it is a reason
+# to keep frame timing in the produce body cheap.
+
+spawn RenderProvider::Instance gpu
+gpu.Create()
+
+# Create before Run for the same reason as render_script.etcs: the Surface
+# needs a live window to take its handle and extent from, and Run would
+# block before we could attach one. Run's own CreateWindow is idempotent
+# (GLFWWindow::CreateWindowConcrete returns early if m_window is set), so
+# calling Create first and Run after is safe -- Run just enters the loop.
+spawn WindowProvider::Window main
+main.Create(800, 600, 'ETCS RenderProvider')
+
+main.spawn(RenderProvider::Surface view)
+view.Create(@gpu, modules/RenderProvider/shaders/)
+
+detach window_events.etcs window=main
+detach render_frames.etcs view=view
+
+# Blocks here for the window's lifetime, polling on the thread that created
+# it. Frames are already running on threads 4 and 5 by now.
+main.Run(800, 600, 'ETCS RenderProvider')
+
+view.Delete()
+gpu.Delete()
+main.Delete()
