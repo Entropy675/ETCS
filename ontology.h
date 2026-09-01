@@ -52,6 +52,11 @@
 
 // standard ontlogy supertype bases:
 #include "ontology/DeletableBase.h"
+// Lifecycle sits beside Deletable and answers a different question -- Delete is
+// a request from outside, Release is a notification from the runtime that is
+// guaranteed to happen exactly once whichever way the entity dies. See
+// ontology/Lifecycle.h.
+#include "ontology/LifecycleBase.h"
 #include "ontology/EphemeralBase.h"
 #include "ontology/ParserBase.h"
 #include "ontology/WrapperBase.h"

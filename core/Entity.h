@@ -2740,6 +2740,29 @@ inline Entity* spawn(const std::string& module_name, const std::string& tag,
 // member call RIDList's handle lambdas need and cannot make themselves.
 inline void* etcs_true_type(Entity* e) { return e ? e->getTrueType() : nullptr; }
 
+/*
+ * Declared in MemoryArena.h, where Entity is necessarily incomplete -- same
+ * split, same reason as etcs_true_type above. Defined here, where the class is
+ * complete.
+ *
+ * THE CAST IS THE WIRE CONTRACT. What getInterfacePointer returns for
+ * "Lifecycle" is the Lifecycle_ subobject address, and Lifecycle_ declares
+ * ETCS::IWireLifecycle as its first non-virtual base -- so the two pointers are
+ * bit-identical and this is exact rather than hopeful. core/InterfaceWire.h
+ * states that requirement once for every wire; ontology/Lifecycle.h restates it
+ * at the base order it constrains.
+ *
+ * A type that does not claim the family returns null here and is skipped, which
+ * is how this stays a call core can make unconditionally.
+ */
+inline bool etcs_release_lifecycle(Entity* e)
+{
+    if (!e) return false;
+    void* raw = e->getInterfacePointer(ETCS::Buffer("Lifecycle"));
+    if (!raw) return false;
+    return static_cast<ETCS::IWireLifecycle*>(raw)->Release();
+}
+
 inline void etcs_supertype_fanout(Entity* e)
 {
     if (!e) return;
