@@ -7,6 +7,13 @@
 
 #include "core/DynamicLoader.h"
 
+// Not a family: the two-row spatial/energy primitive the 3D side states its
+// motion in, reserved in the shape of the 4x4 it grows into. Included here
+// rather than only from Drawable3D.h because it is the vocabulary a physical
+// leaf of ANY family will state itself in, the way Point2D/Rect2D already are
+// for the flat one.
+#include "ontology/OrderVector.h"
+
 // !! ALERT, whenever you add a new Base, you must include it here for it to be visible to other types.
 // If you do not, you will get an error: expected template-name before ‘<’ token
 //   10 |     public UnregisteredBase<UserInstance>

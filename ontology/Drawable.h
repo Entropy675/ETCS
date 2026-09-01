@@ -134,6 +134,33 @@ public:
                          [](Drawable_* a, Drawable_* b) { return a->Order() < b->Order(); });
     }
 
+    /*
+ * Is this node's appearance changing on its own, without anyone marking it?
+ *
+ * CONCRETE AND FALSE BY DEFAULT, deliberately not dispatched -- the same
+ * treatment Drawable2D_ gives ToParent/ToLocal/Pick, and for the same
+ * reason: a dispatched method is one every leaf must write, and almost no
+ * leaf animates itself. A polygon, an image layer, a window's root
+ * rectangle all change only when something changes them, and inheriting
+ * "no" is the right answer for every one of them.
+ *
+ * IT EXISTS BECAUSE A DIRTY FLAG CANNOT ANSWER IT. The flag means "changed
+ * since you last looked", it is consumed by whoever looks, and its writers
+ * mark it BETWEEN walks -- which is exactly what a self-animating node does
+ * not do. Such a node changes DURING the walk that draws it, so the mark it
+ * leaves is consumed by that same frame's upload and there is nothing left
+ * to schedule the next frame with. A tree containing one would either
+ * freeze after a single frame or have to be walked unconditionally forever,
+ * and both of those are wrong.
+ *
+ * So a compositor's gate is "am I dirty, OR is anything under me still
+ * moving", and a compositor answers this for its own parent by asking its
+ * children -- the recursion is the point. A settled tree answers no all the
+ * way down and costs one query per node; a tree with one moving camera in it
+ * keeps exactly the path to that camera awake.
+ */
+    virtual bool Animating() { return false; }
+
 protected:
     /*
  * The recursion, written once. A leaf's DrawInto draws ITSELF and then

@@ -94,6 +94,25 @@ struct DepthSpan
 // and Reorder after a camera moves is the same cascade as Reorder
 // after a hash moves along a seam.
 //
+// SO A DEPTH BUFFER IS ORDERABLE AT A FINER GRAIN, and saying so is
+// the useful part rather than the analogy. Painter's order in 2D
+// (Drawable_::collectDrawableChildren, sorted by the leaf's own
+// operator<) and a depth buffer in 3D are the SAME relation resolved
+// at two different granularities: one answer per node, or one answer
+// per sample. What forces the second is that in three dimensions the
+// relation is not constant over a node -- two boxes can each be in
+// front of the other at different pixels, and three can cycle -- so
+// no ordering OF THE NODES reproduces the picture, and the finest
+// grain at which "in front of" is still a total order is the pixel.
+//
+// That is the whole content of the distinction, and it cuts both
+// ways: 2D can order by node because a flat node's depth IS constant
+// over it, which is why the 2D leaf has no depth method and needs
+// none. A Drawable2D_ carrying one would be a 3D node that had lost
+// its third coordinate. Orderable claims one answer per node; where
+// that claim is true, it is enough, and where it is false, the buffer
+// below is what the claim becomes.
+//
 // THE PROJECTED FRAME IS THE CAMERA, LITERALLY. Project does not
 // return a picture of the scene; it fills the camera's own image
 // plane, which is an ordinary Drawable2D -- indistinguishable from
