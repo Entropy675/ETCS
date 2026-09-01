@@ -568,30 +568,11 @@ public:
                 // Buffer::bufsize, and in any case the result needs to
                 // live somewhere the RING's own lifetime discipline
                 // covers, not writeRaw()'s own stack frame.
-                assert(wrap_scratch_pool_ &&
-                    "writeRaw: LMAX pair has a wrap chain but no scratch pool -- "
-                    "buildWrapManifest should have allocated one alongside it.");
                 MBuffer staged;
                 staged.writeRaw(slot.buf, slot.written);
                 for (size_t i = 0; i < wrap_chain_len_; ++i)
                     wrap_chain_[i]->Wrap(staged, bound_ctx_);
-                size_t scratch_idx = static_cast<size_t>(wrap_scratch_next_seq_)
-                                    & static_cast<size_t>(lmax_page_->index_mask_);
-                MBuffer& scratch = wrap_scratch_pool_[scratch_idx];
-                scratch = staged;
-                LBuffer ptr_slot;
-                const MBuffer* ptr = &scratch;
-                std::memcpy(ptr_slot.buf, &ptr, sizeof(MBuffer*));
-                ptr_slot.written = sizeof(MBuffer*);
-                int retries = 0;
-                while (lmax_page_->write(writer_rid_, ptr_slot) == UINT64_MAX)
-                {
-                    if (bound_ctx_.isInterrupted() || bound_ctx_.isTerminated())
-                        return false;
-                    LMAXSequentialSharedPage::progressiveYield(retries);
-                }
-                ++wrap_scratch_next_seq_;
-                return true;
+                return emitWrapped(staged);
             }
             case ActiveStrategy::Pipe:
             case ActiveStrategy::Socket:
@@ -603,7 +584,7 @@ public:
                 staged.writeRaw(slot.buf, slot.written);
                 for (size_t i = 0; i < wrap_chain_len_; ++i)
                     wrap_chain_[i]->Wrap(staged, bound_ctx_);
-                return stageAndFlush(staged);
+                return emitWrapped(staged);
             }
         }
         return false;
@@ -723,7 +704,10 @@ public:
                 // payload entering at this depth would be.
                 for (size_t j = i + 1; j < wrap_chain_len_; ++j)
                     wrap_chain_[j]->Wrap(tail, bound_ctx_);
-                stageAndFlush(tail);
+                // emitWrapped, not stageAndFlush: this is a frame like any
+                // other and has to go out on whichever transport this pair
+                // actually is. See emitWrapped's own comment.
+                emitWrapped(tail);
             }
         }
         closed_ = true;
@@ -739,6 +723,42 @@ public:
                 if (write_fd_ != -1) ::shutdown(write_fd_, SHUT_WR);
                 break;
         }
+    }
+    /*
+ * Producer-body liveness. See SharedPage::producers_live for what this
+ * exists to make observable and why it lives on the page rather than
+ * here. Three thin accessors rather than exposing the page: the only
+ * two call sites are the produce trampoline (enter/leave, ETCS_API.h)
+ * and the pair's own frame (busy, Entity::call), and neither has any
+ * business reaching further into the transport than this.
+ *
+ * No-ops without a staging page. LMAX pairs are same-tag, in-module and
+ * typed, so their produce side is not enqueued across a DSO boundary
+ * and the frame that started it is the frame that ends it; a pair with
+ * no page at all is one that failed to build. Both answer `not busy`,
+ * which is the truthful answer for each.
+ */
+    // Returns the page it raised the count on -- the TOKEN, which
+    // ProducerLiveGuard holds rather than re-reading this MirrorBuffer on the
+    // way out. It has to: a produce body may hand `stream` onward mid-body
+    // (HTTPParser::Listen moving it into an arena-allocated ListenState), and
+    // the move constructor nulls the source's transport handles by design.
+    // Re-reading would then find no page and never decrement, and the pair's
+    // frame would wait out its whole timeout on a body that had in fact
+    // returned. What is being counted is the BODY, not the ownership.
+    SharedPage* producerEnter()
+    {
+        if (shared_page_) shared_page_->producers_live.fetch_add(1, std::memory_order_acq_rel);
+        return shared_page_;
+    }
+    static void producerLeave(SharedPage* token)
+    {
+        if (token) token->producers_live.fetch_sub(1, std::memory_order_acq_rel);
+    }
+    bool producerBusy() const
+    {
+        return shared_page_
+            && shared_page_->producers_live.load(std::memory_order_acquire) > 0;
     }
     // Non-advancing liveness check.
     bool hasData()
@@ -998,11 +1018,74 @@ public:
     ~MirrorBuffer();
 private:
     // -----------------------------------------------------------------------
+    // emitWrapped — puts one ALREADY-WRAPPED frame on the wire, whichever wire
+    // this is. The single place that knows how a wrapped frame leaves.
+    //
+    // It exists because there were two, and one of them was Pipe-only by
+    // accident. writeRaw's wrap path switched on active_ correctly; closeWrite's
+    // terminator loop -- the stage Close() tails, which are payload exactly like
+    // any other frame -- called stageAndFlush unconditionally. On an LMAX pair
+    // shared_page_ is null and write_fd_ is -1 (makePair<StrategyLMAX> sets
+    // lmax_page_ and nothing else), so the first stage with a non-empty
+    // terminator dereferenced null inside acquireWrite. Latent only because no
+    // wrapper shipped so far emits one on a ring pair -- a TLS close_notify or
+    // a compression flush would have found it immediately, at close, on a path
+    // with no error return to report through.
+    //
+    // Every other strategy-dependent operation in this file switches on
+    // active_. This is that switch, made reachable from both callers instead of
+    // written out once and forgotten once.
+    // -----------------------------------------------------------------------
+    bool emitWrapped(MBuffer& staged)
+    {
+        switch (active_)
+        {
+            case ActiveStrategy::LMAX:
+            {
+                assert(lmax_page_ && "emitWrapped: null LMAX page");
+                assert(wrap_scratch_pool_ &&
+                    "emitWrapped: LMAX pair has a wrap chain but no scratch pool -- "
+                    "buildWrapManifest should have allocated one alongside it.");
+                if (!lmax_page_ || !wrap_scratch_pool_) return false;
+                // The frame must outlive this stack frame: the ring carries a
+                // POINTER, and the consumer reads it after this returns. The
+                // scratch pool is ring-sized and indexed by the same sequence,
+                // so a slot is only reused once the ring itself has wrapped
+                // past it -- which write() refuses to do while it is unread.
+                size_t scratch_idx = static_cast<size_t>(wrap_scratch_next_seq_)
+                                    & static_cast<size_t>(lmax_page_->index_mask_);
+                MBuffer& scratch = wrap_scratch_pool_[scratch_idx];
+                scratch = staged;
+                LBuffer ptr_slot;
+                const MBuffer* ptr = &scratch;
+                std::memcpy(ptr_slot.buf, &ptr, sizeof(MBuffer*));
+                ptr_slot.written = sizeof(MBuffer*);
+                int retries = 0;
+                while (lmax_page_->write(writer_rid_, ptr_slot) == UINT64_MAX)
+                {
+                    if (bound_ctx_.isInterrupted() || bound_ctx_.isTerminated())
+                        return false;
+                    LMAXSequentialSharedPage::progressiveYield(retries);
+                }
+                ++wrap_scratch_next_seq_;
+                return true;
+            }
+            case ActiveStrategy::Pipe:
+            case ActiveStrategy::Socket:
+                if (!shared_page_) return false;
+                return stageAndFlush(staged);
+        }
+        return false;
+    }
+    // -----------------------------------------------------------------------
     // stageAndFlush<N> — stages a TBuffer<N> payload (plaintext Buffer on
     // the fast path, or the wrapped MBuffer on the wrap path) into
     // shared_page_ as [size_t len][payload], then flushes to write_fd_.
     // Generic over N so both callers in writeRaw share one implementation
     // rather than duplicating the staging logic per payload width.
+    //
+    // Pipe/Socket only, and reached through emitWrapped on the wrap path --
+    // see its comment for the bug that being called directly caused.
     // -----------------------------------------------------------------------
     template<size_t N>
     bool stageAndFlush(const TBuffer<N>& payload)
@@ -1252,6 +1335,33 @@ private:
 // Producers that already call closeWrite() explicitly keep working unchanged
 // -- closeWrite() is idempotent on all three strategies.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// ProducerLiveGuard — marks the produce BODY as gone when it returns by any
+// path, so the pair's own frame can wait for it.
+//
+// Constructed by DEFINE_STREAM_FUNC_PRODUCE's trampoline (ETCS_API.h) OUTSIDE
+// StreamWriteGuard, so it destructs last: the count drops only after the write
+// end has actually been closed, and a consumer woken by that close cannot
+// observe "no producers live" while one is still inside closeWrite().
+//
+// ADOPTS a token the trampoline already raised; it does not raise its own.
+// The raise has to happen before the enqueue -- the pair's frame can reach its
+// own teardown before a worker picks the task up, and a flag raised inside the
+// lambda would be the very race it exists to remove. So the two halves are
+// deliberately in different frames: raise at the enqueue, release at the body.
+//
+// Holds the token, not the MirrorBuffer -- see MirrorBuffer::producerEnter.
+// ---------------------------------------------------------------------------
+struct ProducerLiveGuard
+{
+    SharedPage* token;
+    explicit ProducerLiveGuard(SharedPage* t) noexcept : token(t) {}
+    ~ProducerLiveGuard() { MirrorBuffer::producerLeave(token); }
+    ProducerLiveGuard(const ProducerLiveGuard&)            = delete;
+    ProducerLiveGuard& operator=(const ProducerLiveGuard&) = delete;
+    ProducerLiveGuard(ProducerLiveGuard&&)                 = delete;
+    ProducerLiveGuard& operator=(ProducerLiveGuard&&)      = delete;
+};
 struct StreamWriteGuard
 {
     MirrorBuffer& s;

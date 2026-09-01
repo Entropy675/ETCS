@@ -227,6 +227,58 @@ struct SignalContext
     bool isUser1()       const { return walk(&SignalContext::user1);     }
     bool isUser2()       const { return walk(&SignalContext::user2);     }
 
+    // RAISING, as against reading -- and the two are deliberately NOT
+    // symmetric, because "stop" has two different scopes and only one of
+    // them was ever expressible.
+    //
+    //   *ctx.interrupt = 1   ends THIS CALL. Local authority belongs to the
+    //                        one in-flight work function: registerContext
+    //                        (Scope, Bundles.h) points ctx.interrupt at that
+    //                        entry's own flag before the body runs. So the
+    //                        write is invisible the instant the call returns
+    //                        -- exactly right for Window.Run breaking its own
+    //                        poll loop, and inert for anything outside it.
+    //                        Worse, a context with no local authority at all
+    //                        (WIRE_CONTEXT's, whose .interrupt is null) makes
+    //                        it a silent no-op: a raise no reader can observe.
+    //
+    //   raiseClosure*()      ends the CLOSURE the call belongs to. Walks the
+    //                        ACTIVE edge to its OUTERMOST authority and raises
+    //                        there, so every member of that closure sees it
+    //                        through walk() -- detached scripts included,
+    //                        since DetachedRegistry::create parents each one
+    //                        to the root precisely so it sits inside the
+    //                        closure of the entry-point script that started
+    //                        it. Validity of RIDs is grouped the same way, so
+    //                        the set that stops is the set that was granted
+    //                        together.
+    //
+    // Outermost rather than nearest: nearest is the call's own scope again,
+    // which is the thing this verb exists NOT to be. Active edge only --
+    // `provider` answers "which entity owns me", a different question, and
+    // raising along it would end an ownership subtree instead of a call
+    // closure. Those are not the same set, and reads follow both only
+    // because either is a reason to stop.
+    //
+    // Returns false when NO level on the chain holds authority for that
+    // signal. That is a wiring bug at the caller, not a quiet nothing, and
+    // the bool is there so the caller can say so.
+    // const: the walk reads pointers-to-flag, and writing THROUGH one of them
+    // does not modify any SignalContext -- the flags live outside, which is
+    // also why a const chain can still be signalled at all.
+    bool raiseClosure(SignalFlag* const SignalContext::* flag) const
+    {
+        SignalFlag* outermost = nullptr;
+        for (const SignalContext* c = this; c; c = c->up)
+            if (c->*flag) outermost = c->*flag;
+        if (!outermost) return false;
+        outermost->store(1, std::memory_order_release);
+        return true;
+    }
+
+    bool raiseClosureInterrupt() const { return raiseClosure(&SignalContext::interrupt); }
+    bool raiseClosureTerminate() const { return raiseClosure(&SignalContext::terminate); }
+
     // Diagnostic: "why did this interrupt not reach here" without a debugger.
     // Longest path to a root along EITHER edge. Was unambiguous with one
     // edge; now it answers "how far can a signal have to travel to reach

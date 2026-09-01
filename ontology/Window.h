@@ -58,7 +58,7 @@ struct NativeSurfaceHandle
 // here, which meant anything wanting "a Window" generically dragged
 // a whole keyboard ring-buffer along whether it wanted input or not,
 // and there was no way to have an input source or a resizable
-// target that wasn't also a full window. See RenderProvider::Target,
+// target that wasn't also a full window. See RenderProvider::Surface,
 // which needs Resizable without any of this.
 
 class Window_ : virtual public ETCS::Entity

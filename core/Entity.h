@@ -23,6 +23,8 @@
 #include <iostream>
 #include <vector>
 #include <mutex>   // resolvePairModuleMask's cache
+#include <thread>  // the loader stream pair waits out its producer body
+#include <chrono>
 namespace ETCS
 {
 inline ETCS::Buffer source()
@@ -143,6 +145,13 @@ inline ETCS::TagMask resolvePairModuleMask(const ETCS::Buffer& tag_a,
     cache.emplace(std::move(key), evt.result);
     return evt.result;
 }
+
+// Defined at the bottom of this file, once EventNode is complete. Declared
+// here because addTagTrampoline calls it on a non-dependent Entity*, so the
+// name has to be visible where that template is defined, not merely where
+// it is instantiated.
+class Entity;
+inline void etcs_supertype_fanout(Entity* e);
 
 class Entity
 {
@@ -930,6 +939,55 @@ public:
  * the (tag, RID) pair getTypedChildren() above reports it under.
  * nullptr if the tag was never attached, or the RID is no longer live.
  */
+    /*
+ * getOrderedTypedChildren(out) - the same enumeration, with each tag's own
+ * list reporting in ITS order (RIDList::collect_ordered, which sorts by the
+ * pointee's operator< when the concrete type declares one).
+ *
+ * WITHIN a tag, this is a real order. ACROSS tags it is not, and cannot be
+ * from here: children of different concrete types live in different lists,
+ * and two unrelated leaf types have no comparison between them -- that is
+ * what makes operator< on the leaf a safe thing to require in the first
+ * place. Tags come out in first-attachment order, as they always have.
+ *
+ * A caller that needs one order over a MIXED set has to supply the relation
+ * that spans them, which means a scalar every member can answer rather than
+ * a pairwise operator (Drawable_::Order() is exactly that). This function
+ * gives that caller its input already sorted within each group, so the
+ * cross-group step is a stable merge over an almost-sorted sequence instead
+ * of a full sort over an arbitrary one.
+ */
+    void getOrderedTypedChildren(std::vector<std::pair<ETCS::Buffer, RID>>& out) const
+    {
+        std::lock_guard<std::mutex> lock(m_tagMutex);
+        for (const auto& tag : typed_child_order_)
+        {
+            auto it = typed_children_.find(tag);
+            if (it == typed_children_.end()) continue;
+            std::vector<RID> rids;
+            it->second.invoke_collect_rids_ordered(rids);
+            for (RID r : rids) out.emplace_back(tag, r);
+        }
+    }
+    /*
+ * reorderTypedChild(rid) - mark the ordered view of whichever of this
+ * entity's typed-children lists holds `rid` as stale.
+ *
+ * The receiving end of Orderable_::Reorder(): a child whose ordering key
+ * moved tells its PARENT, because the list is the parent's, not the
+ * child's. Searches rather than taking a tag, so a caller that knows only
+ * its own RID -- which is every caller, since an entity does not carry the
+ * key its parent filed it under -- needs nothing it does not have.
+ *
+ * Silent when no list holds it: a root-level entity, or one already
+ * removed. Neither is an error; nothing is holding it in an order.
+ */
+    void reorderTypedChild(RID rid)
+    {
+        std::lock_guard<std::mutex> lock(m_tagMutex);
+        for (auto& entry : typed_children_)
+            if (entry.second.invoke_contains(rid)) { entry.second.invoke_reorder(); return; }
+    }
     Entity* getTypedChild(const ETCS::Buffer& tag, RID rid) const
     {
         std::lock_guard<std::mutex> lock(m_tagMutex);
@@ -1308,6 +1366,20 @@ public:
         auto it = interface_pointers_.find(family);
         return it != interface_pointers_.end() ? it->second : nullptr;
     }
+    /*
+ * The families this entity actually fulfills. Read off
+ * interface_pointers_ rather than the tags map on purpose: this map is
+ * written by exactly one thing, ETCS_MAKE_INSTANCE's ctor, once per
+ * supertype base -- so it is precisely the set of ontology families the
+ * type composed, with none of the state tags ("active") or concrete tag
+ * names that share the tags map. etcs_supertype_fanout below is its one
+ * caller.
+ */
+    void getInterfaceFamilies(std::vector<ETCS::Buffer>& result) const
+    {
+        std::lock_guard<std::mutex> lock(m_tagMutex);
+        for (auto const& [family, _] : interface_pointers_) result.push_back(family);
+    }
     void getAllActions(std::vector<ETCS::Buffer>& all_actions)
     {
         for (auto const& [tag_name, entry] : tags)
@@ -1524,9 +1596,27 @@ public:
         ETCS::MBuffer transportProducer;
         consumer.packConsumer(transportConsumer);
         producer.packProducer(transportProducer);
-        producer_entity->getThreadPool().enqueue(ETCS::Priority::High, ctx,
-            [producer_entity, tag_type, action, transportProducer, ctx]() mutable
+        /*
+ * The count is raised HERE, before the enqueue, and not only inside the
+ * produce trampoline -- because the window this closes starts before the
+ * trampoline exists. This lambda captures producer_entity raw and may not
+ * be picked up by a worker for a while; the consumer can finish, the pair
+ * can tear down, the script can Delete that entity, and only then does a
+ * worker start this and call safeBundleFor on freed tags. Reproduced
+ * exactly that way, in ETCS::Entity::safeBundleFor, off closure_probe.
+ *
+ * Two nested raises, one drop each: this one covers DISPATCH (enqueue ->
+ * trampoline returns), the trampoline's own covers the BODY. The body's
+ * is raised before this one is released, so the count never dips to zero
+ * in between and the pair's frame sees one continuous "busy" from enqueue
+ * to the last line of the produce body.
+ */
+        ETCS::SharedPage* dispatch_token = producer.producerEnter();
+        producer_entity->getThreadPool().enqueue(
+            ETCS::Priority::High, ctx,
+            [producer_entity, tag_type, action, transportProducer, ctx, dispatch_token]() mutable
         {
+            ETCS::ProducerLiveGuard _dispatch_live(dispatch_token);
             try
             {
                 if (ModuleBundle* b = producer_entity->safeBundleFor(tag_type, "producer"))
@@ -1537,6 +1627,53 @@ public:
                 ETCS_LOG("[CALL]", "Producer failed: " << e.what());
             }
         });
+        /*
+ * "This call returned" used to mean only "the CONSUMER half finished".
+ * The produce body kept running on a pool worker afterwards, still
+ * holding `self`, and nothing anywhere could tell. For a script edge that
+ * is a live crash: the closure drain (run_script) joins the detached
+ * script the moment the consumer returns, the next line Deletes the
+ * entity, and the produce body is still calling into it -- reproduced as
+ * a SIGSEGV inside ProduceFrames on scripts/closure_probe.etcs.
+ *
+ * NOT the enqueue's future, which is the trap this first fell into: the
+ * task enqueued below runs the module's produce TRAMPOLINE, and that
+ * trampoline enqueues the actual body onto the MODULE's own pool and
+ * returns. Its future is ready almost immediately and says nothing about
+ * the body. The flag on the shared page is what the body itself raises
+ * and clears (SharedPage::producers_live).
+ *
+ * Order is load-bearing. The wait comes AFTER the consumer returns (which
+ * is what stops draining the pipe, so a blocked producer can make
+ * progress) and BEFORE teardownPair (which frees the very page the
+ * producer writes through). A producer blocked in writeRaw is woken by
+ * the signal, not by the teardown -- every MirrorBuffer wait tests
+ * ctx.isInterrupted()/isTerminated() -- and the closure raise that ends a
+ * script edge is exactly that signal.
+ *
+ * Bounded, and a timeout degrades to the OLD behavior rather than to a
+ * hang: tear down anyway and say so, naming the action. A produce body
+ * that ignores its interrupt is a bug in that body, and this is where it
+ * becomes visible instead of becoming a segfault three lines later in
+ * someone's script.
+ */
+        auto wait_for_producer = [&]()
+        {
+            using namespace std::chrono;
+            const auto deadline = steady_clock::now() + seconds(2);
+            while (producer.producerBusy())
+            {
+                if (steady_clock::now() > deadline)
+                {
+                    ETCS_LOG("[CALL]", "producer " << tag_type << "." << action
+                             << " is still running 2s after its consumer returned -- tearing "
+                                "the pair down with the body live. It is not observing its "
+                                "interrupt.");
+                    break;
+                }
+                std::this_thread::sleep_for(milliseconds(1));
+            }
+        };
         try
         {
             if (ModuleBundle* b = safeBundleFor(tag_type_r, "consumer"))
@@ -1545,10 +1682,12 @@ public:
         catch (const std::exception& e)
         {
             ETCS_LOG("[CALL]", "Consumer failed: " << e.what());
+            wait_for_producer();
             ETCS::MirrorBuffer::teardownPair<ETCS::StrategyPipe, ETCS::SharedPage>(
                 producer, consumer, page);
             throw;
         }
+        wait_for_producer();
         ETCS::MirrorBuffer::teardownPair<ETCS::StrategyPipe, ETCS::SharedPage>(
             producer, consumer, page);
     }
@@ -2042,6 +2181,11 @@ template<typename T>
                 child->module_registry_rid_ = rid;
             }
         }
+
+        // Same fan-in a top-level spawn gets from _make_<T> (ETCS_API.h):
+        // an addTag<T>-created child fulfills exactly the same families and
+        // has to be as findable through them.
+        etcs_supertype_fanout(child);
  
         child->parent_     = parent;
         child->parent_rid_ = rid;
@@ -2282,6 +2426,39 @@ public:
  
     ~Root() {
         /*
+ * WHAT THIS TESTS, and what it used to test. The condition was
+ * `ctx_.isInterrupted() || ctx_.isTerminated()` -- a signal on this
+ * Root's chain, used as a proxy for "the process is tearing itself
+ * down". That proxy held only while the ONLY thing that raised a
+ * signal was the process stopping. It no longer does: a closure
+ * ending raises the same authority (SignalContext::raiseClosure)
+ * with the runtime very much alive, and a detached script's Root --
+ * whose ctx_ IS that closure's chain -- then took this branch and
+ * returned WITHOUT unregistering, leaving root_registry holding a
+ * pointer into a thread stack that the closure drain had already
+ * joined and unmapped. findRootCandidate handed that pointer to
+ * requestUnloadImpl 100ms later and it wrote through it:
+ *
+ *     survivor->module_.parent = target;      DynamicLoader.h:1859
+ *
+ * -- a reproduced SIGSEGV, 3 runs in 3, from scripts/render_script.etcs.
+ *
+ * So test the thing the comment always MEANT. The dance is unsafe
+ * exactly when the machinery it needs is gone: ChangeModuleEvent is
+ * synchronous on the loader's ordering thread, and EventNode::alive()
+ * is false precisely once that thread has been joined in ~EventNode.
+ * Alive means the event completes; dead means there is nothing left
+ * to complete it and the OS reclaims the mapping anyway. A raised
+ * signal, by itself, says nothing about either.
+ *
+ * The race the old condition was really guarding -- ~Root's vacate
+ * firing a RequestUnloadEvent whose recheck thread then dlclose'd
+ * under still-running workers -- is closed at its own level now, by
+ * PendingUnloadRegistry's join barrier (DynamicLoader.h): a recheck
+ * cannot be started after the barrier, and every one started before
+ * it is joined. Guarding it a second time here, with a condition
+ * that also drops registry bookkeeping, cost more than it bought.
+ *
  * If a signal-driven shutdown is already in progress, skip the
  * normal graceful vacate/unload dance entirely -- there is no
  * safe way to synchronously wait for an asynchronous module
@@ -2299,11 +2476,14 @@ public:
  * through that return path in time for the join to matter --
  * this stops the race from ever starting in the first place,
  * for this specific case, rather than trying to win it after
- * the fact. No null check needed -- isInterrupted/isTerminated
- * are already safe on a default-constructed (all-null-pointer)
- * SignalContext, simply returning false.
+ * the fact.
+ *
+ * ctx_ is still carried and still load-bearing -- every entity
+ * this Root hosts reaches it as signal authority -- it is just
+ * no longer what decides this branch. See the note above the
+ * condition for why.
  */
-        if (ctx_.isInterrupted() || ctx_.isTerminated())
+        if (!ETCS::EventNode::alive())
         {
             /*
  * This body returning early is NOT enough on its own --
@@ -2523,8 +2703,91 @@ inline Entity* spawn(const std::string& module_name, const std::string& tag,
     return evt();
 }
 #endif
- 
+
+/*
+ * -- etcs_supertype_fanout ------------------------------------------------
+ * Inserts a fully-constructed entity into the aggregate RIDList of every
+ * ontology family it fulfills. ETCS_SUPERTYPE_BASE (ETCS_API.h) publishes
+ * one such list per family under the bare family name; this is what puts
+ * anything IN them.
+ *
+ * Both this file's and DynamicLoader.h's comments have described this
+ * function as existing for a while, and destroyImpl already carries the
+ * matching fan-OUT -- but nothing ever fanned in, so every family aggregate
+ * was permanently empty and that removal loop was dead. Found by trying to
+ * use one: a spawned ImageSurface carries the Pixels type tag and its
+ * interface pointer, and was absent from the "Pixels" list.
+ *
+ * Called post-construction only (_make_/_make_child_/addTagTrampoline).
+ * It cannot run from ETCS_MAKE_INSTANCE's own ctor, which is where the
+ * families are declared: at that point the object is still being built,
+ * bases after this one have not registered their interface pointers yet,
+ * and getRID() would be dispatching through a half-formed vtable.
+ *
+ * WHAT IS STORED is the interface pointer -- the Family_* subobject
+ * address ETCS_MAKE_INSTANCE registered -- because a family aggregate is
+ * RIDList<Family_*> and RIDList is genuinely typed at its own local
+ * provider (RIDList.h). It goes in through insert_iface rather than the
+ * plain insert slot: that one recovers T with getTrueType(), which is the
+ * most-derived address and therefore the WRONG pointer for a base
+ * subobject. Both slots convert inside handle(), the last place T is
+ * known; the handle stays string-keyed and erased on purpose, and what
+ * makes a key trustworthy across that boundary is module verification, not
+ * anything recoverable from the pointer itself.
+ */
+// Declared in RIDList.h, where Entity is necessarily incomplete -- see its
+// comment there. Defined here, where the class is complete: it is the one
+// member call RIDList's handle lambdas need and cannot make themselves.
+inline void* etcs_true_type(Entity* e) { return e ? e->getTrueType() : nullptr; }
+
+inline void etcs_supertype_fanout(Entity* e)
+{
+    if (!e) return;
+    std::vector<ETCS::Buffer> families;
+    e->getInterfaceFamilies(families);
+    if (families.empty()) return;
+
+    auto& ridMap = ETCS::EventNode::getInstance().ridMap;
+    const RID rid = e->getRID();
+    for (const ETCS::Buffer& family : families)
+    {
+        auto it = ridMap.find(family);
+        if (it == ridMap.end()) continue;   // a family this module does not publish
+        // insert_iface, not insert: this list's T is a base subobject
+        // (Pixels_*, Surface_*), so the pointer it must store is the
+        // adjusted one ETCS_MAKE_INSTANCE registered -- getTrueType(),
+        // which the plain insert slot uses, would be the wrong address.
+        it->second.invoke_insert_iface(rid, e->getInterfacePointer(family));
+    }
+}
+
+/*
+ * A RID plus a family name in, a usable Base* out -- the uniform call
+ * surface over a CRTP family. The list lookup finds the entity whoever
+ * built it, and the interface pointer is the correctly-adjusted subobject
+ * address that ETCS_MAKE_INSTANCE registered, so the caller can invoke the
+ * family's contract without knowing the concrete type, which module made
+ * it, or whether that type exposes the same operations as ETCS work
+ * functions -- every implementor satisfies the C++ contract whether or not
+ * it publishes one.
+ *
+ * Returns nullptr if the family is not published here, the RID is not in
+ * it, or the entity somehow lacks the interface pointer.
+ */
+template <typename Base>
+inline Base* resolve_in_family(const char* family, RID rid)
+{
+    if (rid == 0) return nullptr;
+    const ETCS::Buffer key(family);
+    auto& ridMap = ETCS::EventNode::getInstance().ridMap;
+    auto it = ridMap.find(key);
+    if (it == ridMap.end()) return nullptr;
+    // Straight out of the list: a family aggregate stores the Base*
+    // itself (RIDList.h), so there is no interface-pointer round trip and
+    // no adjustment happening here -- this is the pointer that was stored.
+    return static_cast<Base*>(it->second.invoke_get_iface(rid));
+}
+
 } // namespace ETCS
- 
+
 #endif
- 

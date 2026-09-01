@@ -1,0 +1,19 @@
+#!/usr/bin/env etcs
+# Probe: does closing the window stop a DETACHED frame edge, or does the
+# edge outlive the closure the script started?
+spawn RenderProvider::Instance gpu
+gpu.Create()
+
+spawn WindowProvider::Window main
+main.Create(400, 300, 'closure probe')
+
+main.spawn(RenderProvider::Surface view)
+view.Create(@gpu, ../modules/RenderProvider/shaders/)
+view.Clear(0.1, 0.1, 0.2, 1.0)
+
+detach render_frames.etcs view=view
+
+main.PollEvents()
+main.Close()
+main.PollEvents()
+main.Delete()

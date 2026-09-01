@@ -1,0 +1,97 @@
+#!/usr/bin/env etcs
+#IMPORT ACE_ROOT/scripts
+
+# Composition, then hand-off. The window keeps the poll loop so the close
+# button and the keyboard work; both edges run detached; the picture is a
+# tree assembled here out of scene scripts that know nothing about each other.
+#
+#     ./bin/etcs scripts/streamed_scenes.etcs
+#
+# THE SHAPE, and how it differs from polygon_scene.etcs. That one ends on its
+# detaches and drops you into the shell -- good for poking at a live runtime,
+# but nothing is polling, so the window is inert. This one ends on main.Run(),
+# which owns thread 1 for the window's lifetime: real input, a close button
+# that closes, and the frame edge presenting the whole time. Closing the window
+# raises the closure, the drain winds up both edges, and the Deletes below run
+# against a runtime that has already stopped using what they delete.
+#
+#   1. this script's thread    main.Run()             poll loop (GLFW affinity)
+#   2. a ThreadPool worker     Window.ProduceEvents   input ring -> stream
+#   3. a detached thread       Window.ConsumeEvents   input stream drain
+#   4. a ThreadPool worker     Surface.ProduceFrames  frame clock
+#   5. a detached thread       Surface.ConsumeFrames  acquire, record, present
+#
+# HIGHER ORDER, and what that buys. scene_emblem.etcs is run TWICE, against two
+# different anchors, and produces two emblems in two places from one
+# description -- because every point in it is stated in its anchor's space and
+# none of them is absolute. That is the Drawable contract's upward half doing
+# work: a subtree is relocatable because its coordinates were never absolute.
+#
+# The scene scripts build structure and never draw. This file states the
+# picture, once: one Clear to open a composition, one Draw of the stage to
+# realise everything reachable from it. Splitting those two jobs is what lets
+# a scene script be composed without knowing what else is on the surface.
+
+spawn RenderProvider::Instance gpu
+gpu.Create()
+
+spawn WindowProvider::Window main
+main.Create(1024, 768, 'ETCS composed scenes')
+
+main.spawn(RenderProvider::Surface view)
+view.Create(@gpu, modules/RenderProvider/shaders/)
+
+# The stage: a rectangle the size of the frame, and the root of the tree.
+# Ordinary in every way -- it is the polygon nobody nested inside anything.
+spawn RenderProvider::PolygonDrawable2D stage
+stage.Create()
+stage.AddPoint(0, 0)
+stage.AddPoint(1024, 0)
+stage.AddPoint(1024, 768)
+stage.AddPoint(0, 768)
+stage.SetFill(0.06, 0.07, 0.11, 1.0)
+
+# Two regions of the stage, in the stage's space. Each is a perfectly ordinary
+# polygon that happens to be used as a mounting point.
+stage.spawn(RenderProvider::PolygonDrawable2D left)
+left.Create()
+left.AddPoint(60, 200)
+left.AddPoint(460, 200)
+left.AddPoint(460, 600)
+left.AddPoint(60, 600)
+left.SetFill(0.13, 0.15, 0.22, 1.0)
+left.SetOrder(1)
+
+stage.spawn(RenderProvider::PolygonDrawable2D right)
+right.Create()
+right.AddPoint(560, 320)
+right.AddPoint(960, 320)
+right.AddPoint(960, 720)
+right.AddPoint(560, 720)
+right.SetFill(0.13, 0.15, 0.22, 1.0)
+right.SetOrder(1)
+
+# The same scene, twice, in two places. `run` waits, so the tree is fully
+# built before the next line -- and each sub-script gets its own Root, its own
+# signal context and its own closure, so both copies use the names `body` and
+# `gem` without colliding.
+run scene_emblem.etcs anchor=left
+run scene_emblem.etcs anchor=right
+
+# A different scene, mounted directly on the stage.
+run scene_bars.etcs anchor=stage
+
+# The picture, stated once. Clear opens a composition; Draw appends the whole
+# tree to it, depth-first in Order().
+view.Clear(0.02, 0.02, 0.03, 1.0)
+stage.Draw(@view)
+
+# Hand off. Input first, then frames, then the poll loop.
+detach window_events.etcs window=main
+detach render_frames.etcs view=view
+
+main.Run(1024, 768, 'ETCS composed scenes')
+
+view.Delete()
+gpu.Delete()
+main.Delete()

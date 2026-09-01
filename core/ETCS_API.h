@@ -599,11 +599,29 @@ public: \
         ETCS::ScopeTag _auto_scope(self, #Name, ctx, stream.pairTagMask()); \
         stream.bindContext(_auto_scope.ctx()); \
         const ETCS::TagMask _pair_mod = stream.pairModuleMask(); \
-        self->getThreadPool().enqueue(ETCS::Priority::Medium, ctx, [self, stream = std::move(stream), config, _pair_mod, _auto_scope = std::move(_auto_scope)]() mutable { \
+        /* Raised HERE, on the trampoline's own thread, not inside the pool \
+         * lambda: the enqueue returns immediately and the pair's frame may \
+         * reach its own teardown before a worker has even picked the task \
+         * up. Set before the enqueue, the flag is already true by then; set \
+         * inside, it would be a race the flag exists to remove. Cleared by \
+         * ProducerLiveGuard around the body, so an exception leaving counts \
+         * as leaving. */ \
+        ETCS::SharedPage* _live_token = stream.producerEnter(); \
+        try { \
+        self->getThreadPool().enqueue(ETCS::Priority::Medium, ctx, [self, stream = std::move(stream), config, _pair_mod, _live_token, _auto_scope = std::move(_auto_scope)]() mutable { \
+            ETCS::ProducerLiveGuard _auto_live(_live_token); \
             ETCS::PairScope _pair_scope(_pair_mod); \
             ETCS::StreamWriteGuard _auto_close(stream); \
             _implProduce_##Type##_##Name(*self, stream, config, _auto_scope.ctx()); \
         }); \
+        } catch (...) { \
+            /* enqueue throws once the pool is stopping. The body will never \
+             * run, so release the raise here rather than leaving the pair's \
+             * frame waiting out its timeout on a producer that does not \
+             * exist. */ \
+            ETCS::MirrorBuffer::producerLeave(_live_token); \
+            throw; \
+        } \
     } \
     void _implProduce_##Type##_##Name(Type& self, ETCS::MirrorBuffer& stream, ETCS::Buffer data, ETCS::SignalContext ctx)
 
@@ -1001,6 +1019,9 @@ namespace ETCS
         Name* handler = ETCS::MemoryArena::getInstance().allocate<Name>(); \
         buf.writeString(""); \
         _ridlist_##Name().insert(handler->getRID(), handler);\
+        /* Into every family aggregate this type composes, now that it is \
+         * fully constructed -- see etcs_supertype_fanout (Entity.h). */ \
+        ETCS::etcs_supertype_fanout(handler); \
         bool success = handler->myTagInto(buf); \
         \
         if (success){ \

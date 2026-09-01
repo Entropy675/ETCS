@@ -1,0 +1,88 @@
+#!/usr/bin/env etcs
+
+# graphical_script.etcs plus a renderer and a layer stack. Same shape, one
+# extra module -- but the thread ledger is the part worth reading before
+# editing this file, because it is what decides where each line runs.
+#
+# THREE THREADS, and only one of them is negotiable:
+#
+#   1. THIS script's own thread -- the first OS thread. GLFW binds window
+#      creation and event polling to whichever thread called them, so
+#      whatever creates the window here has to be whatever polls it. That
+#      is main.Create() below, and then view.RunDemo() (which polls the
+#      parent window every frame -- VulkanSurface::RunDemo). Non-negotiable.
+#
+#   2. A ThreadPool worker -- Window.ProduceEvents. Every produce body is
+#      enqueued onto the pool (DEFINE_STREAM_FUNC_PRODUCE, ETCS_API.h), and
+#      this one loops until the window closes, so it HOLDS that worker for
+#      the window's whole lifetime rather than passing through it.
+#
+#   3. The detached thread from `detach` -- Window.ConsumeEvents. Consume
+#      bodies run inline ("this thread IS the body's thread"), so the
+#      detached script thread is the one blocked on the input stream.
+#
+# The renderer is NOT on its own thread here, and that is the honest
+# limitation of this version: Surface.RunDemo drives the frame loop AND
+# polls the window, so it must own thread 1. To actually hand rendering off
+# -- window keeps the poll loop, frames run somewhere else -- the frame pump
+# has to become a stream edge of its own (Surface.ProduceFrames ->
+# Surface.ConsumeFrames, RenderProvider.cc's own comment flags this as the
+# intended shape) and the script becomes main.Run() plus a second detach.
+# See render_script_streamed.etcs for that version.
+#
+# Run from the ETCS root -- the shader path below is cwd-relative, same
+# convention run_website.etcs uses for ./www.
+
+spawn RenderProvider::Instance gpu
+gpu.Create()
+
+# Create, not Run: Run would enter the poll loop and never come back, and
+# the Surface cannot be built until the window exists -- it takes its
+# VkSurfaceKHR from the window's native handle and its swapchain extent
+# from the window's size. Ordering here is a real dependency, not style.
+spawn WindowProvider::Window main
+main.Create(800, 600, 'ETCS RenderProvider')
+
+# Child, not a root spawn: the parent link IS the binding between a surface
+# and the window it draws into. Surface.Create walks getParent() for both
+# the Window and the Resizable interface pointers.
+main.spawn(RenderProvider::Surface view)
+view.Create(@gpu, modules/RenderProvider/shaders/)
+
+# The layer stack. Root spawns: a layer has no owner in the scene-graph
+# sense, it is just an addressable region of pixels whose RID the thing
+# compositing knows. Same drawing verbs as the window surface above --
+# the only difference is that these composite on the CPU into their own
+# bytes, and that one presents.
+spawn RenderProvider::ImageSurface base
+base.Create(320, 240)
+base.Clear(0.15, 0.18, 0.35, 1.0)
+base.DrawRect(20, 20, 120, 80, 0.9, 0.75, 0.15, 1.0)
+
+spawn RenderProvider::ImageSurface overlay
+overlay.Create(160, 120)
+overlay.Clear(0.0, 0.0, 0.0, 0.0)
+overlay.DrawRect(0, 0, 160, 60, 0.2, 0.85, 0.4, 0.6)
+
+# Layer onto layer, on the CPU. w/h of 0 mean the source's own size.
+base.Blit(@overlay, 140, 130, 0, 0, 0.8)
+
+# Layer onto the screen, on the GPU: same call, different surface.
+view.Clear(0.05, 0.05, 0.08, 1.0)
+view.Blit(@base, 80, 60, 640, 480, 1.0)
+view.Present()
+
+# Input, exactly as graphical_script.etcs does it. Detached AFTER the
+# window is live: ProduceEvents spins on IsActive() before registering an
+# observer, so detaching it earlier just burns thread 2 waiting.
+detach window_events.etcs window=main
+
+# Owns thread 1 for the rest of the run: polls, clears, draws, presents,
+# and returns when the frame count runs out or the window is closed.
+view.RunDemo(600)
+
+overlay.Delete()
+base.Delete()
+view.Delete()
+gpu.Delete()
+main.Delete()

@@ -12,17 +12,33 @@
 //   10 |     public UnregisteredBase<UserInstance>
 // Wherever your use of it is.
 
-// these ones are a bit more questionable:
+// these ones are a bit more questionable (too general?):
 #include "ontology/ConnectionStateBase.h"
 #include "ontology/HtmlPageBase.h"
 #include "ontology/WindowBase.h"
-#include "ontology/InputSourceBase.h"
-#include "ontology/ResizableBase.h"
-#include "ontology/TargetBase.h"
+#include "ontology/InputSourceBase.h" 
+#include "ontology/PointerBase.h"
 
 // these ones may be turned into just Database with a flag:
 #include "ontology/LocalDatabaseBase.h"
 #include "ontology/RemoteDatabaseBase.h"
+
+// Lower suspicion graphical/window ontology types (mostly RenderProvider/WindowProvider):
+#include "ontology/ResizableBase.h"
+#include "ontology/ClippableBase.h"
+#include "ontology/SurfaceBase.h"
+#include "ontology/PresentableBase.h"
+#include "ontology/PixelsBase.h"
+
+// The Drawable lineage: Surface refined into a node that occupies space in
+// a parent and nests. DrawableBase composes SurfaceBase, and the two leaf
+// bases compose DrawableBase, so the include order below is the lineage
+// order -- and each header includes what it refines anyway, so this list is
+// for visibility (see the ALERT above), not for ordering.
+#include "ontology/DrawableBase.h"
+#include "ontology/Drawable2DBase.h"
+#include "ontology/Drawable3DBase.h"
+#include "ontology/GlyphsBase.h"
 
 // standard ontlogy supertype bases:
 #include "ontology/DeletableBase.h"
