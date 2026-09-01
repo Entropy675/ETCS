@@ -14,7 +14,12 @@ To write an ETCS provider, you effectively have to introduce yourself to the ETC
 
 To build, pull ACE-Build-Tools in one folder. Pull ETCS in another folder. Pull ETCS-Commons as 'modules' folder in the ETCS folder (it's going to be a git sub-project soon, sorry for my laziness). Run:
 
+```
 sudo python3 ace_install.py install
+
+// within the ETCS repo or the ETCS-Commons repo you need the submodules before compiling:
+git submodule update --init --recursive
+```
 
 That will install all the required packages, you may have to run it twice or install a missing package for some modules...
 Then you can build the main etcs loader via:
