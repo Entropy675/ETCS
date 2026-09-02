@@ -15,8 +15,8 @@
 #     Root> world.DepthAt(@eye, 512, 384)                # how far is the centre
 #     Root> world.Order()                                # energy, heat, ticks
 #     Root> main.CaptureMouse(0)                         # or just press Ctrl+Tab
-#     Root> world.SetTurnsPerPass(1.0)                   # halve the turn rate
-#     Root> world.SetSensitivity(0.5)                    # halve it again
+#     Root> world.SetTurnsPerPass(2.0)                   # double the turn rate
+#     Root> world.SetSensitivity(0.5)                    # or halve it
 #
 # Every one of those takes effect on the next frame, because the frame edge
 # re-walks the tree rather than replaying a list of calls (Surface.Compose,
@@ -92,19 +92,20 @@ world.SetPosition(0.0, 0.0, 0.0)
 # stops, lower it to coast.
 world.SetSpeed(7.0)
 world.SetDamping(6.0)
-# A multiplier on "two full turns for one pass across the frame" -- a ratio you
-# can feel, and one that survives a resize where radians-per-pixel would not.
 # THE WINDOW IS THE AXIS. Pointer travel across the frame's width maps onto
 # rotation about the camera as a plain proportion: a full pass is
-# SetTurnsPerPass rotations, half a pass is half of that. No hardware constant
-# is involved -- a faster mouse simply crosses the width in less hand movement,
-# which is what a faster mouse is for.
+# SetTurnsPerPass rotations, half a pass is half of that. A ratio you can feel,
+# and one that survives a resize where radians-per-pixel would not. No hardware
+# constant is involved -- a faster mouse simply crosses the width in less hand
+# movement, which is what a faster mouse is for.
 #
-# NOTE THE FACTOR OF TWO. "Half the width is pi" and "the full width is two
-# rotations" cannot both hold: at 2.0 a half pass is a FULL rotation (2 pi) and
-# the full pass is two; at 1.0 a half pass is pi and the full pass is one
-# rotation. Set it to 1.0 if the second reading is the one you meant.
-world.SetTurnsPerPass(2.0)
+# ONE, not two, and the factor is worth stating because it was ambiguous.
+# "Half the width is pi" and "the full width is two rotations" cannot both
+# hold. At 1.0 a half pass is pi and a full pass is one revolution, so moving
+# the pointer to the edge of the frame turns the view to what was behind you.
+# At 2.0 the view has gone right round before the pointer reaches the middle of
+# the window, which is what "too sensitive" feels like from the hand.
+world.SetTurnsPerPass(1.0)
 world.SetSensitivity(1.0)
 
 # Heat leaves a point into whatever contains it, and the root's environment is
