@@ -1659,6 +1659,24 @@ public:
  */
         auto wait_for_producer = [&]()
         {
+            /*
+ * SAY THE READER IS GONE BEFORE WAITING FOR THE WRITER.
+ *
+ * A consumer can end for reasons the transport knows nothing about --
+ * Surface::ConsumeFrames returns when its surface retires, and no
+ * interrupt is raised anywhere. The producer is then blocked in
+ * flushStaged waiting for pipe space that only a reader frees, with
+ * nothing to observe: it waited out the whole deadline below and got
+ * torn down mid-write, which is where the tombstoned-page write came
+ * from.
+ *
+ * closeRead makes the reader's departure a fact on the transport, so
+ * the next write fails EPIPE and the body leaves through its own
+ * error path. The deadline stays for bodies that ignore an interrupt
+ * they CAN see; it stops being the ordinary case.
+ */
+            consumer.closeRead();
+
             using namespace std::chrono;
             const auto deadline = steady_clock::now() + seconds(2);
             while (producer.producerBusy())

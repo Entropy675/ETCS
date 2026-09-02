@@ -4,6 +4,7 @@
 
 #include "../core_defs.h"
 #include <cstdint>
+#include <atomic>
 
 // ---------------------------------------------------------------
 // WindowPosition
@@ -73,7 +74,11 @@ public:
     virtual WindowPosition  GetPosition()                                           = 0;
     virtual void            SetPosition(int32_t x, int32_t y)                       = 0;
 
-    void* GetHandle() { return m_window; }
+    // Unguarded on purpose: a surface takes this once, at bind time, while
+    // the window is known live (RenderProvider::Surface). Anything that calls
+    // the platform with it on a running window goes through the backend's own
+    // in-flight guard instead -- see m_window below.
+    void* GetHandle() { return m_window.load(std::memory_order_acquire); }
     bool IsActive() const { return this->hasTag("active"); }
 
     // Non-dispatched (like GetHandle()) on purpose -- see the struct's own
@@ -82,7 +87,26 @@ public:
 
 protected:
     const char*        m_title  = nullptr;
-    void*               m_window = nullptr;
+
+    /*
+     * THE HANDLE IS CLAIMED, NOT CHECKED.
+     *
+     * One cross press reaches this transition from three threads: the pump
+     * that saw it, the script's own Close(), and Run's exit. Destroying a
+     * platform window is not idempotent -- it unlinks the window from the
+     * toolkit's list, so a second destroy walks off the end of that list and
+     * dereferences null, which was the segfault.
+     *
+     * Exchanging the handle out makes the destroy something exactly one
+     * caller wins, and takes the handle with it: the losers read null, which
+     * is already the "already closed" case every method here tests for. A
+     * plain pointer could not express that -- test-then-destroy is two steps
+     * and all three threads fitted between them.
+     *
+     * The claim settles WHO destroys. WHEN is the backend's, because only it
+     * knows which of its calls are in flight -- see GLFWWindow::PlatformUse.
+     */
+    std::atomic<void*>  m_window{ nullptr };
     NativeSurfaceHandle m_nativeSurface{};
 };
 

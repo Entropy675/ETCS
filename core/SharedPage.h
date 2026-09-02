@@ -64,10 +64,25 @@ struct SharedPage
         return page;
     }
 
+    /*
+ * A TOMBSTONED PAGE IS A FAIL STATE, NOT AN ABORT.
+ *
+ * This was an assert, on the reasoning that a write after teardown is a
+ * causal violation. It is -- but the process aborting is not what a caller
+ * can do anything with, and the violation is reachable: the pair's frame
+ * gives a producer two seconds to leave and then tears the transport down
+ * anyway (Entity::call), which is exactly a live body meeting a dead page.
+ *
+ * Nullptr is the answer every caller above already handles -- stageAndFlush
+ * returns false, writeRaw returns false, and the produce loop ends the way it
+ * ends when a consumer hangs up. Same outcome, reported instead of signalled.
+ *
+ * The interesting case is why a body was still writing, and the pair's own
+ * timeout log names it. This one is the landing, not the diagnosis.
+ */
     char* acquireWrite(long long size)
     {
-        assert(!tombstoned.load(std::memory_order_relaxed) &&
-               "acquireWrite on tombstoned SharedPage — causal violation");
+        if (tombstoned.load(std::memory_order_acquire)) return nullptr;
 
         long long offset = written.fetch_add(size, std::memory_order_seq_cst);
         if (offset + size > capacity)
@@ -94,10 +109,11 @@ struct SharedPage
         tombstoned.store(true, std::memory_order_release);
     }
 
+    // Same reachability as acquireWrite, and the same answer: a page nobody
+    // reads any more has nothing to rewind.
     void reset()
     {
-        assert(!tombstoned.load(std::memory_order_relaxed) &&
-               "reset on tombstoned SharedPage — already deleted");
+        if (tombstoned.load(std::memory_order_acquire)) return;
         written.store(0, std::memory_order_relaxed);
     }
 };

@@ -667,6 +667,43 @@ public:
                 break;
         }
     }
+    // -----------------------------------------------------------------------
+    // closeRead — the mirror of closeWrite: says the READER is gone.
+    //
+    // The missing half of the pair's vocabulary, and what its absence cost:
+    // a producer blocked in flushStaged is waiting on pipe space that only a
+    // reader can free, and its only escape was ctx.isInterrupted(). A consumer
+    // that ends on its own terms -- Surface::ConsumeFrames returning because
+    // its surface retired -- raises no interrupt, so the producer waited on a
+    // reader that would never read again, the pair's frame timed out after two
+    // seconds and tore the transport down with the body still inside it.
+    //
+    // Closing the read end turns that wait into EPIPE, which every produce
+    // body already handles: writeRaw returns false and the loop ends. An
+    // explicit fail state instead of a deadline.
+    //
+    // Pipe:   closes read_fd_; the producer's next write fails EPIPE.
+    // Socket: shuts down the receive direction, same effect on the peer.
+    // LMAX:   nothing to do. The pair is one blocking call frame, so a
+    //         consumer that returned has already ended its producer.
+    //
+    // Idempotent. Leaves write_fd_ alone -- on a Pipe consumer that is the ack
+    // channel, not this stream.
+    // -----------------------------------------------------------------------
+    void closeRead()
+    {
+        switch (active_)
+        {
+            case ActiveStrategy::LMAX:
+                break;
+            case ActiveStrategy::Pipe:
+                if (read_fd_ != -1) { ::close(read_fd_); read_fd_ = -1; }
+                break;
+            case ActiveStrategy::Socket:
+                if (read_fd_ != -1) ::shutdown(read_fd_, SHUT_RD);
+                break;
+        }
+    }
     /*
  * Producer-body liveness. See SharedPage::producers_live for what this
  * exists to make observable and why it lives on the page rather than
@@ -1038,7 +1075,14 @@ private:
         char* dest = shared_page_->acquireWrite(static_cast<long long>(total));
         if (!dest)
         {
-            if (debug_) ETCS_LOG("MirrorBuffer", "[PRODUCER] Staging page full.");
+            // Two reasons, and the page distinguishes them: no room left, or
+            // the pair was torn down while this body was still writing
+            // (SharedPage::acquireWrite). Both end the stream for this
+            // producer, which is why one return serves.
+            if (debug_)
+                ETCS_LOG("MirrorBuffer", "[PRODUCER] cannot stage -- "
+                         << (shared_page_->tombstoned.load(std::memory_order_acquire)
+                             ? "the pair was torn down under this write." : "staging page full."));
             return false;
         }
         std::memcpy(dest, &len, sizeof(size_t));
