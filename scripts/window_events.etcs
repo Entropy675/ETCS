@@ -1,6 +1,0 @@
-#!/usr/bin/env etcs
-
-requires window [Window]
-
-window.ProduceEvents() -> window.ConsumeEvents()
-window.Close()

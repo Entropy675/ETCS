@@ -1,0 +1,13 @@
+#!/usr/bin/env etcs
+#IMPORT ACE_ROOT/modules
+
+# The pointer half of the look control, on its own thread.
+#
+# A stream edge blocks the thread that states it, so two channels need two
+# threads -- which is what separate channels mean in the first place. Keeping
+# them on one thread would reintroduce exactly the queueing the split removes.
+
+requires window [Window]
+requires scene [Drawable3D]
+
+window.ProducePointer() -> scene.ConsumeLook()

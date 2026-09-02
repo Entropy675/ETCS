@@ -1,5 +1,5 @@
 #!/usr/bin/env etcs
-#IMPORT ACE_ROOT/scripts
+#IMPORT ACE_ROOT/modules
 
 # streamed_scenes.etcs, with the two emblem regions turned into COMPOSITORS.
 #
@@ -57,16 +57,16 @@ right.SetBackground(0.13, 0.15, 0.22, 1.0)
 right.SetOrder(1)
 
 # The same scene scripts, unchanged, against compositors instead of polygons.
-run scene_emblem.etcs anchor=left
-run scene_emblem.etcs anchor=right
+run RenderProvider/scripts/scene_emblem.etcs anchor=left
+run RenderProvider/scripts/scene_emblem.etcs anchor=right
 
-run scene_bars.etcs anchor=stage
+run RenderProvider/scripts/scene_bars.etcs anchor=stage
 
 view.Clear(0.02, 0.02, 0.03, 1.0)
 stage.Draw(@view)
 
-detach window_events.etcs window=main
-detach render_frames.etcs view=view
+detach WindowProvider/scripts/window_events.etcs window=main
+detach RenderProvider/scripts/render_frames.etcs view=view
 
 main.Run(1024, 768, 'ETCS composited scenes')
 

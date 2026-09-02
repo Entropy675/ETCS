@@ -1,5 +1,5 @@
 #!/usr/bin/env etcs
-#IMPORT ACE_ROOT/scripts
+#IMPORT ACE_ROOT/modules
 
 spawn ForumWebsiteProvider::ForumNode node
 node.Mount(forum)
@@ -17,4 +17,4 @@ forumdb.RowProduce(SELECT * FROM forum_body)   -> node.LoadRows()
 node.Index()
 node.Verify()
 
-detach forum_web.etcs forum=node
+detach NetworkProvider/scripts/forum_web.etcs forum=node

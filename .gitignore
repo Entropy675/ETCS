@@ -1,6 +1,6 @@
 .etcs_history
 .db
-
+Makefile
 # Loader build outputs -- mirrors loaders/Makefile's own `clean` target
 # (Run_*Loader, etcs, *.o) so the two can't drift apart. This is what
 # `2508dbe` committed by accident: a `git add .` after a build stages

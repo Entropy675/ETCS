@@ -1,67 +1,195 @@
 #!/usr/bin/env etcs
+#IMPORT ACE_ROOT/modules
 
-# A reusable 3D scene: a ground slab, three towers at different depths, and a
-# near block that occludes one of them.
+# A 3D scene on a window, driven by w/a/s/d, ending detached in the shell.
 #
-#     run scene3d.etcs anchor=<some Drawable3D>
+#     ./bin/etcs scripts/render_scene3d.etcs
 #
-# THIS SCRIPT NAMES NO ABSOLUTE POSITION, exactly as scene_emblem.etcs names
-# none in 2D. Every box below is stated in the ANCHOR's space, so the same
-# file produces the same arrangement wherever the anchor is -- and moving the
-# anchor moves the whole thing with nothing here recomputed. That is the
-# parent-relative rule one dimension up, and it is the entire mechanism behind
-# w/a/s/d: the input edge translates the anchor, and this scene comes along.
+# and then, with the window focused, hold W/S/A/D/Q/E and move the mouse to
+# look. From the prompt, while it is still running:
 #
-# IT ALSO DOES NOT DRAW, for the same reason the 2D scene scripts do not.
-# Building structure and producing an image are different jobs; a camera makes
-# the image, and it does so from whatever this left behind.
+#     Root> RenderProvider                       # read the RIDs back
+#     Root> eye.LookAt(0.0, 12.0, -6.0, 0.0, 0.0, 6.0)   # move the eye
+#     Root> tower_far.SetColor(1.0, 0.2, 0.2, 1.0)       # repaint one box
+#     Root> block.SetVisible(0)                          # hide the occluder
+#     Root> world.DepthAt(@eye, 512, 384)                # how far is the centre
+#     Root> world.Order()                                # energy, heat, ticks
+#     Root> main.CaptureMouse(0)                         # or just press Ctrl+Tab
+#     Root> world.SetSensitivity(0.5)                    # halve the look rate
+#     Root> world.Look()                                 # angles, rate, lens
 #
-# WHAT TO WATCH: the near block sits in FRONT of the middle tower without being
-# related to it in the tree -- different subtrees, no shared parent but the
-# root. Nothing in the graph says which is in front. The depth buffer does
-# (ontology/Drawable3D.h), and that is the whole reason depth is a family
-# constraint rather than a renderer's private array.
-requires anchor [Drawable3D]
+# Every one of those takes effect on the next frame, because the frame edge
+# re-walks the tree rather than replaying a list of calls (Surface.Compose,
+# below). That is what "drop into the shell and modify the live scene" means
+# here, and it is the same shell the 2D scene scripts already hand you.
+#
+# THE STRUCTURE, four things, each doing one job:
+#
+#   world  a Scene3D  -- geometry, and the thing w/a/s/d translates
+#   eye    a Camera3D -- the image plane; a Drawable2D that a scene fills
+#   stage  a compositor -- where the 3D view and any 2D UI merge
+#   view   a Surface  -- the window's presentable surface
+#
+# and the seam between them is one call each way: the camera names the scene by
+# RID, the compositor holds the camera as an ordinary 2D child, and the surface
+# is handed the compositor as the root to walk. Nothing anywhere says "this one
+# is the 3D one" -- ontology/Camera.h on why that is the whole point.
+#
+# THREAD LEDGER -- five, the same five render_script_streamed.etcs has, with
+# the input consumer doing more than logging:
+#
+#   1. this script's thread   main.Run()               poll-free idle block
+#   2. pool worker            Window.ProduceEvents     poll loop + event source
+#   3. detached thread        Scene3D.ConsumeInput     key bitset + motion tick
+#   4. pool worker            Surface.ProduceFrames    frame clock
+#   5. detached thread        Surface.ConsumeFrames    walk, record, present
 
-# The ground. Wide and thin -- a box is the only primitive here, so a floor is
-# a box that is not tall, which is the same self-similarity the 2D tree has
-# between the screen-sized root rectangle and a triangle three levels down.
-anchor.spawn(RenderProvider::Scene3D ground)
-ground.Create(30.0, 0.5, 30.0)
-ground.SetPosition(0.0, -2.0, 0.0)
-ground.SetColor(0.20, 0.24, 0.30, 1.0)
+spawn RenderProvider::Instance gpu
+gpu.Create()
 
-# Three towers, receding. Same size, placed at increasing z, so the projection
-# has something to be checked against by eye: they should shrink with distance
-# in a straight ratio, and their tops should converge.
-anchor.spawn(RenderProvider::Scene3D tower_near)
-tower_near.Create(1.6, 4.0, 1.6)
-tower_near.SetPosition(-4.0, 0.0, 0.0)
-tower_near.SetColor(0.85, 0.35, 0.30, 1.0)
+# Create before Run: the Surface needs a live window to take its handle and
+# extent from, and Run would block before we could attach one. Run's own
+# CreateWindow is idempotent, so this order is safe and Run just enters the
+# idle block.
+spawn WindowProvider::Window main
+main.Create(1024, 768, 'ETCS 3D scene -- WASD')
 
-anchor.spawn(RenderProvider::Scene3D tower_mid)
-tower_mid.Create(1.6, 4.0, 1.6)
-tower_mid.SetPosition(0.0, 0.0, 6.0)
-tower_mid.SetColor(0.35, 0.75, 0.55, 1.0)
+main.spawn(RenderProvider::Surface view)
+view.Create(@gpu)
 
-anchor.spawn(RenderProvider::Scene3D tower_far)
-tower_far.Create(1.6, 4.0, 1.6)
-tower_far.SetPosition(4.0, 0.0, 12.0)
-tower_far.SetColor(0.40, 0.55, 0.90, 1.0)
+# ── the 2D side: a compositor, so UI and the 3D view merge in one buffer ──
+spawn RenderProvider::CompositeDrawable2D stage
+stage.Create(1024, 768)
+stage.SetPosition(0, 0)
+stage.SetBackground(0.04, 0.05, 0.08, 1.0)
 
-# A cap NESTED IN the near tower, one level deeper, stated in the tower's own
-# space -- so it is at the tower's top, not at the world's. Move the tower and
-# the cap goes with it; move the anchor and all of it goes. Same contract the
-# gem has with the diamond in scene_emblem.etcs.
-tower_near.spawn(RenderProvider::Scene3D cap)
-cap.Create(2.2, 0.4, 2.2)
-cap.SetPosition(0.0, 2.2, 0.0)
-cap.SetColor(0.95, 0.80, 0.30, 1.0)
+# ── the camera: a Drawable2D that a scene fills ──────────────────────────
+#
+# Nested in the stage like any other 2D node, positioned in the stage's space
+# like any other 2D node, ordered against its siblings like any other 2D node.
+# It is a camera only in what fills it.
+stage.spawn(RenderProvider::Camera3D eye)
+eye.Create(1024, 768)
+eye.SetPosition(0, 0)
+eye.SetOrder(1)
+eye.SetBackground(0.07, 0.09, 0.15, 1.0)
+eye.LookAt(0.0, 3.0, -14.0, 0.0, 0.5, 2.0)
+eye.SetLens(60.0, 0.1, 400.0)
 
-# The occluder: near the camera, in front of the middle tower, and a sibling of
-# it rather than an ancestor or a child. The tree has nothing to say about
-# which of the two is visible where they overlap.
-anchor.spawn(RenderProvider::Scene3D block)
-block.Create(2.0, 2.0, 2.0)
-block.SetPosition(0.6, -0.5, 2.0)
-block.SetColor(0.75, 0.45, 0.85, 1.0)
+# ── the scene: an invisible root, and the geometry under it ──────────────
+#
+# The root is a container rather than a box you can see: it is the coordinate
+# origin the scene is stated against and the single thing w/a/s/d translates.
+# Making it invisible is not a trick -- a container with no appearance is
+# exactly what a parent-relative tree wants at its top, and the 2D tree's root
+# rectangle is the same node with SetVisible left on.
+spawn RenderProvider::Scene3D world
+world.Create(1.0, 1.0, 1.0)
+world.SetVisible(0)
+world.SetPosition(0.0, 0.0, 0.0)
+# Terminal speed and drag, per second -- held keys are an acceleration, not a
+# displacement, so these two are the whole feel. Raise the damping for crisper
+# stops, lower it to coast.
+world.SetSpeed(7.0)
+world.SetDamping(6.0)
+# THE LOOK IS ABSOLUTE: where the pointer sits on the camera's frame IS the
+# direction the camera looks. The frame is the plane bisecting the view cone,
+# so its bounding box is the field of view, and the pointer's offset from the
+# centre of that box is a position on a rotational axis -- the full circle
+# across the width, and the pitch range down the height.
+#
+# SENSITIVITY IS THAT SPAN. 1.0 means the width is exactly one turn and the
+# height the full pitch range. 2.0 -- the default, and what is set here -- makes
+# the width TWO turns, which is the more usable choice: a half turn, the thing
+# you ask a look for most often, then lands a quarter of the width from centre
+# rather than at the very edge, so the pointer stays near the middle of the
+# frame. The axis is compressed, not clipped: every direction is still
+# reachable, twice over. Smaller stretches it back out. This is the number to
+# experiment with; there is no other.
+#
+# NOTHING ACCUMULATES, which is the point. Put the pointer back where it was
+# and the view is exactly back where it was -- no drift, no lag, nothing to
+# reset. It also needs no cursor locking, so it behaves the same on displays
+# that refuse to let an application move the pointer (Qubes, XWayland, remote
+# X), where a delta-based look silently turns the whole screen into a joystick.
+#
+# world.Look() prints the angles and both spans.
+world.SetSensitivity(2.0)
+
+# Heat leaves a point into whatever contains it, and the root's environment is
+# outside the model -- so this is the rate at which the scene's accumulated
+# drag heat stops being the scene's problem (ontology/OrderVector.h). Read the
+# ledger back at any time with world.Order().
+world.SetEmissivity(0.5)
+
+run RenderProvider/scripts/scene3d.etcs anchor=world
+
+# One call, and the direction of causality: the camera names the scene. The
+# scene does not know it is being watched until it is projected, at which point
+# it records the viewer so a later move can mark it (Scene3D.h).
+eye.SetScene(@world)
+
+# ── 2D UI, drawn ON the camera's frame ───────────────────────────────────
+#
+# Children of the camera, in the camera's own space, drawn after the
+# projection and clipped to the frame. This is the composition the Camera
+# family exists for: the 3D view is the main surface and the 2D tree is what
+# sits on top of it, with no adapter between the two because there is no
+# difference between the two.
+# A live frame counter over the 3D view -- a Glyphs leaf nested in the camera
+# exactly like the reticle below, so it is drawn after the projection and
+# clipped to the frame. "%f" is substituted at draw time from the surface named
+# by BindFps, because the rate is a property of the frame loop and a script
+# cannot run per frame (TextLabel::BindFps).
+#
+# IT COSTS FRAMES, and that is not a bug to hide: a label whose text changes
+# every frame is a self-animating node, so it answers yes to Animating() and
+# keeps every compositor above it recomposing. A settled scene with the counter
+# on runs at roughly two thirds of what it runs at with the counter off --
+# which is the honest price of watching the number, and the reason to take it
+# off once you have read it.
+eye.spawn(RenderProvider::TextLabel hud)
+hud.Create(24)
+hud.SetText(%f fps -- wasd move / mouse look / ctrl+tab)
+hud.SetPosition(16, 16)
+hud.SetColor(0.6, 1.0, 0.7, 1.0)
+hud.SetBackground(0.0, 0.0, 0.0, 0.45)
+hud.SetPadding(6)
+hud.SetOrder(11)
+hud.BindFps(@view)
+
+eye.spawn(RenderProvider::PolygonDrawable2D reticle)
+reticle.Create()
+reticle.AddPoint(506, 378)
+reticle.AddPoint(518, 378)
+reticle.AddPoint(518, 390)
+reticle.AddPoint(506, 390)
+reticle.SetFill(1.0, 1.0, 1.0, 0.55)
+reticle.SetOrder(10)
+
+# ── the frame edge ───────────────────────────────────────────────────────
+#
+# Compose, not Draw. Draw would issue one composition now and the surface would
+# replay it forever -- right for a still picture, and exactly wrong for a tree
+# that moves, since replaying past calls never asks the camera to make a new
+# image. Binding the root makes the frame edge re-walk it each tick, which is
+# where every dirty flag in this system finally pays for itself: a frame with
+# nothing moving costs one DrawInto per node, no projection, and no upload.
+view.Clear(0.02, 0.02, 0.03, 1.0)
+view.Compose(@stage)
+
+# Hides the cursor, and that is all it does now -- no grab, no confinement, no
+# warping. An absolute look has nothing to confine: the pointer's position over
+# the frame is the angle, so it never needs somewhere to keep going. This is
+# also why the control behaves identically on displays that refuse to let an
+# application move the pointer.
+#
+# CTRL+TAB is the way out -- handled by the window itself (GLFWWindow.h), so it
+# still works if whatever is consuming the input does not.
+main.CaptureMouse(1)
+
+detach scene3d_input.etcs window=main scene=world
+detach RenderProvider/scripts/render_frames.etcs view=view
+
+# does nothing but final setup and run for the window + cleanup when Run exits
+detach scene3d_profile.etcs main=main

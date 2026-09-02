@@ -1,5 +1,5 @@
 #!/usr/bin/env etcs
-#IMPORT ACE_ROOT/scripts
+#IMPORT ACE_ROOT/modules
 
 # A WINDOW AND AN INPUT EDGE, AND NOTHING ELSE. The window is blank on purpose
 # -- there is no renderer in this script at all, so nothing ever draws into it.
@@ -32,6 +32,6 @@
 # render_scene3d.etcs are the two worked examples.
 
 spawn WindowProvider::Window main
-detach window_events.etcs window=main
+detach WindowProvider/scripts/window_events.etcs window=main
 main.Run(600, 600, 'GraphicalLoader Test GUI') 
 main.Delete()

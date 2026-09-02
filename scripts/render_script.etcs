@@ -1,4 +1,5 @@
 #!/usr/bin/env etcs
+#IMPORT ACE_ROOT/modules
 
 # graphical_script.etcs plus a renderer and a layer stack. Same shape, one
 # extra module -- but the thread ledger is the part worth reading before
@@ -75,7 +76,7 @@ view.Present()
 # Input, exactly as graphical_script.etcs does it. Detached AFTER the
 # window is live: ProduceEvents spins on IsActive() before registering an
 # observer, so detaching it earlier just burns thread 2 waiting.
-detach window_events.etcs window=main
+detach WindowProvider/scripts/window_events.etcs window=main
 
 # Owns thread 1 for the rest of the run: polls, clears, draws, presents,
 # and returns when the frame count runs out or the window is closed.
