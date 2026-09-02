@@ -2797,18 +2797,123 @@ inline void etcs_supertype_fanout(Entity* e)
  * Returns nullptr if the family is not published here, the RID is not in
  * it, or the entity somehow lacks the interface pointer.
  */
+// Defined in DynamicLoader.h, which includes this header -- declared here and
+// resolved at template instantiation, which happens in the module's own
+// translation unit after every core header is in.
+ETCS::EventNode* etcs_loader_event_node();
+
 template <typename Base>
 inline Base* resolve_in_family(const char* family, RID rid)
 {
     if (rid == 0) return nullptr;
+
+    /*
+ * TWO PLACES TO LOOK, AND THE SECOND ONE IS THE POINT.
+ *
+ * EventNode::getInstance() is a function-local static, so there is ONE PER
+ * SHARED OBJECT and a module's own ridMap holds only the entities that module
+ * created. That local map answers the INHERITANCE-shaped question: a type
+ * reaching a family its own module publishes and populates.
+ *
+ * Anything else is COMPOSITION, and composition is loader-mediated by design.
+ * The loader absorbs every module's lists under an origin-affixed key --
+ * "RenderProvider:Surface", not "Surface" (DynamicLoader.h's absorb loop) --
+ * and that prefix is not an artefact to route around, it is the OWNERSHIP
+ * EDGE written down. A composed entity belongs to the provider that made it,
+ * the loader is what holds that relation, and so the loader is the only thing
+ * that can hand the pointer over. Asking it is the mechanism, not a fallback.
+ *
+ * WHAT WAS ACTUALLY BROKEN was that this function never asked. It looked in
+ * the caller's own node and stopped, so it implemented only the first of the
+ * two questions and silently answered null to the second -- and null here is
+ * indistinguishable from "no such entity", so every caller's `if (!x) return;`
+ * turned a composed call into a no-op with nothing logged. A PaintProvider
+ * brush painting onto a RenderProvider surface looked exactly like a working
+ * program that drew nothing.
+ *
+ * A QUALIFIED "Provider:Type" IS THE EXACT FORM and the one to prefer. A
+ * provider exports at most one list of a given type name -- two would be a
+ * name conflict inside that provider -- so the pair is a unique key and this is
+ * a LOOKUP, not a search: the provider names the list, the list is asked once,
+ * and nothing is scanned. The ownership edge is followed rather than
+ * rediscovered.
+ *
+ * A BARE FAMILY IS A QUESTION WITH MORE THAN ONE POSSIBLE ANSWER, and the size
+ * of that possibility is the reason this is not a first-match scan.
+ *
+ * RIDs are unique per PROVIDER-TYPE, not per process: the generating sequence
+ * runs per provider per type, and a RID plus a type has a cycle far too long to
+ * collide -- but the same RID value can perfectly well name different entities
+ * under different types. A family is a SET of types, so scanning every
+ * "*:Family" list and taking the first hit can return an entity that merely
+ * shares a number with the one meant. That is the same class of failure this
+ * function was fixed for: a wrong answer that looks exactly like a right one.
+ *
+ * So a bare family collects EVERY match and insists on exactly one. One is the
+ * ordinary case and resolves. Zero is "no such entity". More than one is a real
+ * ambiguity in the question asked, and it is reported and refused rather than
+ * guessed -- the caller has to say which provider it meant, which it can,
+ * because whatever handed it the RID knew.
+ *
+ * The bare form stays because it is what a family is FOR: which provider
+ * satisfies a requirement is precisely what a family exists not to specify,
+ * the same reason scripts `requires` a family rather than a concrete type.
+ * Qualification is how a caller that does know says so.
+ */
     const ETCS::Buffer key(family);
-    auto& ridMap = ETCS::EventNode::getInstance().ridMap;
-    auto it = ridMap.find(key);
-    if (it == ridMap.end()) return nullptr;
-    // Straight out of the list: a family aggregate stores the Base*
-    // itself (RIDList.h), so there is no interface-pointer round trip and
-    // no adjustment happening here -- this is the pointer that was stored.
-    return static_cast<Base*>(it->second.invoke_get_iface(rid));
+    const std::string  name(family);
+    const bool qualified = (name.find(':') != std::string::npos);
+
+    if (!qualified)
+    {
+        // Straight out of the list: a family aggregate stores the Base*
+        // itself (RIDList.h), so there is no interface-pointer round trip and
+        // no adjustment happening here -- this is the pointer that was stored.
+        auto& mine = ETCS::EventNode::getInstance().ridMap;
+        auto it = mine.find(key);
+        if (it != mine.end())
+            if (void* p = it->second.invoke_get_iface(rid))
+                return static_cast<Base*>(p);
+    }
+
+    ETCS::EventNode* owner = etcs_loader_event_node();
+    if (!owner) return nullptr;      // no loader: nothing has been composed
+
+    if (qualified)
+    {
+        auto it = owner->ridMap.find(key);
+        if (it == owner->ridMap.end()) return nullptr;
+        return static_cast<Base*>(it->second.invoke_get_iface(rid));
+    }
+
+    // Only keys that ARE this family under some provider are candidates, which
+    // is both the correctness filter and the whole of the search space.
+    const std::string suffix = ":" + name;
+    void*       found       = nullptr;
+    std::string found_owner;
+    int         matches     = 0;
+
+    for (auto& [k, handle] : owner->ridMap)
+    {
+        const std::string ks = k.toString();
+        if (ks.size() <= suffix.size()) continue;
+        if (ks.compare(ks.size() - suffix.size(), suffix.size(), suffix) != 0) continue;
+
+        void* p = handle.invoke_get_iface(rid);
+        if (!p) continue;
+        if (++matches == 1) { found = p; found_owner = ks; }
+        else
+        {
+            ETCS_LOG("resolve_in_family", "RID:" << rid << " is ambiguous for family '"
+                     << name << "' -- it names an entity under BOTH " << found_owner
+                     << " and " << ks << ". RIDs are unique per provider-type, not per "
+                     "process, so a bare family name is not enough here. Refusing rather "
+                     "than guessing: ask for the one you mean, e.g. resolve_in_family(\""
+                     << ks << "\", rid).");
+            return nullptr;
+        }
+    }
+    return static_cast<Base*>(found);
 }
 
 } // namespace ETCS

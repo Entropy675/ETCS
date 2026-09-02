@@ -2908,5 +2908,15 @@ inline void ETCS::RequestUnloadEvent::operator()()
  */
 }
  
+// The loader's EventNode -- the one node that holds every module's lists under
+// their origin-affixed keys, and therefore the only thing that can resolve a
+// COMPOSED entity for a module that did not create it (core/Entity.h's
+// resolve_in_family). Declared there and defined here because that is the
+// direction the include graph allows. Null in a build with no loader, where
+// nothing has been composed and nothing should resolve.
+namespace ETCS {
+inline EventNode* etcs_loader_event_node() { return ::dynamicLoader.node; }
+}
+
 #endif
  

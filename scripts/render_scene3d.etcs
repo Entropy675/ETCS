@@ -99,10 +99,13 @@ world.SetDamping(6.0)
 # across the width, and the pitch range down the height.
 #
 # SENSITIVITY IS THAT SPAN. 1.0 means the width is exactly one turn and the
-# height the full pitch range, so every direction is reachable without the
-# pointer leaving the view; the two edges of the frame meet behind you. Larger
-# compresses the axis (you reach the stops before the edge), smaller stretches
-# it. This is the number to experiment with; there is no other.
+# height the full pitch range. 2.0 -- the default, and what is set here -- makes
+# the width TWO turns, which is the more usable choice: a half turn, the thing
+# you ask a look for most often, then lands a quarter of the width from centre
+# rather than at the very edge, so the pointer stays near the middle of the
+# frame. The axis is compressed, not clipped: every direction is still
+# reachable, twice over. Smaller stretches it back out. This is the number to
+# experiment with; there is no other.
 #
 # NOTHING ACCUMULATES, which is the point. Put the pointer back where it was
 # and the view is exactly back where it was -- no drift, no lag, nothing to
@@ -111,7 +114,7 @@ world.SetDamping(6.0)
 # X), where a delta-based look silently turns the whole screen into a joystick.
 #
 # world.Look() prints the angles and both spans.
-world.SetSensitivity(1.0)
+world.SetSensitivity(2.0)
 
 # Heat leaves a point into whatever contains it, and the root's environment is
 # outside the model -- so this is the rate at which the scene's accumulated
