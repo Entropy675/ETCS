@@ -223,6 +223,87 @@ int main()
         check_pixel(px, 20, 81, { 255, 255, 255, 255 }, 2, "motion after release does not paint");
     }
 
+    // ── 5b ───────────────────────────────────────────────────────────────
+    std::cout << "\n== 5b. the composed reference, as a set ==\n";
+    {
+        // collect_in_family is the primitive resolve_in_family is built on: a
+        // family spans providers and RIDs are unique only per provider-type, so
+        // "the Surface with RID n" is a question that can have more than one
+        // answer. Here it has exactly one, which is the case worth pinning --
+        // if a second provider ever registers a colliding RID under Surface,
+        // this is what changes.
+        std::vector<Surface_*> hits;
+        const size_t n = ETCS::collect_in_family<Surface_>("Surface", canvas->getRID(), hits);
+        check(n == 1, "collect_in_family finds the canvas exactly once ("
+              + std::to_string(n) + ")");
+
+        hits.clear();
+        const size_t q = ETCS::collect_in_family<Surface_>("RenderProvider:ImageSurface",
+                                                            canvas->getRID(), hits);
+        check(q == 1, "and the qualified Provider:Type form finds it in one lookup");
+
+        hits.clear();
+        check(ETCS::collect_in_family<Surface_>("Surface", 999999999u, hits) == 0,
+              "a RID nothing holds returns an empty set, not a null answer");
+    }
+
+    // ── 5c ───────────────────────────────────────────────────────────────
+    std::cout << "\n== 5c. Orderable::Search across the module boundary ==\n";
+    {
+        // THE POINT OF THIS SECTION is that this file cannot name
+        // PolygonDrawable2D -- the type lives inside RenderProvider.so and no
+        // header here declares it. It holds RIDs and Entity*, nothing more.
+        // The RID-exemplar form is what makes the question askable anyway: the
+        // list resolves the exemplar itself, so the relation stays the type's
+        // while the asking does not.
+        ETCS::Entity* a = ETCS::spawn_entity("RenderProvider", "PolygonDrawable2D", env, loader);
+        ETCS::Entity* b = ETCS::spawn_entity("RenderProvider", "PolygonDrawable2D", env, loader);
+        ETCS::Entity* c = ETCS::spawn_entity("RenderProvider", "PolygonDrawable2D", env, loader);
+        if (!a || !b || !c) { check(false, "could not spawn three PolygonDrawable2D"); }
+        else
+        {
+            a->call("PolygonDrawable2D.Create", "", ctx);
+            b->call("PolygonDrawable2D.Create", "", ctx);
+            c->call("PolygonDrawable2D.Create", "", ctx);
+            // Drawable2D orders by SetOrder, so two at 7 and one at 3 gives an
+            // equivalence class of two -- the case that distinguishes a range
+            // from a find.
+            a->call("PolygonDrawable2D.SetOrder", "7", ctx);
+            b->call("PolygonDrawable2D.SetOrder", "3", ctx);
+            c->call("PolygonDrawable2D.SetOrder", "7", ctx);
+
+            std::vector<ETCS::RID> hits;
+            const size_t n = Orderable_::Search("RenderProvider:PolygonDrawable2D",
+                                                 a->getRID(), hits);
+            check(n == 2, "Search by RID exemplar found the equivalence class ("
+                  + std::to_string(n) + " of 2 at order 7)");
+
+            bool has_a = false, has_c = false, has_b = false;
+            for (ETCS::RID r : hits)
+            { if (r == a->getRID()) has_a = true;
+              if (r == c->getRID()) has_c = true;
+              if (r == b->getRID()) has_b = true; }
+            check(has_a && has_c, "and it is the two that share the standing");
+            check(!has_b, "with the one that does not left out");
+
+            hits.clear();
+            check(Orderable_::Search("RenderProvider:PolygonDrawable2D", b->getRID(), hits) == 1,
+                  "a standing held alone returns exactly that one");
+
+            hits.clear();
+            check(Orderable_::Search("PolygonDrawable2D", a->getRID(), hits) == 0,
+                  "a BARE family name is refused -- an order belongs to one type");
+
+            hits.clear();
+            check(Orderable_::Search("RenderProvider:Instance", a->getRID(), hits) == 0,
+                  "and a type that declares no order reports it rather than matching");
+
+            a->call("PolygonDrawable2D.Delete", "", ctx);
+            b->call("PolygonDrawable2D.Delete", "", ctx);
+            c->call("PolygonDrawable2D.Delete", "", ctx);
+        }
+    }
+
     // ── 6 ────────────────────────────────────────────────────────────────
     std::cout << "\n== 6. teardown is clean and idempotent ==\n";
     pin->call("PaintInput.Delete", "", ctx);

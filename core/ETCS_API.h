@@ -843,7 +843,7 @@ namespace ETCS
         auto* loaderManifest = static_cast<ETCS::Manifest*>(loaderManifestPtr); \
         if (ETCS::compareManifests(ETCS::Entity::getManifest(), loaderManifest, #Name)) { \
             std::cerr << "FATAL: module '" #Name "' and the loader disagree on " \
-                         "HEADER:/ONTOLOGY: hashes -- built for different epochs. " \
+                         "CORE:/HEADER:/ONTOLOGY: hashes -- built for different epochs. " \
                          "Refusing to run." << std::endl; \
             /* TODO(recovery): re-fetch whichever of {this module, the \
              * loader} is older from anticurrententropy.com and retry once \

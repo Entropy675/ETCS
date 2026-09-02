@@ -110,6 +110,25 @@ struct RIDListHandle {
     void* self                                 = nullptr;
     void (*collect_rids_ordered)(void* self, std::vector<RID>& out) = nullptr;
     void (*reorder)(void* self) = nullptr;
+    /*
+ * NULL WHEN THE POINTEE DECLARES NO ORDER, and that is the signal rather than
+ * an oversight: a search needs something to bisect on, and the only thing this
+ * list is sorted by is the Orderable relation. A list without one is not
+ * "searchable but slow", it has no search key at all, so the slot is absent and
+ * a caller can tell the difference. See RIDList::search_ordered.
+ *
+ * The key is passed as const void* because this is the type-erasure boundary;
+ * the lambda that fills this slot casts it back to the pointee type it was
+ * generated for. What guarantees the cast is the CALLER NAMING THE LIST: an
+ * order search is only meaningful inside one concrete type's list (the
+ * comparison belongs to that type), so it is reached by a qualified
+ * "Provider:Type" and naming that is naming the exemplar's type.
+ */
+    void (*search_ordered)(void* self, const void* key, std::vector<RID>& out) = nullptr;
+    // The same search with the exemplar named by RID -- fully type-erased on
+    // both sides, so a caller that cannot name the pointee can still ask.
+    // See RIDList::search_ordered_by.
+    void (*search_ordered_by)(void* self, RID exemplar, std::vector<RID>& out) = nullptr;
     size_t  invoke_count()    const { return count(self);             }
     bool    invoke_contains(RID r) const { return contains(self, r);       }
     bool    invoke_remove(RID r)   const { return remove(self, r);         }
@@ -121,6 +140,12 @@ struct RIDListHandle {
     void    invoke_insert_iface(RID r, void* iface) const { insert_iface(self, r, iface); }
     void*   invoke_get_iface(RID r)        const { return get_iface(self, r);   }
     RIDListHandle invoke_make_in(MemoryArena& arena, const char* name) const { return make_in(arena, name); }
+    // Returns whether this list can be searched at all -- see search_ordered.
+    bool    invoke_searchable() const { return search_ordered != nullptr; }
+    void    invoke_search_ordered(const void* key, std::vector<RID>& out) const
+            { if (search_ordered) search_ordered(self, key, out); }
+    void    invoke_search_ordered_by(RID exemplar, std::vector<RID>& out) const
+            { if (search_ordered_by) search_ordered_by(self, exemplar, out); }
 };
 
 // ── RIDList<T> ────────────────────────────────────────────────────────────────
@@ -237,6 +262,78 @@ struct RIDList {
             for (auto const& kv : entities) out.push_back(kv.first);
         }
     }
+    /*
+ * EQUAL RANGE, NOT A FIND, and that is forced by what the relation means.
+ *
+ * Orderable derives == from < , so equality here is EQUIVALENCE -- "neither
+ * precedes the other" -- and two different entities with the same standing
+ * compare equal (ontology/Orderable.h says so in as many words, and adds that
+ * identity is the RID and only the RID). So a search on the order key can
+ * legitimately match many entities, and returning one of them would be picking
+ * arbitrarily from a set the caller asked for. The result is a range.
+ *
+ * It comes back in the order stable_sort left it, so a caller reading the
+ * matches gets them in the list's own order rather than a permutation that
+ * changes between rebuilds.
+ *
+ * O(log n) against the sorted vector, which is the whole reason this belongs to
+ * Orderable and could not be offered generally: `entities` is an unordered_map,
+ * so a search by RID is already a hash lookup and bisecting it would be both
+ * slower and impossible -- ordered_ is not sorted by RID. The only thing this
+ * list can bisect on is the thing it was sorted by.
+ *
+ * collect_ordered first, because it is what rebuilds a stale order. Searching a
+ * stale index is the one way this could quietly return the wrong range.
+ */
+    void search_ordered(const std::remove_pointer_t<T>& key, std::vector<RID>& out) const {
+        if constexpr (detail::has_ordered_pointee_v<T>) {
+            std::vector<RID> ord;
+            collect_ordered(ord);
+            auto lo = std::lower_bound(ord.begin(), ord.end(), key,
+                [this](RID a, const std::remove_pointer_t<T>& k) {
+                    T ea = get_typed(a);
+                    return ea ? (*ea < k) : true;     // nulls sort first, as in collect_ordered
+                });
+            auto hi = std::upper_bound(lo, ord.end(), key,
+                [this](const std::remove_pointer_t<T>& k, RID b) {
+                    T eb = get_typed(b);
+                    return eb ? (k < *eb) : false;
+                });
+            out.insert(out.end(), lo, hi);
+        } else {
+            (void)key; (void)out;
+        }
+    }
+
+    /*
+ * THE SAME SEARCH, WITH THE EXEMPLAR NAMED BY RID -- and this is the form most
+ * callers actually want.
+ *
+ * "Everything that stands where THIS one stands" needs no exemplar to be
+ * constructed and, more to the point, needs the concrete type in scope NOWHERE
+ * outside this list. The list already holds the pointee, so it looks the
+ * exemplar up itself and hands it to the comparison. A caller with only a RID
+ * and an Entity* -- a loader, another module, a script verb -- can ask an
+ * ordering question about a type it cannot name.
+ *
+ * That is a real gap this closes rather than a convenience. With only the
+ * reference overload, an order search was reachable exclusively from code that
+ * had the leaf type compiled in, which is the owning module and nothing else.
+ * The relation is the type's, but the QUESTION is not, and there was no reason
+ * the question should have been confined to it.
+ *
+ * The exemplar is included in its own result: it stands where it stands.
+ */
+    void search_ordered_by(RID exemplar, std::vector<RID>& out) const {
+        if constexpr (detail::has_ordered_pointee_v<T>) {
+            T e = get_typed(exemplar);
+            if (!e) return;      // not in this list: no standing to match
+            search_ordered(*e, out);
+        } else {
+            (void)exemplar; (void)out;
+        }
+    }
+
     bool contains(RID rid) const {
         return entities.find(rid) != entities.end();
     }
@@ -280,6 +377,13 @@ struct RIDList {
             };
             h.collect_rids_ordered = [](void* self, std::vector<RID>& out) {
                 static_cast<RIDList<T>*>(self)->collect_ordered(out);
+            };
+            h.search_ordered = [](void* self, const void* key, std::vector<RID>& out) {
+                static_cast<RIDList<T>*>(self)->search_ordered(
+                    *static_cast<const std::remove_pointer_t<T>*>(key), out);
+            };
+            h.search_ordered_by = [](void* self, RID exemplar, std::vector<RID>& out) {
+                static_cast<RIDList<T>*>(self)->search_ordered_by(exemplar, out);
             };
             h.reorder = [](void* self) {
                 static_cast<RIDList<T>*>(self)->reorder();
