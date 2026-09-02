@@ -15,8 +15,8 @@
 #     Root> world.DepthAt(@eye, 512, 384)                # how far is the centre
 #     Root> world.Order()                                # energy, heat, ticks
 #     Root> main.CaptureMouse(0)                         # or just press Ctrl+Tab
-#     Root> world.SetTurnsPerPass(2.0)                   # double the turn rate
-#     Root> world.SetSensitivity(0.5)                    # or halve it
+#     Root> world.SetSensitivity(0.5)                    # halve the look rate
+#     Root> world.Look()                                 # angles, rate, lens
 #
 # Every one of those takes effect on the next frame, because the frame edge
 # re-walks the tree rather than replaying a list of calls (Surface.Compose,
@@ -92,20 +92,20 @@ world.SetPosition(0.0, 0.0, 0.0)
 # stops, lower it to coast.
 world.SetSpeed(7.0)
 world.SetDamping(6.0)
-# THE WINDOW IS THE AXIS. Pointer travel across the frame's width maps onto
-# rotation about the camera as a plain proportion: a full pass is
-# SetTurnsPerPass rotations, half a pass is half of that. A ratio you can feel,
-# and one that survives a resize where radians-per-pixel would not. No hardware
-# constant is involved -- a faster mouse simply crosses the width in less hand
-# movement, which is what a faster mouse is for.
+# SENSITIVITY IS A PIXEL RATIO: how many pixels the scene slides across the
+# camera for every pixel the pointer travels. 1.0 means the world tracks the
+# cursor exactly -- drag by forty pixels and the image moves forty. Smaller is
+# slower. This is the number to experiment with; there is no other.
 #
-# ONE, not two, and the factor is worth stating because it was ambiguous.
-# "Half the width is pi" and "the full width is two rotations" cannot both
-# hold. At 1.0 a half pass is pi and a full pass is one revolution, so moving
-# the pointer to the edge of the frame turns the view to what was behind you.
-# At 2.0 the view has gone right round before the pointer reaches the middle of
-# the window, which is what "too sensitive" feels like from the hand.
-world.SetTurnsPerPass(1.0)
+# IT IS MEASURED AGAINST THE LENS above (eye.SetLens), not against the window,
+# so it keeps its feel if you change the field of view or resize the frame.
+# That is what the old SetTurnsPerPass could not do: "one revolution per pass
+# across the width" never consulted the lens, so at 60 degrees it came out at
+# 4.08 in these units -- four times faster than the hand -- and at 20 degrees
+# the same setting would have been three times faster again.
+#
+# world.Look() prints the rate, the lens it was measured against, and what it
+# amounts to in turns per pass, which is now a consequence rather than a knob.
 world.SetSensitivity(1.0)
 
 # Heat leaves a point into whatever contains it, and the root's environment is
