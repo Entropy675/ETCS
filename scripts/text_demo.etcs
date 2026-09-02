@@ -1,0 +1,122 @@
+#!/usr/bin/env etcs
+#IMPORT ACE_ROOT/scripts
+
+# Text on a surface, four ways, so the mechanism is visible rather than
+# implied.
+#
+#     ./bin/etcs scripts/text_demo.etcs
+#
+# WHAT A LABEL IS. TextLabel claims two families: Glyphs, which knows how to
+# measure and draw a run, and Drawable2D, which knows how to be a node in a
+# tree. Being both is what makes a caption a CHILD of the thing it captions --
+# there is no draw-text call anywhere below, only spawns and positions, and the
+# labels appear because their parents were drawn.
+#
+# ITS FONT IS BUILT IN, 5x7, and size is a whole multiple of that cell. A
+# request for 20px becomes a scale of 2 and a real height of 14, which
+# SetSize logs -- a bitmap glyph that lands between pixels is just blurry.
+#
+# WHERE THE TEXT LANDS is decided by whose child it is, exactly as for every
+# other 2D leaf: a label under the stage is in the stage's space, a label under
+# a panel is in the panel's, and moving the panel moves its caption with it.
+
+spawn RenderProvider::Instance gpu
+gpu.Create()
+
+spawn WindowProvider::Window main
+main.Create(900, 600, 'ETCS text')
+
+main.spawn(RenderProvider::Surface view)
+view.Create(@gpu)
+
+spawn RenderProvider::CompositeDrawable2D stage
+stage.Create(900, 600)
+stage.SetPosition(0, 0)
+stage.SetBackground(0.07, 0.08, 0.12, 1.0)
+
+# 1. A heading, straight on the stage.
+stage.spawn(RenderProvider::TextLabel title)
+title.Create(32)
+title.SetText(ETCS Glyphs -- a bitmap font as an ontology family)
+title.SetPosition(40, 40)
+title.SetColor(0.95, 0.95, 1.0, 1.0)
+title.SetOrder(5)
+
+# 2. The full printable set, so every glyph in the table is on screen and a
+#    wrong one is visible rather than theoretical.
+stage.spawn(RenderProvider::TextLabel rowA)
+rowA.Create(24)
+rowA.SetText(ABCDEFGHIJKLMNOPQRSTUVWXYZ)
+rowA.SetPosition(40, 110)
+rowA.SetColor(0.55, 0.80, 1.0, 1.0)
+
+stage.spawn(RenderProvider::TextLabel rowB)
+rowB.Create(24)
+rowB.SetText(abcdefghijklmnopqrstuvwxyz)
+rowB.SetPosition(40, 140)
+rowB.SetColor(0.55, 0.80, 1.0, 1.0)
+
+stage.spawn(RenderProvider::TextLabel rowC)
+rowC.Create(24)
+# The bracket and quote characters are left out of this row on purpose: a
+# .etcs line is parsed for balanced parentheses before it runs, so a payload
+# containing an unmatched one has to be quoted, and quoting the quote
+# characters here would say more about the parser than about the font.
+rowC.SetText(0123456789 !#$%&*+,-./:;<=>?@^_|~)
+rowC.SetPosition(40, 170)
+rowC.SetColor(0.55, 0.80, 1.0, 1.0)
+
+# 3. A caption nested in a PANEL, stated in the panel's space. Move the panel
+#    and the caption goes with it -- the parent-relative rule, and the reason
+#    this file names no absolute position for the label below.
+stage.spawn(RenderProvider::CompositeDrawable2D panel)
+panel.Create(360, 120)
+panel.SetPosition(40, 240)
+panel.SetBackground(0.16, 0.18, 0.26, 1.0)
+panel.SetOrder(2)
+
+panel.spawn(RenderProvider::TextLabel caption)
+caption.Create(24)
+caption.SetText(nested in the panel, in its space)
+caption.SetPosition(20, 24)
+caption.SetColor(1.0, 0.85, 0.4, 1.0)
+
+panel.spawn(RenderProvider::TextLabel caption2)
+caption2.Create(16)
+caption2.SetText(move the panel and this moves)
+caption2.SetPosition(20, 64)
+caption2.SetColor(0.75, 0.78, 0.9, 1.0)
+
+# 4. A label with its own slab behind it, which is what makes text legible over
+#    a busy background without the caller compositing anything.
+stage.spawn(RenderProvider::TextLabel badge)
+badge.Create(24)
+badge.SetText(SetBackground draws a slab under the run)
+badge.SetPosition(40, 400)
+badge.SetColor(0.06, 0.07, 0.10, 1.0)
+badge.SetBackground(0.60, 0.85, 0.55, 1.0)
+badge.SetPadding(8)
+
+# 5. A live frame counter. "%f" is substituted at DRAW time from the surface
+#    named by BindFps -- a script cannot run per frame, so the number has to be
+#    formatted by the thing that is being drawn (TextLabel::BindFps).
+stage.spawn(RenderProvider::TextLabel fps)
+fps.Create(24)
+fps.SetText(%f fps)
+fps.SetPosition(40, 480)
+fps.SetColor(0.55, 1.0, 0.65, 1.0)
+fps.SetBackground(0.0, 0.0, 0.0, 0.45)
+fps.SetPadding(6)
+fps.BindFps(@view)
+
+view.Clear(0.02, 0.02, 0.03, 1.0)
+view.Compose(@stage)
+
+detach window_events.etcs window=main
+detach render_frames.etcs view=view
+
+main.Run(900, 600, 'ETCS text')
+
+view.Delete()
+gpu.Delete()
+main.Delete()

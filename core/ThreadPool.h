@@ -647,8 +647,44 @@ public:
         // this sleep also allows any unload event in transit to resolve in worst case within 100ms
         ETCS_LOG("ThreadPool", "done cushion waiting for threads...");
 
+        /*
+ * NEVER JOIN THE THREAD WE ARE RUNNING ON, and this is not a theoretical
+ * guard -- it is the whole of a crash on exit.
+ *
+ * Any path that reaches exit() from inside a pool worker runs the static
+ * destructors on that worker, which reaches here, which joins the worker
+ * itself. pthread_join on self returns EDEADLK, libstdc++ turns that into a
+ * std::system_error, and an exception leaving a destructor during exit is
+ * std::terminate -- an abort, with the real cause four frames of unwinder
+ * below anything recognisable.
+ *
+ * Reached in practice through Xlib: its default error handler calls exit()
+ * directly, and PollEvents runs on a pool worker, so one X protocol error
+ * (a window destroyed out from under the poll loop) becomes an abort with a
+ * "Resource deadlock avoided" that names nothing involved.
+ *
+ * DETACHING IS THE ONLY OPTION FOR THAT ONE THREAD. It cannot be joined by
+ * itself and it cannot finish before the object it is draining, so the
+ * choice is between detaching it and aborting; and by the time static
+ * destructors are running, the process is leaving anyway. Every OTHER worker
+ * is still joined normally, so this is not a weakening of the shutdown -- it
+ * is the one case where the shutdown is being run BY the thing it is
+ * shutting down.
+ */
+        const std::thread::id self_id = std::this_thread::get_id();
         for (std::thread& worker : workers_)
-            if (worker.joinable()) worker.join();
+        {
+            if (!worker.joinable()) continue;
+            if (worker.get_id() == self_id)
+            {
+                ETCS_LOG("ThreadPool", "drain is running ON a pool worker -- detaching it "
+                         "rather than joining self (would be EDEADLK, then terminate). "
+                         "Something called exit() from inside a work function.");
+                worker.detach();
+                continue;
+            }
+            worker.join();
+        }
     }
     
     bool isDrained() const { return is_drained_.load(std::memory_order_acquire); }

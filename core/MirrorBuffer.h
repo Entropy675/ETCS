@@ -15,6 +15,7 @@
 #endif
 #include "Buffer.h"
 #include "SignalContext.h"
+#include "InterfaceWire.h"
 #include "SharedPage.h"
 #include "LMAXSequentialSharedPage.h"
 
@@ -100,28 +101,6 @@ template<typename Strategy> struct PageFor;
 template<> struct PageFor<StrategyLMAX>   { using type = LMAXSequentialSharedPage; };
 template<> struct PageFor<StrategyPipe>   { using type = SharedPage; };
 template<> struct PageFor<StrategySocket> { using type = SharedPage; };
-// ---------------------------------------------------------------------------
-// WireScope — a wrapper stage's own declaration of which transport
-// strategies it applies to. Checked once per stage, at chain-resolution
-// time (resolveWrapChain, DynamicLoader.h) — never per packet — since a
-// wrapper's applicability to a given strategy is a fixed classification
-// (Scope() is const), not something that varies call to call.
-//
-// NetworkOnly is the fit for anything whose whole purpose IS the wire
-// (TLSWrapper, WebsocketWrapper) — LMAX never leaves the process, so
-// wrapping it would be pure overhead with nothing to protect against.
-// All is the fit for anything orthogonal to transport (access control,
-// auditing) that should apply uniformly regardless of strategy.
-// ---------------------------------------------------------------------------
-enum class WireScope : uint8_t
-{
-    None        = 0,
-    LMAX        = 1 << 0,
-    Pipe        = 1 << 1,
-    Socket      = 1 << 2,
-    NetworkOnly = Pipe | Socket,
-    All         = LMAX | Pipe | Socket,
-};
 // Hard ceiling on tag-stack depth for a single MirrorBuffer pair. Lives
 // here (not Wrapper.h) since MirrorBuffer is what actually owns the fixed
 // arrays this bounds — no allocation anywhere in this file, per its own
@@ -219,48 +198,12 @@ struct WrapStageIdentity
 //   EventStream/custom-event ordering needed: the ring's existing
 //   guarantee already covers it.
 // ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
-// IWireWrapper — the ONLY thing MirrorBuffer knows about a wrapper stage.
-//
-// Deliberately NOT the real Wrapper_ (ontology/Wrapper.h, the ETCS_DISPATCH_
-// METHOD-based CRTP family every concrete TLSWrapper/WebsocketWrapper
-// actually derives from). Wrapper_ derives from Entity, and Entity is not
-// a complete type anywhere in this file — MirrorBuffer.h is parsed WHILE
-// Entity.h is still mid-definition (Entity.h -> Bundles.h -> MirrorBuffer.h),
-// so naming Wrapper_ here is structurally impossible, not merely avoided
-// by convention.
-//
-// This interface is what closes that gap: it has no Entity dependency at
-// all, so it CAN be complete here. Wrapper_ additionally inherits from
-// this (alongside its virtual Entity base) once Entity genuinely is
-// complete, in ontology/Wrapper.h.
-//
-// No separate interface-pointer key or hand-written Wrapper_ constructor
-// is needed: ETCS_MAKE_INSTANCE already registers a generic interface
-// pointer under the family's own bare name ("Wrapper", same key every
-// other Name##_ family gets) pointing at a Wrapper_* subobject address.
-// That SAME stored pointer is reinterpreted as IWireWrapper* directly by
-// resolveWrapChain/buildWrapManifest (DynamicLoader.h) -- safe PROVIDED
-// IWireWrapper is declared as Wrapper_'s FIRST, non-virtual base: under
-// the Itanium C++ ABI, the first non-virtual base subobject sits at
-// offset 0, so a Wrapper_* and an IWireWrapper* pointing at the same
-// object are bit-identical. This is a real dependency on Wrapper_'s own
-// declared base order (ontology/Wrapper.h), not a style choice --
-// getting it wrong produces a silently mis-adjusted pointer at runtime,
-// not a compile error.
-//
-// Positioned here, immediately before MirrorBuffer itself, rather than up
-// alongside WireScope/MAX_WRAP_STAGES — it's defined right where it's
-// used, and nothing above this point in the file needs it.
-// ---------------------------------------------------------------------------
-struct IWireWrapper
-{
-    virtual ~IWireWrapper() = default;
-    virtual void Wrap(ETCS::MBuffer& io, ETCS::SignalContext ctx) = 0;
-    virtual void Unwrap(ETCS::MBuffer& io, ETCS::SignalContext ctx) = 0;
-    virtual void Close(ETCS::MBuffer& io, ETCS::SignalContext ctx) { (void)io; (void)ctx; }
-    virtual ETCS::WireScope Scope() const = 0;
-};
+// IWireWrapper and WireScope now live in core/InterfaceWire.h, with every
+// other slot the runtime calls an ontology family through. They were always
+// this pattern -- declared in core, inherited first by Wrapper_, reinterpreted
+// from the registered interface pointer -- and moving them next to the others
+// is what makes it a standard rather than one file's arrangement. The
+// offset-zero requirement on Wrapper_'s base order is stated there.
 struct MirrorBuffer
 {
     // config carries the action's parameter payload (query string, args…).

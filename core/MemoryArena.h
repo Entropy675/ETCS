@@ -77,6 +77,10 @@ namespace ETCS
 // at its own top. MemoryArena.h never dereferences this pointer — only
 // stores/returns/compares it — so an incomplete type is sufficient.
 class Entity;
+// Defined in Entity.h, where Entity is complete. Hands an entity its
+// IWireLifecycle release if it claims the family, and returns whether THIS
+// call did the work. See releaseIfLifecycled below.
+bool etcs_release_lifecycle(Entity* e);
 
 /*
  * NO DESTRUCTIBLE STATIC IN HERE, and that is a hard requirement rather than
@@ -1284,6 +1288,11 @@ public:
                                 // ~T(), only reclaimEntity's own zeroing
                                 // does, and only this ordering avoids it).
                                 MemoryArena* own_arena = &e->getArena();
+                                // Children first -- see
+                                // destroyChildEntitiesFirst. Before
+                                // reclaimEntity, because that is what runs
+                                // this entity's own ~T().
+                                own_arena->destroyChildEntitiesFirst();
                                 // reclaimEntity, not evokeDestructor -- see
                                 // that method's own comment. Safe here for
                                 // the same reason it's safe below: whatever
@@ -1308,6 +1317,12 @@ public:
                             else if (delete_children)
                             {
                                 MemoryArena* own_arena = &e->getArena(); // see comment above
+                                // Children first -- see
+                                // destroyChildEntitiesFirst. This is the
+                                // cascade case, so every descendant is
+                                // destroyed here, depth-first, and only then
+                                // does reclaimEntity run this entity's ~T().
+                                own_arena->destroyChildEntitiesFirst();
                                 parentArena.reclaimEntity(e, sizeof(T), alignof(T));
                                 // reclaimArena, not evokeDestructor: the arena
                                 // object itself was allocate<MemoryArena>'d out
@@ -1458,6 +1473,26 @@ public:
     // contents) happens inside releaseToFreeList itself, not here.
     bool reclaimEntity(Entity* target, long long size, long long alignment)
     {
+        /*
+     * THE RELEASE GOES HERE because this is the funnel. Every way an entity
+     * can die -- a script's explicit Delete, the closure cascade, a parent
+     * taking its children with it -- ends up in this function to run ~T(),
+     * and nothing reclaims an entity without passing through it.
+     *
+     * Hooking the cascade alone was the first attempt and it was half a
+     * mechanism: a script calling X.Delete() goes straight to a DestroyEvent
+     * and never touches destroyChildEntitiesFirst, so exactly the entry point
+     * the family was added to cover was the one still uncovered. Caught by a
+     * release that never logged.
+     *
+     * Before unlinkRecord and before the destructor, so the object is still
+     * whole and still findable. Idempotent by construction, so the earlier
+     * call the cascade makes -- which reaches a child sooner, while more of
+     * the graph is alive -- costs one atomic read here and no second
+     * teardown.
+     */
+        etcs_release_lifecycle(target);
+
         DestructorRecord* rec = unlinkRecord(target);
         if (!rec)
         {
@@ -1534,6 +1569,96 @@ public:
     // its record -- the callback itself unlinks+destructs via its own
     // evokeDestructor call, once it's finished any election/reparenting
     // work that needs target still fully intact.
+    /*
+ * destroyChildEntitiesFirst — destroy every ENTITY this arena holds, oldest
+ * first, before anything destroys the entity that OWNS the arena.
+ *
+ * WHY THIS EXISTS. A subtree teardown used to run the parent's ~T() and only
+ * then walk the arena, so the observed order for a three-level tree was
+ *
+ *     parent  child_b  child_a  grandchild
+ *
+ * -- exactly inverted. A child's destructor legitimately reaches its parent
+ * (to unregister, to hand back a token, to log what it belonged to), and
+ * every one of those reads a destroyed object. It survived because the
+ * children in this codebase mostly do not look up; the first one that does
+ * would have been a use-after-free with no obvious cause.
+ *
+ * Only ENTITY records are touched. The parent's own container allocations
+ * live in this same arena and its ~T() still needs them, so they are left
+ * exactly where they are -- this is the one reason the fix is not simply
+ * "reclaim the arena first", which would pull the parent's own members out
+ * from under its destructor.
+ *
+ * Oldest first, and deterministic. dtorHead_ is a LIFO stack, so taking the
+ * head would destroy siblings newest-first -- an order nothing chose and
+ * nothing can rely on. Walking to the tail destroys them in the order they
+ * were attached, which is what "first in, first out" says and what a reader
+ * of the script that spawned them expects.
+ *
+ * Depth is free: each callback is the same cascade, so a child destroys ITS
+ * children before itself by the same path, all the way down.
+ *
+ * Terminates because each callback reclaims the entity it was given, which
+ * unlinks that record from this chain -- so the search that follows cannot
+ * return it again. The lock is released across the callback for the same
+ * reason deleteEntity releases it: the cascade re-enters this arena.
+ */
+    /*
+ * Give an entity its Lifecycle release before anything else touches it.
+ *
+ * THE POINT IN TIME IS THE WHOLE VALUE. Called with the object still whole
+ * and the surrounding graph still intact, so what it does -- unbind itself
+ * from something holding it, resolve a peer by RID, stop a stream -- are all
+ * things it can still legally do. Five lines later, in ~T(), none of them
+ * are: bases are coming apart underneath it and its neighbours may already
+ * be gone.
+ *
+ * THROUGH A WIRE, because core sits UNDERNEATH the ontology and cannot name
+ * Lifecycle_ -- ontology.h includes core, so the include cannot run the other
+ * way. ETCS::IWireLifecycle is the slot core declares for exactly this
+ * (core/InterfaceWire.h), the family inherits it as its first non-virtual
+ * base, and the interface pointer the family already registers is therefore
+ * bit-identical to a wire pointer. Same arrangement IWireWrapper has had with
+ * the transport all along; it is a standard now rather than one file's trick.
+ *
+ * The call is idempotent by construction (LifecycleBase's exchange), so an
+ * entity a script already deleted explicitly costs one atomic read here and
+ * nothing else -- which is what lets this be unconditional rather than
+ * something the destroy path has to reason about.
+ */
+    static void releaseIfLifecycled(Entity* e) { etcs_release_lifecycle(e); }
+
+    void destroyChildEntitiesFirst()
+    {
+        while (true)
+        {
+            void (*callback)(void*, MemoryArena&, bool) = nullptr;
+            void* rawPtr = nullptr;
+            Entity* (*to_entity)(void*) = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(allocationMutex_);
+                for (DestructorRecord* rec = dtorHead_; rec; rec = rec->prev)
+                {
+                    if (rec->as_entity && rec->run_entity_delete)
+                    {
+                        callback  = rec->run_entity_delete;  // keep walking:
+                        rawPtr    = rec->ptr;                // the tail is the
+                        to_entity = rec->as_entity;          // oldest record
+                    }
+                }
+            }
+            if (!callback) return;
+            // The release goes BEFORE the destroy callback, while the entity is
+            // still whole and everything around it still resolves -- which is
+            // the only moment a release can do what a release is for. See
+            // releaseIfLifecycled. Outside the lock, deliberately: the callback
+            // below already re-enters this arena, and a release may too.
+            if (to_entity) releaseIfLifecycled(to_entity(rawPtr));
+            callback(rawPtr, *this, true);
+        }
+    }
+
     void deleteEntity(Entity* target, bool delete_children = true)
     {
         void (*callback)(void*, MemoryArena&, bool) = nullptr;

@@ -430,7 +430,11 @@ static bool test_sigint_after_spawning_instance(const std::string& etcs_path)
         return false;
     }
 
-    child.write_line("spawn");
+    // spawn <name> -- the REPL requires a name for every entity it creates.
+    // An unnamed entity can only be reached by its RID, which is exactly
+    // what the language exists to prevent. The name is how anything else
+    // reaches it: @name in a payload, or a script's own attach/ensure/requires.
+    child.write_line("spawn repl_parser");
     if (!child.wait_for_output("HTTPParser Act> ", 3000ms))
     {
         std::cout << "[FAIL] " << name

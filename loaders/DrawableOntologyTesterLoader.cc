@@ -20,14 +20,19 @@
  *      the root: same family, same verbs, different ContainsLocal.
  *   5. drawChildren paints in insertion order while Pick resolves in the
  *      reverse -- so "what you see" and "what you clicked" agree.
- *   6. Project returns a Drawable2D with STABLE identity, and refuses a
- *      degenerate camera rather than inventing an empty view.
+ *   6. A camera is a Drawable2D and the projection fills it, so identity is
+ *      STABLE by construction; a view that cannot exist is refused rather
+ *      than returned empty.
+ *   7. Depth belongs to the 3D family and is asked OF a scene, PASSING a
+ *      camera -- the span, the per-pixel value and the projection agree,
+ *      and moving the eye changes the answer without touching the node.
  */
 #undef ETCS_PRODUCTION_BUILD
 #ifndef ETCS_MODULE_NAME
 #define ETCS_MODULE_NAME "DrawableOntologyTester"
 #endif
 #include "../ETCS.h"
+#include <cmath>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -126,17 +131,74 @@ public:
 };
 
 // ---------------------------------------------------------------------------
-// A 3D node whose projection lands on a plane it does not own.
+// A camera: an ordinary 2D plane that a 3D node fills.
+//
+// Nothing here knows how a scene is rendered, and that is the claim -- the
+// camera holds a pose, a lens and a scene RID, and Render is three lines
+// that resolve and delegate. Everything below Bounds is the Drawable2D
+// membership it gets for free by composing the leaf, which is what lets the
+// tests blit it, nest it and pick it exactly like a BoxNode.
+// ---------------------------------------------------------------------------
+class TestCamera : public CameraBase<TestCamera>
+{
+public:
+    WIRE_TYPE_IDENTITY(TestCamera)
+
+    ViewFrustum view{};
+    ETCS::RID   scene_rid = 0;
+    Rect2D      rect{0, 0, 320, 240};
+    int32_t     z       = 0;
+    int         renders = 0;
+
+    int32_t Order() override { return z; }
+    bool operator<(const TestCamera& o) const { return z < o.z; }
+
+    void        SetViewConcrete(ViewFrustum v) { view = v; }
+    ViewFrustum GetViewConcrete()              { return view; }
+    void        SetSceneConcrete(ETCS::RID s)  { scene_rid = s; }
+    ETCS::RID   GetSceneConcrete()             { return scene_rid; }
+
+    // Resolve, hand over self, done. By RID and by family name, so a scene
+    // built in another module is reached on identical terms -- and a scene
+    // that has been destroyed fails to resolve instead of being dereferenced.
+    bool RenderConcrete()
+    {
+        Drawable3D_* scene = ETCS::resolve_in_family<Drawable3D_>("Drawable3D", scene_rid);
+        if (!scene) return false;
+        ++renders;
+        return scene->Project(this) != nullptr;
+    }
+
+    Rect2D BoundsConcrete() { return rect; }
+    bool   ContainsLocalConcrete(int32_t x, int32_t y)
+    {
+        return x >= 0 && y >= 0
+            && x < static_cast<int32_t>(rect.w) && y < static_cast<int32_t>(rect.h);
+    }
+
+    WindowSize GetSizeConcrete() { return WindowSize{rect.w, rect.h}; }
+    void ClearConcrete(float, float, float, float) {}
+    void DrawRectConcrete(int32_t, int32_t, uint32_t, uint32_t, float, float, float, float) {}
+    void BlitConcrete(Surface_*, int32_t, int32_t, uint32_t, uint32_t, float) {}
+    void DrawIntoConcrete(Surface_* dst) { g_trace.push_back("camera"); drawChildren(dst); }
+};
+
+// ---------------------------------------------------------------------------
+// A 3D node that answers all three halves of the camera seam consistently.
+//
+// Depth is measured along the view direction, which is the only measurement
+// this file needs: the point of the tests is that the whole-node span, the
+// per-pixel value and the projection agree about the same camera, not that
+// anybody can rasterise a box.
 // ---------------------------------------------------------------------------
 class SceneNode : public Drawable3DBase<SceneNode>
 {
 public:
     WIRE_TYPE_IDENTITY(SceneNode)
 
-    Box3D        box{{0.0f, 0.0f, 0.0f}, {1.0f, 1.0f, 1.0f}};
-    Drawable2D_* plane       = nullptr;
-    int          projections = 0;
-    int32_t      z           = 0;
+    Box3D box{{-1.0f, -1.0f, -1.0f}, {1.0f, 1.0f, 1.0f}};
+    int   projections = 0;
+    int32_t z         = 0;
 
     int32_t Order() override { return z; }
     bool operator<(const SceneNode& o) const { return z < o.z; }
@@ -149,11 +211,85 @@ public:
             && p.z >= box.min.z && p.z <= box.max.z;
     }
 
-    // The same plane every call. Contents update; identity does not move.
-    Drawable2D_* ProjectConcrete(CameraSetup camera)
+    // Distance from the eye along the normalised view direction. Scene
+    // units, the same units DepthSpan and DepthAt are stated in, because
+    // three answers in three units are three answers.
+    static float depthOf(const ViewFrustum& v, Point3D p)
     {
-        if (camera.frame_width == 0 || camera.frame_height == 0) return nullptr;
+        float dx = v.look_at.x - v.position.x;
+        float dy = v.look_at.y - v.position.y;
+        float dz = v.look_at.z - v.position.z;
+        float len = std::sqrt(dx * dx + dy * dy + dz * dz);
+        if (len <= 0.0f) return -1.0f;
+        dx /= len; dy /= len; dz /= len;
+        return (p.x - v.position.x) * dx
+             + (p.y - v.position.y) * dy
+             + (p.z - v.position.z) * dz;
+    }
+
+    // Over the eight corners, so the span is the real extent rather than the
+    // centre twice -- the distinction the family's comment insists on.
+    DepthSpan DepthForConcrete(Camera_* camera)
+    {
+        if (!camera) return DepthSpan{-1.0f, -1.0f};
+        const ViewFrustum v = camera->GetView();
+        float lo = 0.0f, hi = 0.0f;
+        bool  first = true;
+        for (int i = 0; i < 8; ++i)
+        {
+            Point3D c{ (i & 1) ? box.max.x : box.min.x,
+                       (i & 2) ? box.max.y : box.min.y,
+                       (i & 4) ? box.max.z : box.min.z };
+            const float d = depthOf(v, c);
+            if (first) { lo = hi = d; first = false; }
+            else if (d < lo) lo = d;
+            else if (d > hi) hi = d;
+        }
+        return DepthSpan{lo, hi};
+    }
+
+    // Flat front face across the frame; negative outside it. A real
+    // implementation varies per pixel, but the contract under test is only
+    // that "nothing here" is negative and never a plausible distance.
+    float DepthAtConcrete(Camera_* camera, int32_t x, int32_t y)
+    {
+        Drawable2D_* plane = planeOf(camera);
+        if (!plane || !plane->ContainsLocal(x, y)) return -1.0f;
+        return DepthForConcrete(camera).nearest;
+    }
+
+    // The camera's OTHER halves are reached by family name, never by casting
+    // Camera_ sideways -- Camera_ declares the view and the scene and nothing
+    // else, exactly as Drawable2D_ declares neither. The lineage lives in the
+    // Bases, so crossing it is a lookup.
+    static Drawable2D_* planeOf(Camera_* camera)
+    {
+        if (!camera) return nullptr;
+        void* p = camera->getInterfacePointer(ETCS::Buffer("Drawable2D"));
+        return p ? static_cast<Drawable2D_*>(p) : nullptr;
+    }
+    static Surface_* surfaceOf(Camera_* camera)
+    {
+        if (!camera) return nullptr;
+        void* p = camera->getInterfacePointer(ETCS::Buffer("Surface"));
+        return p ? static_cast<Surface_*>(p) : nullptr;
+    }
+
+    // Fills the camera and hands it back as the plane it already is. The
+    // identity cannot move: it is the camera.
+    Drawable2D_* ProjectConcrete(Camera_* camera)
+    {
+        Drawable2D_* plane = planeOf(camera);
+        Surface_*    surf  = surfaceOf(camera);
+        if (!plane || !surf) return nullptr;
+
+        const Rect2D frame = plane->Bounds();
+        if (frame.w == 0 || frame.h == 0) return nullptr;
+        const ViewFrustum v = camera->GetView();
+        if (v.far_plane <= v.near_plane) return nullptr;
+
         ++projections;
+        surf->Clear(0.f, 0.f, 0.f, 1.f);
         return plane;
     }
 
@@ -365,37 +501,61 @@ int main()
               "Pick returns the node itself where no child covers the point");
     }
 
-    // -- 6. projection: stable identity, honest refusal ---------------------
+    // -- 6. projection: the camera IS the plane, and refusal is honest ------
     {
-        BoxNode* image_plane = arena.allocate<BoxNode>();
-        image_plane->rect  = Rect2D{0, 0, 320, 240};
-        image_plane->label = "image_plane";
+        TestCamera* cam = arena.allocate<TestCamera>();
+        ViewFrustum v{};
+        v.position      = Point3D{0.f, 0.f, -5.f};
+        v.look_at       = Point3D{0.f, 0.f,  0.f};
+        v.up            = Point3D{0.f, 1.f,  0.f};
+        v.fov_y_radians = 1.0f;
+        v.near_plane    = 0.1f;
+        v.far_plane     = 100.f;
+        cam->SetView(v);
 
         SceneNode* scene = arena.allocate<SceneNode>();
-        scene->plane = image_plane;
 
-        CameraSetup cam{};
-        cam.position      = Point3D{0.f, 0.f, -5.f};
-        cam.look_at       = Point3D{0.f, 0.f,  0.f};
-        cam.up            = Point3D{0.f, 1.f,  0.f};
-        cam.fov_y_radians = 1.0f;
-        cam.near_plane    = 0.1f;
-        cam.far_plane     = 100.f;
-        cam.frame_width   = 320;
-        cam.frame_height  = 240;
+        // The fan-in a real spawn gets for free. Everything else in this file
+        // allocates straight off the arena and never needs it, because it
+        // reaches nodes by pointer -- but a camera reaches its scene by RID
+        // and family, which is a lookup in the aggregate, and the aggregates
+        // are populated post-construction by _make_/addTag, not by the ctor
+        // (Entity.h). Calling it here is what makes this the same path a
+        // module-built scene takes, rather than a shortcut around it.
+        ETCS::etcs_supertype_fanout(scene);
+
+        check(cam->getInterfacePointer(ETCS::Buffer("Camera"))     != nullptr
+           && cam->getInterfacePointer(ETCS::Buffer("Drawable2D")) != nullptr
+           && cam->getInterfacePointer(ETCS::Buffer("Drawable"))   != nullptr
+           && cam->getInterfacePointer(ETCS::Buffer("Surface"))    != nullptr
+           && cam->getInterfacePointer(ETCS::Buffer("Orderable"))  != nullptr,
+              "a camera registers the whole Drawable2D lineage, not a family of its own");
+        check(cam->getInterfacePointer(ETCS::Buffer("Drawable3D")) == nullptr,
+              "a camera is NOT a scene node -- the exclusion holds from this side too");
 
         Drawable2D_* a = scene->Project(cam);
         Drawable2D_* b = scene->Project(cam);
         check(a != nullptr && a == b,
               "Project returns the SAME Drawable2D across calls -- the plane, not a snapshot");
-        check(a == static_cast<Drawable2D_*>(image_plane),
-              "the projected frame is an ordinary Drawable2D like any other");
+        check(a == static_cast<Drawable2D_*>(
+                       static_cast<Drawable2D_*>(cam->getInterfacePointer(ETCS::Buffer("Drawable2D")))),
+              "the projected frame IS the camera, reached as an ordinary Drawable2D");
         check(scene->projections == 2, "each call still did the projection work");
 
-        CameraSetup degenerate = cam;
-        degenerate.frame_width = 0;
-        check(scene->Project(degenerate) == nullptr,
-              "a camera that cannot be realised returns nullptr, not an empty view");
+        // A plane with no extent and a frustum with no depth are two ways of
+        // asking for a view that does not exist; both refuse rather than
+        // handing back something empty a caller cannot tell from correct.
+        cam->rect.w = 0;
+        check(scene->Project(cam) == nullptr,
+              "a zero-sized frame returns nullptr, not an empty view");
+        cam->rect.w = 320;
+
+        ViewFrustum degenerate = v;
+        degenerate.far_plane = degenerate.near_plane;
+        cam->SetView(degenerate);
+        check(scene->Project(cam) == nullptr,
+              "a degenerate frustum returns nullptr too");
+        cam->SetView(v);
 
         check(scene->getInterfacePointer(ETCS::Buffer("Drawable")) != nullptr
            && scene->getInterfacePointer(ETCS::Buffer("Surface"))  != nullptr,
@@ -403,8 +563,44 @@ int main()
         check(scene->getInterfacePointer(ETCS::Buffer("Drawable2D")) == nullptr,
               "a 3D node is NOT registered under its sibling family");
 
+        // -- depth: a property of the 3D family, asked OF the scene ---------
+        //
+        // The box spans z in [-1, 1] with the eye at z = -5 looking down +z,
+        // so the near face is 4 away and the far face 6 -- exact, and the
+        // whole point of stating depth in scene units rather than clip space.
+        DepthSpan span = scene->DepthFor(cam);
+        check(std::fabs(span.nearest - 4.0f) < 1e-4f
+           && std::fabs(span.furthest - 6.0f) < 1e-4f,
+              "DepthFor is a SPAN in scene units, over the node's real extent");
+
+        check(scene->DepthAt(cam, 10, 10) > 0.0f,
+              "DepthAt answers inside the camera's frame");
+        check(scene->DepthAt(cam, -1, 0) < 0.0f
+           && scene->DepthAt(cam, 10000, 0) < 0.0f,
+              "outside the frame DepthAt is negative -- never a plausible distance");
+        check(std::fabs(scene->DepthAt(cam, 10, 10) - span.nearest) < 1e-4f,
+              "the per-pixel and whole-node answers agree about the same camera");
+
+        // Moving the eye changes the depth without touching the node: depth
+        // is a fact about a view, which is why it takes the camera.
+        ViewFrustum moved = v;
+        moved.position = Point3D{0.f, 0.f, -9.f};
+        cam->SetView(moved);
+        check(scene->DepthFor(cam).nearest > span.nearest,
+              "the same node is further from a further camera -- depth is not stored on it");
+        cam->SetView(v);
+
+        // -- the camera drives the scene, by RID and by family --------------
+        cam->SetScene(scene->getRID());
+        check(cam->Render(), "Render resolves the bound scene and delegates to it");
+        check(scene->projections == 3, "Render went through Project, not around it");
+
+        cam->SetScene(0);
+        check(!cam->Render(),
+              "an unbound camera reports false rather than presenting a stale view");
+
         ETCS::MemoryArena::getInstance().deleteEntity(scene, true);
-        ETCS::MemoryArena::getInstance().deleteEntity(image_plane, true);
+        ETCS::MemoryArena::getInstance().deleteEntity(cam, true);
     }
 
     // -- 7. Orderable: one operator required, five derived ----------------
