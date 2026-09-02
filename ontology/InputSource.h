@@ -28,22 +28,41 @@
 // THAT IS ALSO THE ANSWER TO "GIVE MOTION ITS OWN RING", which is the obvious
 // response to motion arriving hundreds of times a second while keys arrive
 // twice. The problem a second ring solves is RATE, and rate has a cheaper
-// answer that costs no ordering: motion deltas ADD, so a run of them is
-// losslessly one event (accumulatePointerDelta below). Two rings would spend
-// the ordering guarantee to buy something coalescing gives away.
+// answer that costs no ordering: a run of positions between two reads is
+// answered by the LAST one (notePointerAt below). Two rings would spend the
+// ordering guarantee to buy something coalescing gives away.
 //
-// dx/dy are RELATIVE, in pixels, and only meaningful for INPUT_MOTION. A
-// delta rather than a position because the thing that moves the view is the
-// movement: an absolute position is unanswerable once the cursor is captured
-// and has no edge of the screen to be near, which is exactly the mode a
-// first-person look runs in.
+// x/y are ABSOLUTE, in pixels, relative to the window's content area, and only
+// meaningful for INPUT_MOTION.
+//
+// A POSITION RATHER THAN A DELTA, which is the opposite of what this carried
+// and is worth the paragraph, because the delta version was not merely
+// inconvenient -- it could not be produced correctly on some platforms at all.
+//
+// A relative control needs the pointer to have somewhere to keep going, so it
+// needs the pointer LOCKED: hidden, and teleported back to the centre
+// whenever it strays. Toolkits implement that by warping the cursor and
+// reporting an accumulated virtual position instead of a real one. Every part
+// of that is a request the display may decline -- Qubes proxies windows from
+// another domain, XWayland answers to a compositor, remote X has no local
+// pointer to move -- and when the warp is declined the accumulator does not
+// degrade, it starts reporting the pointer's DISTANCE FROM THE CENTRE as
+// though it were a movement. The screen becomes a joystick, and nothing in the
+// stack can tell that it happened.
+//
+// A position asks for none of that. It is what the window already knows,
+// needs no cursor to be moved, and is strictly MORE information than a delta:
+// a consumer that wants relative motion differences two positions itself,
+// while a consumer given deltas can never recover where the pointer is. So the
+// primitive is the position, and relativity becomes a choice made downstream
+// rather than a capability the platform has to grant.
 struct InputEvent
 {
     uint16_t key;    // supports NUM_KEYS up to 65535; 0 for a pointer event
     uint8_t  action; // INPUT_UP / INPUT_DOWN / INPUT_MOTION
     uint8_t  _pad;   // reserved (mods, scancode, etc.)
-    int16_t  dx;     // pointer delta, INPUT_MOTION only
-    int16_t  dy;
+    int16_t  x;      // pointer position in the content area, INPUT_MOTION only
+    int16_t  y;
 };
 
 static constexpr uint8_t INPUT_UP     = 0;
@@ -218,20 +237,16 @@ protected:
     void pushKeyDown(int key) { pushEvent({ static_cast<uint16_t>(key), INPUT_DOWN, 0, 0, 0 }); }
     void pushKeyUp  (int key) { pushEvent({ static_cast<uint16_t>(key), INPUT_UP,   0, 0, 0 }); }
 
-    // A pointer movement, as a delta. Key 0 because there is no key: a
-    // consumer switches on the action, and a pointer event that carried a
-    // plausible key code would eventually be read as one.
+    // A pointer position. Key 0 because there is no key: a consumer switches
+    // on the action, and a pointer event that carried a plausible key code
+    // would eventually be read as one.
     //
-    // CLAMPED, not truncated. A coalesced run can exceed int16 range, and a
-    // cast would wrap it -- turning the largest movement the user ever makes
-    // into a delta pointing the other way, which is the one error a look
-    // control cannot recover from. At the clamp the view is already spinning
-    // faster than anyone can follow, so the saturated value is indistinguish-
-    // able from the true one.
-    void pushPointerDelta(int dx, int dy)
+    // Clamped rather than cast, so a position outside int16 saturates at the
+    // edge instead of wrapping to the far side. Only reachable on a display
+    // wider than 32767 pixels, and saturating is the harmless answer there.
+    void pushPointerAt(int x, int y)
     {
-        if (dx == 0 && dy == 0) return;   // not an event
-        pushEvent({ 0, INPUT_MOTION, 0, clamp16(dx), clamp16(dy) });
+        pushEvent({ 0, INPUT_MOTION, 0, clamp16(x), clamp16(y) });
     }
 
     /*
@@ -239,34 +254,41 @@ protected:
  *
  * A pointer reports as fast as its hardware does -- 1000Hz is ordinary -- and
  * nothing downstream consumes at that rate: the drain runs once per poll pass
- * and a view angle is applied once per frame. Every event in between is not
- * extra information, it is the same information split up, because DELTAS ADD.
- * Summing a run and pushing it once is exactly equal to pushing each and
- * having the consumer sum them, which is what the consumer does anyway.
+ * and a view angle is applied once per frame. Every report in between is not
+ * extra information, it is the same information restated, because A POSITION
+ * SUPERSEDES THE ONE BEFORE IT. Keeping the last of a run and pushing it once
+ * is exactly equal to pushing each and having the consumer keep the last,
+ * which is what the consumer does anyway.
+ *
+ * (When these carried deltas the same argument held for a different reason --
+ * deltas ADD, so a run summed to one event. Superseding is the stronger form:
+ * summing is only lossless if nothing is dropped, while the last position is
+ * correct even if every earlier one is lost. That robustness is free here and
+ * was not free before.)
  *
  * Keys are the opposite and this must never be applied to them: a down and an
- * up are not summable, and two presses coalesced into one is a lost keystroke.
- * Additivity is the property being exploited, so it is only offered to the
- * event kind that has it.
+ * up neither add nor supersede, and two presses coalesced into one is a lost
+ * keystroke. The property being exploited belongs to positions, so it is only
+ * offered to the event kind that has it.
  *
  * SINGLE-THREADED BY CONSTRUCTION -- both halves run on whichever thread pumps
- * the OS queue: accumulate from inside the callback, flush once the pump
- * returns. That is one thread, because an OS event queue has one pump, so
- * these need no synchronisation. They are protected rather than public for
- * that reason: only the source doing the pumping may call them.
+ * the OS queue: record from inside the callback, flush once the pump returns.
+ * That is one thread, because an OS event queue has one pump, so these need no
+ * synchronisation. They are protected rather than public for that reason: only
+ * the source doing the pumping may call them.
  */
-    void accumulatePointerDelta(int dx, int dy)
+    void notePointerAt(int x, int y)
     {
-        m_pendingDx += dx;
-        m_pendingDy += dy;
+        m_pendingX = x;
+        m_pendingY = y;
+        m_pendingMotion = true;
     }
 
-    void flushPointerDelta()
+    void flushPointerPosition()
     {
-        if (m_pendingDx == 0 && m_pendingDy == 0) return;
-        pushPointerDelta(m_pendingDx, m_pendingDy);
-        m_pendingDx = 0;
-        m_pendingDy = 0;
+        if (!m_pendingMotion) return;
+        pushPointerAt(m_pendingX, m_pendingY);
+        m_pendingMotion = false;
     }
 
 private:
@@ -283,9 +305,10 @@ private:
     std::atomic<uint32_t>  m_tails[INPUT_MAX_OBSERVERS];
     bool                   m_tailActive[INPUT_MAX_OBSERVERS] = {};
 
-    // Pump-thread only; see accumulatePointerDelta.
-    int                    m_pendingDx = 0;
-    int                    m_pendingDy = 0;
+    // Pump-thread only; see notePointerAt.
+    int                    m_pendingX = 0;
+    int                    m_pendingY = 0;
+    bool                   m_pendingMotion = false;
 
     static int16_t clamp16(int v)
     {
