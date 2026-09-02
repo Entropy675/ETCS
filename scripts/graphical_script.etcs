@@ -1,7 +1,37 @@
 #!/usr/bin/env etcs
+#IMPORT ACE_ROOT/scripts
+
+# A WINDOW AND AN INPUT EDGE, AND NOTHING ELSE. The window is blank on purpose
+# -- there is no renderer in this script at all, so nothing ever draws into it.
+# That is the point: it is the smallest thing that proves the window and its
+# event stream work, with no GPU anywhere in the picture.
+#
+#     ./bin/etcs scripts/graphical_script.etcs
+#
+# What you should see: an empty window that responds to keys (watch the log for
+# KEY DOWN / KEY UP from ConsumeEvents) and closes on the cross.
+#
+# TO MAKE IT RENDER, add a GPU and a surface, then draw once -- the surface
+# RETAINS its composition, so a single set of calls keeps being presented
+# rather than blinking out on the next frame:
+#
+#     spawn RenderProvider::Instance gpu
+#     gpu.Create()
+#     main.spawn(RenderProvider::Surface view)
+#     view.Create(@gpu)
+#     view.Clear(0.05, 0.06, 0.10, 1.0)
+#     view.DrawRect(80, 80, 240, 160, 0.85, 0.35, 0.30, 1.0)
+#     detach render_frames.etcs view=view
+#
+# with the Create lines BEFORE main.Run (Run blocks for the window's lifetime),
+# and the detach after them. render_script.etcs is that script, written out.
+#
+# For a scene that keeps changing rather than one still picture, bind a tree to
+# the surface instead of drawing into it -- view.Compose(@root) makes the frame
+# edge re-walk that tree every tick. composited_scenes.etcs and
+# render_scene3d.etcs are the two worked examples.
 
 spawn WindowProvider::Window main
-
 detach window_events.etcs window=main
 main.Run(600, 600, 'GraphicalLoader Test GUI') 
 main.Delete()

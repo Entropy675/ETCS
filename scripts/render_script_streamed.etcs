@@ -1,14 +1,29 @@
 #!/usr/bin/env etcs
 
-# The shape rendering should actually have: graphical_script.etcs with one
-# more detach. The window keeps the first OS thread and its poll loop; the
-# renderer is handed off to a stream edge exactly like input already is.
+# THE THREAD LEDGER, AND DELIBERATELY NOTHING ON SCREEN. This script issues no
+# Clear, no DrawRect and no Compose, so the window stays blank -- what it
+# demonstrates is the SHAPE of the wiring: the window keeps the first OS thread
+# and its poll loop, and the renderer is handed to a stream edge exactly like
+# input already is. A blank window here means the five threads below came up.
 #
-# REQUIRES the Surface ProduceFrames/ConsumeFrames pair (see
-# render_frames.etcs). Not runnable against main today -- render_script.etcs
-# is the version that is.
+# TO SEE SOMETHING, add either kind of composition after view.Create:
 #
-# THREAD LEDGER once that lands -- five threads, each doing one thing:
+#   one still picture, retained by the surface --
+#     view.Clear(0.05, 0.06, 0.10, 1.0)
+#     view.DrawRect(120, 120, 300, 200, 0.85, 0.35, 0.30, 1.0)
+#
+#   or a live tree the frame edge re-walks every tick --
+#     spawn RenderProvider::CompositeDrawable2D stage
+#     stage.Create(800, 600)
+#     stage.SetBackground(0.06, 0.07, 0.11, 1.0)
+#     run scene_bars.etcs anchor=stage
+#     view.Compose(@stage)
+#
+# The second is what composited_scenes.etcs and render_scene3d.etcs do, and it
+# is the one to use for anything that moves: a retained composition replays the
+# calls it was given and never asks the tree for a new image.
+#
+# THREAD LEDGER -- five threads, each doing one thing:
 #
 #   1. this script's thread    main.Run()              poll loop (GLFW affinity)
 #   2. pool worker             Window.ProduceEvents    input ring -> stream
