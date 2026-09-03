@@ -12,7 +12,7 @@
 #              drains the queue and does the post-poll work for both windows.
 #              Watch for a single `GLFW up.` in the log, and for BOTH windows
 #              staying responsive while only one of them is pumping.
-#   the layout each window gets its own ClayLayout tracking its own size, so
+#   the layout each window gets its own Clayout tracking its own size, so
 #              resizing one re-solves that one and leaves the other alone.
 #   the verbs  neither compositor is told a coordinate anywhere below. The
 #              layout writes them through MoveTo/ResizeTo.
@@ -46,7 +46,7 @@ strip.Create(900, 60)
 strip.SetOrder(2)
 strip.SetBackground(0.18, 0.18, 0.21, 1.0)
 
-spawn RenderProvider::ClayLayout layout
+spawn LayoutProvider::Clayout layout
 layout.Create(900, 600)
 layout.AddBox(@stage, 0, 1, 0.0, 1, 0.0)
 layout.SetDirection(@stage, 1)
@@ -82,7 +82,7 @@ panel.Create(490, 500)
 panel.SetOrder(2)
 panel.SetBackground(0.86, 0.86, 0.88, 1.0)
 
-spawn RenderProvider::ClayLayout aux_layout
+spawn LayoutProvider::Clayout aux_layout
 aux_layout.Create(700, 500)
 aux_layout.AddBox(@aux_stage, 0, 1, 0.0, 1, 0.0)
 aux_layout.SetDirection(@aux_stage, 0)
