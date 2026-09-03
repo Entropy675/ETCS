@@ -20,10 +20,15 @@
 # The whole design turns on there being more than one, and on nothing having
 # to know that but the router:
 #
-#   stage    1280x800  the window's frame -- what the input channel speaks
-#   canvas   1280x740 at (0,0)      the picture's frame
-#   bar      1280x60  at (0,740)    the toolbar's frame
-#   swatch   44x44    at (16,8)     in the BAR's frame, not the window's
+#   stage    the window's frame -- what the input channel speaks
+#   canvas   the picture's frame, whatever is left above the bar
+#   bar      the toolbar's frame, a fixed 60px strip along the bottom
+#   swatch   44x44 at (16,8)   in the BAR's frame, not the window's
+#
+# NO NUMBER ABOVE IS TYPED ANYWHERE BELOW except the bar's 60. The three
+# rectangles come out of a Clay layout that follows the window, so "the canvas
+# is what is left over" is stated once, as a fact, rather than recomputed by
+# hand every time something moves.
 #
 # A pointer report arrives in the stage's frame and is handed to
 # Drawable2D_::PickAt, which walks the same ordered child list the renderer
@@ -33,9 +38,9 @@
 # at (16,8), and that is exactly the coordinate a press on the first swatch
 # arrives as. Nothing anywhere adds an offset; the descent already did.
 #
-# WHAT THAT BUYS, concretely: move the bar to the top by changing one
-# SetPosition below and everything keeps working, because no swatch and no
-# stroke was ever stated in window coordinates to begin with.
+# WHAT THAT BUYS, concretely: change the layout's direction below and the bar
+# moves to the top, with every swatch and every stroke still landing where it
+# should -- because none of them was ever stated in window coordinates.
 #
 # ── THE PARTS ────────────────────────────────────────────────────────────
 #
@@ -51,6 +56,7 @@
 #   sheet    PaintSurface                binds the document to the canvas
 #   palette  PaintPalette                which node means which setting
 #   input    PaintInput                  routing, and the stroke machine
+#   layout   ClayLayout                  who is what size, and where
 #
 # THE CANVAS IS A SURFACE because every Drawable2D is one (ontology/Surface.h
 # and Drawable2D.h) -- so the document renders into a REGION of the window with
@@ -78,12 +84,10 @@ view.Clear(0.13, 0.13, 0.15, 1.0)
 
 spawn RenderProvider::CompositeDrawable2D stage
 stage.Create(1280, 800)
-stage.SetPosition(0, 0)
 stage.SetBackground(0.13, 0.13, 0.15, 1.0)
 
 stage.spawn(RenderProvider::CompositeDrawable2D canvas)
 canvas.Create(1280, 740)
-canvas.SetPosition(0, 0)
 canvas.SetOrder(1)
 canvas.SetBackground(1.0, 1.0, 1.0, 1.0)
 # THE BUFFER IS THE PICTURE, not something derived from the tree: the brush
@@ -92,15 +96,56 @@ canvas.SetRetain(1)
 
 stage.spawn(RenderProvider::CompositeDrawable2D bar)
 bar.Create(1280, 60)
-bar.SetPosition(0, 740)
 bar.SetOrder(2)
 bar.SetBackground(0.18, 0.18, 0.21, 1.0)
 
+# ── the layout ───────────────────────────────────────────────────────────
+#
+# The sizes above are the FIRST frame only. From here the three rectangles are
+# the layout's answer, and the layout is the window's:
+#
+#     window resizes -> layout re-solves -> MoveTo/ResizeTo on each box
+#
+# AddBox <node> <parent> <w_kind> <w_value> <h_kind> <h_value>, kinds being
+# 0 fit, 1 grow, 2 fixed, 3 percent. parent 0 is the root of the layout.
+#
+# The bar is FIXED at 60 and the canvas GROWS, which is the whole statement:
+# the toolbar is a constant, the picture is what is left. Nothing subtracts
+# one from the other anywhere -- express it once and the arithmetic is the
+# solver's problem, at every window size, forever.
+
+spawn RenderProvider::ClayLayout layout
+layout.Create(1280, 800)
+
+# the window: grow / grow, stacked top to bottom
+layout.AddBox(@stage, 0, 1, 0.0, 1, 0.0)
+layout.SetDirection(@stage, 1)
+
+# the picture: grow / grow -- whatever the bar leaves
+layout.AddBox(@canvas, @stage, 1, 0.0, 1, 0.0)
+
+# the toolbar: grow / fixed 60
+layout.AddBox(@bar, @stage, 1, 0.0, 2, 60.0)
+
+# Solve once for the size we came up at, then hand the window the reins. The
+# order matters only in that a first solve before FollowResize means the tree
+# is correct before the first frame rather than after the first resize --
+# FollowResize's own registration fires immediately too, so this is belt and
+# braces on a script that might not have called Create with the window's size.
+layout.Solve()
+layout.FollowResize(@main)
+
 # ── the document ─────────────────────────────────────────────────────────
 #
-# Sized to the CANVAS, not the window. The picture is 1280x740 because that is
-# how much of the screen is the picture, and a document that thought otherwise
-# would be 60 pixels of paper hidden behind the toolbar.
+# Sized to the CANVAS at start-up, and DELIBERATELY NOT in the layout.
+#
+# The window is a viewport onto the picture; the picture is a fixed number of
+# pixels the user decided on. Every paint program works this way, and the
+# alternative is worse in a way that is hard to undo: a document that grew and
+# shrank with the window would have to resample on every drag of a corner, and
+# a stroke drawn at one window size would not be the stroke you get back at
+# another. Resizing larger shows more of the canvas's own background; smaller
+# crops the view, not the paper.
 
 spawn PaintProvider::PaintLayer paper
 paper.Create(1280, 740)
@@ -166,6 +211,7 @@ main.ProduceEvents() -> input.ConsumeRouted()
 main.Close()
 
 input.Delete()
+layout.Delete()
 palette.Delete()
 sheet.Delete()
 doc.Delete()

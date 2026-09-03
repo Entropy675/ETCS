@@ -124,6 +124,21 @@ public:
     virtual bool ContainsLocal(int32_t x, int32_t y) = 0;
 
     /*
+     * Sit at this point in the parent's space. The setter half of Bounds().
+     *
+     * Same shape and same reason as Resizable_::ResizeTo, and the pair is
+     * what a layout solver needs: it computes a rectangle per node and has
+     * to write it back through the family, because it has no business
+     * knowing whether a given box is a compositor, a polygon or a camera.
+     *
+     * Default false, because a node whose position is derived rather than
+     * stored (a shape defined by its own vertices, a child pinned by its
+     * parent) genuinely cannot honour it, and silently ignoring the call
+     * would leave a solver believing it had placed something it had not.
+     */
+    virtual bool MoveTo(Point2D) { return false; }
+
+    /*
  * The two coordinate mappings, concrete rather than dispatched.
  *
  * Translation by Bounds()'s origin is what parent-relative addressing

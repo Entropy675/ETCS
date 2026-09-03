@@ -1,0 +1,123 @@
+#!/usr/bin/env etcs
+#IMPORT ACE_ROOT/modules
+
+# TWO WINDOWS, ONE PUMP, ONE LAYOUT EACH.
+#
+#     ./bin/etcs scripts/paint_two_windows.etcs
+#
+# Not a paint editor -- a demonstration that the three pieces this change added
+# do not care how many windows there are:
+#
+#   the pump   glfwInit/Terminate/PollEvents are library-wide, so ONE thread
+#              drains the queue and does the post-poll work for both windows.
+#              Watch for a single `GLFW up.` in the log, and for BOTH windows
+#              staying responsive while only one of them is pumping.
+#   the layout each window gets its own ClayLayout tracking its own size, so
+#              resizing one re-solves that one and leaves the other alone.
+#   the verbs  neither compositor is told a coordinate anywhere below. The
+#              layout writes them through MoveTo/ResizeTo.
+#
+# Closing EITHER window ends the session, which is the honest behaviour for a
+# script whose main loop is one window's event channel -- see the ledger at the
+# bottom of paint_editor.etcs for why that loop is where it is.
+
+spawn RenderProvider::Instance gpu
+gpu.Create()
+
+# ── window one: a canvas over a bar ───────────────────────────────────────
+
+spawn WindowProvider::Window main
+main.Create(900, 600, 'ETCS Two -- canvas')
+
+main.spawn(RenderProvider::Surface view)
+view.Create(@gpu)
+
+spawn RenderProvider::CompositeDrawable2D stage
+stage.Create(900, 600)
+stage.SetBackground(0.13, 0.13, 0.15, 1.0)
+
+stage.spawn(RenderProvider::CompositeDrawable2D canvas)
+canvas.Create(900, 540)
+canvas.SetOrder(1)
+canvas.SetBackground(1.0, 1.0, 1.0, 1.0)
+
+stage.spawn(RenderProvider::CompositeDrawable2D strip)
+strip.Create(900, 60)
+strip.SetOrder(2)
+strip.SetBackground(0.18, 0.18, 0.21, 1.0)
+
+spawn RenderProvider::ClayLayout layout
+layout.Create(900, 600)
+layout.AddBox(@stage, 0, 1, 0.0, 1, 0.0)
+layout.SetDirection(@stage, 1)
+layout.AddBox(@canvas, @stage, 1, 0.0, 1, 0.0)
+layout.AddBox(@strip, @stage, 1, 0.0, 2, 60.0)
+layout.Solve()
+layout.FollowResize(@main)
+
+view.Compose(@stage)
+
+# ── window two: a sidebar beside a panel ──────────────────────────────────
+#
+# ROW rather than column, and a PERCENT rather than a fixed strip, so the two
+# windows are visibly solving different problems with the same machinery.
+
+spawn WindowProvider::Window aux
+aux.Create(700, 500, 'ETCS Two -- tools')
+
+aux.spawn(RenderProvider::Surface aux_view)
+aux_view.Create(@gpu)
+
+spawn RenderProvider::CompositeDrawable2D aux_stage
+aux_stage.Create(700, 500)
+aux_stage.SetBackground(0.10, 0.10, 0.12, 1.0)
+
+aux_stage.spawn(RenderProvider::CompositeDrawable2D sidebar)
+sidebar.Create(210, 500)
+sidebar.SetOrder(1)
+sidebar.SetBackground(0.22, 0.24, 0.30, 1.0)
+
+aux_stage.spawn(RenderProvider::CompositeDrawable2D panel)
+panel.Create(490, 500)
+panel.SetOrder(2)
+panel.SetBackground(0.86, 0.86, 0.88, 1.0)
+
+spawn RenderProvider::ClayLayout aux_layout
+aux_layout.Create(700, 500)
+aux_layout.AddBox(@aux_stage, 0, 1, 0.0, 1, 0.0)
+aux_layout.SetDirection(@aux_stage, 0)
+# 30% of the window, at every window size
+aux_layout.AddBox(@sidebar, @aux_stage, 3, 0.30, 1, 0.0)
+aux_layout.AddBox(@panel, @aux_stage, 1, 0.0, 1, 0.0)
+aux_layout.Solve()
+aux_layout.FollowResize(@aux)
+
+aux_view.Compose(@aux_stage)
+
+# ── the frame edges, and the one pump ─────────────────────────────────────
+#
+# Two frame loops, because a frame belongs to a surface. ONE event pump,
+# because the event queue belongs to the library -- `main.ProduceEvents()`
+# below drains for both windows, and `aux` needs no loop of its own.
+
+detach RenderProvider/scripts/render_frames.etcs view=view
+detach RenderProvider/scripts/render_frames.etcs view=aux_view
+
+main.ProduceEvents() -> main.ConsumeEvents()
+
+main.Close()
+aux.Close()
+
+aux_layout.Delete()
+layout.Delete()
+panel.Delete()
+sidebar.Delete()
+aux_stage.Delete()
+strip.Delete()
+canvas.Delete()
+stage.Delete()
+aux_view.Delete()
+view.Delete()
+gpu.Delete()
+aux.Delete()
+main.Delete()
