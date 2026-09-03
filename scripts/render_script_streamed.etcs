@@ -1,4 +1,5 @@
 #!/usr/bin/env etcs
+#IMPORT ACE_ROOT/modules
 
 # THE THREAD LEDGER, AND DELIBERATELY NOTHING ON SCREEN. This script issues no
 # Clear, no DrawRect and no Compose, so the window stays blank -- what it
@@ -51,8 +52,8 @@ main.Create(800, 600, 'ETCS RenderProvider')
 main.spawn(RenderProvider::Surface view)
 view.Create(@gpu, modules/RenderProvider/shaders/)
 
-detach window_events.etcs window=main
-detach render_frames.etcs view=view
+detach WindowProvider/scripts/window_events.etcs window=main
+detach RenderProvider/scripts/render_frames.etcs view=view
 
 # Blocks here for the window's lifetime, polling on the thread that created
 # it. Frames are already running on threads 4 and 5 by now.

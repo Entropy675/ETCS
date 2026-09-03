@@ -1,5 +1,5 @@
 #!/usr/bin/env etcs
-#IMPORT ACE_ROOT/scripts
+#IMPORT ACE_ROOT/modules
 
 # Composition, then hand-off. The window keeps the poll loop so the close
 # button and the keyboard work; both edges run detached; the picture is a
@@ -75,11 +75,11 @@ right.SetOrder(1)
 # built before the next line -- and each sub-script gets its own Root, its own
 # signal context and its own closure, so both copies use the names `body` and
 # `gem` without colliding.
-run scene_emblem.etcs anchor=left
-run scene_emblem.etcs anchor=right
+run RenderProvider/scripts/scene_emblem.etcs anchor=left
+run RenderProvider/scripts/scene_emblem.etcs anchor=right
 
 # A different scene, mounted directly on the stage.
-run scene_bars.etcs anchor=stage
+run RenderProvider/scripts/scene_bars.etcs anchor=stage
 
 # The picture, stated once. Clear opens a composition; Draw appends the whole
 # tree to it, depth-first in Order().
@@ -87,8 +87,8 @@ view.Clear(0.02, 0.02, 0.03, 1.0)
 stage.Draw(@view)
 
 # Hand off. Input first, then frames, then the poll loop.
-detach window_events.etcs window=main
-detach render_frames.etcs view=view
+detach WindowProvider/scripts/window_events.etcs window=main
+detach RenderProvider/scripts/render_frames.etcs view=view
 
 main.Run(1024, 768, 'ETCS composed scenes')
 

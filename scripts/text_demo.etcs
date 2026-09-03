@@ -1,5 +1,5 @@
 #!/usr/bin/env etcs
-#IMPORT ACE_ROOT/scripts
+#IMPORT ACE_ROOT/modules
 
 # Text on a surface, four ways, so the mechanism is visible rather than
 # implied.
@@ -112,8 +112,8 @@ fps.BindFps(@view)
 view.Clear(0.02, 0.02, 0.03, 1.0)
 view.Compose(@stage)
 
-detach window_events.etcs window=main
-detach render_frames.etcs view=view
+detach WindowProvider/scripts/window_events.etcs window=main
+detach RenderProvider/scripts/render_frames.etcs view=view
 
 main.Run(900, 600, 'ETCS text')
 

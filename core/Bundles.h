@@ -234,7 +234,35 @@ inline bool compareManifests(Manifest& ours, Manifest* theirs, const std::string
     {
         std::string key(key_c);
         std::string their_hash(their_hash_c);
-        bool is_contract = (key.rfind("ONTOLOGY:", 0) == 0 || key.rfind("HEADER:", 0) == 0);
+        /*
+     * CORE COUNTS AS A CONTRACT, and leaving it out was the hole.
+     *
+     * ONTOLOGY and HEADER are contracts because they define DISPATCH SHAPES --
+     * disagree and a call goes to the wrong place. Core headers were treated as
+     * informational on the reasoning that they are implementation, but that is
+     * the wrong distinction: core is where the types that CROSS THE DSO BOUNDARY
+     * live. RIDListHandle says so against itself -- "a slot added in the middle
+     * shifts every later one, and a single translation unit built against the
+     * older layout calls the wrong function pointer through a valid-looking
+     * self". A layout disagreement is not milder than a contract disagreement,
+     * it is the same failure one level down, and it presents worse: a wrong
+     * vtable slot usually crashes, a wrong function-pointer slot in a
+     * plain struct just quietly does something else.
+     *
+     * Which is exactly how it was found. Adding a slot to RIDListHandle and
+     * rebuilding only the loader left every module calling through the old
+     * layout. Nothing crashed. The renderer simply presented zero frames and
+     * the window stayed blank -- and the handshake printed CORE:RIDList.h with
+     * a visible difference and marked it OK.
+     *
+     * The cost of this being a hard failure is that a partial rebuild after a
+     * core change now refuses to run instead of running wrongly. That is the
+     * trade being made deliberately: `ace make modules --force` is a minute,
+     * and the alternative is a silent behavioural bug with no symptom pointing
+     * anywhere near its cause.
+     */
+        bool is_contract = (key.rfind("ONTOLOGY:", 0) == 0 || key.rfind("HEADER:", 0) == 0
+                         || key.rfind("CORE:", 0) == 0);
         std::stringstream row;
         row << std::left << std::setw(40) << key;
         if (ours.count(key_c))
@@ -254,7 +282,35 @@ inline bool compareManifests(Manifest& ours, Manifest* theirs, const std::string
         for (auto const& [key_c, their_hash_c] : *theirs)
         {
             std::string key(key_c);
-            bool is_contract = (key.rfind("ONTOLOGY:", 0) == 0 || key.rfind("HEADER:", 0) == 0);
+            /*
+     * CORE COUNTS AS A CONTRACT, and leaving it out was the hole.
+     *
+     * ONTOLOGY and HEADER are contracts because they define DISPATCH SHAPES --
+     * disagree and a call goes to the wrong place. Core headers were treated as
+     * informational on the reasoning that they are implementation, but that is
+     * the wrong distinction: core is where the types that CROSS THE DSO BOUNDARY
+     * live. RIDListHandle says so against itself -- "a slot added in the middle
+     * shifts every later one, and a single translation unit built against the
+     * older layout calls the wrong function pointer through a valid-looking
+     * self". A layout disagreement is not milder than a contract disagreement,
+     * it is the same failure one level down, and it presents worse: a wrong
+     * vtable slot usually crashes, a wrong function-pointer slot in a
+     * plain struct just quietly does something else.
+     *
+     * Which is exactly how it was found. Adding a slot to RIDListHandle and
+     * rebuilding only the loader left every module calling through the old
+     * layout. Nothing crashed. The renderer simply presented zero frames and
+     * the window stayed blank -- and the handshake printed CORE:RIDList.h with
+     * a visible difference and marked it OK.
+     *
+     * The cost of this being a hard failure is that a partial rebuild after a
+     * core change now refuses to run instead of running wrongly. That is the
+     * trade being made deliberately: `ace make modules --force` is a minute,
+     * and the alternative is a silent behavioural bug with no symptom pointing
+     * anywhere near its cause.
+     */
+        bool is_contract = (key.rfind("ONTOLOGY:", 0) == 0 || key.rfind("HEADER:", 0) == 0
+                         || key.rfind("CORE:", 0) == 0);
             if (is_contract && ours.count(key_c) && ours[key_c] != their_hash_c)
                 ETCS_LOG("FATAL", "Interface mismatch (" << label << ") -- Key: " << key
                     << "  Ours: " << ours[key_c] << "  Theirs: " << their_hash_c);

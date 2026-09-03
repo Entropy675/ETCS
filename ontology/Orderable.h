@@ -46,6 +46,59 @@
 class Orderable_ : virtual public ETCS::Entity
 {
 public:
+    /*
+ * SEARCH IS A PROPERTY OF THIS FAMILY, and of no other, because this family is
+ * the only thing that says what a search would be BY.
+ *
+ * A list is bisectable only in the key it was sorted with, and the key
+ * RIDList sorts with is the pointee's operator< -- this relation. A type that
+ * claims nothing here leaves its list with no order and therefore no search;
+ * one that claims this gets both from the same declaration. So searchability
+ * is not an extra thing a type opts into, it is what having an order already
+ * means.
+ *
+ * BY EXEMPLAR, so nothing is added to what a leaf must declare. A leaf still
+ * states operator< and nothing else (OrderableBase derives the rest), and the
+ * search compares against an instance of the leaf rather than against some
+ * separate key type every implementor would have to invent and keep in step
+ * with the comparison. The call surface is shaped at this boundary instead --
+ * which is what the boundary is for.
+ *
+ * RETURNS A RANGE. == here is equivalence, not identity (see this file's own
+ * note above), so many entities can share a standing and picking one of them
+ * would be answering a different question than the one asked.
+ *
+ * QUALIFIED "Provider:Type", not a bare family, because the comparison belongs
+ * to one concrete type. Identity searches fan out across providers -- a RID
+ * means the same everywhere -- but an order does not: comparing against
+ * another type's relation is not a narrower search, it is a question with no
+ * answer. See ETCS::search_in_family.
+ */
+    template <typename Leaf>
+    static size_t Search(const char* qualified_type, const Leaf& exemplar,
+                         std::vector<ETCS::RID>& out)
+    {
+        return ETCS::search_in_family<Leaf>(qualified_type, exemplar, out);
+    }
+
+    /*
+ * AND THE FORM THAT NEEDS NO TYPE AT ALL: name the exemplar by RID and the
+ * list looks it up itself.
+ *
+ * This is the one most callers want, and it is what keeps the question from
+ * being confined to the module that owns the relation. A loader, another
+ * provider, or a script verb holds RIDs and Entity pointers, never leaf types
+ * -- and "everything that stands where this one stands" is a perfectly good
+ * question for any of them to ask. The comparison stays the type's; only the
+ * asking is opened up.
+ */
+    static size_t Search(const char* qualified_type, ETCS::RID exemplar,
+                         std::vector<ETCS::RID>& out)
+    {
+        return ETCS::search_in_family(qualified_type, exemplar, out);
+    }
+
+public:
     virtual ~Orderable_() = default;
 
     /*

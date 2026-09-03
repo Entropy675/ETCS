@@ -1,4 +1,5 @@
 #!/usr/bin/env etcs
+#IMPORT ACE_ROOT/modules
 
 # A window, its input edge, a scene, and a rendering edge -- then the script
 # ENDS, on purpose, and you land in the ETCS shell with all of it still live.
@@ -103,8 +104,8 @@ view.Blit(@backdrop, 80, 60, 864, 648, 1.0)
 # Input first: ProduceEvents spins on IsActive() before registering an
 # observer, so detaching it before the window is live just burns thread 2
 # waiting.
-detach window_events.etcs window=main
+detach WindowProvider/scripts/window_events.etcs window=main
 
 # And the frame pump. This is the last line that starts anything, and after
 # it the script has nothing left to do -- which is the whole point.
-detach render_frames.etcs view=view
+detach RenderProvider/scripts/render_frames.etcs view=view

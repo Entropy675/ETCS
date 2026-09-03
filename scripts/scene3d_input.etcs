@@ -1,4 +1,5 @@
 #!/usr/bin/env etcs
+#IMPORT ACE_ROOT/modules
 
 # The w/a/s/d edge: the window's event stream, consumed by a 3D scene.
 #
@@ -56,6 +57,16 @@
 
 requires window [Window]
 requires scene [Drawable3D]
+
+# TWO CHANNELS, TWO THREADS. Keys and pointer share nothing that needs
+# synchronising -- a step is a function of which keys are held, a look of where
+# the pointer is -- so they travel separately and neither queues behind the
+# other's bursts (ontology/InputSource.h). An edge blocks the thread that
+# states it, so the pointer half is detached and this thread keeps the keys.
+#
+# The keys edge is also the window's event pump, which is why it is the one
+# that ends the closure when the window closes; the pointer edge only drains.
+detach scene3d_look.etcs window=window scene=scene
 
 window.ProduceEvents() -> scene.ConsumeInput()
 

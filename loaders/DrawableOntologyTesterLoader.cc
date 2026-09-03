@@ -628,6 +628,57 @@ int main()
         ETCS::MemoryArena::getInstance().deleteEntity(same, true);
     }
 
+    // -- 8b. search_ordered: bisect the order, and return the RANGE ----------
+    //
+    // The order is what makes a search possible, so this is the only search
+    // the ontology can offer -- and because Orderable's == is EQUIVALENCE
+    // rather than identity, matching has to return every entity that shares a
+    // standing, not one of them. Three boxes at z=20 is the case that tells a
+    // find from an equal_range, so three is what this builds.
+    {
+        ETCS::RIDList<BoxNode*> list(ETCS::MemoryArena::getInstance());
+        const int32_t zs[] = {40, 20, 10, 20, 30, 20};
+        std::vector<BoxNode*> nodes;
+        for (int i = 0; i < 6; ++i)
+        {
+            BoxNode* n = arena.allocate<BoxNode>();
+            n->rect = Rect2D{0, 0, 10, 10};
+            n->z = zs[i];
+            nodes.push_back(n);
+            list.insert(static_cast<ETCS::RID>(1000 + i), n);
+        }
+
+        std::vector<ETCS::RID> hits;
+        BoxNode probe;  probe.z = 20;
+        list.search_ordered(probe, hits);
+        check(hits.size() == 3, "search_ordered returns the whole equivalence range ("
+              + std::to_string(hits.size()) + " of 3 at z=20)");
+
+        bool all20 = !hits.empty();
+        for (ETCS::RID r : hits) if (list.get_typed(r)->z != 20) all20 = false;
+        check(all20, "and every entity it returns actually has that standing");
+
+        hits.clear();
+        probe.z = 40;
+        list.search_ordered(probe, hits);
+        check(hits.size() == 1, "a standing held by one entity returns exactly it");
+
+        hits.clear();
+        probe.z = 999;
+        list.search_ordered(probe, hits);
+        check(hits.empty(), "a standing nothing holds returns nothing, not the nearest");
+
+        // The bound the bisection depends on: search AFTER a key moves must see
+        // the new position, or it is reading a stale index.
+        nodes[0]->z = 20;              // was 40, alone; now a fourth at 20
+        list.reorder();
+        hits.clear();
+        probe.z = 20;
+        list.search_ordered(probe, hits);
+        check(hits.size() == 4, "after Reorder the search sees the new standing ("
+              + std::to_string(hits.size()) + " of 4)");
+    }
+
     // -- 8. the RIDList orders a homogeneous list by the leaf's operator< --
     //
     // Five boxes under one parent, spawned in an order that has nothing to

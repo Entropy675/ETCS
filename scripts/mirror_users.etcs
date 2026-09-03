@@ -1,6 +1,0 @@
-#!/usr/bin/env etcs
-
-requires from
-requires to
-
-from.QueryProduce(SELECT * FROM users) -> to.RowConsume()

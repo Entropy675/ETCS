@@ -66,14 +66,26 @@ endif
 # Per-loader additions. EXTRA_LINK is kept OUT of LDFLAGS on purpose:
 # it lands after the translation unit on the command line, because
 # gold does not rescan an archive it has already passed.
+#
+# Bound with TARGET-SPECIFIC variables (`name: VAR += ...` below), not
+# an `ifeq ($(FILE),name)` gate on a global EXTRA_CXXFLAGS/EXTRA_LINK.
+# The default `loaders` target compiles every *Loader.cc in one `make`
+# invocation with no FILE set, through the single shared `%Loader:
+# %Loader.cc` pattern rule -- an ifeq keyed on FILE never matches there,
+# so a global variable silently drops every loader's inherited flags
+# except when that one loader is built alone via FILE=<name>. That is
+# the exact bug _inherited_module_flags's own docstring warns about:
+# the loader still compiles, quietly against /usr/include instead of
+# the module's vendored headers, and fails with a signature mismatch
+# in a header nobody touched. Target-specific variables are scoped to
+# the target itself, so they apply whichever way that target is asked
+# for -- `make loaders`, `make FILE=<name>`, or a direct `make <name>`.
 EXTRA_CXXFLAGS :=
 EXTRA_LINK :=
 
-ifeq ($(FILE),SCSRealTesterLoader)
-    # inherits: NetworkProvider
-    EXTRA_CXXFLAGS += -DMBEDTLS_THREADING_C -DMBEDTLS_THREADING_PTHREAD -I../modules/NetworkProvider/picohttpparser -I../modules/NetworkProvider/mbedtls/include -I../modules/NetworkProvider/mbedtls/tf-psa-crypto/include -I../modules/NetworkProvider/mbedtls/tf-psa-crypto/drivers/builtin/include -I../modules/NetworkProvider/mbedtls/tf-psa-crypto/drivers/everest/include -I../modules/NetworkProvider/mbedtls/tf-psa-crypto/drivers/pqcp/include -I../modules/NetworkProvider/mbedtls/tf-psa-crypto/drivers/p256-m
-    EXTRA_LINK += ../modules/NetworkProvider/mbedtls/build/library/libmbedtls.a ../modules/NetworkProvider/mbedtls/build/library/libmbedx509.a ../modules/NetworkProvider/mbedtls/build/library/libmbedcrypto.a -ldl
-endif
+# SCSRealTesterLoader inherits: NetworkProvider
+SCSRealTesterLoader: EXTRA_CXXFLAGS += -DMBEDTLS_THREADING_C -DMBEDTLS_THREADING_PTHREAD -I../modules/NetworkProvider/picohttpparser -I../modules/NetworkProvider/mbedtls/include -I../modules/NetworkProvider/mbedtls/tf-psa-crypto/include -I../modules/NetworkProvider/mbedtls/tf-psa-crypto/drivers/builtin/include -I../modules/NetworkProvider/mbedtls/tf-psa-crypto/drivers/everest/include -I../modules/NetworkProvider/mbedtls/tf-psa-crypto/drivers/pqcp/include -I../modules/NetworkProvider/mbedtls/tf-psa-crypto/drivers/p256-m
+SCSRealTesterLoader: EXTRA_LINK += ../modules/NetworkProvider/mbedtls/build/library/libmbedtls.a ../modules/NetworkProvider/mbedtls/build/library/libmbedx509.a ../modules/NetworkProvider/mbedtls/build/library/libmbedcrypto.a -ldl
 
 # If FILE is specified, build only that one; otherwise every *Loader.cc.
 ifdef FILE

@@ -1,5 +1,5 @@
 #!/usr/bin/env etcs
-#IMPORT ACE_ROOT/scripts
+#IMPORT ACE_ROOT/modules
 
 # The whole site. Owns the transport and nothing else: each domain is detached
 # and brings its own routes, so this file never learns what a thread or a board
@@ -62,7 +62,7 @@ web.AddHandler(@web Serve)
 web.Start()
 web.IsStarted()
 
-detach chess_lobby.etcs
+detach ChessProvider/scripts/chess_lobby.etcs
 detach forum_lobby.etcs
 
 # http://localhost:8080/

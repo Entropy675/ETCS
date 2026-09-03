@@ -1659,6 +1659,24 @@ public:
  */
         auto wait_for_producer = [&]()
         {
+            /*
+ * SAY THE READER IS GONE BEFORE WAITING FOR THE WRITER.
+ *
+ * A consumer can end for reasons the transport knows nothing about --
+ * Surface::ConsumeFrames returns when its surface retires, and no
+ * interrupt is raised anywhere. The producer is then blocked in
+ * flushStaged waiting for pipe space that only a reader frees, with
+ * nothing to observe: it waited out the whole deadline below and got
+ * torn down mid-write, which is where the tombstoned-page write came
+ * from.
+ *
+ * closeRead makes the reader's departure a fact on the transport, so
+ * the next write fails EPIPE and the body leaves through its own
+ * error path. The deadline stays for bodies that ignore an interrupt
+ * they CAN see; it stops being the ordinary case.
+ */
+            consumer.closeRead();
+
             using namespace std::chrono;
             const auto deadline = steady_clock::now() + seconds(2);
             while (producer.producerBusy())
@@ -2797,18 +2815,279 @@ inline void etcs_supertype_fanout(Entity* e)
  * Returns nullptr if the family is not published here, the RID is not in
  * it, or the entity somehow lacks the interface pointer.
  */
+// Defined in DynamicLoader.h, which includes this header -- declared here and
+// resolved at template instantiation, which happens in the module's own
+// translation unit after every core header is in.
+ETCS::EventNode* etcs_loader_event_node();
+
 template <typename Base>
 inline Base* resolve_in_family(const char* family, RID rid)
 {
     if (rid == 0) return nullptr;
+
+    /*
+ * TWO PLACES TO LOOK, AND THE SECOND ONE IS THE POINT.
+ *
+ * EventNode::getInstance() is a function-local static, so there is ONE PER
+ * SHARED OBJECT and a module's own ridMap holds only the entities that module
+ * created. That local map answers the INHERITANCE-shaped question: a type
+ * reaching a family its own module publishes and populates.
+ *
+ * Anything else is COMPOSITION, and composition is loader-mediated by design.
+ * The loader absorbs every module's lists under an origin-affixed key --
+ * "RenderProvider:Surface", not "Surface" (DynamicLoader.h's absorb loop) --
+ * and that prefix is not an artefact to route around, it is the OWNERSHIP
+ * EDGE written down. A composed entity belongs to the provider that made it,
+ * the loader is what holds that relation, and so the loader is the only thing
+ * that can hand the pointer over. Asking it is the mechanism, not a fallback.
+ *
+ * WHAT WAS ACTUALLY BROKEN was that this function never asked. It looked in
+ * the caller's own node and stopped, so it implemented only the first of the
+ * two questions and silently answered null to the second -- and null here is
+ * indistinguishable from "no such entity", so every caller's `if (!x) return;`
+ * turned a composed call into a no-op with nothing logged. A PaintProvider
+ * brush painting onto a RenderProvider surface looked exactly like a working
+ * program that drew nothing.
+ *
+ * A QUALIFIED "Provider:Type" IS THE EXACT FORM and the one to prefer. A
+ * provider exports at most one list of a given type name -- two would be a
+ * name conflict inside that provider -- so the pair is a unique key and this is
+ * a LOOKUP, not a search: the provider names the list, the list is asked once,
+ * and nothing is scanned. The ownership edge is followed rather than
+ * rediscovered.
+ *
+ * A BARE FAMILY IS A QUESTION WITH MORE THAN ONE POSSIBLE ANSWER, and the size
+ * of that possibility is the reason this is not a first-match scan.
+ *
+ * RIDs are unique per PROVIDER-TYPE, not per process: the generating sequence
+ * runs per provider per type, and a RID plus a type has a cycle far too long to
+ * collide -- but the same RID value can perfectly well name different entities
+ * under different types. A family is a SET of types, so scanning every
+ * "*:Family" list and taking the first hit can return an entity that merely
+ * shares a number with the one meant. That is the same class of failure this
+ * function was fixed for: a wrong answer that looks exactly like a right one.
+ *
+ * So a bare family collects EVERY match and insists on exactly one. One is the
+ * ordinary case and resolves. Zero is "no such entity". More than one is a real
+ * ambiguity in the question asked, and it is reported and refused rather than
+ * guessed -- the caller has to say which provider it meant, which it can,
+ * because whatever handed it the RID knew.
+ *
+ * The bare form stays because it is what a family is FOR: which provider
+ * satisfies a requirement is precisely what a family exists not to specify,
+ * the same reason scripts `requires` a family rather than a concrete type.
+ * Qualification is how a caller that does know says so.
+ */
     const ETCS::Buffer key(family);
-    auto& ridMap = ETCS::EventNode::getInstance().ridMap;
-    auto it = ridMap.find(key);
-    if (it == ridMap.end()) return nullptr;
-    // Straight out of the list: a family aggregate stores the Base*
-    // itself (RIDList.h), so there is no interface-pointer round trip and
-    // no adjustment happening here -- this is the pointer that was stored.
-    return static_cast<Base*>(it->second.invoke_get_iface(rid));
+    const std::string  name(family);
+    const bool qualified = (name.find(':') != std::string::npos);
+
+    if (!qualified)
+    {
+        // Straight out of the list: a family aggregate stores the Base*
+        // itself (RIDList.h), so there is no interface-pointer round trip and
+        // no adjustment happening here -- this is the pointer that was stored.
+        auto& mine = ETCS::EventNode::getInstance().ridMap;
+        auto it = mine.find(key);
+        if (it != mine.end())
+            if (void* p = it->second.invoke_get_iface(rid))
+                return static_cast<Base*>(p);
+    }
+
+    ETCS::EventNode* owner = etcs_loader_event_node();
+    if (!owner) return nullptr;      // no loader: nothing has been composed
+
+    if (qualified)
+    {
+        auto it = owner->ridMap.find(key);
+        if (it == owner->ridMap.end()) return nullptr;
+        return static_cast<Base*>(it->second.invoke_get_iface(rid));
+    }
+
+    // Only keys that ARE this family under some provider are candidates, which
+    // is both the correctness filter and the whole of the search space.
+    const std::string suffix = ":" + name;
+    void*       found       = nullptr;
+    std::string found_owner;
+    int         matches     = 0;
+
+    for (auto& [k, handle] : owner->ridMap)
+    {
+        const std::string ks = k.toString();
+        if (ks.size() <= suffix.size()) continue;
+        if (ks.compare(ks.size() - suffix.size(), suffix.size(), suffix) != 0) continue;
+
+        void* p = handle.invoke_get_iface(rid);
+        if (!p) continue;
+        if (++matches == 1) { found = p; found_owner = ks; }
+        else
+        {
+            ETCS_LOG("resolve_in_family", "RID:" << rid << " is ambiguous for family '"
+                     << name << "' -- it names an entity under BOTH " << found_owner
+                     << " and " << ks << ". RIDs are unique per provider-type, not per "
+                     "process. This overload can only answer with one, so it answers with "
+                     "none: use collect_in_family to get them all, or name the provider, "
+                     "e.g. resolve_in_family(\"" << ks << "\", rid).");
+            return nullptr;
+        }
+    }
+    return static_cast<Base*>(found);
+}
+
+/*
+ * THE SAME QUESTION, ANSWERED WITH EVERYTHING IT MATCHES.
+ *
+ * resolve_in_family above is the convenience for the overwhelmingly common case
+ * where a caller wants one entity and there is one to have. This is the
+ * primitive underneath it, and the honest shape: a family spans providers, RIDs
+ * are unique only per provider-type, so "the Surface with RID n" can have more
+ * than one answer and a function that returns a single pointer has nowhere to
+ * put the others.
+ *
+ * Refusing was the wrong call. The matches ARE the information a caller needs
+ * to choose between them, and throwing them away to return null leaves the
+ * caller knowing only that something went wrong. Returning the set puts the
+ * decision where it belongs.
+ *
+ * Appends rather than clearing, so a caller can accumulate across several
+ * families into one list. Returns how many THIS call added.
+ */
+template <typename Base>
+inline size_t collect_in_family(const char* family, RID rid, std::vector<Base*>& out)
+{
+    if (rid == 0) return 0;
+    const std::string name(family);
+    const ETCS::Buffer key(family);
+    size_t added = 0;
+
+    if (name.find(':') != std::string::npos)
+    {
+        ETCS::EventNode* owner = etcs_loader_event_node();
+        if (!owner) return 0;
+        auto it = owner->ridMap.find(key);
+        if (it == owner->ridMap.end()) return 0;
+        if (void* p = it->second.invoke_get_iface(rid)) { out.push_back(static_cast<Base*>(p)); ++added; }
+        return added;
+    }
+
+    {
+        auto& mine = ETCS::EventNode::getInstance().ridMap;
+        auto it = mine.find(key);
+        if (it != mine.end())
+            if (void* p = it->second.invoke_get_iface(rid))
+            { out.push_back(static_cast<Base*>(p)); ++added; }
+    }
+
+    ETCS::EventNode* owner = etcs_loader_event_node();
+    if (!owner) return added;
+
+    const std::string suffix = ":" + name;
+    for (auto& [k, handle] : owner->ridMap)
+    {
+        const std::string ks = k.toString();
+        if (ks.size() <= suffix.size()) continue;
+        if (ks.compare(ks.size() - suffix.size(), suffix.size(), suffix) != 0) continue;
+        if (void* p = handle.invoke_get_iface(rid))
+        { out.push_back(static_cast<Base*>(p)); ++added; }
+    }
+    return added;
+}
+
+/*
+ * SEARCH BY THE ORDER KEY -- the other half of the pair, and deliberately not
+ * the same function.
+ *
+ * resolve/collect are keyed on IDENTITY. A RID means the same thing in every
+ * provider's list, so they fan out across the ownership edge and their
+ * plurality comes from spanning providers.
+ *
+ * This is keyed on the ORDER, which is a property of one concrete type: the
+ * comparison is the pointee's own operator<, so a search is only meaningful
+ * inside a list whose pointee IS that type. That is why this takes a QUALIFIED
+ * "Provider:Type" and does not fan out -- comparing a Camera3D exemplar against
+ * a Scene3D's relation is not a narrower search, it is a different question
+ * with no answer. Naming the list is also naming the exemplar's type, which is
+ * what makes the type-erased cast underneath sound.
+ *
+ * ITS PLURALITY HAS A DIFFERENT CAUSE, and that is worth keeping separate too.
+ * Orderable derives == from <, so equal means EQUIVALENT -- neither precedes
+ * the other -- and many distinct entities can share a standing
+ * (ontology/Orderable.h). So this returns a range because the relation says it
+ * must, not because providers might collide.
+ *
+ * O(log n): it bisects the vector the Orderable relation already keeps sorted.
+ * That is the whole reason searchability belongs to Orderable and cannot be
+ * offered generally -- a type that declares no order gives the list nothing to
+ * bisect on, and the handle's slot is simply absent (RIDList.h), which this
+ * reports rather than papering over.
+ */
+/*
+ * SEARCH BY AN EXEMPLAR NAMED BY RID -- "everything that stands where this one
+ * stands". The form that does not require the caller to have the type.
+ *
+ * The list resolves the exemplar itself, so the concrete leaf appears nowhere
+ * outside the module that owns it while the QUESTION stays askable by anyone
+ * holding a RID. The relation belongs to the type; asking about it does not.
+ */
+inline size_t search_in_family(const char* qualified, RID exemplar, std::vector<RID>& out)
+{
+    const std::string name(qualified);
+    if (name.find(':') == std::string::npos)
+    {
+        ETCS_LOG("search_in_family", "'" << name << "' is a bare family name, and an order "
+                 "search needs one concrete type: the comparison belongs to the pointee, so "
+                 "it only means something inside one provider's list.");
+        return 0;
+    }
+
+    ETCS::EventNode* owner = etcs_loader_event_node();
+    if (!owner) return 0;
+    auto it = owner->ridMap.find(ETCS::Buffer(qualified));
+    if (it == owner->ridMap.end()) return 0;
+
+    if (!it->second.invoke_searchable())
+    {
+        ETCS_LOG("search_in_family", name << " declares no order, so there is nothing to "
+                 "search on. A type becomes searchable by claiming Orderable and defining "
+                 "operator< -- that relation IS the search key.");
+        return 0;
+    }
+
+    const size_t before = out.size();
+    it->second.invoke_search_ordered_by(exemplar, out);
+    return out.size() - before;
+}
+
+template <typename Leaf>
+inline size_t search_in_family(const char* qualified, const Leaf& exemplar,
+                               std::vector<RID>& out)
+{
+    const std::string name(qualified);
+    if (name.find(':') == std::string::npos)
+    {
+        ETCS_LOG("search_in_family", "'" << name << "' is a bare family name, and an order "
+                 "search needs one concrete type: the comparison belongs to the pointee, so "
+                 "it only means something inside one provider's list. Name it, e.g. "
+                 "\"RenderProvider:" << name << "\".");
+        return 0;
+    }
+
+    ETCS::EventNode* owner = etcs_loader_event_node();
+    if (!owner) return 0;
+    auto it = owner->ridMap.find(ETCS::Buffer(qualified));
+    if (it == owner->ridMap.end()) return 0;
+
+    if (!it->second.invoke_searchable())
+    {
+        ETCS_LOG("search_in_family", name << " declares no order, so there is nothing to "
+                 "search on. A type becomes searchable by claiming Orderable and defining "
+                 "operator< -- that relation IS the search key.");
+        return 0;
+    }
+
+    const size_t before = out.size();
+    it->second.invoke_search_ordered(static_cast<const void*>(&exemplar), out);
+    return out.size() - before;
 }
 
 } // namespace ETCS
