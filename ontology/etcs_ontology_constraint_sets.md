@@ -56,6 +56,40 @@ the lineage and *exclusive* across siblings at the same branch point:
   semantic rule about family membership, not merely a technical one about
   ambiguous method resolution.
 
+### Where a lineage is declared — two spellings, one meaning
+
+A refinement can be stated in either of two places, and both are load-bearing:
+
+```
+class LocalDatabase_ : public Database_          on the INTERFACE
+DrawableBase : public SurfaceBase<Derived>       on the BASE
+```
+
+The second is not a shorthand for the first; for most of the ontology it is
+the only spelling available. `ETCS_SUPERTYPE_BASE` inherits its interface
+**non-virtually**, so an interface that also inherited its parent interface
+would be reached twice — once through the interface, once through the composed
+Base — and every inherited call would be ambiguous. The rule the ontology
+settled on, stated in `Drawable.h`, is therefore:
+
+> an interface declares only its own **increment**,
+> a Base carries the **lineage**.
+
+`Database` can use the interface spelling because it has no `DatabaseBase.h`
+at all — nothing composes it, so nothing reaches it twice. Every family that
+*does* have a Base uses the second spelling. The entire `Resizable → Surface →
+Drawable → {Drawable2D, Drawable3D} → Camera` lineage is declared this way, and
+a reader (or a tool) that inspects only interface inheritance sees six
+unrelated families sitting flat beside each other.
+
+That second spelling is also where the **exclusivity** lives, and where it is
+mechanically enforced. Because `Drawable2DBase` and `Drawable3DBase` both
+compose `DrawableBase` non-virtually, a leaf inheriting both acquires two
+`Drawable_` subobjects and every call through them is ambiguous — the
+incoherent claim is a compile error rather than something a reviewer has to
+catch. `ace ontology` reads both spellings and prints the resulting forest,
+with the exclusive sets named and every module's leaves audited against them.
+
 Using bracket notation for illustration: given families rooted at `X`, `A`,
 `C`, and `D` respectively, a leaf type may draw **at most one member from
 each family**:
@@ -73,11 +107,24 @@ A valid leaf might compose one pick from each bracket — e.g. `Y + B + C + D`
 
 Distinct from sibling exclusivity within one family is **deliberate
 composition across independent families**. When a leaf's `Base<Derived>`
-template inherits from more than one family's `Base` (e.g.
-`ConnectionStateBase<Derived>` composing `EphemeralBase<Derived>` alongside
-`ConnectionState_`), that is a single, coherent choice: "one pick from the
-domain-role family, bundled with one pick from the lifecycle family." This is
-not exclusivity being violated — it's exclusivity being correctly scoped.
+template inherits from more than one family's `Base`, that is a single,
+coherent choice: "one pick from the domain-role family, bundled with one pick
+from the lifecycle family." This is not exclusivity being violated — it's
+exclusivity being correctly scoped.
+
+Note the tension with the previous section: composition at the `Base` layer is
+how refinement is declared **and** how orthogonal axes are folded in, so the
+spelling alone does not distinguish them. What distinguishes them is whether
+the composing family's own header claims the relationship as an *is-a*.
+`Drawable.h` does — "This is a refinement of Surface, not a sibling of it.
+Every Drawable is a Surface" — and `SurfaceBase` composing `ResizableBase` and
+`OrderableBase` is the same claim made twice (every surface has a size and a
+stacking position). A family may therefore refine more than one parent; `ace
+ontology` renders it under the first and cross-references it under the rest.
+
+A leaf-level fold-in of two unrelated axes is a different act from a
+family-level refinement even though both are written `public XBase<Derived>`,
+and the difference is in the interface header's own claim, not in the syntax.
 Exclusivity applies *within* a family (siblings), never *across* independent
 families (orthogonal axes). Folding two orthogonal families together at the
 `Base` declaration is the intended mechanism for building a leaf's full,

@@ -59,7 +59,7 @@
 #   sheet    PaintSurface                binds the document to the canvas
 #   palette  PaintPalette                which node means which setting
 #   input    PaintInput                  routing, and the stroke machine
-#   layout   Clayout                     who is what size, and where
+#   layout   Layout                     who is what size, and where
 #
 # THE CANVAS IS A SURFACE because every Drawable2D is one (ontology/Surface.h
 # and Drawable2D.h) -- so the document renders into a REGION of the window with
@@ -117,7 +117,7 @@ bar.SetBackground(0.18, 0.18, 0.21, 1.0)
 # one from the other anywhere -- express it once and the arithmetic is the
 # solver's problem, at every window size, forever.
 
-spawn LayoutProvider::Clayout layout
+spawn LayoutProvider::Layout layout
 layout.Create(1280, 800)
 
 # the window: grow / grow, stacked top to bottom
