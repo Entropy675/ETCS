@@ -11,6 +11,8 @@
 #include <iomanip>
 #include <pthread.h>
 #include <string>
+#include <cstring>
+#include <filesystem>
 #include <sstream>
 #include <cmath>
 #include <algorithm>
@@ -111,11 +113,17 @@ enum class TestEventKind : int { Inline = 0, Async = 1, Drop = 2 };
 struct TestInEvent
 {
     TestEventKind kind    = TestEventKind::Inline;
-    int           tag_bit = -1;
+    int           tag_bit = -1;   // node id on the tag graph, or -1 = empty
     int           data    = 0;
 };
 static_assert(sizeof(TestInEvent) <= MAX_LMAX_BUFFER_SIZE,
               "TestInEvent must fit one LBuffer slot -- enqueue() memcpys it whole");
+// Precomputed per-node relation masks (low 64 bits of TagMask). When
+// g_use_relation_table is true, mask_for looks up tag_bit here instead of
+// emitting a single bit. Table is filled by the ontology-style graph builder
+// before sparse-graph blasts; left zero for adversarial/unit tests.
+static uint64_t g_relation_mask[64]{};
+static std::atomic<bool> g_use_relation_table{false};
 struct TestWorkResult : ETCS::WorkResult
 {
     int result_data = 0;
@@ -197,6 +205,15 @@ struct TestEventStream
     ETCS::TagMask mask_for(TestState&, const TestInEvent& evt)
     {
         if (evt.tag_bit < 0) return ETCS::TagMask{};
+        if (g_use_relation_table.load(std::memory_order_relaxed)
+            && evt.tag_bit < 64)
+        {
+            // Ontology-encoded relation mask: self + lineage ancestors +
+            // exclusive-sibling conflict bits. Precomputed by build_ontology_graph.
+            ETCS::TagMask m;
+            m.w[0] = g_relation_mask[evt.tag_bit];
+            return m;
+        }
         return ETCS::TagMask::bit(static_cast<size_t>(evt.tag_bit));
     }
     ETCS::DispatchResult on_event(TestState& st,
@@ -606,7 +623,7 @@ inline uint64_t fast_hash(uint64_t x)
 // ── blast / throughput ────────────────────────────────────────────────────────
 static void test_eventstream_blast(ETCS::MemoryArena& arena, int TOTAL = 100000)
 {
-    section("EventStream: Blast — Multi-Producer Async (Pinned)");
+    section("EventStream: Blast - Multi-Producer Async (Pinned)");
     constexpr int PRODUCERS = 4;
     const int     CORES     = get_core_count();
     int PER_PRODUCER    = TOTAL / PRODUCERS;
@@ -662,8 +679,227 @@ static void test_eventstream_blast(ETCS::MemoryArena& arena, int TOTAL = 100000)
     TEST("blast: all events emitted " , emitted.size() == static_cast<size_t>(EFFECTIVE_TOTAL));
     std::cout << "  [INFO] " << formatWithCommas(EFFECTIVE_TOTAL)
               << " events in " << std::fixed << std::setprecision(3) << ms
-              << "ms — " << formatWithCommas(static_cast<long long>(ops)) << " ops/sec\n";
+              << "ms - " << formatWithCommas(static_cast<long long>(ops)) << " ops/sec\n";
 }
+
+
+
+// ── Per-module graphs from real ETCS-Commons sources ─────────────────────────
+//
+// For each of the 8 providers, nodes = ETCS_MODULE_EXPORT_MAIN tags and
+// edges = addTag<T> relationships found in that module's headers/cc.
+// Relation mask[node] = bit(self) | bits(AST neighbors from those edges).
+// Ontology families are only the vocabulary those types implement; bits are
+// set only from module edges.
+
+struct ModEdge { int a, b; }; // undirected for intersects()
+
+struct ModuleGraph {
+    const char* name;
+    const char* const* tags; // bit i = tags[i]
+    int n_tags;
+    const ModEdge* edges;
+    int n_edges;
+};
+
+// --- ChessProvider: ChessNode addTag<ChessLobby>, addTag<ChessGame> ---
+static const char* CHESS_TAGS[] = {"ChessGame", "ChessLobby", "ChessNode"};
+static const ModEdge CHESS_EDGES[] = {{2,0},{2,1}}; // Node-Game, Node-Lobby
+
+// --- DatabaseProvider: LocalDatabase (+ RemoteDatabase declared) ---
+static const char* DB_TAGS[] = {"LocalDatabase", "RemoteDatabase"};
+static const ModEdge DB_EDGES[] = {}; // no addTag between them in module
+
+// --- ForumWebsiteProvider: ForumNode addTag<ForumSelf>, addTag<ForumThread> ---
+static const char* FORUM_TAGS[] = {"ForumThread", "ForumSelf", "ForumNode"};
+static const ModEdge FORUM_EDGES[] = {{2,0},{2,1}};
+
+// --- LayoutProvider: Layout only ---
+static const char* LAYOUT_TAGS[] = {"Layout"};
+static const ModEdge LAYOUT_EDGES[] = {};
+
+// --- NetworkProvider: HttpServer→ConnectionManager→SocketConnectionState,
+//     FileHtmlPage↔StaticHtmlPage ---
+static const char* NET_TAGS[] = {
+    "HttpServer", "ConnectionManager", "HTTPParser", "TLSContext",
+    "SocketConnectionState", "StaticHtmlPage", "FileHtmlPage", "TarpitNode"
+};
+static const ModEdge NET_EDGES[] = {
+    {0,1}, // HttpServer - ConnectionManager
+    {1,4}, // ConnectionManager - SocketConnectionState
+    {6,5}, // FileHtmlPage - StaticHtmlPage
+};
+
+// --- PaintProvider: document/layer/tool/surface/input/palette (composition
+//     graph used as local walk; no addTag edges in sources) ---
+static const char* PAINT_TAGS[] = {
+    "PaintDocument", "PaintLayer", "PaintTool",
+    "PaintSurface", "PaintInput", "PaintPalette"
+};
+static const ModEdge PAINT_EDGES[] = {
+    {0,1},{1,2},{0,3},{3,4},{0,5} // document owns layers/surface/palette; layer-tool; surface-input
+};
+
+// --- RenderProvider: surface/drawable/camera family as used together ---
+static const char* RENDER_TAGS[] = {
+    "Instance", "Surface", "ImageSurface", "PolygonDrawable2D",
+    "CompositeDrawable2D", "Scene3D", "Camera3D", "TextLabel"
+};
+static const ModEdge RENDER_EDGES[] = {
+    {0,1}, // Instance - Surface
+    {1,2}, // Surface - ImageSurface (both Surface family usage)
+    {3,4}, // Polygon - Composite
+    {5,6}, // Scene3D - Camera3D
+    {4,7}, // Composite - TextLabel
+};
+
+// --- WindowProvider: Window only ---
+static const char* WINDOW_TAGS[] = {"Window"};
+static const ModEdge WINDOW_EDGES[] = {};
+
+static const ModuleGraph MODULE_GRAPHS[] = {
+    {"ChessProvider",   CHESS_TAGS,  3, CHESS_EDGES,  2},
+    {"DatabaseProvider",DB_TAGS,     2, DB_EDGES,     0},
+    {"ForumWebsiteProvider", FORUM_TAGS, 3, FORUM_EDGES, 2},
+    {"LayoutProvider",  LAYOUT_TAGS, 1, LAYOUT_EDGES, 0},
+    {"NetworkProvider", NET_TAGS,    8, NET_EDGES,    3},
+    {"PaintProvider",   PAINT_TAGS,  6, PAINT_EDGES,  5},
+    {"RenderProvider",  RENDER_TAGS, 8, RENDER_EDGES, 5},
+    {"WindowProvider",  WINDOW_TAGS, 1, WINDOW_EDGES, 0},
+};
+static constexpr int MODULE_GRAPH_COUNT = 8;
+
+static void print_module_graph(const ModuleGraph& g)
+{
+    std::cout << "\n── Module AST edges: " << g.name << " ──\n";
+    std::cout << "  tags:";
+    for (int i = 0; i < g.n_tags; ++i)
+        std::cout << " [" << i << "]" << g.tags[i];
+    std::cout << "\n  edges:";
+    if (g.n_edges == 0) std::cout << " (none - single-tag or no addTag links)";
+    for (int e = 0; e < g.n_edges; ++e)
+        std::cout << "  " << g.tags[g.edges[e].a] << "-" << g.tags[g.edges[e].b];
+    std::cout << "\n";
+}
+
+// Encode this module's edges into g_relation_mask[0..n_tags).
+static void build_module_relation_table(const ModuleGraph& g)
+{
+    std::memset(g_relation_mask, 0, sizeof(g_relation_mask));
+    for (int i = 0; i < g.n_tags; ++i)
+        g_relation_mask[i] = (uint64_t(1) << i);
+    for (int e = 0; e < g.n_edges; ++e)
+    {
+        int a = g.edges[e].a, b = g.edges[e].b;
+        g_relation_mask[a] |= (uint64_t(1) << b);
+        g_relation_mask[b] |= (uint64_t(1) << a);
+    }
+    std::cout << "  masks:";
+    for (int i = 0; i < g.n_tags; ++i)
+        std::cout << "  " << g.tags[i] << "=0x" << std::hex << g_relation_mask[i] << std::dec;
+    std::cout << "\n";
+}
+
+// Pick an endpoint of edge `e` (or tag index if no edges).
+static int module_edge_endpoint(const ModuleGraph& g, int edge_or_tag, int which)
+{
+    if (g.n_edges <= 0)
+        return edge_or_tag % g.n_tags;
+    const ModEdge& e = g.edges[edge_or_tag % g.n_edges];
+    return (which & 1) ? e.b : e.a;
+}
+
+// Bursty producers: storm one edge neighborhood, yield so the GRB can drain,
+// then move to the next edge. Ops/sec uses active enqueue time only (excludes
+// inter-burst sleeps), matching LMAXTester intermittent-burst accounting.
+static void test_eventstream_blast_module(ETCS::MemoryArena& arena,
+                                          const ModuleGraph& g,
+                                          int TOTAL)
+{
+    section((std::string("EventStream: Blast module (bursty edges) ") + g.name).c_str());
+    print_module_graph(g);
+    build_module_relation_table(g);
+
+    constexpr int PRODUCERS = 4;
+    constexpr int BURST     = 64;   // events per edge storm
+    constexpr int SLEEP_US  = 50;   // gap between storms so the window can drain
+    const int     CORES     = get_core_count();
+    int PER_PRODUCER    = TOTAL / PRODUCERS;
+    int EFFECTIVE_TOTAL = PER_PRODUCER * PRODUCERS;
+
+    g_use_relation_table.store(true, std::memory_order_release);
+
+    TestEventStream stream;
+    WIRE_CONTEXT();
+    stream.start(arena, PRODUCERS);
+    stream.start_workers(CORES > 2 ? CORES - 2 : 2);
+    std::atomic<bool> start_flag{false};
+    std::atomic<uint64_t> active_ns_sum{0};
+    std::vector<std::thread> producers;
+    for (int p = 0; p < PRODUCERS; ++p)
+    {
+        producers.emplace_back([&, p]() {
+            pin_thread((p + 1) % CORES);
+            while (!start_flag.load(std::memory_order_acquire));
+            uint64_t local_active_ns = 0;
+            int issued = 0;
+            int edge_cursor = p; // each producer starts on a different edge
+            while (issued < PER_PRODUCER)
+            {
+                const int burst_n = std::min(BURST, PER_PRODUCER - issued);
+                // Alternate endpoints of this edge within the burst so both
+                // sides of the relation fire, still local to one edge.
+                auto b0 = std::chrono::high_resolution_clock::now();
+                for (int k = 0; k < burst_n; ++k)
+                {
+                    int node = module_edge_endpoint(g, edge_cursor, k);
+                    TestEventKind kind = (k % 4 == 0)
+                        ? TestEventKind::Inline
+                        : TestEventKind::Async;
+                    TestInEvent evt{kind, node, p * PER_PRODUCER + issued + k};
+                    stream.enqueue(evt);
+                }
+                auto b1 = std::chrono::high_resolution_clock::now();
+                local_active_ns += static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(b1 - b0).count());
+                issued += burst_n;
+                edge_cursor++;
+                // Yield between storms - not counted in active_ns.
+                if (issued < PER_PRODUCER)
+                    std::this_thread::sleep_for(std::chrono::microseconds(SLEEP_US));
+            }
+            active_ns_sum.fetch_add(local_active_ns, std::memory_order_relaxed);
+        });
+    }
+    start_flag.store(true, std::memory_order_release);
+    while (stream.emit_count_.load(std::memory_order_acquire) < (size_t)EFFECTIVE_TOTAL)
+    {
+        int backoff = 0;
+        ETCS::LMAXSequentialSharedPage::busySpin(backoff);
+    }
+    auto emitted = stream.wait_for_emits(EFFECTIVE_TOTAL, 10000);
+    for (auto& t : producers) t.join();
+    stream.stop_workers();
+    stream.stop();
+    g_use_relation_table.store(false, std::memory_order_release);
+
+    // Active time = sum of per-producer burst intervals (excludes sleeps).
+    // Divide by PRODUCERS for a wall-ish active rate comparable across runs.
+    uint64_t active_ns = active_ns_sum.load(std::memory_order_relaxed) / PRODUCERS;
+    double ops = active_ns > 0
+        ? (static_cast<double>(EFFECTIVE_TOTAL) / active_ns) * 1e9
+        : 0.0;
+    double ms  = active_ns / 1000000.0;
+    TEST("blast module graph: all events emitted",
+         emitted.size() == static_cast<size_t>(EFFECTIVE_TOTAL));
+    std::cout << "  [INFO] " << g.name
+              << "  burst=" << BURST << " gap=" << SLEEP_US << "us"
+              << "  " << formatWithCommas(EFFECTIVE_TOTAL)
+              << " events active " << std::fixed << std::setprecision(3) << ms
+              << "ms* - " << formatWithCommas(static_cast<long long>(ops)) << " ops/sec\n";
+    std::cout << "         * active producer time only (excludes inter-burst sleeps)\n";
+}
+
 // ── main ──────────────────────────────────────────────────────────────────────
 // #include "../core/TempMemoryArena.h"
 int main()
@@ -672,7 +908,7 @@ int main()
     //ETCS::TempMemoryArena tmp;
     //tmp.touchAll();
     ETCS::MemoryArena& arena = ETCS::MemoryArena::getInstance();
-    std::cout << "EventStream GRB test suite [Randomized Event Dependency bitmasks - worst case/random performance]\n";
+    std::cout << "EventStream GRB test suite [adversarial random + 8 module AST-edge masks]\n";
     std::cout << "arena chunk size: " << arena.getChunkSize() << " bytes\n";
     std::cout << "huge pages:       " << (arena.isUsingHugePages() ? "yes" : "no") << "\n";
     std::cout << "GAP_DEPTH:        " << ETCS::GAP_DEPTH << "\n";
@@ -688,7 +924,8 @@ int main()
     test_eventstream_independent_tags(arena);
     test_eventstream_gap_depth_backpressure(arena);
     test_eventstream_mixed_traffic(arena);
-    // ── blast scaling ─────────────────────────────────────────────────────────
+    // ── blast scaling - adversarial (random single-bit / dense contention) ───
+    std::cout << "\n── Adversarial (random single-bit tags / dense contention) ──\n";
     test_eventstream_blast(arena, 500);
     test_eventstream_blast(arena, 10000);
     test_eventstream_blast(arena, 100000);
@@ -696,6 +933,38 @@ int main()
     test_eventstream_blast(arena, 1000000);
     test_eventstream_blast(arena, 5000000);
     test_eventstream_blast(arena, 10000000);
+    // one blast per module that exists under ../modules (and/or ../bin/*.so)
+    std::cout << "\n-- Per-module AST-edge masks (discovered from modules/) --\n";
+    {
+        namespace fs = std::filesystem;
+        const fs::path modules_dir = fs::path("..") / "modules";
+        const fs::path bin_dir     = fs::path("..") / "bin";
+        int ran = 0;
+        for (int mi = 0; mi < MODULE_GRAPH_COUNT; ++mi)
+        {
+            const ModuleGraph& g = MODULE_GRAPHS[mi];
+            const fs::path mod_dir = modules_dir / g.name;
+            const fs::path so_bin  = bin_dir / (std::string(g.name) + ".so");
+            const fs::path so_mod  = mod_dir / (std::string(g.name) + ".so");
+            bool present = fs::is_directory(mod_dir)
+                        || fs::exists(so_bin)
+                        || fs::exists(so_mod);
+            if (!present)
+            {
+                std::cout << "  [skip] " << g.name
+                          << " (not found under modules/ or bin/)\n";
+                continue;
+            }
+            std::cout << "  [found] " << g.name;
+            if (fs::exists(so_bin)) std::cout << "  so=bin/" << g.name << ".so";
+            else if (fs::exists(so_mod)) std::cout << "  so=modules/" << g.name << "/" << g.name << ".so";
+            else std::cout << "  (sources only, no .so yet)";
+            std::cout << "\n";
+            test_eventstream_blast_module(arena, g, 1000000);
+            ++ran;
+        }
+        std::cout << "  modules tested: " << ran << " / " << MODULE_GRAPH_COUNT << "\n";
+    }
     std::cout << "\n────────────────────────────────────\n";
     std::cout << "passed: " << s_passed << "\n";
     std::cout << "failed: " << s_failed << "\n";
