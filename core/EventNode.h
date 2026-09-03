@@ -5,6 +5,7 @@
 #include <sstream>
 #include <cstdlib>
 #include "Buffer.h"
+#include "Log.h"
 #include "RIDList.h"
 #include "EventStream.h"
 #include "ArenaAllocator.h"
@@ -64,8 +65,12 @@ struct DLInEvent
     // crossing that same boundary.
     ETCS::Entity*      tagmodify_target = nullptr;
     bool               tagmodify_is_remove = false;
-    void              (*tagmodify_impl)(ETCS::Entity*, const ETCS::Buffer&, bool) = nullptr;
+    // Returns whether the surface actually moved -- see Entity::tagModifyImpl.
+    // The answer rides home in release_value and is published by on_emit, the
+    // same read-then-publish split AddTag uses for rid_out.
+    bool              (*tagmodify_impl)(ETCS::Entity*, const ETCS::Buffer&, bool) = nullptr;
     std::atomic<bool>* tagmodify_done = nullptr;
+    std::atomic<bool>* tagmodify_changed = nullptr;
     // TagModify only — the emitting entity's own TYPE bit, stamped at the
     // call site from that type's static TAG_MASK (WIRE_TYPE_IDENTITY,
     // ETCS_API.h) rather than looked up by string in whichever EventNode
@@ -357,12 +362,13 @@ struct AddTagEvent : Event
 // state) — only the DECISION to remove the tag stays local here.
 struct TagModifyEvent : Event
 {
-    using Impl = void(*)(ETCS::Entity*, const ETCS::Buffer&, bool);
+    using Impl = bool(*)(ETCS::Entity*, const ETCS::Buffer&, bool);
     ETCS::Entity*     target;
     bool              is_remove;
     Impl              impl;
     ETCS::TagMask     type_mask;
     std::atomic<bool> done{false};
+    std::atomic<bool> changed{false};
     // An empty mask here means the emitting type has no contract identity --
     // an Entity-derived type with no tag block, so nothing assigned its
     // TAG_MASK. Substituted for all() on the same fail-shut reasoning as
@@ -375,7 +381,18 @@ struct TagModifyEvent : Event
                     const ETCS::TagMask& mask)
         : Event(key), target(t), is_remove(remove), impl(fn),
           type_mask(mask.any() ? mask : ETCS::TagMask::all()) {}
-    void operator()();
+    /*
+ * Returns whether THIS call moved the surface.
+ *
+ * That makes a tag operation a claim as well as a record, which is what a
+ * lifecycle reached from several threads at once needs and what the tag
+ * surface was always the right place to put: `removeTag("active")` both
+ * states that the window is no longer active AND tells exactly one of the
+ * three callers racing to close it that the close is theirs to finish. No
+ * second mechanism, and the ordering is the one every other state change in
+ * the module already takes.
+ */
+    bool operator()();
 };
 // PairMaskEvent — resolve two contract tags into a MODULE-scope mask.
 //
@@ -542,6 +559,29 @@ public:
     // one, since heap memory's lifetime doesn't depend on MemoryArena's
     // teardown schedule at all. Written only from the EventStream consumer
     // thread — no external lock needed.
+    /*
+ * WHERE THIS DSO'S LOG LINES GO, reachable from outside this DSO.
+ *
+ * A trampoline rather than a method, for the reason every other trampoline
+ * here exists: ETCS::log_to_file is an inline variable, so the loader and each
+ * module have their own. A method defined in this header and called through a
+ * module's EventNode* would inline the LOADER's copy and set the LOADER's
+ * flag. Taking the address where the object is CONSTRUCTED captures whichever
+ * DSO actually built this instance, which is the one whose flag is meant.
+ *
+ * ABOVE `stream`, and that placement is load-bearing rather than tidy. This
+ * class has an #ifdef ETCS_LOADER fork in the middle of it -- LoaderStream on
+ * one side, ModuleProxy on the other -- so every member declared after that
+ * point sits at a DIFFERENT OFFSET in a loader build than in a module build.
+ * The loader reads this pointer out of a MODULE's EventNode, so it has to live
+ * in the part of the layout both builds agree on: the prefix, with ridMap and
+ * scope, which is exactly why those two were already the only things the
+ * loader touched. Declared below the fork it was read as garbage and called --
+ * a jump to 0x400000000, found the first time this ran.
+ */
+    void (*set_log_to_file)(bool) = nullptr;
+    bool (*get_log_to_file)()     = nullptr;
+
     std::unordered_map<ETCS::Buffer, RIDListHandle> ridMap;
     // -----------------------------------------------------------------------
     // Tag bit index — maps each of THIS module's own contract tags (the
@@ -860,6 +900,11 @@ public:
                     if (e->unload_done)  e->unload_done->store(true, std::memory_order_release);
                     break;
                 case DLInEvent::Kind::TagModify:
+                    // Answer before flag: the caller spins on the flag, so the
+                    // store that releases it must be the last touch here.
+                    if (e->tagmodify_changed)
+                        e->tagmodify_changed->store(e->release_value != 0,
+                                                    std::memory_order_relaxed);
                     if (e->tagmodify_done) e->tagmodify_done->store(true, std::memory_order_release);
                     break;
                 case DLInEvent::Kind::ChangeModule:
@@ -983,7 +1028,11 @@ public:
         void on_emit(DLState&, ETCS::GapSlot& slot)
         {
             DLInEvent* e = static_cast<DLInEvent*>(slot.result);
-            if (e && e->tagmodify_done)
+            if (!e) return;
+            // Answer before flag -- see LoaderStream::on_emit's own note.
+            if (e->tagmodify_changed)
+                e->tagmodify_changed->store(e->release_value != 0, std::memory_order_relaxed);
+            if (e->tagmodify_done)
                 e->tagmodify_done->store(true, std::memory_order_release);
         }
         // Module scope. TagModify is handled locally and its mask is genuine
@@ -1028,6 +1077,11 @@ public:
 
     EventNode()
     {
+        // Taken HERE rather than as default member initialisers, for the same
+        // reason as the placement above: the constructor is what runs in the
+        // owning DSO, and these must be that DSO's own functions.
+        set_log_to_file = &ETCS::set_log_to_file;
+        get_log_to_file = &ETCS::get_log_to_file;
         stream.owner = this; // wire back-pointer now that EventNode is complete --
                               // both LoaderStream and ModuleProxy have this member.
         s_alive.store(true, std::memory_order_release);

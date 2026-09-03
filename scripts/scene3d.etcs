@@ -98,8 +98,11 @@ world.SetDamping(6.0)
 # centre of that box is a position on a rotational axis -- the full circle
 # across the width, and the pitch range down the height.
 #
-# SENSITIVITY IS THAT SPAN. 1.0 means the width is exactly one turn and the
-# height the full pitch range. 2.0 -- the default, and what is set here -- makes
+# SENSITIVITY IS THE YAW SPAN. 1.0 means the width is exactly one turn. It does
+# NOT touch pitch: only a circle can be gone round twice inside one frame, and a
+# bounded axis compressed the same way just puts its own stops inside the frame,
+# which is a dead zone. The height maps onto the pitch range once, top edge to
+# bottom edge, always. 2.0 -- the default, and what is set here -- makes
 # the width TWO turns, which is the more usable choice: a half turn, the thing
 # you ask a look for most often, then lands a quarter of the width from centre
 # rather than at the very edge, so the pointer stays near the middle of the

@@ -315,7 +315,39 @@ int main()
     // second arrival must find the work already done.
     tool->call("PaintTool.Delete", "", ctx);
     check(true, "Delete on every tag, twice on one, did not fault");
+
+    /*
+     * THE DELETE GATE, which section 1's composed reference now depends on.
+     *
+     * That section proves a RID resolves across a module boundary while its
+     * target is alive. The half nothing asked is what a resolve is worth
+     * AFTERWARDS -- and the answer used to be "a pointer into freed memory,
+     * for as long as you kept it", because a bare resolve is true about the
+     * instant it was given and about nothing later.
+     *
+     * resolve_held carries the interval with the pointer: truthy means the
+     * entity cannot be freed while the hold lives, falsy covers gone AND
+     * going. This checks both ends of that, which is as far as a
+     * single-threaded loader can go -- the race itself needs the delete on
+     * another thread while a walk is inside, which is what the scene3d frame
+     * edge exercises.
+     */
+    {
+        ETCS::Held<Surface_> live = ETCS::resolve_held<Surface_>("Surface", canvas->getRID());
+        check(static_cast<bool>(live), "a live entity yields a hold");
+        // Called THROUGH the hold, which is the point: the pointer stays good
+        // for the whole scope rather than for the instant it was handed over.
+        if (live) live->Clear(0.0f, 1.0f, 0.0f, 1.0f);
+        check(live && pixel_at(px, 4, 4).g == 255,
+              "and the held pointer is usable through it");
+        check(!canvas->isRetiring(), "and it is not retiring while it is held");
+    }
+
+    const ETCS::RID canvas_rid = canvas->getRID();
     canvas->call("ImageSurface.Delete", "", ctx);
+    check(!ETCS::resolve_held<Surface_>("Surface", canvas_rid),
+          "a deleted entity yields no hold -- the resolve reports it rather than "
+          "handing back memory the delete has already reclaimed");
 
     std::cout << "\n=== Summary: " << g_pass << " passed, " << g_fail << " failed ===\n";
     return g_fail == 0 ? 0 : 1;

@@ -1132,6 +1132,46 @@ inline void repl_shell_loop_with(ETCS::SignalContext& sig, ReplLineSource& in)
             continue;
         }
 
+        /*
+         * WHERE THE LOG GOES, changed while it is running.
+         *
+         * It matters most exactly here: a prompt sharing stdout with a frame
+         * loop's logging is a prompt you cannot read, and the answer used to
+         * be a rebuild. Each module keeps its own destination (ETCS::
+         * log_to_file, Log.h) and writes to logs/<ModuleName>.log, so this
+         * visits every loaded one rather than flipping a single global.
+         */
+        if (mod_input == "log" || mod_input.rfind("log ", 0) == 0)
+        {
+            std::string arg = (mod_input.size() > 4) ? mod_input.substr(4) : "";
+            size_t b0 = arg.find_first_not_of(" \t");
+            size_t b1 = arg.find_last_not_of(" \t");
+            arg = (b0 == std::string::npos) ? "" : arg.substr(b0, b1 - b0 + 1);
+
+            if (arg == "file" || arg == "term" || arg == "terminal")
+            {
+                const bool to_file = (arg == "file");
+                ETCS::set_log_destination(to_file);
+                ETCS_LOG("ShellREPL", COLOR_LIB << "log -> "
+                         << (to_file ? "logs/<Module>.log (one file per provider)"
+                                     : "this terminal")
+                         << COLOR_RESET);
+            }
+            else if (arg.empty() || arg == "status")
+            {
+                ETCS_LOG("ShellREPL", COLOR_DIR << "log destination: "
+                         << (ETCS::log_destination_is_file()
+                             ? "logs/<Module>.log" : "terminal")
+                         << COLOR_RESET << "   (log file | log term)");
+            }
+            else
+            {
+                repl_err() << COLOR_WARN << "log: expected 'file', 'term', or nothing"
+                           << COLOR_RESET << "\n";
+            }
+            continue;
+        }
+
         if (mod_input == "jobs")
         {
             auto jobs = ETCS::DetachedRegistry::getInstance().list();
