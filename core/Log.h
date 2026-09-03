@@ -20,13 +20,24 @@
  * destination is a module's own property. `log file` in the shell sets every
  * one it can reach (CommandExecutor.h).
  *
- * The default follows the shell: built with ETCS_REPL_SHELL, a terminal that
- * is also a prompt is a terminal you cannot read, so lines go to the files and
- * the prompt stays legible. Without it, stdout is the whole interface and the
- * lines belong there. ETCS_LOG_TO_FILE still forces the file default, which is
- * what a production build wants.
+ * The default follows the shell: built WITH ETCS_REPL_SHELL there is a person
+ * at that terminal reading it, so the lines go there and `log file` moves them
+ * away when they get in the way. Built WITHOUT it nobody is watching stdout,
+ * so the files are where the lines are of any use. ETCS_LOG_TO_FILE forces the
+ * file default either way, which is what a production build wants.
+ *
+ * ONLY THE LOADER CAN ANSWER THIS, which is why the shell half of the test is
+ * gated on ETCS_LOADER. A module is never compiled with ETCS_REPL_SHELL --
+ * that flag describes the executable, not the library -- so a module reading
+ * it would conclude "nobody is watching" in the one case where somebody is.
+ * Modules therefore start VISIBLE and are told the truth the moment they
+ * register (Module::registerLoader). The few lines a module emits before that
+ * -- its ThreadPool coming up, its manifest comparison -- follow this default,
+ * and defaulting them to the terminal is deliberate: a module cannot know
+ * whether anyone is there, and lines nobody asked to hide are worth more on
+ * screen than lines nobody can find are worth in a file.
  */
-#if defined(ETCS_LOG_TO_FILE) || defined(ETCS_REPL_SHELL)
+#if defined(ETCS_LOG_TO_FILE) || (defined(ETCS_LOADER) && !defined(ETCS_REPL_SHELL))
     #define ETCS_LOG_TO_FILE_DEFAULT true
 #else
     #define ETCS_LOG_TO_FILE_DEFAULT false
