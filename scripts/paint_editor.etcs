@@ -1,0 +1,180 @@
+#!/usr/bin/env etcs
+#IMPORT ACE_ROOT/modules
+
+# A paint editor: canvas, toolbar, and a pointer that knows which it is on.
+#
+#     ./bin/etcs scripts/paint_editor.etcs
+#
+# Pick a colour or a nib from the bar along the bottom, then hold any key and
+# move over the canvas to draw. The window's cross ends the session.
+#
+# AN ORCHESTRATION, WHICH IS WHY IT IS HERE. It spawns from three providers --
+# RenderProvider for the device, surface and shapes, WindowProvider for the
+# window and its input, PaintProvider for the document and the brush -- so it
+# is a composition rather than any one provider's script. The parts it is made
+# of live with the providers that own them (PaintProvider/scripts/), and this
+# file does nothing but assemble them into a program.
+#
+# ── THE FRAMES ───────────────────────────────────────────────────────────
+#
+# The whole design turns on there being more than one, and on nothing having
+# to know that but the router:
+#
+#   stage    1280x800  the window's frame -- what the input channel speaks
+#   canvas   1280x740 at (0,0)      the picture's frame
+#   bar      1280x60  at (0,740)    the toolbar's frame
+#   swatch   44x44    at (16,8)     in the BAR's frame, not the window's
+#
+# A pointer report arrives in the stage's frame and is handed to
+# Drawable2D_::PickAt, which walks the same ordered child list the renderer
+# draws with -- so what receives an event is what the user can actually see --
+# and returns the deepest node under the point WITH the point already
+# translated into that node's own space. The toolbar's swatches are laid out
+# at (16,8), and that is exactly the coordinate a press on the first swatch
+# arrives as. Nothing anywhere adds an offset; the descent already did.
+#
+# WHAT THAT BUYS, concretely: move the bar to the top by changing one
+# SetPosition below and everything keeps working, because no swatch and no
+# stroke was ever stated in window coordinates to begin with.
+#
+# ── THE PARTS ────────────────────────────────────────────────────────────
+#
+#   gpu      RenderProvider::Instance    the device
+#   view     RenderProvider::Surface     the window's presentable surface
+#   stage    CompositeDrawable2D         the root everything hangs from
+#   canvas   CompositeDrawable2D         the drawing area, and a Surface
+#   bar      CompositeDrawable2D         the toolbar's own frame
+#   paper    PaintLayer                  the opaque sheet
+#   ink      PaintLayer                  what strokes land on
+#   doc      PaintDocument               the layer stack
+#   brush    PaintTool                   radius and colour
+#   sheet    PaintSurface                binds the document to the canvas
+#   palette  PaintPalette                which node means which setting
+#   input    PaintInput                  routing, and the stroke machine
+#
+# THE CANVAS IS A SURFACE because every Drawable2D is one (ontology/Surface.h
+# and Drawable2D.h) -- so the document renders into a REGION of the window with
+# the same call it used when it had the whole thing, and the toolbar is not
+# something the picture has to be aware of.
+#
+# ── THREAD LEDGER -- four ────────────────────────────────────────────────
+#
+#   1. this script's thread   main.ProduceEvents -> input.ConsumeRouted
+#   2. detached thread        main.ProducePointer -> input.ConsumeRoutedPointer
+#   3. pool worker            Surface.ProduceFrames    frame clock
+#   4. detached thread        Surface.ConsumeFrames    walk, record, present
+
+spawn RenderProvider::Instance gpu
+gpu.Create()
+
+spawn WindowProvider::Window main
+main.Create(1280, 800, 'ETCS Paint')
+
+main.spawn(RenderProvider::Surface view)
+view.Create(@gpu)
+view.Clear(0.13, 0.13, 0.15, 1.0)
+
+# ── the tree ─────────────────────────────────────────────────────────────
+
+spawn RenderProvider::CompositeDrawable2D stage
+stage.Create(1280, 800)
+stage.SetPosition(0, 0)
+stage.SetBackground(0.13, 0.13, 0.15, 1.0)
+
+stage.spawn(RenderProvider::CompositeDrawable2D canvas)
+canvas.Create(1280, 740)
+canvas.SetPosition(0, 0)
+canvas.SetOrder(1)
+canvas.SetBackground(1.0, 1.0, 1.0, 1.0)
+# THE BUFFER IS THE PICTURE, not something derived from the tree: the brush
+# writes into it from outside the walk, so a recompose must not clear it.
+canvas.SetRetain(1)
+
+stage.spawn(RenderProvider::CompositeDrawable2D bar)
+bar.Create(1280, 60)
+bar.SetPosition(0, 740)
+bar.SetOrder(2)
+bar.SetBackground(0.18, 0.18, 0.21, 1.0)
+
+# ── the document ─────────────────────────────────────────────────────────
+#
+# Sized to the CANVAS, not the window. The picture is 1280x740 because that is
+# how much of the screen is the picture, and a document that thought otherwise
+# would be 60 pixels of paper hidden behind the toolbar.
+
+spawn PaintProvider::PaintLayer paper
+paper.Create(1280, 740)
+paper.Clear(1.0, 1.0, 1.0, 1.0)
+
+spawn PaintProvider::PaintLayer ink
+ink.Create(1280, 740)
+ink.Clear(0.0, 0.0, 0.0, 0.0)
+
+spawn PaintProvider::PaintDocument doc
+doc.Create(1280, 740, 'untitled')
+doc.AddLayer(@paper)
+doc.AddLayer(@ink)
+doc.SetActiveLayer(@ink)
+
+spawn PaintProvider::PaintTool brush
+brush.SetRadius(8.0)
+brush.SetColor(0.10, 0.10, 0.12, 1.0)
+
+spawn PaintProvider::PaintSurface sheet
+sheet.Create(@canvas)
+sheet.AttachDocument(@doc)
+sheet.Render()
+
+# ── the toolbar ──────────────────────────────────────────────────────────
+#
+# The palette is bound to the tool BEFORE the bar is populated, so a swatch is
+# never registered against a palette that has nowhere to put it.
+
+spawn PaintProvider::PaintPalette palette
+palette.BindTool(@brush)
+
+run PaintProvider/scripts/paint_toolbar.etcs bar=bar palette=palette
+
+# ── input ────────────────────────────────────────────────────────────────
+#
+# Three bindings, and each answers a different question: BindRoot says which
+# frame the incoming coordinates are in, BindCanvas says which single node's
+# frame is the picture's, and BindPalette says who to ask whether a press was
+# a selection. Without the root this is the unrouted edge and the canvas is
+# assumed to be the window, which is what paint_surface.etcs still wants.
+
+spawn PaintProvider::PaintInput input
+input.Create(@doc, @brush, @sheet)
+input.BindRoot(@stage)
+input.BindCanvas(@canvas)
+input.BindPalette(@palette)
+input.SetBrush(8.0, 0.10, 0.10, 0.12, 1.0)
+
+# ── the frame edge ───────────────────────────────────────────────────────
+#
+# Compose, not Draw: the tree is re-walked every tick, so a stroke stamped into
+# the canvas and a swatch that has just been pressed both show up on the next
+# frame without anything here asking for a redraw.
+view.Compose(@stage)
+
+detach RenderProvider/scripts/render_frames.etcs view=view
+detach PaintProvider/scripts/paint_routed_pointer.etcs window=main input=input
+
+# The pump AND the press channel. Returns when the window closes.
+main.ProduceEvents() -> input.ConsumeRouted()
+
+main.Close()
+
+input.Delete()
+palette.Delete()
+sheet.Delete()
+doc.Delete()
+ink.Delete()
+paper.Delete()
+brush.Delete()
+bar.Delete()
+canvas.Delete()
+stage.Delete()
+view.Delete()
+gpu.Delete()
+main.Delete()

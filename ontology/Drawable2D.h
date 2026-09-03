@@ -83,6 +83,26 @@ struct Rect2D
 // hold one or the other and never both -- enforced by the compiler,
 // see Drawable.h.
 
+/*
+ * A HIT: the node, AND the point in that node's own space.
+ *
+ * Pick answers the first half. The second half is the half a caller actually
+ * acts on, and it was being thrown away -- an input edge that learns a press
+ * landed on the toolbar still has the position in WINDOW coordinates, and the
+ * toolbar's swatches are laid out in the toolbar's. Recovering it meant
+ * walking the chain a second time by hand, with the same rule written twice.
+ *
+ * The descent already computes it: every step down applies ToLocal, so the
+ * point is in the right frame at every level and simply had nowhere to go.
+ * Carrying it out is free.
+ */
+struct Pick2D
+{
+    class Drawable2D_* node = nullptr;
+    Point2D            local{ 0, 0 };
+    explicit operator bool() const { return node != nullptr; }
+};
+
 class Drawable2D_ : virtual public ETCS::Entity
 {
 public:
@@ -163,12 +183,39 @@ public:
  * type, so a subtree assembled from three different modules' shape
  * leaves picks exactly as well as one module's does.
  */
-    Drawable2D_* Pick(Point2D local)
+    Drawable2D_* Pick(Point2D local) { return PickAt(local).node; }
+
+    /*
+ * The same descent, keeping the coordinate it arrives at.
+ *
+ * WHAT THIS IS FOR: an input channel speaks one frame -- the window's -- and
+ * every node it could be talking to speaks its own. Routing an event is
+ * therefore two questions that have to be answered together, because the
+ * answer to the second is produced on the way to the first: which node, and
+ * where on it. Handing back only the node leaves the caller holding a point
+ * measured in somebody else's space, which is exactly the bug that looks like
+ * a toolbar whose buttons are all offset.
+ *
+ * THE SAME LIST drawChildren uses (Drawable_::collectDrawableChildren, ordered
+ * by Order()), read backwards. That is not a detail and not a coincidence: the
+ * last child painted is the topmost one, so a picker walking forward hands
+ * back the node buried underneath whatever the user can actually see. Sharing
+ * one traversal is what keeps the two answers the same answer -- two walks
+ * with the same rule written twice agree only until somebody edits one.
+ *
+ * Reaches its own Drawable half through getInterfacePointer, because
+ * Drawable2D_ does not inherit Drawable_ (Drawable.h explains why the lineage
+ * lives in the Bases). Reaching a family by name is the rule here even when
+ * the family is your own other half, and it recurses through the family
+ * interface pointer too -- so a subtree assembled from three different
+ * modules' shape leaves picks exactly as well as one module's does.
+ */
+    Pick2D PickAt(Point2D local)
     {
-        if (!ContainsLocal(local.x, local.y)) return nullptr;
+        if (!ContainsLocal(local.x, local.y)) return {};
 
         void* as_drawable = getInterfacePointer(ETCS::Buffer("Drawable"));
-        if (!as_drawable) return this;   // no lineage composed: nothing nested to consult
+        if (!as_drawable) return Pick2D{ this, local };  // no lineage: nothing nested
 
         std::vector<Drawable_*> ordered;
         static_cast<Drawable_*>(as_drawable)->collectDrawableChildren(ordered);
@@ -177,9 +224,9 @@ public:
             void* as_2d = ordered[i]->getInterfacePointer(ETCS::Buffer("Drawable2D"));
             if (!as_2d) continue;        // a 3D child is not pickable in this plane
             Drawable2D_* d = static_cast<Drawable2D_*>(as_2d);
-            if (Drawable2D_* hit = d->Pick(d->ToLocal(local))) return hit;
+            if (Pick2D hit = d->PickAt(d->ToLocal(local))) return hit;
         }
-        return this;
+        return Pick2D{ this, local };
     }
 };
 
