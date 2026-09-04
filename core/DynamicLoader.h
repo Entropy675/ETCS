@@ -2888,12 +2888,31 @@ inline bool ETCS::TagModifyEvent::operator()()
     evt.tagmodify_done      = &done;
     evt.tagmodify_changed   = &changed;
     /*
- * Stamped at construction from the emitting type's own static TAG_MASK
- * (Entity::myTagMask), so the handler never has to resolve it -- see
- * DLInEvent::tagmodify_mask's own comment (EventNode.h) for why that
- * lookup was outright wrong on the loader's side.
+ * ACQUIRED HERE, from the thread this event is being emitted on, exactly as
+ * origin_extra_mask is at every other site in this file:
+ *
+ *     own bit          identity, unconditional -- two ops on one entity
+ *                      serialize whatever either of them reaches
+ *   | causal edge      what the WORK FUNCTION running on this thread has
+ *                      been observed to touch (CausalScope, Bundles.h)
+ *   | extra            the one thing a caller supplies: ScopeTag's stream
+ *                      pair, so a flag orders against both halves
+ *
+ * falling back to the type's whole TAG_CLOSURE while no frame has settled.
+ * Resolved at the EMIT site and never by the handler -- see
+ * DLInEvent::tagmodify_mask's own comment (EventNode.h) for why that lookup
+ * was outright wrong on the loader's side.
  */
-    evt.tagmodify_mask      = type_mask;
+    evt.tagmodify_mask      = ETCS::CausalEdgeMask(target->myTagMask(),
+                                                   target->myTagClosure())
+                            | extra_mask;
+    /*
+ * Fail shut. An empty mask means the emitting type has no contract identity
+ * at all, and a type the ordering system has never heard of is the last
+ * thing to grant independence from it -- same reasoning as DispatchResult.
+ */
+    if (!evt.tagmodify_mask.any())
+        evt.tagmodify_mask  = ETCS::TagMask::all();
     /*
  * A REFUSED ENQUEUE ANSWERS "not mine", and that is the right answer: the
  * stream is already cleaning up, so there is no ordering left to join and

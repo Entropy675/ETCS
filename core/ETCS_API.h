@@ -494,6 +494,7 @@ public: \
  \
     void _implWork_##Type##_##Name(Type& self, ETCS::SignalContext ctx,  \
                                     FOR_EACH_COMMA(_PARAM_REF, __VA_ARGS__)); \
+    ETCS_CAUSAL_EDGE_STORE(Type, Name) \
  \
     void _work_##Type##_##Name(ETCS::Entity* handler, ETCS::Buffer& data, \
                       ETCS::SignalContext ctx) { \
@@ -505,6 +506,7 @@ public: \
                      "data=" << data.buf); \
             return; \
         } \
+        ETCS_CAUSAL_SCOPE(Type, Name); \
         _implWork_##Type##_##Name(*static_cast<Type*>(handler->getTrueType()), ctx, \
                                     FOR_EACH_COMMA(_ARGNAME, __VA_ARGS__)); \
     } \
@@ -576,6 +578,7 @@ public: \
 // would be wrong.
 #define DEFINE_STREAM_FUNC_PRODUCE(Type, Name) \
     void _implProduce_##Type##_##Name(Type& self, ETCS::MirrorBuffer& stream, ETCS::Buffer data, ETCS::SignalContext ctx); \
+    ETCS_CAUSAL_EDGE_STORE(Type, Name) \
     \
     void _stream_##Type##_##Name(ETCS::Entity* handler, ETCS::MBuffer& data, ETCS::SignalContext ctx) { \
         Type* self = static_cast<Type*>(handler->getTrueType()); \
@@ -611,6 +614,7 @@ public: \
         self->getThreadPool().enqueue(ETCS::Priority::Medium, ctx, [self, stream = std::move(stream), config, _pair_mod, _live_token, _auto_scope = std::move(_auto_scope)]() mutable { \
             ETCS::ProducerLiveGuard _auto_live(_live_token); \
             ETCS::PairScope _pair_scope(_pair_mod); \
+            ETCS_CAUSAL_SCOPE(Type, Name); \
             ETCS::StreamWriteGuard _auto_close(stream); \
             _implProduce_##Type##_##Name(*self, stream, config, _auto_scope.ctx()); \
         }); \
@@ -627,6 +631,7 @@ public: \
 
 #define DEFINE_STREAM_FUNC_CONSUME(Type, Name) \
     void _implConsume_##Type##_##Name(Type& self, ETCS::MirrorBuffer stream, ETCS::Buffer data, ETCS::SignalContext ctx); \
+    ETCS_CAUSAL_EDGE_STORE(Type, Name) \
  \
     void _stream_##Type##_##Name(ETCS::Entity* handler, ETCS::MBuffer& data, ETCS::SignalContext ctx) { \
         if(!handler) { \
@@ -651,14 +656,42 @@ public: \
         /* Runs inline, so this thread IS the body's thread. Read before the \
          * move below; PairScope copies. */ \
         ETCS::PairScope _pair_scope(stream.pairModuleMask()); \
+        ETCS_CAUSAL_SCOPE(Type, Name); \
         _implConsume_##Type##_##Name(*self, std::move(stream), config, _auto_scope.ctx()); \
     } \
  \
     void _implConsume_##Type##_##Name(Type& self, ETCS::MirrorBuffer stream, ETCS::Buffer data, ETCS::SignalContext ctx)
 
 // DEFINE_WORK_FUNC provides self&, Buffer&, and SignalContext
+/*
+ * ETCS_CAUSAL_EDGE_STORE / ETCS_CAUSAL_SCOPE
+ *
+ * The per-(Type, Action) record of what one work function touches, and the
+ * RAII frame that fills it. Bundles.h::CausalEdgeFrame carries the whole
+ * argument; the short version is that a mask should be the edges of ONE
+ * invocation rather than the union of everything its type has ever reached.
+ *
+ * The statics are per translation unit and per action, which is the grain the
+ * mask wants -- the same grain the trampoline symbols already have, so the
+ * naming falls out of what these macros do anyway.
+ *
+ * Atomic because a work function runs on arbitrary pool workers and several
+ * may be inside the same action at once. fetch_or is the only write, so there
+ * is no writer-writer case to lose; the settled flag is released after the
+ * words and acquired before them, so a reader either sees the previous
+ * settled answer or the fallback, never a half-written one.
+ */
+#define ETCS_CAUSAL_EDGE_STORE(Type, Name) \
+    static std::atomic<uint64_t> _edge_w_##Type##_##Name[ETCS::TAG_WORDS]{}; \
+    static std::atomic<bool>     _edge_set_##Type##_##Name{false};
+
+#define ETCS_CAUSAL_SCOPE(Type, Name) \
+    ETCS::CausalScope _causal_edge_scope( \
+        _edge_w_##Type##_##Name, &_edge_set_##Type##_##Name)
+
 #define DEFINE_WORK_FUNC(Type, Name) \
     void _implWork_##Type##_##Name(Type& self, ETCS::Buffer& data, ETCS::SignalContext ctx); \
+    ETCS_CAUSAL_EDGE_STORE(Type, Name) \
     \
     void _work_##Type##_##Name(ETCS::Entity* handler, ETCS::Buffer& data, ETCS::SignalContext ctx) { \
         if(!handler) { \
@@ -667,6 +700,7 @@ public: \
                      "to dispatch."); \
             return; \
         } \
+        ETCS_CAUSAL_SCOPE(Type, Name); \
         _implWork_##Type##_##Name(*static_cast<Type*>(handler->getTrueType()), data, ctx); \
     } \
     \

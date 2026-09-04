@@ -97,6 +97,7 @@ struct TagMask
 static_assert(std::is_trivially_copyable_v<TagMask>,
               "TagMask rides inside GapSlot across DSO boundaries");
 } // namespace ETCS
+#include <atomic>
 #include "MirrorBuffer.h"
 namespace ETCS
 {
@@ -533,6 +534,178 @@ struct PairScope
     PairScope(const PairScope&)            = delete;
     PairScope& operator=(const PairScope&) = delete;
 };
+// ---------------------------------------------------------------------------
+// CausalEdge — the ordering mask of the WORK FUNCTION running on this thread.
+//
+// ── WHY THIS EXISTS ────────────────────────────────────────────────────────
+//
+// TAG_CLOSURE (ETCS_API.h) is accumulated per TYPE and never cleared: every
+// type any member of Camera3D ever reached, unioned for the life of the
+// process. So `SetPosition` and `Render` emit the SAME ordering mask, and a
+// position write serializes against a projection it cannot touch.
+//
+// That is measurable, and it measures badly. The EventStream suite bursts real
+// module masks against a control that picks a uniform bit in a 64-wide word on
+// one event in ten -- a distribution where almost nothing depends on anything.
+// The control wins by ~8x. A real mask losing to noise is not the price of the
+// guarantee; it is the union being far wider than the dependency it stands for.
+//
+// ── WHAT REPLACES IT ───────────────────────────────────────────────────────
+//
+// The mask of one INVOCATION, discovered rather than declared.
+//
+// Declared was the obvious alternative and it is worse: a macro cannot see its
+// own body (which is exactly why TAG_CLOSURE is accumulated at runtime in the
+// first place), so declaring would move the closure from something the system
+// observes to something a developer maintains, where under-declaring silently
+// loses ordering.
+//
+// It does not have to be declared, because every acquisition already passes
+// through machinery we own. Entity::call is the only execution model in the
+// substrate, addTagTrampoline<T> is the only place an acquisition is recorded
+// (Entity.h: noteAcquires "is called only from" there), and the work-function
+// trampolines already push thread-local RAII scopes -- ScopeTag and PairScope,
+// immediately above. This is that same pattern, generalised from a CARRIER to
+// an ACCUMULATOR.
+//
+// ── EDGES, NOT CLOSURE ─────────────────────────────────────────────────────
+//
+// A frame does NOT inherit what its callees touched, and this is the whole
+// reason it stays small.
+//
+// The tempting rule is transitive: if A calls C and C writes X, then A touches
+// X. It is also the disease -- a transitive union per invocation is the
+// per-type union computed more often, and it reintroduces exactly the width
+// this exists to remove.
+//
+// It is unnecessary because the reaction inside C is ITSELF an ordered event
+// through this same machinery, carrying its own frame and its own mask, and it
+// serializes against whatever it genuinely interacts with. A only needs the
+// EDGE to C. Ordering composes along the path; it does not need to be
+// flattened into the node.
+//
+// So push() starts EMPTY rather than inheriting, and pop() restores the parent
+// without folding into it. The graph is the composition.
+//
+// ── WARM-UP FAILS SHUT ─────────────────────────────────────────────────────
+//
+// The first invocation of a work function has touched nothing yet, so it has
+// no edge set to offer and falls back to the type's full closure. Settled from
+// the second invocation onward. That is the same shape TAG_CLOSURE already
+// has -- it starts empty and grows -- so it is not a new hazard, but it does
+// mean the narrow mask is an optimisation over a correct-and-wide default
+// rather than a replacement for one.
+// ---------------------------------------------------------------------------
+struct CausalEdgeFrame
+{
+    // What THIS invocation has acquired so far. Starts empty; never inherits.
+    ETCS::TagMask accumulated{};
+    // The settled answer from previous invocations of this same work function,
+    // or empty while unsettled. Read by myTagClosure while the frame is live.
+    ETCS::TagMask settled{};
+    bool          has_settled = false;
+    // Where to fold `accumulated` on the way out -- the per-(Type, Action)
+    // statics the DEFINE_WORK_FUNC macros declare. Null for a frame with
+    // nowhere to record (a nested helper that is not itself a work function).
+    std::atomic<uint64_t>* store_w   = nullptr;
+    std::atomic<bool>*     store_set = nullptr;
+};
+
+inline CausalEdgeFrame*& ActiveCausalEdgeRef()
+{
+    thread_local CausalEdgeFrame* f = nullptr;
+    return f;
+}
+inline CausalEdgeFrame* ActiveCausalEdge() { return ActiveCausalEdgeRef(); }
+
+// Records an acquisition against the innermost live frame. Called from
+// addTagTrampoline<T> alongside the type-level noteAcquires, which stays as
+// the wide fallback the warm-up path needs.
+inline void NoteCausalEdge(const ETCS::TagMask& other)
+{
+    if (!other.any()) return;
+    if (CausalEdgeFrame* f = ActiveCausalEdgeRef()) f->accumulated |= other;
+}
+
+struct CausalScope
+{
+    CausalEdgeFrame  frame;
+    CausalEdgeFrame* saved;
+
+    CausalScope(std::atomic<uint64_t>* store_w, std::atomic<bool>* store_set)
+        : saved(ActiveCausalEdgeRef())
+    {
+        frame.store_w   = store_w;
+        frame.store_set = store_set;
+        if (store_set && store_set->load(std::memory_order_acquire))
+        {
+            for (size_t i = 0; i < ETCS::TAG_WORDS; ++i)
+                frame.settled.w[i] = store_w[i].load(std::memory_order_relaxed);
+            frame.has_settled = true;
+        }
+        // EMPTY, not inherited -- see "EDGES, NOT CLOSURE" above.
+        ActiveCausalEdgeRef() = &frame;
+    }
+
+    ~CausalScope()
+    {
+        // Fold this invocation's edges into the per-action record. Monotonic
+        // and never cleared, for TAG_CLOSURE's own reason: a function that
+        // reached something once may reach it again, and un-setting is the one
+        // fail-open move available here.
+        if (frame.store_w && frame.accumulated.any())
+        {
+            for (size_t i = 0; i < ETCS::TAG_WORDS; ++i)
+                if (frame.accumulated.w[i])
+                    frame.store_w[i].fetch_or(frame.accumulated.w[i],
+                                              std::memory_order_relaxed);
+            if (frame.store_set)
+                frame.store_set->store(true, std::memory_order_release);
+        }
+        else if (frame.store_set && !frame.store_set->load(std::memory_order_acquire))
+        {
+            // Ran and touched nothing. That IS the answer for this function and
+            // it is the most valuable one -- a work function with no edges
+            // orders against nothing but its own type. Marked settled so the
+            // second invocation stops falling back to the type-wide closure.
+            frame.store_set->store(true, std::memory_order_release);
+        }
+        // Restore WITHOUT folding into the parent: the parent's edge to this
+        // callee is recorded at the acquisition site, not by inheriting here.
+        ActiveCausalEdgeRef() = saved;
+    }
+
+    CausalScope(const CausalScope&)            = delete;
+    CausalScope& operator=(const CausalScope&) = delete;
+};
+
+// CausalEdgeMask — the ordering mask for an event emitted right here, ACQUIRED
+// at the emit site rather than threaded down to it.
+//
+// `own` is the emitting type's identity bit, which is in the answer
+// unconditionally: two operations on one entity must serialize whatever either
+// of them reaches. `fallback` is the wide-but-correct mask to use while no
+// causal frame has settled -- outside a work function entirely, or on a
+// function's FIRST invocation, which has not yet observed what it touches.
+// Wide and correct until narrow and correct exists; never narrow and wrong.
+//
+// Read ambiently, on the precedent already at eight module-side event sites in
+// DynamicLoader.h:
+//
+//     evt.origin_extra_mask = ETCS::ActivePairModuleMask();
+//
+// The pair mask is not a parameter of anything -- an event that fires from
+// inside a stream body picks it up from the thread it is on. The causal edge is
+// the same kind of fact about the same thread, so it rides the same way. That
+// keeps the emit sites (Entity::addTag/removeTag) saying only what they mean
+// and gives any future event kind the mask for the cost of one line.
+inline ETCS::TagMask CausalEdgeMask(const ETCS::TagMask& own,
+                                    const ETCS::TagMask& fallback)
+{
+    const CausalEdgeFrame* f = ActiveCausalEdgeRef();
+    if (f && f->has_settled) return own | f->settled;
+    return fallback;
+}
 // ScopeTag — RAII guard around one stream call's body, auto-injected by
 // DEFINE_STREAM_FUNC_PRODUCE/_CONSUME. Construction flips the REPL-visible
 // "active_scope_<label>_<addr>" flag AND registers this call's context into

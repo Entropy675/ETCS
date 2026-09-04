@@ -751,15 +751,16 @@ public:
  * type tag-list operations serialize against each other in causal
  * sequence; different-type operations commit independently.
  *
- * myTagClosure() supplies the ordering bits: this type's own plus every
- * type in its module it holds a reference to (TAG_CLOSURE, accumulated by
- * addTag<T>). Its own bit alone would be wrong -- an op on a node that owns
- * boards touches those boards, through pointers no mask can see at the
- * point of use.
+ * NO MASK IS PASSED. The ordering bits are acquired by the event itself,
+ * on the thread it is emitted from: this type's own bit, narrowed to what
+ * the work function running here has been observed to touch, falling back
+ * to the whole TAG_CLOSURE until that has settled. Its own bit alone would
+ * be wrong -- an op on a node that owns boards touches those boards,
+ * through pointers no mask can see at the point of use.
  *
- * Carried on the event rather than resolved by whichever EventNode services
- * it -- see DLInEvent::tagmodify_mask (EventNode.h) for why that lookup
- * silently returned nothing on the loader's side.
+ * Acquired at the emit site rather than resolved by whichever EventNode
+ * services it -- see DLInEvent::tagmodify_mask (EventNode.h) for why that
+ * lookup silently returned nothing on the loader's side.
  * -----------------------------------------------------------------------
  */
     // Returns whether this call is the one that put the flag on -- the
@@ -771,8 +772,7 @@ public:
             throw std::invalid_argument(
                 std::string("addTag: flag must start with a lowercase letter: ")
                 + (s ? s : ""));
-        return ETCS::TagModifyEvent{this, flag, false, &Entity::tagModifyImpl,
-                                    myTagClosure()}();
+        return ETCS::TagModifyEvent{this, flag, false, &Entity::tagModifyImpl}();
     }
     /*
  * TAG-scope bits beyond this entity's own closure -- ScopeTag passes a
@@ -787,8 +787,7 @@ public:
             throw std::invalid_argument(
                 std::string("addTag: flag must start with a lowercase letter: ")
                 + (s ? s : ""));
-        return ETCS::TagModifyEvent{this, flag, false, &Entity::tagModifyImpl,
-                                    myTagClosure() | extra}();
+        return ETCS::TagModifyEvent{this, flag, false, &Entity::tagModifyImpl, extra}();
     }
     /*
  * -----------------------------------------------------------------------
@@ -1277,13 +1276,12 @@ public:
  * alternative for deleting a leaf being an EXPLICIT EntityUnloadEvent
  * targeting a child directly, not a bare `delete` on its pointer.
  *
- * myTagClosure() supplies the ordering bits -- see addTag(Buffer) above.
+ * The event acquires its own ordering bits -- see addTag(Buffer) above.
  * -----------------------------------------------------------------------
  */
     bool removeTag(const ETCS::Buffer& tag)
     {
-        return ETCS::TagModifyEvent{this, tag, true, &Entity::tagModifyImpl,
-                                    myTagClosure()}();
+        return ETCS::TagModifyEvent{this, tag, true, &Entity::tagModifyImpl}();
     }
     /*
  * See addTag's own overload. ScopeTag's destructor must pass the same extra
@@ -1292,8 +1290,7 @@ public:
  */
     bool removeTag(const ETCS::Buffer& tag, const ETCS::TagMask& extra)
     {
-        return ETCS::TagModifyEvent{this, tag, true, &Entity::tagModifyImpl,
-                                    myTagClosure() | extra}();
+        return ETCS::TagModifyEvent{this, tag, true, &Entity::tagModifyImpl, extra}();
     }
     /*
  * -----------------------------------------------------------------------
@@ -2030,8 +2027,9 @@ public:
     }
     /*
  * myTagClosure - this type's own bit PLUS every type in its module it holds
- * a reference to (WIRE_TYPE_IDENTITY's TAG_CLOSURE). What addTag/removeTag
- * put on a TagModifyEvent, so what ModuleProxy's buffer admits against.
+ * a reference to (WIRE_TYPE_IDENTITY's TAG_CLOSURE). The WIDE FALLBACK a
+ * TagModifyEvent orders against until its work function's causal edge has
+ * settled, so what ModuleProxy's buffer admits against on a first pass.
  *
  * Empty here, like myTagMask: a type with no tag block has nothing to close
  * over, and TagModifyEvent substitutes all() -- keeping the fail-shut
@@ -2048,7 +2046,14 @@ public:
         return ETCS::TagMask{};
     }
     virtual void noteAcquires(const ETCS::TagMask&) {}
- 
+    /*
+ * Both of the above are the WIDE fallback, and stay that way. The narrow
+ * answer -- what the work function on this thread actually touches -- is
+ * not an entity property at all and is not asked for here: the event
+ * acquires it ambiently at emit, from ETCS::CausalEdgeMask (Bundles.h),
+ * the same way it acquires the stream pair's module mask.
+ */
+
     ETCS::Buffer myTagBuffer()
     {
         return ETCS::Buffer(myTag());
@@ -2337,6 +2342,22 @@ template<typename T>
         {
             parent->noteAcquires(child_bit);
             child->noteAcquires(parent->myTagMask());
+            /*
+     * THE EDGE, recorded against the work function running on this
+     * thread rather than against the types.
+     *
+     * Same acquisition, second consumer. noteAcquires above widens the
+     * TYPE's closure for the life of the process; this widens only the
+     * frame of the invocation that actually made the acquisition, which
+     * is what the ordering mask should have been all along
+     * (Bundles.h::CausalEdgeFrame).
+     *
+     * BOTH directions, because a reference is an edge either way: the
+     * parent now reaches the child's type, and the child is reachable
+     * from the parent's. Neither is the callee's closure being
+     * inherited -- that is the thing this deliberately does not do.
+     */
+            ETCS::NoteCausalEdge(child_bit | parent->myTagMask());
         }
         return rid;
     }
