@@ -344,17 +344,22 @@ struct AddTagEvent : Event
 // addTagTrampoline<T> already uses for crossing that same boundary.
 // Entity-only -- Root never has tags/flags_ either.
 //
-// type_mask is the emitting entity's own TYPE bit, taken at the call site
-// from that type's static TAG_MASK (Entity::myTagMask(), backed by
-// WIRE_TYPE_IDENTITY in ETCS_API.h) — same-type operations serialize
-// against each other via the reorder buffer's existing collision logic;
-// different-type operations commit independently.
+// The ordering mask is ACQUIRED by operator()(), not passed in: the
+// emitting type's own bit from the target, narrowed to the running work
+// function's causal edge when one has settled (ETCS::CausalEdgeMask,
+// Bundles.h). Same-type operations serialize against each other via the
+// reorder buffer's existing collision logic; different-type operations
+// commit independently.
 //
-// Passed in rather than resolved by the handler, and that is a fix rather
-// than a refactor: the handler used to call GetTagBit on whichever
-// EventNode serviced the event, and the LOADER's own tag_bit_index is
-// never populated by anything, so loader-originated tag modifications
-// silently got an empty mask. See DLInEvent::tagmodify_mask's own comment.
+// Acquired at the emit site rather than resolved by the HANDLER, and that
+// distinction is a fix rather than a refactor: the handler used to call
+// GetTagBit on whichever EventNode serviced the event, and the LOADER's own
+// tag_bit_index is never populated by anything, so loader-originated tag
+// modifications silently got an empty mask. See DLInEvent::tagmodify_mask.
+//
+// extra_mask is the only mask a CALLER supplies — TAG-scope bits beyond the
+// entity's own, which ScopeTag uses to order a flag against both halves of a
+// stream pair. Empty for the ordinary addTag/removeTag.
 //
 // For removeTag on a tag pointing to an entity relation, the actual child
 // deletion still goes through the EXISTING EntityUnloadEvent child-target
@@ -366,21 +371,16 @@ struct TagModifyEvent : Event
     ETCS::Entity*     target;
     bool              is_remove;
     Impl              impl;
-    ETCS::TagMask     type_mask;
+    ETCS::TagMask     extra_mask;
     std::atomic<bool> done{false};
     std::atomic<bool> changed{false};
-    // An empty mask here means the emitting type has no contract identity --
-    // an Entity-derived type with no tag block, so nothing assigned its
-    // TAG_MASK. Substituted for all() on the same fail-shut reasoning as
-    // DispatchResult: a type the ordering system has never heard of is the
-    // last thing to grant independence from it.
-    //
-    // Done here rather than by defaulting TAG_MASK, which must stay
-    // empty-until-assigned for ETCS_TAG_DECLARE's alias guard to work.
+    // The fail-shut substitution an empty mask needs — a type with no tag
+    // block, so nothing ever assigned its TAG_MASK — is made in operator()(),
+    // where the mask is now acquired. Kept out of TAG_MASK's own default,
+    // which must stay empty-until-assigned for ETCS_TAG_DECLARE's alias guard.
     TagModifyEvent(ETCS::Entity* t, const ETCS::Buffer& key, bool remove, Impl fn,
-                    const ETCS::TagMask& mask)
-        : Event(key), target(t), is_remove(remove), impl(fn),
-          type_mask(mask.any() ? mask : ETCS::TagMask::all()) {}
+                    const ETCS::TagMask& extra = ETCS::TagMask{})
+        : Event(key), target(t), is_remove(remove), impl(fn), extra_mask(extra) {}
     /*
  * Returns whether THIS call moved the surface.
  *

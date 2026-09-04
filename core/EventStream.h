@@ -191,6 +191,21 @@ protected:
     uint64_t                  tail_seq_        = 0;
     uint64_t                  cmp_seq_         = 0;
     uint64_t                  stall_reports_   = 0;
+    /*
+ * blocked_admissions_ — how many events arrived and could NOT start, because
+ * their mask met a live slot's.
+ *
+ * The one number that says whether the ordering masks are the right width,
+ * and it is not a timing. Throughput answers the question only through the
+ * scheduler, which on a loaded machine answers something else entirely (the
+ * capability suite measured a 4x swing on a fixed control). This counts the
+ * decision itself: same traffic, narrower masks, fewer refusals -- an
+ * integer, reproducible to the event.
+ *
+ * Written only by the ordering thread; atomic for readers, relaxed because
+ * nothing is ordered against it.
+ */
+    std::atomic<uint64_t>     blocked_admissions_{ 0 };
     std::thread               ordering_thread_;
     std::atomic<bool>         stop_{ false };
     // Set true the instant shutdown begins (start of stop()/~EventStream()),
@@ -327,14 +342,22 @@ protected:
             // commit. Under an all() mask with synchronous handlers the parked
             // branch is never taken -- each slot empties before the next
             // arrives, which is why this restructure changes nothing yet.
-            if (!reorder_.blocked(in_seq_)) launch_slot(in_seq_);
+            if (!reorder_.blocked(in_seq_))
+                launch_slot(in_seq_);
+            else
+                blocked_admissions_.fetch_add(1, std::memory_order_relaxed);
             service();
             ++in_seq_;
         }
         ETCS_LOG("EventStream", "Ordering thread exiting. in_seq="
-            << in_seq_ << " cmp_seq=" << cmp_seq_);
+            << in_seq_ << " cmp_seq=" << cmp_seq_ << " blocked_admissions="
+            << blocked_admissions_.load(std::memory_order_relaxed));
     }
 public:
+    // See blocked_admissions_. Ratio against in_seq_ is the useful reading:
+    // what fraction of arrivals this stream's masks refused to let start.
+    uint64_t blockedAdmissions() const
+    { return blocked_admissions_.load(std::memory_order_relaxed); }
     EventStream()  = default;
     ~EventStream()
     {
