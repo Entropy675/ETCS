@@ -9,6 +9,8 @@ Makefile
 loaders/Run_*Loader
 loaders/etcs
 loaders/*.o
+logs/
+bin/
 bin/Run_*Loader
 bin/etcs
 bin/*.so

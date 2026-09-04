@@ -224,6 +224,34 @@ private:
     SharedPage*               shared_page_  = nullptr;
     bool         is_producer_   = true;
     uint64_t     writer_rid_    = 0;
+    /*
+     * THE OTHER END. Passed to every makePair specialization since the
+     * beginning and, until now, discarded by two of them and logged by the
+     * third -- the direction of the edge was computed at every call site and
+     * then thrown away.
+     *
+     * Keeping it makes the pair say WHO as well as WHICH WAY: is_producer_
+     * already answers "which half am I", and this answers "who is the other
+     * half", so either side can name its peer. peerRid() below composes the
+     * two, and the stream-boundary requirement gate (ETCS_API.h) is the first
+     * caller that needs it -- a consume body checking what produces into it
+     * has to be able to ask.
+     *
+     * SEPARATE FIELDS RATHER THAN REUSING writer_rid_, which looks like it
+     * already holds this and does not: unpack() assigns it the RING POINTER
+     * on the LMAX path ("for ring slot attribution", below), so after a
+     * round trip it is not a RID at all. Two identity fields that nothing
+     * else writes are the only way to make the answer trustworthy on both
+     * sides of a pack.
+     *
+     * ZERO ON THE SOCKET STRATEGY, and that is not an oversight to paper
+     * over: makePair<StrategySocket> repurposes both rid parameters as
+     * socket fds (see its own comment), so there is no RID to keep. A gate
+     * therefore cannot run on a cross-machine pair today, and says so rather
+     * than failing open silently.
+     */
+    uint64_t     edge_from_rid_ = 0;   // the producer end
+    uint64_t     edge_to_rid_   = 0;   // the consumer end
     uint64_t     next_read_seq_ = 0;
     bool         debug_         = false;
     SignalContext bound_ctx_;
@@ -511,6 +539,7 @@ public:
                 // Buffer::bufsize, and in any case the result needs to
                 // live somewhere the RING's own lifetime discipline
                 // covers, not writeRaw()'s own stack frame.
+                if (!directionAllows(true, "Wrap")) return false;
                 MBuffer staged;
                 staged.writeRaw(slot.buf, slot.written);
                 for (size_t i = 0; i < wrap_chain_len_; ++i)
@@ -523,6 +552,7 @@ public:
                 assert(shared_page_ && "writeRaw: null staging SharedPage");
                 if (wrap_chain_len_ == 0)
                     return stageAndFlush(slot); // fast path — byte-identical to pre-wrapper behavior
+                if (!directionAllows(true, "Wrap")) return false;
                 MBuffer staged;
                 staged.writeRaw(slot.buf, slot.written);
                 for (size_t i = 0; i < wrap_chain_len_; ++i)
@@ -578,6 +608,7 @@ public:
                 MBuffer frame = *ptr;
                 lmax_page_->markConsumed(next_read_seq_);
                 ++next_read_seq_;
+                if (wrap_chain_len_ && !directionAllows(false, "Unwrap")) return false;
                 for (size_t i = wrap_chain_len_; i-- > 0; )
                     wrap_chain_[i]->Unwrap(frame, bound_ctx_);
                 if (frame.written > Buffer::bufsize)
@@ -596,6 +627,7 @@ public:
             {
                 if (wrap_chain_len_ == 0)
                     return fillAndCopyInto(slot, bound_ctx_); // fast path, unchanged
+                if (!directionAllows(false, "Unwrap")) return false;
                 MBuffer frame;
                 if (!fillAndCopyInto(frame, bound_ctx_)) return false;
                 for (size_t i = wrap_chain_len_; i-- > 0; )
@@ -839,6 +871,10 @@ public:
         // which must stay terminal for restAsString().
         for (size_t i = 0; i < ETCS::TAG_WORDS; ++i) transport << pair_tag_mask_.w[i];
         for (size_t i = 0; i < ETCS::TAG_WORDS; ++i) transport << pair_module_mask_.w[i];
+        // The edge, both ends, in producer-then-consumer order on BOTH halves
+        // -- the direction is the field order, so it survives the wire without
+        // needing is_producer_ to interpret it.
+        transport << edge_from_rid_ << edge_to_rid_;
         packWrapManifest(transport);
         // Plain write(), not operator<<, for this last field specifically:
         // config is always the terminal field, and unpack() reconstructs
@@ -865,6 +901,10 @@ public:
         // which must stay terminal for restAsString().
         for (size_t i = 0; i < ETCS::TAG_WORDS; ++i) transport << pair_tag_mask_.w[i];
         for (size_t i = 0; i < ETCS::TAG_WORDS; ++i) transport << pair_module_mask_.w[i];
+        // The edge, both ends, in producer-then-consumer order on BOTH halves
+        // -- the direction is the field order, so it survives the wire without
+        // needing is_producer_ to interpret it.
+        transport << edge_from_rid_ << edge_to_rid_;
         packWrapManifest(transport);
         transport.write(config.c_str()); // see packConsumer's own comment
     }
@@ -900,6 +940,7 @@ public:
         wrap_scratch_pool_ = reinterpret_cast<MBuffer*>(wrap_scratch_p); // nullptr if 0, as intended
         for (size_t i = 0; i < ETCS::TAG_WORDS; ++i) transport >> pair_tag_mask_.w[i];
         for (size_t i = 0; i < ETCS::TAG_WORDS; ++i) transport >> pair_module_mask_.w[i];
+        transport >> edge_from_rid_ >> edge_to_rid_;
         unpackWrapManifest(transport);
         config.writeString(transport.restAsString().c_str());
         if (is_lmax)
@@ -938,9 +979,47 @@ public:
     { pair_tag_mask_ = tag_scope; pair_module_mask_ = module_scope; }
     const ETCS::TagMask& pairTagMask()    const { return pair_tag_mask_; }
     const ETCS::TagMask& pairModuleMask() const { return pair_module_mask_; }
+    /*
+     * WRAP IS THE PRODUCE SIDE. UNWRAP IS THE CONSUME SIDE.
+     *
+     * True by construction today -- the Wrap walks are in writeRaw and the
+     * Unwrap walks in readRaw, and a producer writes while a consumer reads --
+     * but true only as a consequence of where the calls happen to sit, which
+     * is a convention rather than a check. Stated here so it is one.
+     *
+     * The stages are ordered: writeRaw walks 0..len-1 and readRaw walks
+     * len-1..0, so a stage that ran on the wrong side would not merely be
+     * misplaced, it would unwrap in wrap order. Encryption applied by the
+     * reader, compression reversed by the writer -- both produce a payload
+     * that is structurally valid and semantically garbage, which is the worst
+     * shape a transport bug can have.
+     *
+     * NOT an assert: this returns false and logs, the same refusal every other
+     * failure on this path takes (see unpack()'s capability negotiation). A
+     * transport that has become directionally confused should stop carrying
+     * bytes, not take the process down.
+     */
+    bool directionAllows(bool want_producer, const char* what) const
+    {
+        if (is_producer_ == want_producer) return true;
+        ETCS_LOG("MirrorBuffer",
+                 what << " attempted on the " << (is_producer_ ? "PRODUCE" : "CONSUME")
+                 << " half of the pair, which only the "
+                 << (want_producer ? "PRODUCE" : "CONSUME") << " half may do. "
+                 "Producer RID:" << edge_from_rid_ << " -> consumer RID:" << edge_to_rid_
+                 << ". Refusing rather than running the wrap chain backwards.");
+        return false;
+    }
+
     int    readFd()  const { return read_fd_; }
     int    writeFd() const { return write_fd_; }
     bool   isProducer() const { return is_producer_; }
+    uint64_t producerRid() const { return edge_from_rid_; }
+    uint64_t consumerRid() const { return edge_to_rid_; }
+    // The end that is NOT me. The whole reason both rids are kept: a body
+    // knows itself and cannot otherwise name what it was wired to. Zero means
+    // unavailable (a socket pair, or a half built before makePair ran).
+    uint64_t peerRid() const { return is_producer_ ? edge_to_rid_ : edge_from_rid_; }
     MirrorBuffer(const MirrorBuffer&)            = delete;
     MirrorBuffer& operator=(const MirrorBuffer&) = delete;
     MirrorBuffer(MirrorBuffer&& o) noexcept
@@ -948,7 +1027,9 @@ public:
           read_fd_(o.read_fd_), write_fd_(o.write_fd_),
           lmax_page_(o.lmax_page_), shared_page_(o.shared_page_),
           is_producer_(o.is_producer_),
-          writer_rid_(o.writer_rid_), next_read_seq_(o.next_read_seq_),
+          writer_rid_(o.writer_rid_),
+          edge_from_rid_(o.edge_from_rid_), edge_to_rid_(o.edge_to_rid_),
+          next_read_seq_(o.next_read_seq_),
           debug_(o.debug_), bound_ctx_(o.bound_ctx_),
           active_(o.active_),
           wrap_chain_len_(o.wrap_chain_len_),
@@ -1379,12 +1460,16 @@ inline void MirrorBuffer::makePair<StrategyLMAX, LMAXSequentialSharedPage>(
     producer.lmax_page_     = page;
     producer.is_producer_   = true;
     producer.writer_rid_    = writer_rid;
+    producer.edge_from_rid_ = writer_rid;
+    producer.edge_to_rid_   = reader_rid;
     producer.next_read_seq_ = 0;
     consumer.bound_ctx_     = producer.bound_ctx_;
     consumer.active_        = MirrorBuffer::ActiveStrategy::LMAX;
     consumer.lmax_page_     = page;
     consumer.is_producer_   = false;
     consumer.writer_rid_    = writer_rid;
+    consumer.edge_from_rid_ = writer_rid;
+    consumer.edge_to_rid_   = reader_rid;
     consumer.next_read_seq_ = 0;
     // See buildWrapManifest's own comment -- runs regardless of strategy,
     // since an All-scope wrapper legitimately applies to LMAX too. Only
@@ -1427,6 +1512,8 @@ inline void MirrorBuffer::makePair<StrategyPipe, SharedPage>(
     producer.shared_page_ = page;
     producer.is_producer_ = true;
     producer.writer_rid_  = writer_rid;
+    producer.edge_from_rid_ = writer_rid;
+    producer.edge_to_rid_   = reader_rid;
     producer.read_fd_     = fds_ack[0];
     producer.write_fd_    = fds_data[1];
     MirrorBuffer::setNonBlocking(producer.read_fd_);
@@ -1436,6 +1523,8 @@ inline void MirrorBuffer::makePair<StrategyPipe, SharedPage>(
     consumer.shared_page_ = page;
     consumer.is_producer_ = false;
     consumer.writer_rid_  = writer_rid;
+    consumer.edge_from_rid_ = writer_rid;
+    consumer.edge_to_rid_   = reader_rid;
     consumer.read_fd_     = fds_data[0];
     consumer.write_fd_    = fds_ack[1];
     MirrorBuffer::setBlocking(consumer.read_fd_);

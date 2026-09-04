@@ -3,9 +3,55 @@
 #include <atomic>
 #include <ostream>
 #include <sstream>
+#include <iostream>
+
+/*
+ * WHERE A LINE GOES IS A RUNTIME PROPERTY, not a compile-time one.
+ *
+ * ETCS_LOG_TO_FILE decided it at build time, which is the wrong axis: the same
+ * binary wants the terminal while you are reading it and the file while you
+ * are using the shell, and those alternate minute to minute. It now sets only
+ * the DEFAULT.
+ *
+ * ONE FLAG PER MODULE, by construction rather than by design: this header is
+ * compiled into the loader and into every module, and an inline variable under
+ * -fvisibility=hidden gives each DSO its own copy. That is the right grain --
+ * getModuleLog() already writes to logs/<ModuleName>.log, so a module's
+ * destination is a module's own property. `log file` in the shell sets every
+ * one it can reach (CommandExecutor.h).
+ *
+ * The default follows the shell: built WITH ETCS_REPL_SHELL there is a person
+ * at that terminal reading it, so the lines go there and `log file` moves them
+ * away when they get in the way. Built WITHOUT it nobody is watching stdout,
+ * so the files are where the lines are of any use. ETCS_LOG_TO_FILE forces the
+ * file default either way, which is what a production build wants.
+ *
+ * ONLY THE LOADER CAN ANSWER THIS, which is why the shell half of the test is
+ * gated on ETCS_LOADER. A module is never compiled with ETCS_REPL_SHELL --
+ * that flag describes the executable, not the library -- so a module reading
+ * it would conclude "nobody is watching" in the one case where somebody is.
+ * Modules therefore start VISIBLE and are told the truth the moment they
+ * register (Module::registerLoader). The few lines a module emits before that
+ * -- its ThreadPool coming up, its manifest comparison -- follow this default,
+ * and defaulting them to the terminal is deliberate: a module cannot know
+ * whether anyone is there, and lines nobody asked to hide are worth more on
+ * screen than lines nobody can find are worth in a file.
+ */
+#if defined(ETCS_LOG_TO_FILE) || (defined(ETCS_LOADER) && !defined(ETCS_REPL_SHELL))
+    #define ETCS_LOG_TO_FILE_DEFAULT true
+#else
+    #define ETCS_LOG_TO_FILE_DEFAULT false
+#endif
 
 namespace ETCS {
     inline std::atomic<bool> log_enabled{true};
+    inline std::atomic<bool> log_to_file{ ETCS_LOG_TO_FILE_DEFAULT };
+
+    // Set THIS DSO's destination. The loader reaches a module's copy through
+    // that module's own EventNode (EventNode::SetLogToFile), which is compiled
+    // into the module and so writes the module's variable, not the loader's.
+    inline void set_log_to_file(bool on) { log_to_file.store(on, std::memory_order_relaxed); }
+    inline bool get_log_to_file()        { return log_to_file.load(std::memory_order_relaxed); }
 
     // Thread-local ETCS_LOG redirect. Set via LogSinkGuard only -- direct
     // assignment skips the restore that nested guards rely on.
@@ -74,19 +120,16 @@ namespace ETCS {
 // write() against an O_APPEND descriptor, which the kernel does not split.
 // The cost is a syscall per line, paid on a path that was already doing file
 // I/O, to buy a transcript that can be trusted.
-#ifdef ETCS_LOG_TO_FILE
+// One branch now, on a relaxed atomic load. A thread-local sink still wins
+// over both -- it is a capture, and a capture that silently went to a file
+// would not be one.
 #define ETCS_LOG_2(type, msg) \
     do { \
         if (ETCS::log_sink) ETCS_LOG_LINE(type, msg, *ETCS::log_sink); \
-        else              { ETCS_LOG_LINE(type, msg, getModuleLog()); getModuleLog().flush(); } \
-    } while (0)
-#else
-#define ETCS_LOG_2(type, msg) \
-    do { \
-        if (ETCS::log_sink) ETCS_LOG_LINE(type, msg, *ETCS::log_sink); \
+        else if (ETCS::log_to_file.load(std::memory_order_relaxed)) \
+                          { ETCS_LOG_LINE(type, msg, getModuleLog()); getModuleLog().flush(); } \
         else              { ETCS_LOG_LINE(type, msg, std::cout); std::cout.flush(); } \
     } while (0)
-#endif
 
 #define ETCS_LOG_1(msg) ETCS_LOG_2(this->myTag(), msg)
 

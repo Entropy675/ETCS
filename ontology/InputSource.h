@@ -43,6 +43,28 @@ struct InputEvent
 static constexpr uint8_t INPUT_UP     = 0;
 static constexpr uint8_t INPUT_DOWN   = 1;
 static constexpr uint8_t INPUT_MOTION = 2;
+/*
+ * MOUSE BUTTONS, and they are POINTER events rather than key events.
+ *
+ * They were missing entirely -- the pipeline carried keys and positions and
+ * nothing else -- so anything that wanted "press here" had to borrow the
+ * keyboard, which is how a paint program ended up drawing on any keystroke
+ * instead of on a click. Borrowing the keyboard is also wrong in a way that
+ * would not have stayed hidden: a button pressed at a position is a different
+ * event from a key pressed while a position happens to be current.
+ *
+ * They travel on the POINTER ring, and carry their own x/y. Both follow from
+ * the same fact: a click is a thing that happens SOMEWHERE. Putting it on the
+ * key ring would have separated it from the position it means, and the two
+ * rings drain independently, so the press could arrive before or after the
+ * position it belongs to. Carrying the coordinate on the event removes the
+ * question rather than answering it.
+ *
+ * Not coalesced. Positions supersede one another and buttons never do -- see
+ * notePointerAt, which is why the coalescing lives there and not in the ring.
+ */
+static constexpr uint8_t INPUT_BUTTON_DOWN = 3;
+static constexpr uint8_t INPUT_BUTTON_UP   = 4;
 
 static constexpr uint32_t INPUT_SLOT_SIZE = sizeof(InputEvent);
 static constexpr uint8_t  INPUT_MAX_OBSERVERS = 16;
@@ -209,6 +231,27 @@ public:
 protected:
     void pushKeyDown(int key) { pushKey({ static_cast<uint16_t>(key), INPUT_DOWN, 0, 0, 0 }); }
     void pushKeyUp  (int key) { pushKey({ static_cast<uint16_t>(key), INPUT_UP,   0, 0, 0 }); }
+
+    /*
+ * A BUTTON, WITH THE POSITION IT WAS PRESSED AT.
+ *
+ * Straight onto the pointer ring rather than through notePointerAt: that path
+ * COALESCES, which is exactly right for positions and exactly wrong for
+ * these. It also flushes any pending position first, so a click cannot
+ * overtake the last movement before it -- the two arrive in the order they
+ * happened, which is what a stroke's first sample depends on.
+ *
+ * The keyboard snapshot is deliberately not touched. It answers getHeld() for
+ * KEYS, and a mouse button written into it would be a held key nothing ever
+ * releases -- the same reason pushKey keeps pointer events out of it.
+ */
+    void pushButton(int button, bool down, int x, int y)
+    {
+        flushPointerPosition();
+        m_pointer.write({ static_cast<uint16_t>(button),
+                          down ? INPUT_BUTTON_DOWN : INPUT_BUTTON_UP,
+                          0, clamp16(x), clamp16(y) });
+    }
 
     /*
  * COALESCING, and why the pointer gets it and keys never can.

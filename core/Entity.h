@@ -205,6 +205,10 @@ private:
         Entity*       child  = nullptr;
     };
     mutable std::mutex                  m_tagMutex;
+    // The delete gate -- see tryHold() for what these two mean together and
+    // why neither alone is enough.
+    std::atomic<int>                    lifetime_holds_{ 0 };
+    std::atomic<bool>                   retiring_{ false };
     /*
  * ---------------------------------------------------------------------
  * owning_arena_ - the arena this entity's OWN outer object and its
@@ -758,14 +762,17 @@ public:
  * silently returned nothing on the loader's side.
  * -----------------------------------------------------------------------
  */
-    void addTag(const ETCS::Buffer& flag)
+    // Returns whether this call is the one that put the flag on -- the
+    // transition, not just the ordering. See tagModifyImpl.
+    bool addTag(const ETCS::Buffer& flag)
     {
         const char* s = flag.c_str();
         if (!s || !s[0] || s[0] < 'a' || s[0] > 'z')
             throw std::invalid_argument(
                 std::string("addTag: flag must start with a lowercase letter: ")
                 + (s ? s : ""));
-        ETCS::TagModifyEvent{this, flag, false, &Entity::tagModifyImpl, myTagClosure()}();
+        return ETCS::TagModifyEvent{this, flag, false, &Entity::tagModifyImpl,
+                                    myTagClosure()}();
     }
     /*
  * TAG-scope bits beyond this entity's own closure -- ScopeTag passes a
@@ -773,15 +780,15 @@ public:
  * module, so the OR is meaningful; see streamPairMask for why a foreign
  * type never arrives here as bits.
  */
-    void addTag(const ETCS::Buffer& flag, const ETCS::TagMask& extra)
+    bool addTag(const ETCS::Buffer& flag, const ETCS::TagMask& extra)
     {
         const char* s = flag.c_str();
         if (!s || !s[0] || s[0] < 'a' || s[0] > 'z')
             throw std::invalid_argument(
                 std::string("addTag: flag must start with a lowercase letter: ")
                 + (s ? s : ""));
-        ETCS::TagModifyEvent{this, flag, false, &Entity::tagModifyImpl,
-                             myTagClosure() | extra}();
+        return ETCS::TagModifyEvent{this, flag, false, &Entity::tagModifyImpl,
+                                    myTagClosure() | extra}();
     }
     /*
  * -----------------------------------------------------------------------
@@ -1273,19 +1280,20 @@ public:
  * myTagClosure() supplies the ordering bits -- see addTag(Buffer) above.
  * -----------------------------------------------------------------------
  */
-    void removeTag(const ETCS::Buffer& tag)
+    bool removeTag(const ETCS::Buffer& tag)
     {
-        ETCS::TagModifyEvent{this, tag, true, &Entity::tagModifyImpl, myTagClosure()}();
+        return ETCS::TagModifyEvent{this, tag, true, &Entity::tagModifyImpl,
+                                    myTagClosure()}();
     }
     /*
  * See addTag's own overload. ScopeTag's destructor must pass the same extra
  * bits its constructor did, or the pair's removal orders differently from
  * its insertion.
  */
-    void removeTag(const ETCS::Buffer& tag, const ETCS::TagMask& extra)
+    bool removeTag(const ETCS::Buffer& tag, const ETCS::TagMask& extra)
     {
-        ETCS::TagModifyEvent{this, tag, true, &Entity::tagModifyImpl,
-                             myTagClosure() | extra}();
+        return ETCS::TagModifyEvent{this, tag, true, &Entity::tagModifyImpl,
+                                    myTagClosure() | extra}();
     }
     /*
  * -----------------------------------------------------------------------
@@ -1375,6 +1383,73 @@ public:
  * names that share the tags map. etcs_supertype_fanout below is its one
  * caller.
  */
+    /*
+ * ================= THE DELETE GATE =================================
+ *
+ * THE DELETE EVENT IS THE AUTHORITY ON THIS ENTITY'S LIFETIME, and these
+ * are what let it be one. Before them a resolve handed back a bare pointer
+ * with no interval attached: re-resolving every frame made a composed
+ * reference safe against a delete that had ALREADY happened, and could not
+ * make it safe against one happening now, because there was no span over
+ * which the answer stayed true. Surface::RecomposeBound resolved its compose
+ * root, and destroyImpl freed the tree while the walk was still in it.
+ *
+ * Three states, and the ordering thread is what moves between them:
+ *
+ *   live      -- holds are granted
+ *   retiring  -- beginRetire(), from destroyImpl before it touches a list.
+ *                No NEW hold is granted, so no new walk can start. Callers
+ *                read this as "already gone", which is what it is.
+ *   quiesced  -- the holds outstanding when retiring began have all been
+ *                dropped, and only now may the memory go.
+ *
+ * The pairing with the RIDList removal is what makes it total: removal stops
+ * new RESOLUTIONS, retiring stops new HOLDS, quiescing waits out the ones
+ * already granted. Between them there is no moment at which a walk can begin
+ * on an entity about to be freed, and none at which the free overtakes a walk
+ * in progress.
+ *
+ * WHICH WALKS MAY HOLD is decidable because every one of them comes through
+ * ETCS::resolve_held below -- one path, and ours. The rule on a held region
+ * is that it must not emit an ordered event, since the Delete it would queue
+ * behind may be the one waiting on the hold. Checked rather than documented:
+ * see ETCS_ASSERT_NO_LIFETIME_HOLD.
+ */
+    bool tryHold()
+    {
+        if (retiring_.load(std::memory_order_seq_cst)) return false;
+        lifetime_holds_.fetch_add(1, std::memory_order_seq_cst);
+        // Re-read AFTER the raise: beginRetire may have landed in between, and
+        // it reads the count after its own store. Two seq_cst pairs, so
+        // "I got a hold" and "I saw nobody holding" cannot both be true.
+        if (retiring_.load(std::memory_order_seq_cst))
+        {
+            lifetime_holds_.fetch_sub(1, std::memory_order_seq_cst);
+            return false;
+        }
+        return true;
+    }
+    void releaseHold() { lifetime_holds_.fetch_sub(1, std::memory_order_seq_cst); }
+
+    // Callable from anywhere: has the gate closed on this entity? A false is
+    // only a snapshot -- take a hold if you are about to USE it.
+    bool isRetiring() const { return retiring_.load(std::memory_order_seq_cst); }
+    void beginRetire()      { retiring_.store(true, std::memory_order_seq_cst); }
+
+    // True once nothing is inside. The deadline is so that a walk which breaks
+    // the no-event rule degrades to the old behaviour with a line naming it,
+    // rather than parking the ordering thread forever.
+    bool awaitQuiesced(int budget_ms)
+    {
+        for (int waited = 0; waited < budget_ms; ++waited)
+        {
+            if (lifetime_holds_.load(std::memory_order_seq_cst) == 0) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return lifetime_holds_.load(std::memory_order_seq_cst) == 0;
+    }
+    int lifetimeHolds() const { return lifetime_holds_.load(std::memory_order_seq_cst); }
+
     void getInterfaceFamilies(std::vector<ETCS::Buffer>& result) const
     {
         std::lock_guard<std::mutex> lock(m_tagMutex);
@@ -2032,13 +2107,28 @@ private:
  * informational tag being removed).
  * -----------------------------------------------------------------------
  */
-    static void tagModifyImpl(Entity* target, const ETCS::Buffer& key, bool is_remove)
+    /*
+ * ANSWERS WHETHER THE SURFACE ACTUALLY CHANGED, which is the half this was
+ * missing rather than a convenience.
+ *
+ * Tags ARE the state surface, so a tag going on or off is the recorded form
+ * of a state transition -- and the question anything downstream of that
+ * surface asks is not "was a tag operation ordered" but "did the surface
+ * move". A hash surface recomputing lazily needs exactly that bit to know
+ * whether it has anything to recompute; a caller claiming a transition needs
+ * exactly that bit to know whether it was the one that made it.
+ *
+ * false is the honest answer for every path that leaves flags_/tags as it
+ * found them: an add of a flag already present, a remove of one absent, a
+ * refusal to remove a foundational name, and a scope interrupt -- which
+ * REQUESTS that a call stop and does not itself remove anything (see below).
+ */
+    static bool tagModifyImpl(Entity* target, const ETCS::Buffer& key, bool is_remove)
     {
         if (!is_remove)
         {
             std::lock_guard<std::mutex> lock(target->m_tagMutex);
-            target->flags_.emplace(key, true);
-            return;
+            return target->flags_.emplace(key, true).second;
         }
  
         /*
@@ -2075,7 +2165,7 @@ private:
  * second input the tag namespace has no way to carry.
  */
                 if (target->scope_.interruptLabel(label) > 0)
-                    return;
+                    return false;
                 /*
  * Zero live scopes: fall through. This is the ordinary path
  * when ~ScopeTag removes the flag after unregistering the LAST
@@ -2090,10 +2180,11 @@ private:
         {
             ETCS_LOG("Entity", "removeTag: '" << key_str
                      << "' is foundational to this entity's type -- refusing to remove.");
-            return;
+            return false;
         }
  
         Entity* child_to_delete = nullptr;
+        bool    changed          = false;
         {
             std::lock_guard<std::mutex> lock(target->m_tagMutex);
             auto it = target->tags.find(key);
@@ -2101,15 +2192,17 @@ private:
             {
                 child_to_delete = it->second.child;
                 target->tags.erase(it);
+                changed = true;
             }
             else
             {
-                target->flags_.erase(key);
+                changed = (target->flags_.erase(key) > 0);
             }
         }
  
         if (child_to_delete)
             ETCS::EntityUnloadEvent{child_to_delete}();
+        return changed;
     }
  
     /*
@@ -2819,6 +2912,124 @@ inline void etcs_supertype_fanout(Entity* e)
 // resolved at template instantiation, which happens in the module's own
 // translation unit after every core header is in.
 ETCS::EventNode* etcs_loader_event_node();
+
+// Defined below; resolve_held is stated in terms of it.
+template <typename Base> inline Base* resolve_in_family(const char* family, RID rid);
+
+/*
+ * HOW MANY LIFETIME HOLDS THIS THREAD IS INSIDE.
+ *
+ * Not for correctness -- the counts on the entities are that -- but so the one
+ * rule a held region carries can be CHECKED. A hold makes the loader's
+ * ordering thread wait; emitting an ordered event from inside one makes this
+ * thread wait on the loader. Both at once is the deadlock, and it is the only
+ * way to build one out of this mechanism.
+ */
+inline thread_local int lifetime_hold_depth = 0;
+
+#define ETCS_ASSERT_NO_LIFETIME_HOLD(who)                                     \
+    assert(ETCS::lifetime_hold_depth == 0 &&                                  \
+           who ": emitted from inside a lifetime hold. The ordering thread "  \
+           "this waits on may be inside the Delete that is waiting on the "   \
+           "hold. Read what you need through the hold, drop it, then emit.")
+
+/*
+ * A HOLD ON ONE ENTITY'S LIFETIME. Either it exists, and the entity cannot be
+ * freed while it does, or it does not, and the entity is already gone -- which
+ * is the "check if already deleted" the caller wanted and the "hold until the
+ * state is determined" in the same object, because they are the same question
+ * asked at the same instant.
+ *
+ * Move-only. Copying one would be a second hold nothing raised.
+ */
+class LifetimeHold
+{
+public:
+    LifetimeHold() = default;
+    explicit LifetimeHold(Entity* e)
+    {
+        if (e && e->tryHold()) { held_ = e; ++lifetime_hold_depth; }
+    }
+    ~LifetimeHold() { release(); }
+
+    LifetimeHold(LifetimeHold&& o) noexcept : held_(o.held_) { o.held_ = nullptr; }
+    LifetimeHold& operator=(LifetimeHold&& o) noexcept
+    {
+        if (this != &o) { release(); held_ = o.held_; o.held_ = nullptr; }
+        return *this;
+    }
+    LifetimeHold(const LifetimeHold&)            = delete;
+    LifetimeHold& operator=(const LifetimeHold&) = delete;
+
+    explicit operator bool() const { return held_ != nullptr; }
+
+    // Drop it early, which is what a walk does before it emits anything.
+    void release()
+    {
+        if (!held_) return;
+        held_->releaseHold();
+        held_ = nullptr;
+        --lifetime_hold_depth;
+    }
+
+private:
+    Entity* held_ = nullptr;
+};
+
+/*
+ * A resolved interface pointer WITH the interval over which it stays valid.
+ *
+ * Falsy means the same thing a null resolve always meant -- not published, not
+ * in the list, or gone -- with one case added that could not previously be
+ * expressed: being deleted right now. Truthy means the entity cannot be freed
+ * until this object dies, so the pointer is good for the whole of the scope
+ * that holds it rather than for the instant it was handed over.
+ */
+template <typename Base>
+class Held
+{
+public:
+    Held() = default;
+    Held(Base* p, LifetimeHold&& h) : ptr_(p), hold_(std::move(h)) {}
+
+    explicit operator bool() const { return ptr_ != nullptr; }
+    Base* operator->() const { return ptr_; }
+    Base& operator*()  const { return *ptr_; }
+    Base* get()        const { return ptr_; }
+
+    // For the moments a walk has to emit: finish with the pointer, drop the
+    // hold, then fire. See ETCS_ASSERT_NO_LIFETIME_HOLD.
+    void release() { hold_.release(); ptr_ = nullptr; }
+
+private:
+    Base*        ptr_ = nullptr;
+    LifetimeHold hold_;
+};
+
+/*
+ * resolve_in_family, plus the interval. THE FORM TO USE whenever the pointer
+ * outlives the line that got it -- a tree walk, a blit, anything that calls
+ * through it more than once.
+ *
+ * The bare resolve below stays, and is still right where the pointer is
+ * consumed immediately and entirely within the caller's own frame. This one is
+ * for the rest, and the difference is not a style preference: without the hold
+ * the answer is true at the instant it is given and about nothing after that.
+ */
+template <typename Base>
+inline Held<Base> resolve_held(const char* family, RID rid)
+{
+    Base* p = resolve_in_family<Base>(family, rid);
+    if (!p) return {};
+    // The interface pointer is a base subobject; the gate lives on the entity,
+    // so the hold goes through the family's own Entity upcast rather than the
+    // adjusted pointer. static_cast, not dynamic_cast: every family base is
+    // `virtual public Entity`, and derived-to-virtual-base is an ordinary
+    // upcast -- it is the reverse direction that needs RTTI.
+    LifetimeHold h(static_cast<Entity*>(p));
+    if (!h) return {};
+    return Held<Base>(p, std::move(h));
+}
 
 template <typename Base>
 inline Base* resolve_in_family(const char* family, RID rid)

@@ -169,4 +169,35 @@ private:
     }
 };
 
+/*
+ * WHOEVER HOLDS A MERGED COPY OF WHAT CHANGED IS OUT OF DATE, AND EVERY PIXEL
+ * OWNER ABOVE YOU HOLDS ONE.
+ *
+ * That is the entire upward half of the dirty flag, and it is what lets a
+ * compositor skip a whole subtree safely: a node that changes is responsible
+ * for saying so, and it says so to exactly the caches that could hold it --
+ * the pixel owners on the path from here to the root, and nothing on a
+ * sibling branch.
+ *
+ * Walks PAST a pixel owner rather than stopping at the first. A compositor
+ * nested in a compositor caches this node transitively and both must be told.
+ * This is the difference between this walk and the coordinate one in
+ * Drawable2D: coordinates are relative to the NEAREST origin, staleness
+ * propagates to EVERY cache.
+ *
+ * `from` is included, so a brush that wrote into a buffer from outside the
+ * tree passes the node it wrote to; a node that changed itself passes `this`.
+ * Both are the same statement. Reached by family name, so this needs to know
+ * nothing about any concrete type -- it marks anything that owns pixels,
+ * which is exactly the set of things that could have cached the caller.
+ */
+inline void etcs_mark_pixel_path(ETCS::Entity* from)
+{
+    for (ETCS::Entity* n = from; n; n = n->getParent())
+    {
+        void* p = n->getInterfacePointer(ETCS::Buffer("Pixels"));
+        if (p) static_cast<Pixels_*>(p)->MarkDirty();
+    }
+}
+
 #endif

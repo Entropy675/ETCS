@@ -26,9 +26,12 @@
 #include "ontology/InputSourceBase.h" 
 #include "ontology/PointerBase.h"
 
-// these ones may be turned into just Database with a flag:
-#include "ontology/LocalDatabaseBase.h"
-#include "ontology/RemoteDatabaseBase.h"
+// One family, and locality is not part of it -- see DatabaseBase.h. The two
+// that used to be here, LocalDatabase and RemoteDatabase, split it along a
+// line that carried no constraint: one added nothing and the other added a
+// synonym. They live on as TAG names a provider may export, which is where a
+// difference in expected locale belongs.
+#include "ontology/DatabaseBase.h"
 
 // Lower suspicion graphical/window ontology types (mostly RenderProvider/WindowProvider):
 #include "ontology/ResizableBase.h"

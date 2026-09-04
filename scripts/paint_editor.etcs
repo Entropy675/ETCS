@@ -1,0 +1,229 @@
+#!/usr/bin/env etcs
+#IMPORT ACE_ROOT/modules
+
+# A paint editor: canvas, toolbar, and a pointer that knows which it is on.
+#
+#     ./bin/etcs scripts/paint_editor.etcs
+#
+# Pick a colour or a nib from the bar along the bottom, then hold any key and
+# move over the canvas to draw. The window's cross ends the session.
+#
+# AN ORCHESTRATION, WHICH IS WHY IT IS HERE. It spawns from three providers --
+# RenderProvider for the device, surface and shapes, WindowProvider for the
+# window and its input, PaintProvider for the document and the brush -- so it
+# is a composition rather than any one provider's script. The parts it is made
+# of live with the providers that own them (PaintProvider/scripts/), and this
+# file does nothing but assemble them into a program.
+#
+# ── THE FRAMES ───────────────────────────────────────────────────────────
+#
+# The whole design turns on there being more than one, and on nothing having
+# to know that but the router:
+#
+#   stage    the window's frame -- what the input channel speaks
+#   canvas   the picture's frame, whatever is left above the bar
+#   bar      the toolbar's frame, a fixed 60px strip along the bottom
+#   swatch   44x44 at (16,8)   in the BAR's frame, not the window's
+#
+# NO NUMBER ABOVE IS TYPED ANYWHERE BELOW except the bar's 60. The three
+# rectangles come out of a Clay layout that follows the window, so "the canvas
+# is what is left over" is stated once, as a fact, rather than recomputed by
+# hand every time something moves.
+#
+# A pointer report arrives in the stage's frame and is handed to
+# Drawable2D_::PickAt, which walks the same ordered child list the renderer
+# draws with -- so what receives an event is what the user can actually see --
+# and returns the deepest node under the point WITH the point already
+# translated into that node's own space. The toolbar's swatches are laid out
+# at (16,8), and that is exactly the coordinate a press on the first swatch
+# arrives as. Nothing anywhere adds an offset; the descent already did.
+#
+# WHAT THAT BUYS, concretely: change the layout's direction below and the bar
+# moves to the top, with every swatch and every stroke still landing where it
+# should -- because none of them was ever stated in window coordinates.
+#
+# ── THE PARTS ────────────────────────────────────────────────────────────
+#
+# Four providers, and the layout is its own because it belongs to none of the
+# others -- it arranges nodes by family name and links against no renderer.
+#
+#   gpu      RenderProvider::Instance    the device
+#   view     RenderProvider::Surface     the window's presentable surface
+#   stage    CompositeDrawable2D         the root everything hangs from
+#   canvas   CompositeDrawable2D         the drawing area, and a Surface
+#   bar      CompositeDrawable2D         the toolbar's own frame
+#   paper    PaintLayer                  the opaque sheet
+#   ink      PaintLayer                  what strokes land on
+#   doc      PaintDocument               the layer stack
+#   brush    PaintTool                   radius and colour
+#   sheet    PaintSurface                binds the document to the canvas
+#   palette  PaintPalette                which node means which setting
+#   input    PaintInput                  routing, and the stroke machine
+#   layout   Layout                     who is what size, and where
+#
+# THE CANVAS IS A SURFACE because every Drawable2D is one (ontology/Surface.h
+# and Drawable2D.h) -- so the document renders into a REGION of the window with
+# the same call it used when it had the whole thing, and the toolbar is not
+# something the picture has to be aware of.
+#
+# ── THREAD LEDGER -- four ────────────────────────────────────────────────
+#
+#   1. this script's thread   main.ProduceEvents -> input.ConsumeRouted
+#   2. detached thread        main.ProducePointer -> input.ConsumeRoutedPointer
+#   3. pool worker            Surface.ProduceFrames    frame clock
+#   4. detached thread        Surface.ConsumeFrames    walk, record, present
+
+spawn RenderProvider::Instance gpu
+gpu.Create()
+
+spawn WindowProvider::Window main
+main.Create(1280, 800, 'ETCS Paint')
+
+main.spawn(RenderProvider::Surface view)
+view.Create(@gpu)
+view.Clear(0.13, 0.13, 0.15, 1.0)
+
+# ── the tree ─────────────────────────────────────────────────────────────
+
+spawn RenderProvider::CompositeDrawable2D stage
+stage.Create(1280, 800)
+stage.SetBackground(0.13, 0.13, 0.15, 1.0)
+
+stage.spawn(RenderProvider::CompositeDrawable2D canvas)
+canvas.Create(1280, 740)
+canvas.SetOrder(1)
+canvas.SetBackground(1.0, 1.0, 1.0, 1.0)
+# THE BUFFER IS THE PICTURE, not something derived from the tree: the brush
+# writes into it from outside the walk, so a recompose must not clear it.
+canvas.SetRetain(1)
+
+stage.spawn(RenderProvider::CompositeDrawable2D bar)
+bar.Create(1280, 60)
+bar.SetOrder(2)
+bar.SetBackground(0.18, 0.18, 0.21, 1.0)
+
+# ── the layout ───────────────────────────────────────────────────────────
+#
+# The sizes above are the FIRST frame only. From here the three rectangles are
+# the layout's answer, and the layout is the window's:
+#
+#     window resizes -> layout re-solves -> MoveTo/ResizeTo on each box
+#
+# AddBox <node> <parent> <w_kind> <w_value> <h_kind> <h_value>, kinds being
+# 0 fit, 1 grow, 2 fixed, 3 percent. parent 0 is the root of the layout.
+#
+# The bar is FIXED at 60 and the canvas GROWS, which is the whole statement:
+# the toolbar is a constant, the picture is what is left. Nothing subtracts
+# one from the other anywhere -- express it once and the arithmetic is the
+# solver's problem, at every window size, forever.
+
+spawn LayoutProvider::Layout layout
+layout.Create(1280, 800)
+
+# the window: grow / grow, stacked top to bottom
+layout.AddBox(@stage, 0, 1, 0.0, 1, 0.0)
+layout.SetDirection(@stage, 1)
+
+# the picture: grow / grow -- whatever the bar leaves
+layout.AddBox(@canvas, @stage, 1, 0.0, 1, 0.0)
+
+# the toolbar: grow / fixed 60
+layout.AddBox(@bar, @stage, 1, 0.0, 2, 60.0)
+
+# Solve once for the size we came up at, then hand the window the reins. The
+# order matters only in that a first solve before FollowResize means the tree
+# is correct before the first frame rather than after the first resize --
+# FollowResize's own registration fires immediately too, so this is belt and
+# braces on a script that might not have called Create with the window's size.
+layout.Solve()
+layout.FollowResize(@main)
+
+# ── the document ─────────────────────────────────────────────────────────
+#
+# Sized to the CANVAS at start-up, and DELIBERATELY NOT in the layout.
+#
+# The window is a viewport onto the picture; the picture is a fixed number of
+# pixels the user decided on. Every paint program works this way, and the
+# alternative is worse in a way that is hard to undo: a document that grew and
+# shrank with the window would have to resample on every drag of a corner, and
+# a stroke drawn at one window size would not be the stroke you get back at
+# another. Resizing larger shows more of the canvas's own background; smaller
+# crops the view, not the paper.
+
+spawn PaintProvider::PaintLayer paper
+paper.Create(1280, 740)
+paper.Clear(1.0, 1.0, 1.0, 1.0)
+
+spawn PaintProvider::PaintLayer ink
+ink.Create(1280, 740)
+ink.Clear(0.0, 0.0, 0.0, 0.0)
+
+spawn PaintProvider::PaintDocument doc
+doc.Create(1280, 740, 'untitled')
+doc.AddLayer(@paper)
+doc.AddLayer(@ink)
+doc.SetActiveLayer(@ink)
+
+spawn PaintProvider::PaintTool brush
+brush.SetRadius(8.0)
+brush.SetColor(0.10, 0.10, 0.12, 1.0)
+
+spawn PaintProvider::PaintSurface sheet
+sheet.Create(@canvas)
+sheet.AttachDocument(@doc)
+sheet.Render()
+
+# ── the toolbar ──────────────────────────────────────────────────────────
+#
+# The palette is bound to the tool BEFORE the bar is populated, so a swatch is
+# never registered against a palette that has nowhere to put it.
+
+spawn PaintProvider::PaintPalette palette
+palette.BindTool(@brush)
+
+run PaintProvider/scripts/paint_toolbar.etcs bar=bar palette=palette
+
+# ── input ────────────────────────────────────────────────────────────────
+#
+# Three bindings, and each answers a different question: BindRoot says which
+# frame the incoming coordinates are in, BindCanvas says which single node's
+# frame is the picture's, and BindPalette says who to ask whether a press was
+# a selection. Without the root this is the unrouted edge and the canvas is
+# assumed to be the window, which is what paint_surface.etcs still wants.
+
+spawn PaintProvider::PaintInput input
+input.Create(@doc, @brush, @sheet)
+input.BindRoot(@stage)
+input.BindCanvas(@canvas)
+input.BindPalette(@palette)
+input.SetBrush(8.0, 0.10, 0.10, 0.12, 1.0)
+
+# ── the frame edge ───────────────────────────────────────────────────────
+#
+# Compose, not Draw: the tree is re-walked every tick, so a stroke stamped into
+# the canvas and a swatch that has just been pressed both show up on the next
+# frame without anything here asking for a redraw.
+view.Compose(@stage)
+
+detach RenderProvider/scripts/render_frames.etcs view=view
+detach PaintProvider/scripts/paint_routed_pointer.etcs window=main input=input
+
+# The pump AND the press channel. Returns when the window closes.
+main.ProduceEvents() -> input.ConsumeRouted()
+
+main.Close()
+
+input.Delete()
+layout.Delete()
+palette.Delete()
+sheet.Delete()
+doc.Delete()
+ink.Delete()
+paper.Delete()
+brush.Delete()
+bar.Delete()
+canvas.Delete()
+stage.Delete()
+view.Delete()
+gpu.Delete()
+main.Delete()

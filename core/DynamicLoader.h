@@ -33,6 +33,35 @@ namespace ETCS {
  * owns LoaderStream; in module scope it is wired via RegisterDynamicLoader.
  */
     static EventNode& getLoader() { return *dynamicLoader.node; }
+
+    /*
+ * EVERY LOADED MODULE'S OWN LOG DESTINATION, in one place the shell can reach.
+ *
+ * ETCS::log_to_file is an inline variable, so there is one per DSO -- which is
+ * the grain that makes sense, since getModuleLog() already writes to
+ * logs/<ModuleName>.log and a module's destination is a module's own business.
+ * The cost of that grain is that a single switch has to visit each of them,
+ * and this map is how it finds them: filled at registerLoader, emptied at
+ * unload, keyed by the module's own scope name.
+ */
+    inline std::unordered_map<std::string, EventNode*>& module_log_nodes()
+    {
+        static std::unordered_map<std::string, EventNode*> nodes;
+        return nodes;
+    }
+
+    // The switch behind `log file` / `log term`. The loader's own flag first,
+    // then every module's, through the trampoline each registered.
+    inline void set_log_destination(bool to_file)
+    {
+        ETCS::set_log_to_file(to_file);
+        for (auto& [name, node] : module_log_nodes())
+            if (node && node->set_log_to_file) node->set_log_to_file(to_file);
+    }
+
+    // What the loader is doing right now. Modules are kept in step by the
+    // setter above, so one answer describes all of them.
+    inline bool log_destination_is_file() { return ETCS::get_log_to_file(); }
 }
 namespace ETCS
 {
@@ -192,6 +221,18 @@ bool ETCS::Module::registerLoader(EventNode& st)
         ETCS::EventNode* node = reg(static_cast<void*>(&getLoader()));
         if (node)
         {
+            // Remembered so `log file` / `log term` can reach this module's own
+            // destination flag -- see ETCS::set_log_destination below. Keyed by
+            // scope so a reload replaces rather than accumulates, and erased on
+            // unload so the shell never calls through a dlclose'd trampoline.
+            ETCS::module_log_nodes()[node->scope] = node;
+            // Brought into step with the loader the moment it can be. Anything
+            // the module logged BEFORE this -- its ThreadPool coming up, its
+            // manifest comparison -- followed the module's own compile-time
+            // default, because there was no module yet for the loader to tell.
+            // That chatter is startup-only and lands on the terminal; from
+            // here on the module goes where the loader goes.
+            node->set_log_to_file(ETCS::get_log_to_file());
             // Absorb module ridMap entries directly via st
             for (const auto& [originalKey, handle] : node->ridMap)
             {
@@ -1126,7 +1167,8 @@ ETCS::DispatchResult ETCS::EventNode::LoaderStream::on_event(
  * for the very reason the discipline existed -- a caller cannot pop
  * its frame while spinning on a flag nobody has set.
  */
-            evt.tagmodify_impl(evt.tagmodify_target, evt.conjugate_key, evt.tagmodify_is_remove);
+            evt.release_value = evt.tagmodify_impl(evt.tagmodify_target, evt.conjugate_key,
+                                                  evt.tagmodify_is_remove) ? 1 : 0;
             return {ETCS::DispatchKind::Inline, &evt};
         }
         case DLInEvent::Kind::PairMask:
@@ -1874,6 +1916,8 @@ void ETCS::EventNode::LoaderStream::requestUnloadImpl(ETCS::Module* target)
     // is unmapLibrary's step 1 now -- see its comment for why it is
     // module-scoped rather than process-wide.)
     module_registry.erase(module_name);
+    // Before the library goes: the trampoline it holds lives in that DSO.
+    ETCS::module_log_nodes().erase(module_name);
     module_arena_registry.erase(module_name);
     type_catalog_registry.erase(module_name);
 
@@ -2091,6 +2135,21 @@ bool ETCS::EventNode::LoaderStream::destroyImpl(const std::string& conjugate_key
     }
  
     ETCS::Entity* target = it->second.invoke_get(rid);
+
+    /*
+ * THE GATE CLOSES BEFORE THE LISTS DO, and that order is the whole of it.
+ *
+ * Retiring first means no new hold is granted from here on, so no new walk
+ * can start; the removals below then mean no new RESOLUTION can start either.
+ * Together those shut the front door. The wait further down shuts the back
+ * one: whatever was already walking gets to finish before the memory it is
+ * walking goes away.
+ *
+ * The other order -- lists first, gate second -- leaves exactly the window
+ * this exists to close, because a resolve that has already returned is not
+ * stopped by removing anything.
+ */
+    if (target) target->beginRetire();
     /*
  * Fan OUT of every aggregate this entity was fanned INTO. An entity is
  * inserted into its own per-tag RIDList (the conjugate_key one below) AND
@@ -2140,6 +2199,22 @@ bool ETCS::EventNode::LoaderStream::destroyImpl(const std::string& conjugate_key
  
     if (removed && target)
     {
+        /*
+ * The last thing between the removals and the free: whatever was already
+ * walking this entity when the gate closed.
+ *
+ * Bounded, and a timeout degrades to the OLD behaviour rather than to a
+ * hang -- free anyway and say so, naming the entity. A walk still holding
+ * after two seconds has broken the one rule a held region carries (see
+ * ETCS_ASSERT_NO_LIFETIME_HOLD), and this is where that becomes a line in
+ * the log instead of a parked ordering thread.
+ */
+        if (!target->awaitQuiesced(2000))
+            ETCS_LOG("DynamicLoader", "destroyImpl: RID " << rid << " (" << conjugate_key
+                     << ") still has " << target->lifetimeHolds() << " lifetime hold(s) 2s "
+                     "after retiring -- freeing anyway. Something is holding a resolve "
+                     "across a wait.");
+
         MemoryArena* parentArena = target->getParent()
             ? &target->getOwningArena()
             : (target->module_.parent ? target->module_.parent->module_arena : nullptr);
@@ -2324,7 +2399,8 @@ ETCS::DispatchResult ETCS::EventNode::ModuleProxy::on_event(
  * EventNode::getInstance() resolves to THIS ModuleProxy -- which is
  * what lets a stream pair's tag mask reach a buffer that can read it.
  */
-        evt.tagmodify_impl(evt.tagmodify_target, evt.conjugate_key, evt.tagmodify_is_remove);
+        evt.release_value = evt.tagmodify_impl(evt.tagmodify_target, evt.conjugate_key,
+                                              evt.tagmodify_is_remove) ? 1 : 0;
         return {ETCS::DispatchKind::Inline, &evt};
     }
  
@@ -2582,6 +2658,7 @@ bool ETCS::drainEntityScopes(ETCS::Entity* target, const char* who)
 inline ETCS::Entity* ETCS::LoadEvent::operator()()
 {
     ETCS_ASSERT_NOT_ORDERING_THREAD("LoadEvent");
+    ETCS_ASSERT_NO_LIFETIME_HOLD("LoadEvent");
     DLInEvent evt{};
     evt.kind = DLInEvent::Kind::Load;
     evt.conjugate_key = conjugate_key;
@@ -2622,6 +2699,7 @@ inline ETCS::Entity* ETCS::LoadEvent::operator()()
 inline bool ETCS::ResolveEvent::operator()()
 {
     ETCS_ASSERT_NOT_ORDERING_THREAD("ResolveEvent");
+    ETCS_ASSERT_NO_LIFETIME_HOLD("ResolveEvent");
     DLInEvent evt{};
     evt.kind           = DLInEvent::Kind::Resolve;
     evt.conjugate_key  = conjugate_key;
@@ -2641,6 +2719,7 @@ inline bool ETCS::ResolveEvent::operator()()
 inline bool ETCS::DestroyEvent::operator()()
 {
     ETCS_ASSERT_NOT_ORDERING_THREAD("DestroyEvent");
+    ETCS_ASSERT_NO_LIFETIME_HOLD("DestroyEvent");
     /*
  * THE expected drain point. `target` is optional only because the older
  * two-and-three-arg constructors predate it; when supplied, no caller has
@@ -2676,6 +2755,7 @@ inline bool ETCS::DestroyEvent::operator()()
 inline ETCS::RID ETCS::AddTagEvent::operator()()
 {
     ETCS_ASSERT_NOT_ORDERING_THREAD("AddTagEvent");
+    ETCS_ASSERT_NO_LIFETIME_HOLD("AddTagEvent");
     DLInEvent evt{};
     evt.kind              = DLInEvent::Kind::AddTag;
     evt.conjugate_key     = conjugate_key;
@@ -2717,6 +2797,7 @@ inline ETCS::RID ETCS::AddTagEvent::operator()()
 inline void ETCS::EntityUnloadEvent::operator()()
 {
     ETCS_ASSERT_NOT_ORDERING_THREAD("EntityUnloadEvent");
+    ETCS_ASSERT_NO_LIFETIME_HOLD("EntityUnloadEvent");
     /*
  * Belt-and-braces, NOT the expected path -- and the two paths into this
  * event differ in what they can promise:
@@ -2773,6 +2854,7 @@ inline void ETCS::Root::changeModule(const std::string& targetModule)
 inline void ETCS::ChangeModuleEvent::operator()()
 {
     ETCS_ASSERT_NOT_ORDERING_THREAD("ChangeModuleEvent");
+    ETCS_ASSERT_NO_LIFETIME_HOLD("ChangeModuleEvent");
     DLInEvent evt{};
     evt.kind              = DLInEvent::Kind::ChangeModule;
     evt.conjugate_key      = conjugate_key;
@@ -2793,9 +2875,10 @@ inline void ETCS::ChangeModuleEvent::operator()()
  * LOCALLY (see ModuleProxy::on_event's fork) - never crosses to the
  * loader itself, regardless of which scope fires it.
  */
-inline void ETCS::TagModifyEvent::operator()()
+inline bool ETCS::TagModifyEvent::operator()()
 {
     ETCS_ASSERT_NOT_ORDERING_THREAD("TagModifyEvent");
+    ETCS_ASSERT_NO_LIFETIME_HOLD("TagModifyEvent");
     DLInEvent evt{};
     evt.kind                = DLInEvent::Kind::TagModify;
     evt.conjugate_key       = conjugate_key;
@@ -2803,6 +2886,7 @@ inline void ETCS::TagModifyEvent::operator()()
     evt.tagmodify_is_remove = is_remove;
     evt.tagmodify_impl      = impl;
     evt.tagmodify_done      = &done;
+    evt.tagmodify_changed   = &changed;
     /*
  * Stamped at construction from the emitting type's own static TAG_MASK
  * (Entity::myTagMask), so the handler never has to resolve it -- see
@@ -2810,9 +2894,15 @@ inline void ETCS::TagModifyEvent::operator()()
  * lookup was outright wrong on the loader's side.
  */
     evt.tagmodify_mask      = type_mask;
+    /*
+ * A REFUSED ENQUEUE ANSWERS "not mine", and that is the right answer: the
+ * stream is already cleaning up, so there is no ordering left to join and
+ * nothing should be acting on a claim it thinks it won.
+ */
     if (!ETCS::EventNode::getInstance().stream.enqueue(DLInEventPtr{&evt}))
-        return;
+        return false;
     while (!done.load(std::memory_order_acquire));
+    return changed.load(std::memory_order_acquire);
 }
  
 /*
@@ -2831,6 +2921,7 @@ inline void ETCS::TagModifyEvent::operator()()
 inline void ETCS::PairMaskEvent::operator()()
 {
     ETCS_ASSERT_NOT_ORDERING_THREAD("PairMaskEvent");
+    ETCS_ASSERT_NO_LIFETIME_HOLD("PairMaskEvent");
     DLInEvent evt{};
     evt.kind           = DLInEvent::Kind::PairMask;
     evt.conjugate_key  = conjugate_key;
@@ -2850,6 +2941,7 @@ inline void ETCS::PairMaskEvent::operator()()
 inline ETCS::Entity* ETCS::CreateEvent::operator()()
 {
     ETCS_ASSERT_NOT_ORDERING_THREAD("CreateEvent");
+    ETCS_ASSERT_NO_LIFETIME_HOLD("CreateEvent");
     /*
  * Folds into a Load event at the proxy boundary - conjugate_key carries
  * full addressing so the loader fulfills it directly. Always module-

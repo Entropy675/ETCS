@@ -87,6 +87,24 @@ using ReplLineSource = std::function<bool(const std::string& prompt, std::string
 inline std::ostream& repl_out() { return ETCS::log_sink ? *ETCS::log_sink : std::cout; }
 inline std::ostream& repl_err() { return ETCS::log_sink ? *ETCS::log_sink : std::cerr; }
 
+/*
+ * A REPLY IS NOT A LOG LINE, and until the destination became switchable
+ * nothing had to say so.
+ *
+ * These two were the same stream, which was harmless while the log had exactly
+ * one place to go. The moment `log file` existed it stopped being harmless: the
+ * shell answered `jobs` into logs/etcs.log and left the person who typed it
+ * looking at a bare prompt. The output they asked to move is the PROVIDERS'
+ * chatter, and their own command's answer is the one thing that must never
+ * follow it.
+ *
+ * So the shell's replies go to repl_out() unconditionally -- which still
+ * honours log_sink, because a session that borrowed this shell is the one
+ * caller that genuinely is somewhere else. Same formatting as ETCS_LOG, on
+ * purpose: it is the same shell, not a new voice.
+ */
+#define ETCS_SHELL(type, msg) ETCS_LOG_LINE(type, msg, repl_out())
+
 inline bool repl_is_module(const std::filesystem::directory_entry& entry)
 {
     auto ext = entry.path().extension().string();
@@ -433,29 +451,29 @@ inline ETCS::ExecutionContext repl_nav_context(const std::string& mod_name,
 inline void repl_shell_print_dir(std::vector<std::string>& mods)
 {
     mods.clear();
-    ETCS_LOG("ShellREPL", "\n" << COLOR_DIR << "[ " << fs::current_path().string()
+    ETCS_SHELL("ShellREPL", "\n" << COLOR_DIR << "[ " << fs::current_path().string()
              << " ]" << COLOR_RESET);
     for (const auto& entry : fs::directory_iterator("."))
     {
         if (entry.is_directory())
         {
-            ETCS_LOG("ShellREPL", COLOR_DIR << "  [DIR] "
+            ETCS_SHELL("ShellREPL", COLOR_DIR << "  [DIR] "
                      << entry.path().filename().string() << COLOR_RESET);
         }
         else if (repl_is_module(entry))
         {
-            ETCS_LOG("ShellREPL", COLOR_LIB << "  [" << mods.size() << "] "
+            ETCS_SHELL("ShellREPL", COLOR_LIB << "  [" << mods.size() << "] "
                      << entry.path().stem().string() << COLOR_RESET);
             mods.push_back(entry.path().stem().string());
         }
         else if (entry.path().extension() == ".etcs")
         {
-            ETCS_LOG("ShellREPL", COLOR_EXEC << "  [ETCS] "
+            ETCS_SHELL("ShellREPL", COLOR_EXEC << "  [ETCS] "
                      << entry.path().filename().string() << COLOR_RESET);
         }
         else
         {
-            ETCS_LOG("ShellREPL", "        " << entry.path().filename().string());
+            ETCS_SHELL("ShellREPL", "        " << entry.path().filename().string());
         }
     }
 }
@@ -486,11 +504,11 @@ inline void repl_shell_print_live_modules(std::vector<std::string>& all_mods)
     std::sort(live_only.begin(), live_only.end());
     if (live_only.empty()) return;
 
-    ETCS_LOG("ShellREPL", COLOR_LIB
+    ETCS_SHELL("ShellREPL", COLOR_LIB
              << "  --- Live modules (loaded, not in this directory) ---" << COLOR_RESET);
     for (size_t i = 0; i < live_only.size(); ++i)
     {
-        ETCS_LOG("ShellREPL", COLOR_LIB << "  [" << all_mods.size() + i << "] "
+        ETCS_SHELL("ShellREPL", COLOR_LIB << "  [" << all_mods.size() + i << "] "
                  << live_only[i] << COLOR_RESET);
     }
     for (auto& m : live_only) all_mods.push_back(std::move(m));
@@ -523,7 +541,7 @@ inline void repl_shell_action_loop(ETCS::Entity* e, ETCS::Root& nav_root,
     auto cat_it = catalog.find(tag_name);
     if (cat_it == catalog.end())
     {
-        ETCS_LOG("ShellREPL", COLOR_WARN << "Type '" << tag_name
+        ETCS_SHELL("ShellREPL", COLOR_WARN << "Type '" << tag_name
             << "' has no catalog entry in " << mod_name << COLOR_RESET);
         return;
     }
@@ -561,12 +579,12 @@ inline void repl_shell_action_loop(ETCS::Entity* e, ETCS::Root& nav_root,
 
     while (true)
     {
-        ETCS_LOG("ShellREPL", "\n--- Actions for " << COLOR_DIR << tag_name
+        ETCS_SHELL("ShellREPL", "\n--- Actions for " << COLOR_DIR << tag_name
             << COLOR_RESET << " [RID:" << COLOR_RID << target_rid << COLOR_RESET << "] ---");
         for (size_t i = 0; i < action_list.size(); ++i)
         {
             const auto& [action_name, work] = action_list[i];
-            ETCS_LOG("ShellREPL", COLOR_ACT << "  [" << i << "] "
+            ETCS_SHELL("ShellREPL", COLOR_ACT << "  [" << i << "] "
                 << tag_name << "." << action_name.toString()
                 << (work.isStream ? "  [stream]" : "") << COLOR_RESET);
         }
@@ -580,7 +598,7 @@ inline void repl_shell_action_loop(ETCS::Entity* e, ETCS::Root& nav_root,
             parent_mod = parent->getSourceModule().toString();
             parent_tag = parent->getSourceTag().toString();
             parent_rid = parent->getRID();
-            ETCS_LOG("ShellREPL", COLOR_DIR << "  [up] " << COLOR_RESET
+            ETCS_SHELL("ShellREPL", COLOR_DIR << "  [up] " << COLOR_RESET
                 << parent_mod << "::" << parent_tag
                 << " [RID:" << COLOR_RID << parent_rid << COLOR_RESET << "]");
         }
@@ -589,10 +607,10 @@ inline void repl_shell_action_loop(ETCS::Entity* e, ETCS::Root& nav_root,
         e->getTypedChildren(children);
         if (!children.empty())
         {
-            ETCS_LOG("ShellREPL", COLOR_DIR << "  --- Children ---" << COLOR_RESET);
+            ETCS_SHELL("ShellREPL", COLOR_DIR << "  --- Children ---" << COLOR_RESET);
             for (size_t i = 0; i < children.size(); ++i)
             {
-                ETCS_LOG("ShellREPL", COLOR_DIR << "  [c" << i << "] " << COLOR_RESET
+                ETCS_SHELL("ShellREPL", COLOR_DIR << "  [c" << i << "] " << COLOR_RESET
                     << children[i].first.toString() << " [RID:" << COLOR_RID
                     << children[i].second << COLOR_RESET << "]");
             }
@@ -619,14 +637,14 @@ inline void repl_shell_action_loop(ETCS::Entity* e, ETCS::Root& nav_root,
         e->collectScopes(scopes);
         if (!scopes.empty())
         {
-            ETCS_LOG("ShellREPL", COLOR_WARN << "  --- Active work ---" << COLOR_RESET);
+            ETCS_SHELL("ShellREPL", COLOR_WARN << "  --- Active work ---" << COLOR_RESET);
             for (size_t i = 0; i < scopes.size(); ++i)
             {
-                ETCS_LOG("ShellREPL", COLOR_WARN << "  [s" << i << "] " << COLOR_RESET
+                ETCS_SHELL("ShellREPL", COLOR_WARN << "  [s" << i << "] " << COLOR_RESET
                     << scopes[i].label << " " << COLOR_RID << scopes[i].index << COLOR_RESET
                     << (scopes[i].interrupted ? "  (stopping)" : ""));
             }
-            ETCS_LOG("ShellREPL",
+            ETCS_SHELL("ShellREPL",
                 "  [s<n>] Interrupt by position   [kill <label> [index]] Interrupt directly");
         }
 
@@ -640,7 +658,7 @@ inline void repl_shell_action_loop(ETCS::Entity* e, ETCS::Root& nav_root,
         e = resolve_self();
         if (!e)
         {
-            ETCS_LOG("ShellREPL", COLOR_WARN << "Entity RID:" << target_rid
+            ETCS_SHELL("ShellREPL", COLOR_WARN << "Entity RID:" << target_rid
                 << " was destroyed while awaiting input -- returning to the "
                    "instance list." << COLOR_RESET);
             return;
@@ -656,17 +674,17 @@ inline void repl_shell_action_loop(ETCS::Entity* e, ETCS::Root& nav_root,
             }
             else if (parent_rid)
             {
-                ETCS_LOG("ShellREPL", COLOR_WARN << "Parent RID:" << parent_rid
+                ETCS_SHELL("ShellREPL", COLOR_WARN << "Parent RID:" << parent_rid
                     << " is no longer alive." << COLOR_RESET);
             }
             else
             {
-                ETCS_LOG("ShellREPL", COLOR_WARN << "This entity has no parent." << COLOR_RESET);
+                ETCS_SHELL("ShellREPL", COLOR_WARN << "This entity has no parent." << COLOR_RESET);
             }
             e = resolve_self();
             if (!e)
             {
-                ETCS_LOG("ShellREPL", COLOR_WARN << "Entity RID:" << target_rid
+                ETCS_SHELL("ShellREPL", COLOR_WARN << "Entity RID:" << target_rid
                     << " no longer exists -- returning to the instance list." << COLOR_RESET);
                 return;
             }
@@ -688,20 +706,20 @@ inline void repl_shell_action_loop(ETCS::Entity* e, ETCS::Root& nav_root,
                     }
                     else
                     {
-                        ETCS_LOG("ShellREPL", COLOR_WARN << "Child no longer alive." << COLOR_RESET);
+                        ETCS_SHELL("ShellREPL", COLOR_WARN << "Child no longer alive." << COLOR_RESET);
                     }
                 }
                 else
                 {
-                    ETCS_LOG("ShellREPL", COLOR_WARN << "Invalid child index." << COLOR_RESET);
+                    ETCS_SHELL("ShellREPL", COLOR_WARN << "Invalid child index." << COLOR_RESET);
                 }
             } catch (...) {
-                ETCS_LOG("ShellREPL", COLOR_WARN << "Invalid child selector." << COLOR_RESET);
+                ETCS_SHELL("ShellREPL", COLOR_WARN << "Invalid child selector." << COLOR_RESET);
             }
             e = resolve_self();
             if (!e)
             {
-                ETCS_LOG("ShellREPL", COLOR_WARN << "Entity RID:" << target_rid
+                ETCS_SHELL("ShellREPL", COLOR_WARN << "Entity RID:" << target_rid
                     << " no longer exists -- returning to the instance list." << COLOR_RESET);
                 return;
             }
@@ -739,10 +757,10 @@ inline void repl_shell_action_loop(ETCS::Entity* e, ETCS::Root& nav_root,
                 }
                 else
                 {
-                    ETCS_LOG("ShellREPL", COLOR_WARN << "Invalid scope index." << COLOR_RESET);
+                    ETCS_SHELL("ShellREPL", COLOR_WARN << "Invalid scope index." << COLOR_RESET);
                 }
             } catch (...) {
-                ETCS_LOG("ShellREPL", COLOR_WARN << "Invalid scope selector." << COLOR_RESET);
+                ETCS_SHELL("ShellREPL", COLOR_WARN << "Invalid scope selector." << COLOR_RESET);
             }
             continue;
         }
@@ -840,14 +858,14 @@ inline void repl_shell_action_loop(ETCS::Entity* e, ETCS::Root& nav_root,
 #ifdef ETCS_REPL_SHELL
         if (repl_sigint_raised())
         {
-            ETCS_LOG("ShellREPL", COLOR_WARN << "\n[SIGNAL] Action interrupted." << COLOR_RESET);
+            ETCS_SHELL("ShellREPL", COLOR_WARN << "\n[SIGNAL] Action interrupted." << COLOR_RESET);
             g_sig_int.store(0, std::memory_order_release);
         }
 #endif
         e = resolve_self();
         if (!e)
         {
-            ETCS_LOG("ShellREPL", COLOR_WARN << "Entity RID:" << target_rid
+            ETCS_SHELL("ShellREPL", COLOR_WARN << "Entity RID:" << target_rid
                 << " no longer exists (destroyed by the action just run) "
                    "-- returning to the instance list." << COLOR_RESET);
             return;
@@ -873,20 +891,20 @@ inline void repl_shell_instance_loop(const std::string& mod_name, const std::str
         const ETCS::RIDListHandle* handle = (it != ridMap.end()) ? &it->second : nullptr;
         if (!handle)
         {
-            ETCS_LOG("ShellREPL", COLOR_WARN << " Tag is invalid!" << COLOR_RESET);
+            ETCS_SHELL("ShellREPL", COLOR_WARN << " Tag is invalid!" << COLOR_RESET);
             return;
         }
 
         std::vector<ETCS::RID> live_rids;
         handle->invoke_collect_rids(live_rids);
 
-        ETCS_LOG("ShellREPL", "\n--- Live instances of " << COLOR_LIB << tag_name
+        ETCS_SHELL("ShellREPL", "\n--- Live instances of " << COLOR_LIB << tag_name
             << COLOR_RESET << " in " << COLOR_DIR << mod_name << COLOR_RESET
             << " [" << COLOR_RID << live_rids.size() << COLOR_RESET << " active] ---");
 
         if (live_rids.empty())
         {
-            ETCS_LOG("ShellREPL",
+            ETCS_SHELL("ShellREPL",
                 COLOR_WARN << "  (none — spawn one from the tag menu first)" << COLOR_RESET);
         }
         else
@@ -899,11 +917,11 @@ inline void repl_shell_instance_loop(const std::string& mod_name, const std::str
                 for (auto& [name, b] : named_here)
                     if (b.tag == tag_name && b.rid == live_rids[i])
                         { alias = " (" + name + ")"; break; }
-                ETCS_LOG("ShellREPL", COLOR_RID << "  [" << i
+                ETCS_SHELL("ShellREPL", COLOR_RID << "  [" << i
                     << "] RID:" << live_rids[i] << COLOR_RESET << alias);
             }
         }
-        ETCS_LOG("ShellREPL",
+        ETCS_SHELL("ShellREPL",
             "  [n] Select   [spawn <name>] Create and name   [back] Return");
 
         std::string i_in;
@@ -975,7 +993,7 @@ inline void repl_shell_instance_loop(const std::string& mod_name, const std::str
             {
                 ETCS::GlobalNames::getInstance().record(
                     sname, ETCS::NameBinding{e->getRID(), mod_name, tag_name});
-                ETCS_LOG("ShellREPL", COLOR_LIB << "spawned '" << sname << "' -> RID:"
+                ETCS_SHELL("ShellREPL", COLOR_LIB << "spawned '" << sname << "' -> RID:"
                          << e->getRID() << COLOR_RESET
                          << " -- reachable as a global by any script from here.");
                 repl_shell_action_loop(e, nav_root, sig, in);
@@ -996,11 +1014,11 @@ inline void repl_shell_instance_loop(const std::string& mod_name, const std::str
                     }
                     else
                     {
-                        ETCS_LOG("ShellREPL", COLOR_WARN << "Entity dead." << COLOR_RESET);
+                        ETCS_SHELL("ShellREPL", COLOR_WARN << "Entity dead." << COLOR_RESET);
                     }
                 }
             } catch (...) {
-                ETCS_LOG("ShellREPL", COLOR_WARN << "Invalid index." << COLOR_RESET);
+                ETCS_SHELL("ShellREPL", COLOR_WARN << "Invalid index." << COLOR_RESET);
             }
             continue;
         }
@@ -1019,7 +1037,7 @@ inline void repl_shell_tag_loop(const std::string& mod_name, ETCS::Root& nav_roo
     {
         if (sig.isInterrupted() || sig.isTerminated()) break;
 
-        ETCS_LOG("ShellREPL", "\n--- Tags in " << COLOR_LIB << mod_name << COLOR_RESET << " ---");
+        ETCS_SHELL("ShellREPL", "\n--- Tags in " << COLOR_LIB << mod_name << COLOR_RESET << " ---");
         for (size_t i = 0; i < tags.size(); ++i)
         {
             ETCS::Buffer key;
@@ -1027,7 +1045,7 @@ inline void repl_shell_tag_loop(const std::string& mod_name, ETCS::Root& nav_roo
             auto& ridMap = ETCS::EventNode::getInstance().ridMap;
             auto it = ridMap.find(key);
             size_t live_count = (it != ridMap.end()) ? it->second.invoke_count() : 0;
-            ETCS_LOG("ShellREPL", COLOR_LIB << "  [" << i << "] " << tags[i].toString()
+            ETCS_SHELL("ShellREPL", COLOR_LIB << "  [" << i << "] " << tags[i].toString()
                 << COLOR_RESET << "  (" << COLOR_RID << live_count << " live" << COLOR_RESET << ")");
         }
 
@@ -1039,18 +1057,18 @@ inline void repl_shell_tag_loop(const std::string& mod_name, ETCS::Root& nav_roo
             auto alive_named = repl_live_globals_for_module(mod_name);
             if (!alive_named.empty())
             {
-                ETCS_LOG("ShellREPL", COLOR_DIR
+                ETCS_SHELL("ShellREPL", COLOR_DIR
                     << "  --- Root script names (reachable by attach/ensure) ---"
                     << COLOR_RESET);
                 for (auto& [name, b] : alive_named)
                 {
-                    ETCS_LOG("ShellREPL", COLOR_RID << "  " << name << COLOR_RESET
+                    ETCS_SHELL("ShellREPL", COLOR_RID << "  " << name << COLOR_RESET
                         << " -> " << b.tag << " RID:" << COLOR_RID << b.rid << COLOR_RESET);
                 }
             }
         }
 
-        ETCS_LOG("ShellREPL", "  [back] Return   [detach] Detach   [exit] Quit");
+        ETCS_SHELL("ShellREPL", "  [back] Return   [detach] Detach   [exit] Quit");
 
         std::string t_in;
         if (!in(mod_name + " Tag> ", t_in)) break;
@@ -1073,7 +1091,7 @@ inline void repl_shell_tag_loop(const std::string& mod_name, ETCS::Root& nav_roo
 
     if (detach_module)
     {
-        ETCS_LOG("ShellREPL",
+        ETCS_SHELL("ShellREPL",
             "Detaching module: " << mod_name << " (leaving live entities running).");
     }
 }
@@ -1117,7 +1135,7 @@ inline void repl_shell_loop_with(ETCS::SignalContext& sig, ReplLineSource& in)
         repl_shell_print_dir(available_mods);
         repl_shell_print_live_modules(available_mods);
 #endif
-        ETCS_LOG("ShellREPL", "--------------------------------------------------------");
+        ETCS_SHELL("ShellREPL", "--------------------------------------------------------");
 
         std::string mod_input;
         if (!in("Root> ", mod_input)) break;
@@ -1132,19 +1150,59 @@ inline void repl_shell_loop_with(ETCS::SignalContext& sig, ReplLineSource& in)
             continue;
         }
 
+        /*
+         * WHERE THE LOG GOES, changed while it is running.
+         *
+         * It matters most exactly here: a prompt sharing stdout with a frame
+         * loop's logging is a prompt you cannot read, and the answer used to
+         * be a rebuild. Each module keeps its own destination (ETCS::
+         * log_to_file, Log.h) and writes to logs/<ModuleName>.log, so this
+         * visits every loaded one rather than flipping a single global.
+         */
+        if (mod_input == "log" || mod_input.rfind("log ", 0) == 0)
+        {
+            std::string arg = (mod_input.size() > 4) ? mod_input.substr(4) : "";
+            size_t b0 = arg.find_first_not_of(" \t");
+            size_t b1 = arg.find_last_not_of(" \t");
+            arg = (b0 == std::string::npos) ? "" : arg.substr(b0, b1 - b0 + 1);
+
+            if (arg == "file" || arg == "term" || arg == "terminal")
+            {
+                const bool to_file = (arg == "file");
+                ETCS::set_log_destination(to_file);
+                ETCS_SHELL("ShellREPL", COLOR_LIB << "log -> "
+                         << (to_file ? "logs/<Module>.log (one file per provider)"
+                                     : "this terminal")
+                         << COLOR_RESET);
+            }
+            else if (arg.empty() || arg == "status")
+            {
+                ETCS_SHELL("ShellREPL", COLOR_DIR << "log destination: "
+                         << (ETCS::log_destination_is_file()
+                             ? "logs/<Module>.log" : "terminal")
+                         << COLOR_RESET << "   (log file | log term)");
+            }
+            else
+            {
+                repl_err() << COLOR_WARN << "log: expected 'file', 'term', or nothing"
+                           << COLOR_RESET << "\n";
+            }
+            continue;
+        }
+
         if (mod_input == "jobs")
         {
             auto jobs = ETCS::DetachedRegistry::getInstance().list();
             if (jobs.empty())
             {
-                ETCS_LOG("ShellREPL", COLOR_WARN << "  (no detached scripts running)" << COLOR_RESET);
+                ETCS_SHELL("ShellREPL", COLOR_WARN << "  (no detached scripts running)" << COLOR_RESET);
             }
             else
             {
-                ETCS_LOG("ShellREPL", COLOR_DIR << "--- Detached scripts ---" << COLOR_RESET);
+                ETCS_SHELL("ShellREPL", COLOR_DIR << "--- Detached scripts ---" << COLOR_RESET);
                 for (const auto& [id, script] : jobs)
                 {
-                    ETCS_LOG("ShellREPL", COLOR_RID << "  [" << id << "] " << COLOR_RESET << script);
+                    ETCS_SHELL("ShellREPL", COLOR_RID << "  [" << id << "] " << COLOR_RESET << script);
                 }
             }
             continue;
@@ -1174,7 +1232,7 @@ inline void repl_shell_loop_with(ETCS::SignalContext& sig, ReplLineSource& in)
                               : ETCS::DetachedRegistry::getInstance().interrupt(id);
             if (found)
             {
-                ETCS_LOG("ShellREPL", COLOR_LIB << (term ? "Terminating" : "Interrupting")
+                ETCS_SHELL("ShellREPL", COLOR_LIB << (term ? "Terminating" : "Interrupting")
                          << " job [" << id << "]..." << COLOR_RESET);
             }
             else
@@ -1312,7 +1370,7 @@ inline void repl_shell_loop_with(ETCS::SignalContext& sig, ReplLineSource& in)
                     nb.tag    = e->getSourceTag().toString();
                 }
                 script_ctx.bind(name, nb);
-                ETCS_LOG("ShellREPL", "Injected: " << name << " -> RID:" << nb.rid
+                ETCS_SHELL("ShellREPL", "Injected: " << name << " -> RID:" << nb.rid
                          << " (" << nb.module << "::" << nb.tag << ")");
             }
             if (!args_valid) continue;
@@ -1333,7 +1391,7 @@ inline void repl_shell_loop_with(ETCS::SignalContext& sig, ReplLineSource& in)
             ETCS::Root nav_root(sig);
             if (!ETCS::ResolveEvent{mod_name.c_str(), &nav_root}())
             {
-                ETCS_LOG("ShellREPL", COLOR_WARN << "Failed to load module: "
+                ETCS_SHELL("ShellREPL", COLOR_WARN << "Failed to load module: "
                     << mod_name << COLOR_RESET);
                 continue;
             }
@@ -1453,7 +1511,7 @@ inline void repl_shell_attach_loop(const std::string& path, ETCS::SignalContext&
         }
     };
 
-    ETCS_LOG("ShellREPL", COLOR_LIB << "attached to " << path << COLOR_RESET
+    ETCS_SHELL("ShellREPL", COLOR_LIB << "attached to " << path << COLOR_RESET
              << " -- 'detach' returns here, 'exit' ends the remote session.");
 
     if (!pump_until_prompt())
@@ -1479,14 +1537,14 @@ inline void repl_shell_attach_loop(const std::string& path, ETCS::SignalContext&
         }
         if (!pump_until_prompt())
         {
-            ETCS_LOG("ShellREPL", COLOR_WARN << "attach: remote session ended."
+            ETCS_SHELL("ShellREPL", COLOR_WARN << "attach: remote session ended."
                      << COLOR_RESET);
             break;
         }
     }
 
     ::close(fd);
-    ETCS_LOG("ShellREPL", COLOR_LIB << "detached from " << path << COLOR_RESET);
+    ETCS_SHELL("ShellREPL", COLOR_LIB << "detached from " << path << COLOR_RESET);
 }
 #endif // __linux__
 #endif // ETCS_REPL_SHELL
