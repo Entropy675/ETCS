@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<language id="etcs" name="ETCS" version="2.0">
+  <metadata>
+    <property name="mimetypes">text/x-etcs</property>
+    <property name="line-comment-start">#</property>
+    <property name="file-extensions">etcs</property>
+  </metadata>
+
+  <styles>
+    <style id="comment" name="Comment" map-to="def:comment"/>
+    <style id="keyword" name="Keyword" map-to="def:keyword"/>
+    <style id="special-keyword" name="Special Keyword" map-to="def:statement"/>
+    <style id="type" name="Data Type" map-to="def:type"/>
+    <style id="string" name="String" map-to="def:string"/>
+    <style id="operator" name="Operator" map-to="def:operator"/>
+    <style id="identifier" name="Identifier" map-to="def:identifier"/>
+  </styles>
+
+  <definitions>
+    <context id="etcs" class="no-spell-check">
+      <include>
+        <!-- Comments -->
+        <context id="line-comment" style-ref="comment">
+          <match>#.*$</match>
+        </context>
+
+        <!-- Strings -->
+        <context id="string-double" style-ref="string">
+          <start>"</start>
+          <end>"</end>
+        </context>
+        <context id="string-single" style-ref="string">
+          <start>'</start>
+          <end>'</end>
+        </context>
+
+        <!-- Special Keywords & Operators (detach, run, ->) -->
+        <context id="special-keywords" style-ref="special-keyword">
+          <match>\b(detach|run)\b|-></match>
+        </context>
+
+        <!-- Standard Keywords -->
+        <context id="standard-keywords" style-ref="keyword">
+          <match>\b(requires|spawn)\b</match>
+        </context>
+
+        <!-- Provider::Type Pattern -->
+        <context id="provider-type" style-ref="type">
+          <match>\b[A-Za-z_][A-Za-z0-9_]*::[A-Za-z_][A-Za-z0-9_]*\b</match>
+        </context>
+
+        <!-- Brackets -->
+        <context id="brackets" style-ref="operator">
+          <match>[\[\]\(\)]</match>
+        </context>
+
+        <!-- Identifiers -->
+        <context id="identifiers" style-ref="identifier">
+          <match>\b[a-zA-Z_][a-zA-Z0-9_]*\b</match>
+        </context>
+      </include>
+    </context>
+  </definitions>
+</language>
