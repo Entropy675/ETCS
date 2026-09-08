@@ -24,6 +24,14 @@
 // of work you are, and a cooperative stop. No priority, no affinity -- those
 // are policy, and policy belongs to whatever schedules.
 //
+// WHATEVER SCHEDULES IS Thread, which refines this one (ontology/Thread.h). The
+// pair reads in one direction: this family is the LESS strict of the two, held
+// by anything with a body to stop, while a Thread additionally owns signal
+// authority and a closure and can detach children. So VulkanSurface is Threaded
+// and is not a Thread -- it has a frame loop, it is not an actor. Claiming
+// Thread claims this cumulatively; claiming both Bases is a redundant claim and
+// a compile error.
+//
 // Cooperative, not preemptive. Halt sets a flag; it does not join or cancel. A
 // body that never polls Halted() is not stopped by this, which is honest rather
 // than weak -- the alternative is killing a thread mid-Vulkan-call.

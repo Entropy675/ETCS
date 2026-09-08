@@ -113,7 +113,9 @@ ETCS_SUPERTYPE_BASE(Observable)
         for (const auto& o : m_observers) out.push_back(o.rid);
     }
 
-    bool Observed() const override
+    // Family-level, not on the interface -- see Observable.h. A node with no
+    // observers can skip work whose only purpose is to be looked at.
+    bool Observed() const
     {
         std::lock_guard<std::mutex> lock(m_obsMutex);
         return !m_observers.empty();

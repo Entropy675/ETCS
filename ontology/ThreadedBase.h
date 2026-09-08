@@ -31,6 +31,12 @@ ETCS_SUPERTYPE_BASE(Threaded)
 
     ETCS::WorkShape Shape() const override { return ETCS::WorkShape::Held; }
 
+    // Refused, because owning a body is not being an actor. A Thread overrides
+    // this (ontology/ThreadBase.h); everything else that merely has a loop --
+    // VulkanSurface's frame producer, say -- correctly says no. Same shape as
+    // Resizable_::ResizeTo defaulting false.
+    uint64_t Detach(const ETCS::Buffer&) override { return 0; }
+
 private:
     std::atomic<bool> m_halted{false};
 };

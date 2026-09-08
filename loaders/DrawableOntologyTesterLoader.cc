@@ -351,6 +351,27 @@ public:
     void DrawIntoConcrete(Surface_*) {}
 };
 
+// A minimal actor: claims Thread, so it gets Threaded (Halt/Halted/Shape), a
+// SignalContext and a closure without writing any of them.
+class Worker : public ThreadBase<Worker>
+{
+public:
+    WIRE_TYPE_IDENTITY(Worker)
+
+    ETCS::Buffer script{"none"};
+    ETCS::Buffer ScriptConcrete() { return script; }
+
+    // Children are real entities, so the DAG is the parent edge.
+    uint64_t DetachConcrete(const ETCS::Buffer& s)
+    {
+        Worker* child = this->addTag<Worker>();   // the Halted guard is ThreadBase's
+        if (!child) return 0;
+        child->script = s;
+        InheritClosureTo(*child);            // the copy it carries into its own lifetime
+        return child->getRID();
+    }
+};
+
 class Instrument : public ClippableBase<Instrument>,
                    public GlyphsBase<Instrument>,
                    public PointerBase<Instrument>
@@ -1065,6 +1086,85 @@ int main()
 
         ETCS::MemoryArena::getInstance().deleteEntity(follower, true);
         ETCS::MemoryArena::getInstance().deleteEntity(source, true);
+    }
+
+    // -- 19. Thread: the actor, and the DAG as the parent edge --------------
+    {
+        Worker* root = arena.allocate<Worker>();
+        root->script = ETCS::Buffer("root.etcs");
+
+        check(root->getInterfacePointer(ETCS::Buffer("Thread")) != nullptr,
+              "leaf registers Thread");
+        check(root->getInterfacePointer(ETCS::Buffer("Threaded")) != nullptr,
+              "leaf registers Threaded (inherited lineage) -- one cannot be held without the other");
+        check(root->Script() == ETCS::Buffer("root.etcs"), "Script dispatches to the leaf");
+
+        const ETCS::RID a = root->Detach(ETCS::Buffer("a.etcs"));
+        const ETCS::RID b = root->Detach(ETCS::Buffer("b.etcs"));
+        check(a != 0 && b != 0 && a != b, "detaching yields distinct child RIDs");
+
+        // "Which jobs did this one start" is the child registry, not a
+        // registry beside it -- the whole DetachedRegistry, answered.
+        std::vector<std::pair<ETCS::Buffer, ETCS::RID>> kids;
+        root->getOrderedTypedChildren(kids);
+        check(kids.size() == 2, "the detached jobs ARE this thread's children");
+
+        ETCS::MemoryArena::getInstance().deleteEntity(root, true);
+    }
+
+    // -- 20. Thread: a halted actor spawns nothing -------------------------
+    {
+        Worker* w = arena.allocate<Worker>();
+        check(w->Halt(), "the first Halt places the request");
+        check(!w->Halt(), "...a second finds one already standing");
+        check(w->Halted(), "and the body's poll sees it");
+        check(w->Detach(ETCS::Buffer("late.etcs")) == 0,
+              "a halted thread refuses to detach -- 0 rather than a silent no-op");
+        ETCS::MemoryArena::getInstance().deleteEntity(w, true);
+    }
+
+    // -- 21. Thread: the closure travels by value --------------------------
+    //
+    // The reason it is family state and not a local: a detached job outlives
+    // the statement that launched it, so by the time it runs the only surviving
+    // reference to its inputs is the copy it carries.
+    {
+        Worker* parent = arena.allocate<Worker>();
+        const char* q = "SELECT * FROM t";
+        check(parent->Bind(ETCS::Buffer("query"), q, std::strlen(q)),
+              "a binding that fits is taken");
+        check(parent->ClosureSize() == 1, "and lands in the closure");
+
+        ETCS::Buffer got;
+        check(parent->Lookup(ETCS::Buffer("query"), got) && got == ETCS::Buffer(q),
+              "and reads back verbatim");
+
+        const ETCS::RID kid = parent->Detach(ETCS::Buffer("run_query.etcs"));
+        // getTrueType, not static_cast: Entity is a virtual base, so
+        // base-to-derived is illegal (addTagTrampoline's own comment says why).
+        ETCS::Entity* kid_e = parent->getTypedChild(ETCS::Buffer("Worker"), kid);
+        Worker* child = kid_e ? static_cast<Worker*>(kid_e->getTrueType()) : nullptr;
+        check(child != nullptr, "the child exists");
+        ETCS::Buffer inherited;
+        check(child && child->Lookup(ETCS::Buffer("query"), inherited)
+                    && inherited == ETCS::Buffer(q),
+              "the child carries a COPY of the closure into its own lifetime");
+
+        // Rebinding the parent must not reach into a job already launched.
+        const char* q2 = "DROP TABLE t";
+        parent->Bind(ETCS::Buffer("query"), q2, std::strlen(q2));
+        ETCS::Buffer after;
+        child->Lookup(ETCS::Buffer("query"), after);
+        check(after == ETCS::Buffer(q),
+              "...a copy, not a view -- the parent rebinding does not rewrite a running job");
+
+        // Too large to fit fails AT THE BINDING rather than truncating.
+        std::string huge(ETCS::Buffer::bufsize + 16, 'x');
+        check(!parent->Bind(ETCS::Buffer("huge"), huge.c_str(), huge.size()),
+              "a blob too large for the buffer is refused, not silently shortened");
+        check(parent->ClosureSize() == 1, "...and nothing is bound as a side effect");
+
+        ETCS::MemoryArena::getInstance().deleteEntity(parent, true);
     }
 
     ETCS::MemoryArena::getInstance().deleteEntity(canvas, true);

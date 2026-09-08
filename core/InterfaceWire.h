@@ -176,6 +176,28 @@ struct IWireThread
     // The readback, and what a running body polls. On the wire rather than the
     // family for the reason IWireLifecycle carries Released().
     virtual bool Halted() const = 0;
+
+    /*
+     * Start `script` as a child of this entity. Returns the child's RID, or 0
+     * if refused.
+     *
+     * ON THE WIRE BECAUSE CORE CANNOT DO IT. The dependency runs ontology ->
+     * core and never back, so CommandExecutor's detach can talk to a Thread but
+     * cannot allocate one -- and a detached script IS a Thread. This is the one
+     * capability core structurally lacks and must delegate, which is exactly
+     * what a wire is for.
+     *
+     * It does not contradict this wire's "two things and no more" boundary. That
+     * boundary was drawn against POLICY -- priority, affinity, who runs next --
+     * and this is not policy. It is "make another of you", answered by the only
+     * thing that knows how.
+     *
+     * A Threaded that is not a Thread returns 0, the way Resizable_::ResizeTo
+     * returns false: having a body to stop does not make you an actor, and
+     * refusing is the honest answer rather than an absent method. So a caller
+     * checks the return instead of first asking what kind of thing it holds.
+     */
+    virtual uint64_t Detach(const ETCS::Buffer& script) = 0;
 };
 
 // ---------------------------------------------------------------------------

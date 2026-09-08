@@ -103,6 +103,39 @@ A valid leaf might compose one pick from each bracket — e.g. `Y + B + C + D`
 
 ---
 
+### A worked lineage: `Threaded → Thread`
+
+The concurrency axis is a lineage in exactly this sense, and it is worth
+stating because the two names differ by one letter while the claim differs a
+great deal.
+
+`Threaded` is *"I own a body that runs and can be asked to stop"* — Shape,
+Halt, Halted, and no more. Its own header draws the boundary explicitly:
+
+> No priority, no affinity — those are policy, and policy belongs to whatever
+> schedules.
+
+`Thread` is whatever schedules. It is *"I AM a control thread"*: an actor
+holding its own signal authority, carrying a closure of bound inputs, able to
+detach children. So `ThreadBase` composes `ThreadedBase`, the Base spelling
+above, and the refinement is a genuine is-a — every Thread owns a body that
+can be halted, and the reverse does not hold.
+
+The reverse mattering is the point. `VulkanSurface` is `Threaded` and is
+deliberately **not** a `Thread`: it has a frame loop, it is not an actor
+running scripts. A family that collapsed the two would force every entity with
+a loop to also claim signal authority and a closure it has no use for.
+
+Being a lineage rather than a sibling pair, the relation is **cumulative, not
+exclusive** — there is no `Thread | Threaded` bracket, because claiming
+`Thread` already claims `Threaded`. A leaf that names both `Bases` gets two
+`Threaded_` subobjects and every `Halt()` through them is ambiguous, but that
+is the same compile error a leaf naming `DrawableBase` and `Drawable2DBase`
+would get: redundancy caught mechanically, not an incoherent claim about what
+the entity is.
+
+---
+
 ## 3. Orthogonal composition via fold-in at the `Base` layer
 
 Distinct from sibling exclusivity within one family is **deliberate

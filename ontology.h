@@ -67,6 +67,11 @@
 // Observable is the general observer/dirty structure the render tree already
 // had twice by hand. See ontology/Observable.h.
 #include "ontology/ObservableBase.h"
+// Thread refines Threaded: an entity that IS a control thread, owning signal
+// authority and a closure, rather than one that merely has a body to stop.
+// Nothing claims it yet -- it is the surface the CommandExecutor migration
+// lands on. See ontology/Thread.h.
+#include "ontology/ThreadBase.h"
 #include "ontology/EphemeralBase.h"
 #include "ontology/ParserBase.h"
 #include "ontology/WrapperBase.h"

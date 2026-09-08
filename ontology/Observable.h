@@ -51,9 +51,17 @@ public:
     void MarkObserved() override                   = 0;
     bool TakeObserved(uint64_t observer_rid) override = 0;
 
-    // Is anything watching? A node with no observers can skip work whose only
-    // purpose is to be looked at.
-    virtual bool Observed() const = 0;
+    // NOTHING ELSE. The four above are the wire, answered by the base for
+    // every claimant, so this family adds no dispatched method of its own and
+    // `ace ontology` correctly reports it as having none -- the same shape
+    // Threaded and Lifecycle have.
+    //
+    // "Is anyone watching" (Observed) and "who" (ObserverRids) both live on
+    // ObservableBase instead. They were briefly declared here, which made the
+    // tool flag this family as not proving its lineage, and it was right to:
+    // a pure virtual no leaf implements is a lineage claim with nothing behind
+    // it. Halted went the other way -- onto IWireThread -- because the arena
+    // genuinely asks it. Nothing outside this family asks either of these.
 };
 
 // This entity's Observable half, or null if it never claimed the family.
