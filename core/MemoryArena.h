@@ -77,10 +77,11 @@ namespace ETCS
 // at its own top. MemoryArena.h never dereferences this pointer — only
 // stores/returns/compares it — so an incomplete type is sufficient.
 class Entity;
-// Defined in Entity.h, where Entity is complete. Hands an entity its
-// IWireLifecycle release if it claims the family, and returns whether THIS
-// call did the work. See releaseIfLifecycled below.
-bool etcs_release_lifecycle(Entity* e);
+// Defined in Entity.h, where Entity is complete. Retires an entity at the
+// single reclaim funnel: its IWireLifecycle release if it claims the family,
+// then -- for every entity -- its departure from its parent's child list.
+// Returns whether THIS call did the release. See retireEntity below.
+bool etcs_retire_entity(Entity* e);
 
 /*
  * NO DESTRUCTIBLE STATIC IN HERE, and that is a hard requirement rather than
@@ -1455,7 +1456,7 @@ public:
     {
         DestructorRecord* rec = unlinkRecord(target);
         if (!rec) return false;
-        rec->dtor(rec->ptr);
+        runRecordDtor(rec);
         return true;
     }
  
@@ -1491,7 +1492,7 @@ public:
      * the graph is alive -- costs one atomic read here and no second
      * teardown.
      */
-        etcs_release_lifecycle(target);
+        etcs_retire_entity(target);
 
         DestructorRecord* rec = unlinkRecord(target);
         if (!rec)
@@ -1503,7 +1504,7 @@ public:
         //ETCS_LOG("MemoryArena", "reclaimEntity: reclaiming " << (void*)target
         //         << " size=" << size << " align=" << alignment);
         void* raw = rec->ptr;
-        rec->dtor(raw);
+        runRecordDtor(rec);
  
         // rec itself -- unlinkRecord only removed it from dtorHead_'s own
         // linked list; that's bookkeeping, not reclaim. registerDtorLocked
@@ -1548,7 +1549,7 @@ public:
         DestructorRecord* rec = unlinkRecord(static_cast<void*>(target));
         if (!rec) return false;
         void* raw = rec->ptr;
-        rec->dtor(raw);
+        runRecordDtor(rec);
         releaseToFreeList(raw, static_cast<long long>(sizeof(MemoryArena)),
                                 static_cast<long long>(alignof(MemoryArena)));
         releaseToFreeList(rec,
@@ -1627,7 +1628,31 @@ public:
  * nothing else -- which is what lets this be unconditional rather than
  * something the destroy path has to reason about.
  */
-    static void releaseIfLifecycled(Entity* e) { etcs_release_lifecycle(e); }
+    static void retireEntity(Entity* e) { etcs_retire_entity(e); }
+
+    /*
+ * runRecordDtor — the cleanup path, and the only place this arena runs a
+ * destructor.
+ *
+ * Memory teardown and lifecycle are the same arena-side hook, and they were
+ * split across seven call sites that each ran rec->dtor themselves. Three --
+ * the whole-chain walks in reset(), clearEntities() and memoryTeardown() -- ran
+ * destructors with no retire at all.
+ *
+ * Measured: a traced composited_scenes created 13 entities, destructed 13 and
+ * retired 3. The other ten were addTag<T> children reclaimed by memoryTeardown's
+ * raw walk, so none of the lifecycle machinery ran for the entities that make up
+ * a scene graph. Now 13 of 13.
+ *
+ * A record with no entity behind it (a Module, a nested arena) takes the same
+ * path with that step skipped.
+ */
+    static void runRecordDtor(DestructorRecord* rec)
+    {
+        if (!rec) return;
+        if (rec->as_entity) etcs_retire_entity(rec->as_entity(rec->ptr));
+        rec->dtor(rec->ptr);
+    }
 
     void destroyChildEntitiesFirst()
     {
@@ -1652,9 +1677,9 @@ public:
             // The release goes BEFORE the destroy callback, while the entity is
             // still whole and everything around it still resolves -- which is
             // the only moment a release can do what a release is for. See
-            // releaseIfLifecycled. Outside the lock, deliberately: the callback
+            // retireEntity. Outside the lock, deliberately: the callback
             // below already re-enters this arena, and a release may too.
-            if (to_entity) releaseIfLifecycled(to_entity(rawPtr));
+            if (to_entity) retireEntity(to_entity(rawPtr));
             callback(rawPtr, *this, true);
         }
     }
@@ -1698,7 +1723,7 @@ public:
     {
         DestructorRecord* rec = unlinkRecord(target);
         if (!rec) return false; // not found — already evoked/forgotten, or never existed here
-        rec->dtor(rec->ptr);    // unlocked — matches allocate<T>'s own philosophy
+        runRecordDtor(rec);     // unlocked — matches allocate<T>'s own philosophy
         return true;
     }
  
@@ -1749,7 +1774,7 @@ public:
         if (isTeardown_) return;
  
         DestructorRecord* rec = dtorHead_;
-        while (rec) { rec->dtor(rec->ptr); rec = rec->prev; }
+        while (rec) { runRecordDtor(rec); rec = rec->prev; }
         dtorHead_ = nullptr;
     }
  
@@ -1780,7 +1805,7 @@ public:
         // of the same map). This was invisible before ArenaAllocator's
         // own deallocate() actually did anything -- the reentrant call
         // was always POSSIBLE, just inert.
-        while (rec) { rec->dtor(rec->ptr); rec = rec->prev; }
+        while (rec) { runRecordDtor(rec); rec = rec->prev; }
  
         std::lock_guard<std::mutex> lock(allocationMutex_);
         // Every chunk goes back to used=0 below -- any block this arena's
@@ -1829,7 +1854,7 @@ public:
         // std::mutex from the same thread -- undefined behavior, and
         // exactly what a real, reproduced SIGFPE inside std::
         // unordered_map's own operator[] traced back to.
-        while (rec) { rec->dtor(rec->ptr); rec = rec->prev; }
+        while (rec) { runRecordDtor(rec); rec = rec->prev; }
  
         std::lock_guard<std::mutex> lock(allocationMutex_);
         free_blocks_.clear(); // every chunk backing these addresses is about

@@ -43,6 +43,15 @@ ETCS_SUPERTYPE_BASE(Lifecycle)
     {
         if (m_released.exchange(true, std::memory_order_acq_rel)) return false;
         static_cast<Derived*>(this)->ReleaseConcrete();
+        // Delete is NOT called from here, and the obvious version of that hangs:
+        //
+        //     DestroyEvent::operator()  <-  VulkanSurface::DeleteConcrete
+        //                               <-  LifecycleBase<VulkanSurface>::Release
+        //
+        // Delete's body is a blocking request to the loader to destroy this RID,
+        // and Release runs from inside the arena walk already destroying it, so
+        // the event waits on this very thread. Delete calls Release instead --
+        // Release is local and returns.
         return true;
     }
 

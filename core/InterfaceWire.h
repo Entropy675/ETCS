@@ -108,10 +108,11 @@ struct IWireLifecycle
 };
 
 // ---------------------------------------------------------------------------
-// IWireThread — the scheduler's slot. DECLARED, NOT YET CLAIMED: there is no
-// Threaded family and ThreadPool does not consult it. It is here because this
-// header is where a wire is pre-declared before it is wired, and because the
-// gap it names is one this codebase has already been bitten by three times.
+// IWireThread — the scheduler's slot. CLAIMED by the Threaded family
+// (ontology/Threaded.h), and called by the arena's reclaim funnel, which halts
+// an entity's bodies before it releases the state those bodies are using. The
+// gap it names stopped being an argument and became a measured crash; see the
+// family header for the reproduction that claimed it.
 //
 // THE PATTERN IT COMPLETES. Each wire pairs a core subsystem with the one
 // question it has to ask an entity that it has no other way to reach:
@@ -137,10 +138,10 @@ struct IWireLifecycle
 //   the sharp end of exactly that -- a thread that could not be told to stop,
 //   being joined by itself.
 //
-// So the wire would carry two things and no more: what shape of work this is,
-// and a cooperative halt that reports whether it took. Deliberately NOT a
-// priority or an affinity -- those are policy, and policy belongs to whatever
-// schedules, not to the thing being scheduled.
+// So the wire carries what shape of work this is, and a cooperative halt --
+// the request and its readback, the same request/readback pair IWireLifecycle
+// carries. Deliberately NOT a priority or an affinity: those are policy, and
+// policy belongs to whatever schedules, not to the thing being scheduled.
 //
 // Left unclaimed on purpose. Adding the interface is cheap and reversible;
 // adding call sites inside ThreadPool changes when every stream body in the
@@ -171,6 +172,10 @@ struct IWireThread
     // can report which bodies acknowledged and which it is about to wait on
     // blindly, instead of treating both the same and calling it a timeout.
     virtual bool Halt() = 0;
+
+    // The readback, and what a running body polls. On the wire rather than the
+    // family for the reason IWireLifecycle carries Released().
+    virtual bool Halted() const = 0;
 };
 
 } // namespace ETCS

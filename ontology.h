@@ -60,6 +60,10 @@
 // guaranteed to happen exactly once whichever way the entity dies. See
 // ontology/Lifecycle.h.
 #include "ontology/LifecycleBase.h"
+// Threaded claims IWireThread, the wire core/InterfaceWire.h declared and left
+// unclaimed. Beside Lifecycle because they are used together: retiring an
+// entity asks its bodies to stop before it tells the type to let go.
+#include "ontology/ThreadedBase.h"
 #include "ontology/EphemeralBase.h"
 #include "ontology/ParserBase.h"
 #include "ontology/WrapperBase.h"

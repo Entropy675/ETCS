@@ -720,7 +720,22 @@ inline ETCS::TagMask CausalEdgeMask(const ETCS::TagMask& own,
 struct ScopeTag
 {
     static constexpr const char* kPrefix = "active_scope_";
+    /*
+ * Identity, not a pointer, because of when ~ScopeTag runs. A ScopeTag lives for
+ * a stream call's whole body -- a frame clock lasts as long as its window -- so
+ * the destructor runs in the trampoline's epilogue, and for an edge that ended
+ * BECAUSE its entity retired, that entity is what just went away. The old body
+ * dereferenced `e` twice there (unregisterScope, then removeTag), which was two
+ * of this epoch's crash sites: the second showed up as tagModifyImpl on the
+ * ordering thread, servicing an event whose target was gone.
+ *
+ * `e` remains for construction and as the moved-from sentinel only.
+ */
     ETCS::Entity* e;
+    // ETCS_RID_SIZE rather than ETCS::RID: RIDList.h, where the alias lives,
+    // is included after this header. Same type, spelled with what is in scope.
+    ETCS_RID_SIZE rid = 0;
+    ETCS::Buffer  conjugate_key;
     ETCS::Buffer  tag;
     // The derived context for this call (see Scope::registerContext). Held by
     // value and copied on move: it is only pointers, and the flag it points at
@@ -747,7 +762,8 @@ struct ScopeTag
     ScopeTag(const ScopeTag&)            = delete;
     ScopeTag& operator=(const ScopeTag&) = delete;
     ScopeTag(ScopeTag&& other) noexcept
-        : e(other.e), tag(other.tag), scope_ctx(other.scope_ctx),
+        : e(other.e), rid(other.rid), conjugate_key(other.conjugate_key),
+          tag(other.tag), scope_ctx(other.scope_ctx),
           scope_id(other.scope_id), extra_mask(other.extra_mask)
     {
         other.e = nullptr;
@@ -769,8 +785,27 @@ struct WorkBundle
     WorkBundle(ETCS::Buffer m = "", ETCS::Buffer w = "", const void* f = nullptr, HASH_TYPE h = 0, bool stream = false)
         : module_tag(std::move(m)), work_tag(std::move(w)), workFunc(f), hash(h), isStream(stream) {}
     
-    bool operator()(ETCS::Entity* child, ETCS::Buffer& data, ETCS::SignalContext ctx = {});
-    bool operator()(ETCS::Entity* child, ETCS::MBuffer& data, ETCS::SignalContext ctx = {});
+    /*
+ * By RID, not by pointer, which follows from what this struct is: bookkeeping
+ * for a TYPE's work function, outliving every instance it dispatches for. The
+ * one instance-shaped thing in a call is the identity, and a RID is the stable
+ * form -- a number into a live registry rather than an address into memory an
+ * arena may have wiped.
+ *
+ * The resolution IS the liveness check. Either it resolves and the pointer is
+ * good for this frame, or it does not and there is nowhere to dispatch. One
+ * operation, one answer, one early exit.
+ *
+ * Concretely: the trampoline's first act is handler->getTrueType(), and a wiped
+ * entity is non-null with a ZEROED VTABLE -- so its null guard passes and the
+ * call faults on `call *0x20(%rax)` with rax=0. The registry stores what
+ * getTrueType() returned at insert time, so resolving here removes the need for
+ * that call rather than guarding it.
+ */
+    bool operator()(ETCS_RID_SIZE rid, const ETCS::Buffer& conjugate_key,
+                    ETCS::Buffer& data, ETCS::SignalContext ctx = {});
+    bool operator()(ETCS_RID_SIZE rid, const ETCS::Buffer& conjugate_key,
+                    ETCS::MBuffer& data, ETCS::SignalContext ctx = {});
 };
 // Defined ahead of Module: Module's inline methods construct ModuleBundle by
 // value, so it must be complete there. ModuleBundle needs only Module*.
@@ -797,8 +832,13 @@ struct ModuleBundle
     }
     
     ETCS::Entity* operator()();
-    bool operator()(ETCS::Entity* child, const ETCS::Buffer& work, ETCS::Buffer& data, ETCS::SignalContext ctx = {});
-    bool operator()(ETCS::Entity* child, const ETCS::Buffer& work, ETCS::MBuffer& data, ETCS::SignalContext ctx = {});
+    // Carries the identity through rather than the pointer, for WorkBundle's
+    // reason above -- this hop only routes to the right action and has no
+    // business dereferencing anything on the way.
+    bool operator()(ETCS_RID_SIZE rid, const ETCS::Buffer& conjugate_key,
+                    const ETCS::Buffer& work, ETCS::Buffer& data, ETCS::SignalContext ctx = {});
+    bool operator()(ETCS_RID_SIZE rid, const ETCS::Buffer& conjugate_key,
+                    const ETCS::Buffer& work, ETCS::MBuffer& data, ETCS::SignalContext ctx = {});
 };
 // ── LifetimeOwner ─────────────────────────────────────────────────────────────
 // A tagged reference to whichever kind of thing is serving as a Module's

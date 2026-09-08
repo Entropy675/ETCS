@@ -194,12 +194,51 @@ protected:
  * reparent), and a cached vector of Drawable_* is a dangling pointer
  * waiting for the first script that removes a layer mid-run.
  */
+    // A child named the way the blit source is: by RID, resolved at the point
+    // of use. Order is snapshotted because only the sort needs it.
+    struct ChildRef { ETCS::Buffer tag; ETCS::RID rid; int32_t order; };
+
+    void collectDrawableChildRefs(std::vector<ChildRef>& out)
+    {
+        std::vector<std::pair<ETCS::Buffer, ETCS::RID>> kids;
+        getOrderedTypedChildren(kids);
+        out.reserve(kids.size());
+        for (const auto& entry : kids)
+        {
+            ETCS::Entity* child = getTypedChild(entry.first, entry.second);
+            if (!child) continue;
+            void* iface = child->getInterfacePointer(ETCS::Buffer("Drawable"));
+            if (!iface) continue;
+            out.push_back(ChildRef{entry.first, entry.second,
+                                   static_cast<Drawable_*>(iface)->Order()});
+        }
+        std::stable_sort(out.begin(), out.end(),
+                         [](const ChildRef& a, const ChildRef& b) { return a.order < b.order; });
+    }
+
+    /*
+ * Resolved per child at the moment of the call, not once into a vector of
+ * pointers that is then walked. The old body held each pointer across an
+ * entire recursive subtree draw, so a frame edge running while a closure's
+ * arena reclaimed that subtree read a vtable coming apart (ASAN: READ at 0x20
+ * in _stream_Surface_ConsumeFrames).
+ *
+ * Same rule the blit source above already follows: resolve at replay, skip
+ * what is gone.
+ */
     void drawChildren(Surface_* dst)
     {
         if (!dst) return;
-        std::vector<Drawable_*> ordered;
-        collectDrawableChildren(ordered);
-        for (Drawable_* child : ordered) child->DrawInto(dst);
+        std::vector<ChildRef> ordered;
+        collectDrawableChildRefs(ordered);
+        for (const ChildRef& c : ordered)
+        {
+            ETCS::Entity* child = getTypedChild(c.tag, c.rid);
+            if (!child) continue;
+            void* iface = child->getInterfacePointer(ETCS::Buffer("Drawable"));
+            if (!iface) continue;
+            static_cast<Drawable_*>(iface)->DrawInto(dst);
+        }
     }
 };
 

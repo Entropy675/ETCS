@@ -821,8 +821,23 @@ ETCS::Entity* ETCS::ModuleBundle::operator()()
     return nullptr;
 #endif
 }
-bool ETCS::WorkBundle::operator()(ETCS::Entity* child, ETCS::Buffer& tagbuff, ETCS::SignalContext ctx)
+bool ETCS::WorkBundle::operator()(ETCS_RID_SIZE rid, const ETCS::Buffer& conjugate_key,
+                                  ETCS::Buffer& tagbuff, ETCS::SignalContext ctx)
 {
+    /*
+ * THE RESOLUTION IS THE LIVENESS CHECK -- see WorkBundle's own comment.
+ * Either the RID names something the loader still holds, in which case the
+ * pointer is good for the whole of this frame, or it does not and there is
+ * nothing to dispatch to. No flag, no second question, one early exit.
+ */
+    ETCS::Entity* child = ETCS::etcs_resolve_by_key(conjugate_key, rid);
+    if (!child)
+    {
+        ETCS_LOG("WorkBundle::operator()", "RID:" << rid << " (" << conjugate_key
+            << ") no longer resolves -- the entity was reclaimed before "
+            << module_tag << "." << work_tag << " could dispatch. Refusing.");
+        return false;
+    }
 #ifdef ETCS_LOG_FUNCTION_EVOCATION_PATH
     ETCS_LOG("WorkBundle::operator()", "ENTER module_tag=" << module_tag << " work_tag=" << work_tag
         << " child=" << (void*)child << " workFunc=" << (void*)workFunc);
@@ -869,8 +884,23 @@ bool ETCS::WorkBundle::operator()(ETCS::Entity* child, ETCS::Buffer& tagbuff, ET
  * message even inside the loader, so a stream dispatch failing here was
  * invisible in both scopes rather than only one.
  */
-bool ETCS::WorkBundle::operator()(ETCS::Entity* child, ETCS::MBuffer& tagbuff, ETCS::SignalContext ctx)
+bool ETCS::WorkBundle::operator()(ETCS_RID_SIZE rid, const ETCS::Buffer& conjugate_key,
+                                  ETCS::MBuffer& tagbuff, ETCS::SignalContext ctx)
 {
+    /*
+ * THE RESOLUTION IS THE LIVENESS CHECK -- see WorkBundle's own comment.
+ * Either the RID names something the loader still holds, in which case the
+ * pointer is good for the whole of this frame, or it does not and there is
+ * nothing to dispatch to. No flag, no second question, one early exit.
+ */
+    ETCS::Entity* child = ETCS::etcs_resolve_by_key(conjugate_key, rid);
+    if (!child)
+    {
+        ETCS_LOG("WorkBundle::operator()", "RID:" << rid << " (" << conjugate_key
+            << ") no longer resolves -- the entity was reclaimed before "
+            << module_tag << "." << work_tag << " could dispatch. Refusing.");
+        return false;
+    }
 #ifdef ETCS_LOG_FUNCTION_EVOCATION_PATH
     ETCS_LOG("WorkBundle::operator()", "ENTER (stream) module_tag=" << module_tag
         << " work_tag=" << work_tag << " child=" << (void*)child
@@ -908,7 +938,8 @@ bool ETCS::WorkBundle::operator()(ETCS::Entity* child, ETCS::MBuffer& tagbuff, E
  * cannot tell "wrote nothing" from "never ran", which is exactly how a missing
  * action came to look like a successful response echoing the request back.
  */
-bool ETCS::ModuleBundle::operator()(ETCS::Entity* child, const ETCS::Buffer& work,
+bool ETCS::ModuleBundle::operator()(ETCS_RID_SIZE rid, const ETCS::Buffer& conjugate_key,
+                                    const ETCS::Buffer& work,
                                     ETCS::Buffer& data, ETCS::SignalContext ctx)
 {
 #ifdef ETCS_LOG_FUNCTION_EVOCATION_PATH
@@ -928,7 +959,7 @@ bool ETCS::ModuleBundle::operator()(ETCS::Entity* child, const ETCS::Buffer& wor
 #ifdef ETCS_LOG_FUNCTION_EVOCATION_PATH
         ETCS_LOG("ModuleBundle::operator()", "about to invoke WorkBundle::operator() for " << work << "...");
 #endif
-        pass = it->second(child, data, ctx);
+        pass = it->second(rid, conjugate_key, data, ctx);
 #ifdef ETCS_LOG_FUNCTION_EVOCATION_PATH
         ETCS_LOG("ModuleBundle::operator()", "EXIT -- WorkBundle::operator()(...) returned normally for " << work);
 #endif
@@ -938,12 +969,13 @@ bool ETCS::ModuleBundle::operator()(ETCS::Entity* child, const ETCS::Buffer& wor
             << " does not provide requested action: " << work);
     return pass;
 }
-bool ETCS::ModuleBundle::operator()(ETCS::Entity* child, const ETCS::Buffer& work,
+bool ETCS::ModuleBundle::operator()(ETCS_RID_SIZE rid, const ETCS::Buffer& conjugate_key,
+                                    const ETCS::Buffer& work,
                                     ETCS::MBuffer& data, ETCS::SignalContext ctx)
 {
     auto it = actions.find(work);
     bool pass = false;
-    if (it != actions.end()) pass = it->second(child, data, ctx);
+    if (it != actions.end()) pass = it->second(rid, conjugate_key, data, ctx);
     else ETCS_LOG("ModuleBundle::operator()", "Tag: " << this->tag
              << " does not provide requested action (stream): " << work);
     return pass;
@@ -2151,52 +2183,29 @@ bool ETCS::EventNode::LoaderStream::destroyImpl(const std::string& conjugate_key
  */
     if (target) target->beginRetire();
     /*
- * Fan OUT of every aggregate this entity was fanned INTO. An entity is
- * inserted into its own per-tag RIDList (the conjugate_key one below) AND
- * into one aggregate list per supertype family it declares -- Deletable,
- * Ephemeral, ConnectionState, and so on (ETCS_SUPERTYPE_BASE publishes
- * those under the bare family name; etcs_supertype_fanout inserts on
- * construction). Only the per-tag removal existed, so every aggregate kept
- * a permanent node holding a pointer into an arena that is about to be
- * reclaimed.
+ * Fan in -- the inverse of the fanout that published this entity, replacing the
+ * loop that used to be here.
  *
- * Two consequences, and the second is worse than the leak: those lists grew
- * without bound in the MODULE's root arena (measured at ~94MB over six
- * hours of one polling page), and every entry past the first was a dangling
- * Entity*, so anything iterating an aggregate walked freed memory.
+ * Why the removal matters, kept from what stood here: without it those lists
+ * grow without bound in the module's root arena (measured at ~94MB over six
+ * hours of one polling page), and every entry past the first is a dangling
+ * Entity*, so anything iterating an aggregate walks freed memory.
  *
- * The node bytes DO come back once erased -- ArenaAllocator::deallocate
- * pushes to the arena's free list and every node is identically sized, so
- * the next insert reuses them. Reclamation was never missing; the removal
- * was. Done BEFORE the per-tag remove so `target` is still resolvable.
+ * Why it is a call now: what was here walked getTags() and built "Module:Tag"
+ * keys, while fanout inserts under the bare names getInterfaceFamilies()
+ * returns. The two never named the same key, so the aggregates this was written
+ * to clean were never cleaned by it. etcs_supertype_fanin reads the same
+ * accessor the insert does and covers both scopes. Position unchanged: before
+ * awaitQuiesced, while target still resolves.
  */
-    if (target)
-    {
-        /*
- * conjugate_key is "Module:Tag" -- split here rather than adding a
- * parameter, since on_event's own parse (Kind::Destroy) is a different
- * scope and this is the only other place that needs the module half.
- */
-        const size_t colon = conjugate_key.find(':');
-        const std::string module_name =
-            (colon == std::string::npos) ? conjugate_key : conjugate_key.substr(0, colon);
-        std::vector<ETCS::Buffer> type_tags;
-        target->getTags(type_tags);
-        for (const ETCS::Buffer& t : type_tags)
-        {
-            ETCS::Buffer agg_key(module_name + ":" + t.toString());
-            if (agg_key == key) continue;              // the per-tag list, handled below
-            auto agg = owner->ridMap.find(agg_key);
-            if (agg == owner->ridMap.end()) continue;  // not an aggregate this module publishes
-            if (agg->second.invoke_remove(rid))
-                ETCS_LOG("DynamicLoader", "destroyImpl: removed RID " << rid
-                         << " from aggregate " << agg_key.toString());
-        }
-    }
-    bool removed = it->second.invoke_remove(rid);
-    ETCS_LOG("DynamicLoader", "destroyImpl: removed RID " << rid << " from " << conjugate_key
-        << " -> " << (removed ? "ok" : "failed"));
- 
+    if (target) ETCS::etcs_supertype_fanin(target);
+    // Presence was established by the invoke_contains check above, and fan-in
+    // removed it from everything -- so "did this remove a live entity" is
+    // "was there one to remove".
+    const bool removed = (target != nullptr);
+    ETCS_LOG("DynamicLoader", "destroyImpl: fanned RID " << rid << " out of "
+        << conjugate_key << " -> " << (removed ? "ok" : "no target"));
+
     if (removed && target)
     {
         /*

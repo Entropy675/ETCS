@@ -906,6 +906,15 @@ public:
  * needing it.
  * -----------------------------------------------------------------------
  */
+    // The child's half of removeTypedChild, so a caller holding only the child
+    // does not need to know how it is registered. Idempotent. Does NOT null
+    // parent_ -- the upward link is still wanted; what ends is being reachable
+    // downward, which is the direction a walker traverses.
+    void detachFromParent()
+    {
+        if (parent_) parent_->removeTypedChild(parent_rid_);
+    }
+
     void removeTypedChild(RID rid)
     {
         std::lock_guard<std::mutex> lock(m_tagMutex);
@@ -1561,7 +1570,10 @@ public:
         ETCS_LOG("Entity::call", "about to invoke (*bundle)(this=" << (void*)this
                  << ", action=" << action << ", data.written=" << data.written << ", forward)...");
 #endif
-        (*self_it->second.bundle)(this, action, data, forward);
+        // Identity from here, where it is unambiguous: `this` is the object whose
+        // member function is executing. Everything below carries the RID and
+        // re-resolves once, at the dispatch boundary.
+        (*self_it->second.bundle)(getRID(), myConjugateKey(), action, data, forward);
 #ifdef ETCS_LOG_FUNCTION_EVOCATION_PATH
         ETCS_LOG("Entity::call", "EXIT -- (*bundle)(...) returned normally for " << tag_type << "." << action);
 #endif
@@ -1692,7 +1704,8 @@ public:
             try
             {
                 if (ModuleBundle* b = producer_entity->safeBundleFor(tag_type, "producer"))
-                    (*b)(producer_entity, action, transportProducer, ctx);
+                    (*b)(producer_entity->getRID(), producer_entity->myConjugateKey(),
+                         action, transportProducer, ctx);
             }
             catch (const std::exception& e)
             {
@@ -1767,7 +1780,7 @@ public:
         try
         {
             if (ModuleBundle* b = safeBundleFor(tag_type_r, "consumer"))
-                (*b)(this, action_r, transportConsumer, ctx);
+                (*b)(getRID(), myConjugateKey(), action_r, transportConsumer, ctx);
         }
         catch (const std::exception& e)
         {
@@ -1876,7 +1889,8 @@ public:
         try
         {
             if (ModuleBundle* b = producer_entity->safeBundleFor(tag_type, "producer"))
-                (*b)(producer_entity, action, transportProducer, ctx);
+                (*b)(producer_entity->getRID(), producer_entity->myConjugateKey(),
+                         action, transportProducer, ctx);
         }
         catch (const std::exception& e)
         {
@@ -1885,7 +1899,7 @@ public:
         try
         {
             if (ModuleBundle* b = safeBundleFor(tag_type_r, "consumer"))
-                (*b)(this, action_r, transportConsumer, ctx);
+                (*b)(getRID(), myConjugateKey(), action_r, transportConsumer, ctx);
         }
         catch (const std::exception& e)
         {
@@ -2053,6 +2067,14 @@ public:
  * acquires it ambiently at emit, from ETCS::CausalEdgeMask (Bundles.h),
  * the same way it acquires the stream pair's module mask.
  */
+
+    // "Module:Tag" -- the key this entity is registered under, and the other
+    // half of every (key, rid) resolution.
+    ETCS::Buffer myConjugateKey() const
+    {
+        return ETCS::Buffer((getSourceModule().toString() + ":"
+                             + getSourceTag().toString()).c_str());
+    }
 
     ETCS::Buffer myTagBuffer()
     {
@@ -2380,6 +2402,16 @@ inline ETCS::ScopeTag::ScopeTag(ETCS::Entity* entity, const char* label,
     : e(entity), extra_mask(extra)
 {
     /*
+ * Recorded HERE, where the entity is unambiguously alive -- the caller is
+ * entering the call. Everything the destructor needs is captured now so that
+ * it never has to trust the pointer later. See ScopeTag's own comment.
+ */
+    if (entity)
+    {
+        rid = entity->getRID();
+        conjugate_key = entity->myConjugateKey();
+    }
+    /*
  * "active_scope_Listen" -- no guard address anymore. The address made
  * every instance's flag unique, which meant the flag could only ever
  * express the fine-grained target, and expressed it as an unreadable
@@ -2424,10 +2456,42 @@ inline ETCS::ScopeTag::ScopeTag(ETCS::Entity* entity, const char* label,
  * double-removeTag against a guard that was never really "this one" to
  * begin with.
  */
+/*
+ * Resolve an entity by conjugate key and RID, through the LOADER only.
+ *
+ * The loader's map is the authoritative one: each EventNode::getInstance() is a
+ * per-SO static holding only what that module created, while the loader absorbs
+ * every module's lists and watches them join and leave. Checking the local map
+ * first would answer correctly for a module's own entities and wrongly for
+ * anything composed.
+ *
+ * Null means gone -- a real answer, not an error.
+ */
+ETCS::EventNode* etcs_loader_event_node();   // defined below
+inline Entity* etcs_resolve_by_key(const ETCS::Buffer& conjugate_key, RID rid)
+{
+    if (rid == 0 || conjugate_key.written == 0) return nullptr;
+    ETCS::EventNode* owner = etcs_loader_event_node();
+    if (!owner) return nullptr;
+    auto it = owner->ridMap.find(conjugate_key);
+    if (it == owner->ridMap.end()) return nullptr;
+    if (!it->second.invoke_contains(rid)) return nullptr;
+    return it->second.invoke_get(rid);
+}
+
 inline ETCS::ScopeTag::~ScopeTag()
 {
-    if (!e) return;
-    Scope::Removal rem = e->unregisterScope(scope_id);
+    if (!e) return;                      // moved-from: not ours to unwind
+    /*
+ * ASK FOR THE POINTER AGAIN. `e` is only the moved-from sentinel by now; the
+ * entity it named may have been reclaimed while this scope's body ran, which
+ * is the ordinary case for a frame edge that ended because its surface
+ * retired. Null here means there is nothing left to unregister and no tag
+ * left to remove.
+ */
+    ETCS::Entity* live = etcs_resolve_by_key(conjugate_key, rid);
+    if (!live) return;
+    Scope::Removal rem = live->unregisterScope(scope_id);
     /*
  * Unregister first, THEN removeTag -- load-bearing ordering. removeTag
  * fires a TagModifyEvent whose handler calls interruptLabel(label) for
@@ -2436,7 +2500,7 @@ inline ETCS::ScopeTag::~ScopeTag()
  * erasing the flag from flags_ rather than treating the removal as an
  * interrupt request and returning early with the flag still set.
  */
-    if (rem.found && rem.last_of_label) e->removeTag(tag, extra_mask);
+    if (rem.found && rem.last_of_label) live->removeTag(tag, extra_mask);
 }
  
 /*
@@ -2887,12 +2951,89 @@ inline void* etcs_true_type(Entity* e) { return e ? e->getTrueType() : nullptr; 
  * A type that does not claim the family returns null here and is skipped, which
  * is how this stays a call core can make unconditionally.
  */
-inline bool etcs_release_lifecycle(Entity* e)
+/*
+ * etcs_supertype_fanin — the inverse of etcs_supertype_fanout, written directly
+ * beneath it so the pair cannot drift again.
+ *
+ * It drifted once. Fanout inserts under the names getInterfaceFamilies()
+ * returns, read out of interface_pointers_. The only removal that existed
+ * (destroyImpl) walked getTags() instead -- a different map -- and built
+ * qualified "Module:Tag" keys from it, so the two never named the same key. A
+ * traced run of composited_scenes showed 78 insertions into the unqualified
+ * family lists and zero removals, with all 78 later resolves returning hits for
+ * entities already destructed. Those lists are what resolve_in_family checks
+ * FIRST, before asking the loader, which is why resolving by RID was never a
+ * liveness check.
+ *
+ * Both scopes in one call: the module's own map under the unqualified name, the
+ * loader's under the origin-affixed one. The per-TYPE entry goes too -- same
+ * kind of registration, made by ETCS_MAKE_INSTANCE rather than by fanout.
+ */
+inline void etcs_supertype_fanin(Entity* e)
+{
+    if (!e) return;
+    std::vector<ETCS::Buffer> families;
+    e->getInterfaceFamilies(families);
+
+    const RID         rid    = e->getRID();
+    const std::string module = e->getSourceModule().toString();
+    const ETCS::Buffer own_tag = e->getSourceTag();
+
+    // Everything this entity was published under, in the module's own spelling.
+    std::vector<ETCS::Buffer> names = families;
+    if (own_tag.written) names.push_back(own_tag);
+
+    auto& mine = ETCS::EventNode::getInstance().ridMap;
+    ETCS::EventNode* owner = etcs_loader_event_node();
+
+    for (const ETCS::Buffer& name : names)
+    {
+        auto local = mine.find(name);
+        if (local != mine.end()) local->second.invoke_remove(rid);
+
+        if (!owner) continue;
+        ETCS::Buffer qualified((module + ":" + name.toString()).c_str());
+        auto absorbed = owner->ridMap.find(qualified);
+        if (absorbed != owner->ridMap.end()) absorbed->second.invoke_remove(rid);
+    }
+}
+
+inline bool etcs_retire_entity(Entity* e)
 {
     if (!e) return false;
-    void* raw = e->getInterfacePointer(ETCS::Buffer("Lifecycle"));
-    if (!raw) return false;
-    return static_cast<ETCS::IWireLifecycle*>(raw)->Release();
+    // Gate first: no new hold is granted, so no walk that has not started ever
+    // will. destroyImpl did this around an explicit Delete and the arena's
+    // reclaim -- the other way every entity dies -- did not.
+    e->beginRetire();
+    // Then halt, before anything it is using is taken away. Cooperative, so this
+    // does not wait: the body stops at its next opportunity.
+    if (void* raw = e->getInterfacePointer(ETCS::Buffer("Threaded")))
+        static_cast<ETCS::IWireThread*>(raw)->Halt();
+    // Then wait for what was already inside. After the halt, deliberately: a
+    // body that has been asked to stop drains in one iteration.
+    if (!e->awaitQuiesced(2000))
+        ETCS_LOG("retireEntity", "RID:" << e->getRID() << " still held after 2000ms -- "
+                 "reclaiming anyway. A walk is holding it across an emit.");
+    // Release while the parent link is still live -- "unbind from what holds
+    // you" is on its own list of jobs.
+    bool released = false;
+    if (void* raw = e->getInterfacePointer(ETCS::Buffer("Lifecycle")))
+        released = static_cast<ETCS::IWireLifecycle*>(raw)->Release();
+    /*
+ * Then leave the parent's child list, for every entity. This used to happen in
+ * ~Entity(), which meant a child was still answerable through getTypedChild
+ * while its own destructor ran: a concurrent frame edge resolved it, called
+ * through it, and read a vtable coming apart. reclaimEntity is the moment that
+ * works -- before unlinkRecord, before ~T(), and ours to order.
+ *
+ * ~Entity() still makes the same call; removeTypedChild is a no-op once the RID
+ * is gone, so neither path has to know about the other.
+ */
+    e->detachFromParent();
+    // And leave every registry it was published into, keyed the way it was
+    // admitted. This is what turns "the RID resolved" into "it is alive".
+    etcs_supertype_fanin(e);
+    return released;
 }
 
 inline void etcs_supertype_fanout(Entity* e)
