@@ -11,13 +11,23 @@
 // meant to care about.
 //
 // EDGE_BITS is one machine word and should stay one: the whole design is that
-// every edge's state is a single atomic load or store. CHAIN_SLOTS are the
-// reserved tail used to extend capacity past one word (see the chain note
-// below); DIRECT_SLOTS is what is left for real observers.
+// every edge's state within a block is a single atomic load or store.
+// MAX_BLOCKS bounds the chain, so exhaustion is a loud refusal rather than a
+// silent aliasing -- 8 blocks is 512 edges on one entity, which is already far
+// past anything this runtime does.
+//
+// THE CHAIN IS STORAGE, NOT OBSERVATION, and that is why no bits are reserved
+// for it. An extension block is this entity's own slot table continued
+// elsewhere -- it is reached by pointer, never addressed as an edge, and marks
+// propagate into it EAGERLY carrying the original origin. Treating it as an
+// observer instead would make an entity's registry an observer of itself, cost
+// a real edge per block to say so, and blur the origin across the hop, since a
+// lazily-pulled node cannot reconstruct which of several coalesced changes was
+// whose. Storage has none of those problems: an RID is a global identity, so
+// depth changes where a slot LIVES and never what the edge IS.
 // ---------------------------------------------------------------------------
-#define ETCS_OBSERVABLE_EDGE_BITS     64
-#define ETCS_OBSERVABLE_CHAIN_SLOTS    8
-#define ETCS_OBSERVABLE_DIRECT_SLOTS  (ETCS_OBSERVABLE_EDGE_BITS - ETCS_OBSERVABLE_CHAIN_SLOTS)
+#define ETCS_OBSERVABLE_EDGE_BITS   64   // edges per block -- one machine word
+#define ETCS_OBSERVABLE_MAX_BLOCKS   8   // blocks per entity; refuse past this
 
 // ---------------------------------------------------------------------------
 // The edge registry, and the bookkeeping every observed type would otherwise
@@ -73,29 +83,38 @@ ETCS_SUPERTYPE_BASE(Observable)
         if (!observer_rid) return ETCS::ObserverEdge{};
 
         // Already registered? Hand back the edge it already has.
-        for (unsigned i = 0; i < ETCS_OBSERVABLE_DIRECT_SLOTS; ++i)
-            if (m_slot[i].load(std::memory_order_acquire) == observer_rid)
-                return ETCS::ObserverEdge{observer_rid, static_cast<uint8_t>(i)};
-
-        for (unsigned i = 0; i < ETCS_OBSERVABLE_DIRECT_SLOTS; ++i)
+        for (unsigned blk = 0; blk < ETCS_OBSERVABLE_MAX_BLOCKS; ++blk)
         {
-            uint64_t expected = 0;
-            const uint64_t bit = 1ull << i;
-            m_dirty.fetch_or(bit, std::memory_order_release);      // dirty first
-            if (m_slot[i].compare_exchange_strong(expected, observer_rid,
-                                                  std::memory_order_acq_rel))
+            Block* b = this->blockAt(blk, false);
+            if (!b) break;
+            for (unsigned i = 0; i < ETCS_OBSERVABLE_EDGE_BITS; ++i)
+                if (b->rid[i].load(std::memory_order_acquire) == observer_rid)
+                    return this->makeEdge(observer_rid, blk, i);
+        }
+
+        for (unsigned blk = 0; blk < ETCS_OBSERVABLE_MAX_BLOCKS; ++blk)
+        {
+            Block* b = this->blockAt(blk, true);
+            for (unsigned i = 0; i < ETCS_OBSERVABLE_EDGE_BITS; ++i)
             {
-                m_occupied.fetch_or(bit, std::memory_order_release);
+                uint64_t expected = 0;
+                const uint64_t bit = 1ull << i;
+                b->dirty.fetch_or(bit, std::memory_order_release);   // dirty first
+                if (!b->rid[i].compare_exchange_strong(expected, observer_rid,
+                                                       std::memory_order_acq_rel))
+                    continue;
+                b->occupied.fetch_or(bit, std::memory_order_release);
                 if (observer_rid == static_cast<Derived*>(this)->getRID())
-                    m_selfSlot.store(static_cast<int8_t>(i), std::memory_order_release);
-                return ETCS::ObserverEdge{observer_rid, static_cast<uint8_t>(i)};
+                    m_selfEdge.store(static_cast<int32_t>(blk * ETCS_OBSERVABLE_EDGE_BITS + i),
+                                     std::memory_order_release);
+                return this->makeEdge(observer_rid, blk, i);
             }
         }
-        // Full. Refused loudly rather than aliased silently -- see the chain
-        // note in Observable.h for how capacity is meant to grow.
+        // Every block full. Refused loudly rather than aliased silently.
         ETCS_LOG("Observable", "RID:" << static_cast<Derived*>(this)->getRID()
                  << " has no free edge slot for observer RID:" << observer_rid
-                 << " (" << ETCS_OBSERVABLE_DIRECT_SLOTS << " direct slots in use).");
+                 << " (" << (ETCS_OBSERVABLE_MAX_BLOCKS * ETCS_OBSERVABLE_EDGE_BITS)
+                 << " edges in use).");
         return ETCS::ObserverEdge{};
     }
 
@@ -104,16 +123,22 @@ ETCS_SUPERTYPE_BASE(Observable)
     void Unobserve(uint64_t observer_rid) override
     {
         if (!observer_rid) return;
-        for (unsigned i = 0; i < ETCS_OBSERVABLE_DIRECT_SLOTS; ++i)
+        for (unsigned blk = 0; blk < ETCS_OBSERVABLE_MAX_BLOCKS; ++blk)
         {
-            if (m_slot[i].load(std::memory_order_acquire) != observer_rid) continue;
-            const uint64_t bit = 1ull << i;
-            m_slot[i].store(0, std::memory_order_release);
-            m_occupied.fetch_and(~bit, std::memory_order_release);
-            m_dirty.fetch_and(~bit, std::memory_order_release);
-            if (m_selfSlot.load(std::memory_order_acquire) == static_cast<int8_t>(i))
-                m_selfSlot.store(-1, std::memory_order_release);
-            return;
+            Block* b = this->blockAt(blk, false);
+            if (!b) return;
+            for (unsigned i = 0; i < ETCS_OBSERVABLE_EDGE_BITS; ++i)
+            {
+                if (b->rid[i].load(std::memory_order_acquire) != observer_rid) continue;
+                const uint64_t bit = 1ull << i;
+                b->rid[i].store(0, std::memory_order_release);
+                b->occupied.fetch_and(~bit, std::memory_order_release);
+                b->dirty.fetch_and(~bit, std::memory_order_release);
+                const int32_t idx = static_cast<int32_t>(blk * ETCS_OBSERVABLE_EDGE_BITS + i);
+                if (m_selfEdge.load(std::memory_order_acquire) == idx)
+                    m_selfEdge.store(-1, std::memory_order_release);
+                return;
+            }
         }
     }
 
@@ -154,23 +179,28 @@ ETCS_SUPERTYPE_BASE(Observable)
  */
     void MarkObservedLocal(uint64_t origin_rid) override
     {
-        uint64_t exclude = 0;
+        int32_t excludeIdx = -1;
         if (origin_rid)
         {
             if (origin_rid == static_cast<Derived*>(this)->getRID())
-            {
-                const int8_t s = m_selfSlot.load(std::memory_order_acquire);
-                if (s >= 0) exclude = 1ull << static_cast<unsigned>(s);
-            }
+                excludeIdx = m_selfEdge.load(std::memory_order_acquire);
             else
-            {
-                for (unsigned i = 0; i < ETCS_OBSERVABLE_DIRECT_SLOTS; ++i)
-                    if (m_slot[i].load(std::memory_order_acquire) == origin_rid)
-                    { exclude = 1ull << i; break; }
-            }
+                excludeIdx = this->findEdge(origin_rid);
         }
-        const uint64_t live = m_occupied.load(std::memory_order_acquire);
-        m_dirty.fetch_or(live & ~exclude, std::memory_order_release);
+
+        // Eagerly across the whole chain, carrying the same exclusion: the
+        // blocks are one table, not a lazy hop, so origin stays exact at depth.
+        for (unsigned blk = 0; blk < ETCS_OBSERVABLE_MAX_BLOCKS; ++blk)
+        {
+            Block* b = this->blockAt(blk, false);
+            if (!b) return;
+            uint64_t exclude = 0;
+            if (excludeIdx >= 0
+             && static_cast<unsigned>(excludeIdx) / ETCS_OBSERVABLE_EDGE_BITS == blk)
+                exclude = 1ull << (static_cast<unsigned>(excludeIdx) % ETCS_OBSERVABLE_EDGE_BITS);
+            const uint64_t live = b->occupied.load(std::memory_order_acquire);
+            b->dirty.fetch_or(live & ~exclude, std::memory_order_release);
+        }
     }
 
     /*
@@ -225,11 +255,16 @@ ETCS_SUPERTYPE_BASE(Observable)
  */
     bool TakeObserved(const ETCS::ObserverEdge& e) override
     {
-        if (!e.valid() || e.slot >= ETCS_OBSERVABLE_DIRECT_SLOTS) return true;
-        if (m_slot[e.slot].load(std::memory_order_acquire) != e.observer_rid)
+        if (!e.valid()) return true;
+        const unsigned blk = e.slot / ETCS_OBSERVABLE_EDGE_BITS;
+        const unsigned i   = e.slot % ETCS_OBSERVABLE_EDGE_BITS;
+        if (blk >= ETCS_OBSERVABLE_MAX_BLOCKS) return true;
+        Block* b = this->blockAt(blk, false);
+        if (!b) return true;
+        if (b->rid[i].load(std::memory_order_acquire) != e.observer_rid)
             return true;                       // stale handle: no live edge, no claim
-        const uint64_t bit = 1ull << e.slot;
-        return (m_dirty.fetch_and(~bit, std::memory_order_acq_rel) & bit) != 0;
+        const uint64_t bit = 1ull << i;
+        return (b->dirty.fetch_and(~bit, std::memory_order_acq_rel) & bit) != 0;
     }
 
     /*
@@ -240,10 +275,9 @@ ETCS_SUPERTYPE_BASE(Observable)
  */
     bool TakeObserved(uint64_t observer_rid) override
     {
-        for (unsigned i = 0; i < ETCS_OBSERVABLE_DIRECT_SLOTS; ++i)
-            if (m_slot[i].load(std::memory_order_acquire) == observer_rid)
-                return TakeObserved(ETCS::ObserverEdge{observer_rid, static_cast<uint8_t>(i)});
-        return true;
+        const int32_t idx = this->findEdge(observer_rid);
+        if (idx < 0) return true;
+        return TakeObserved(ETCS::ObserverEdge{observer_rid, static_cast<uint16_t>(idx)});
     }
 
     /*
@@ -268,25 +302,100 @@ ETCS_SUPERTYPE_BASE(Observable)
     // the wire: the runtime never needs the list, only the answer.
     void ObserverRids(std::vector<uint64_t>& out) const
     {
-        for (unsigned i = 0; i < ETCS_OBSERVABLE_DIRECT_SLOTS; ++i)
+        for (unsigned blk = 0; blk < ETCS_OBSERVABLE_MAX_BLOCKS; ++blk)
         {
-            const uint64_t r = m_slot[i].load(std::memory_order_acquire);
-            if (r) out.push_back(r);
+            Block* b = this->blockAt(blk, false);
+            if (!b) return;
+            for (unsigned i = 0; i < ETCS_OBSERVABLE_EDGE_BITS; ++i)
+            {
+                const uint64_t r = b->rid[i].load(std::memory_order_acquire);
+                if (r) out.push_back(r);
+            }
         }
     }
 
-    // One load each, where the vector form had to take a lock and look at a
-    // container. Family-level, not on the interface -- see Observable.h.
-    bool Observed()  const { return m_occupied.load(std::memory_order_acquire) != 0; }
-    bool AnyStale()  const { return m_dirty.load(std::memory_order_acquire)    != 0; }
+    // One load per live block, where the vector form took a lock and looked at
+    // a container. Family-level, not on the interface -- see Observable.h.
+    bool Observed() const { return this->anyBlockBitSet(&Block::occupied); }
+    bool AnyStale() const { return this->anyBlockBitSet(&Block::dirty); }
 
 private:
-    std::atomic<uint64_t> m_occupied{0};   // slot i holds a live edge
-    std::atomic<uint64_t> m_dirty{0};      // slot i has entropy to flow
-    std::atomic<uint64_t> m_slot[ETCS_OBSERVABLE_DIRECT_SLOTS]{};
-    // Which slot is this entity's own edge, or -1. Cached because "the origin is
-    // me" is nearly every mark in the system; see MarkObservedLocal.
-    std::atomic<int8_t>   m_selfSlot{-1};
+    // One word of edges, plus the RIDs those bits belong to. The first lives
+    // inline; the rest are allocated only if an entity ever exceeds one word.
+    struct Block
+    {
+        std::atomic<uint64_t> occupied{0};   // bit i holds a live edge
+        std::atomic<uint64_t> dirty{0};      // bit i has entropy to flow
+        std::atomic<uint64_t> rid[ETCS_OBSERVABLE_EDGE_BITS]{};
+        std::atomic<Block*>   next{nullptr};
+    };
+
+    // The first block is inline; the rest come from THIS ENTITY'S OWN local
+    // arena, so an extension has the same lifetime as the edges it holds and is
+    // reclaimed with the entity rather than by a destructor this base cannot
+    // declare (ETCS_MAKE_INSTANCE already defines ~ObservableBase). It is also
+    // the only allocator that is correct here: a block is entity-local content,
+    // exactly what local_arena_ exists for.
+    Block m_head;
+
+    static ETCS::ObserverEdge makeEdge(uint64_t rid, unsigned blk, unsigned bit)
+    { return ETCS::ObserverEdge{rid, static_cast<uint16_t>(blk * ETCS_OBSERVABLE_EDGE_BITS + bit)}; }
+
+    // The RID->index inversion, for callers holding no handle. The only search
+    // left in the structure, and the handle form exists to skip it.
+    int32_t findEdge(uint64_t rid) const
+    {
+        if (!rid) return -1;
+        for (unsigned blk = 0; blk < ETCS_OBSERVABLE_MAX_BLOCKS; ++blk)
+        {
+            Block* b = this->blockAt(blk, false);
+            if (!b) return -1;
+            for (unsigned i = 0; i < ETCS_OBSERVABLE_EDGE_BITS; ++i)
+                if (b->rid[i].load(std::memory_order_acquire) == rid)
+                    return static_cast<int32_t>(blk * ETCS_OBSERVABLE_EDGE_BITS + i);
+        }
+        return -1;
+    }
+
+    bool anyBlockBitSet(std::atomic<uint64_t> Block::* which) const
+    {
+        for (unsigned blk = 0; blk < ETCS_OBSERVABLE_MAX_BLOCKS; ++blk)
+        {
+            Block* b = this->blockAt(blk, false);
+            if (!b) return false;
+            if ((b->*which).load(std::memory_order_acquire) != 0) return true;
+        }
+        return false;
+    }
+
+    // Block at `index`, or null if the chain is shorter. `make` extends it.
+    Block* blockAt(unsigned index, bool make) const
+    {
+        Block* b = const_cast<Block*>(&m_head);
+        for (unsigned n = 0; n < index; ++n)
+        {
+            Block* nxt = b->next.load(std::memory_order_acquire);
+            if (!nxt)
+            {
+                if (!make) return nullptr;
+                ETCS::MemoryArena& arena =
+                    const_cast<Derived*>(static_cast<const Derived*>(this))->getArena();
+                Block* fresh = arena.allocate<Block>();
+                if (!fresh) return nullptr;
+                Block* expect = nullptr;
+                if (!b->next.compare_exchange_strong(expect, fresh,
+                                                     std::memory_order_acq_rel))
+                    nxt = expect;                    // lost the race; theirs wins,
+                                                     // ours is arena-owned and inert
+                else nxt = fresh;
+            }
+            b = nxt;
+        }
+        return b;
+    }
+    // This entity's own edge index, or -1. Cached because "the origin is me" is
+    // nearly every mark in the system; see MarkObservedLocal.
+    std::atomic<int32_t>  m_selfEdge{-1};
 };
 
 #endif

@@ -226,7 +226,7 @@ struct IWireThread
 struct ObserverEdge
 {
     uint64_t observer_rid = 0;
-    uint8_t  slot         = 0;
+    uint16_t slot         = 0;
     bool valid() const { return observer_rid != 0; }
 };
 

@@ -1293,6 +1293,60 @@ int main()
         ETCS::MemoryArena::getInstance().deleteEntity(node, true);
     }
 
+    // -- 25. The chain: capacity past one word, origin exact at depth --------
+    //
+    // Extension blocks are STORAGE, not observers -- this entity's slot table
+    // continued elsewhere, reached by pointer and never addressed as an edge.
+    // So no bits are reserved for them, marks propagate into them eagerly
+    // carrying the original origin, and an RID being a global identity means
+    // depth changes where a slot lives, never what the edge is.
+    {
+        PixelNode* src = arena.allocate<PixelNode>();
+        src->Allocate(4, 4);
+
+        // One past a single word, so at least one extension block is forced.
+        const unsigned N = ETCS_OBSERVABLE_EDGE_BITS + 8;
+        std::vector<ETCS::ObserverEdge> edges;
+        for (unsigned k = 0; k < N; ++k)
+            edges.push_back(src->Observe(9000 + k));
+
+        bool all_valid = true, spans_blocks = false;
+        for (const auto& e : edges)
+        {
+            if (!e.valid()) all_valid = false;
+            if (e.slot >= ETCS_OBSERVABLE_EDGE_BITS) spans_blocks = true;
+        }
+        check(all_valid, "capacity extends past one word");
+        check(spans_blocks, "...into a second block, by index");
+        check(src->Observed(), "and the entity reports as watched");
+
+        for (const auto& e : edges) (void)src->TakeObserved(e);   // settle every edge
+
+        // A change caused by ONE observer must reach all the others and skip
+        // only that one -- including when cause and observer are in different
+        // blocks, which is the case the chain could have blurred.
+        const uint64_t cause = 9000 + (ETCS_OBSERVABLE_EDGE_BITS + 2);   // in block 1
+        src->MarkObservedLocal(cause);
+
+        unsigned told = 0, cause_told = 0;
+        for (const auto& e : edges)
+        {
+            const bool dirty = src->TakeObserved(e);
+            if (e.observer_rid == cause) cause_told += dirty ? 1 : 0;
+            else                          told      += dirty ? 1 : 0;
+        }
+        check(told == N - 1, "every other edge is told, across both blocks");
+        check(cause_told == 0, "and the cause is not told about its own change, at depth");
+
+        // The edge in the far block still round-trips by RID as well as handle.
+        const uint64_t far = 9000 + ETCS_OBSERVABLE_EDGE_BITS;
+        src->MarkObservedLocal(0);
+        check(src->TakeObserved(far), "an edge in an extension block reads by RID too");
+        check(!src->TakeObserved(far), "...and clears just that one");
+
+        ETCS::MemoryArena::getInstance().deleteEntity(src, true);
+    }
+
     ETCS::MemoryArena::getInstance().deleteEntity(canvas, true);
     ETCS::MemoryArena::getInstance().deleteEntity(sink, true);
 
