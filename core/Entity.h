@@ -2177,7 +2177,7 @@ private:
         {
             void* p = n->getInterfacePointer(ETCS::Buffer("Observable"));
             if (!p) continue;
-            static_cast<ETCS::IWireObservable*>(p)->MarkObserved();
+            static_cast<ETCS::IWireObservable*>(p)->MarkObserved(target->getRID());
             break;
         }
         return changed;

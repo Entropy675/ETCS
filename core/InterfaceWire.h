@@ -215,19 +215,69 @@ struct IWireThread
 // read-and-clear flag lets whichever looks first consume the other's
 // invalidation.
 // ---------------------------------------------------------------------------
+// The observer's own end of one edge. Defined in core because it crosses the
+// wire: two words, trivially copyable, fixed layout -- the same reason TBuffer
+// exists rather than std::string.
+//
+// slot is a CACHE of the RID->position inversion, never a replacement for it.
+// The RID stays the identity; the slot makes reading the edge a load and a
+// compare instead of a search, and a handle whose slot has been vacated and
+// reused fails its verify rather than silently addressing a stranger.
+struct ObserverEdge
+{
+    uint64_t observer_rid = 0;
+    uint8_t  slot         = 0;
+    bool valid() const { return observer_rid != 0; }
+};
+
 struct IWireObservable
 {
     virtual ~IWireObservable() = default;
 
-    // Register/forget something that watches this entity. An observer that is
-    // an ancestor does not need this -- see MarkObserved.
-    virtual void Observe(uint64_t observer_rid) = 0;
+    // Register something that watches this entity, and hand back its end of the
+    // edge. An observer that is an ancestor does not need this -- see
+    // MarkObserved.
+    virtual ObserverEdge Observe(uint64_t observer_rid) = 0;
     virtual void Unobserve(uint64_t observer_rid) = 0;
 
-    // This entity changed. Marks every registered observer, then bubbles to the
-    // nearest Observable ancestor, which does the same -- so a change reaches
-    // the root by composition rather than by anyone walking the whole tree.
-    virtual void MarkObserved() = 0;
+    /*
+     * This entity changed. Marks every registered observer, then bubbles to the
+     * nearest Observable ancestor, which does the same -- so a change reaches
+     * the root by composition rather than by anyone walking the whole tree.
+     *
+     * ORIGIN IS WHO CAUSED IT, and it is carried unchanged through every hop.
+     * The observer whose RID equals it is skipped: you never need telling about
+     * a change you made yourself.
+     *
+     * That one bit of identity is what the bare flag could not express, and its
+     * absence was a lost update rather than an inefficiency. A node that writes
+     * its own cache marks itself along with everyone else, so it had to clear
+     * its own bit afterwards -- and that clear could not tell its own mark from
+     * one a concurrent writer had left during the write, so it swallowed it.
+     * Demonstrated in the ontology tester. Skipping at the source removes the
+     * clear, and with it the race.
+     */
+    virtual void MarkObserved(uint64_t origin_rid) = 0;
+
+    /*
+     * Mark my own observers and STOP -- no walk in either direction.
+     *
+     * The primitive the DOWNWARD edge is built from. MarkObserved says "what I
+     * contain changed", which is news to whoever holds a merged copy of me, so
+     * it travels up. The opposite statement -- "the frame I hand my children
+     * changed" -- is news to what is below me, and the two cannot be the same
+     * call: a compositor recomposing its own pixels is not telling its children
+     * their coordinates moved.
+     *
+     * On the wire because reaching a child's Observable half is a cross-family
+     * hop like any other; the walk that uses it is family-level
+     * (ObservableBase::MarkObservedBelow).
+     */
+    virtual void MarkObservedLocal(uint64_t origin_rid) = 0;
+
+    // Read-and-clear through a held edge: index, verify, test-and-clear. No
+    // search, and a stale handle is detected rather than aliased.
+    virtual bool TakeObserved(const ObserverEdge& edge) = 0;
 
     // Has this changed since `observer` last looked? Read-and-clear, and only
     // for that observer.

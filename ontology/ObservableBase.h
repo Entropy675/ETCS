@@ -1,72 +1,248 @@
 #ifndef BASE_OBSERVABLE_H__
 #define BASE_OBSERVABLE_H__
 #include "Observable.h"
-#include <algorithm>
-#include <mutex>
+#include <atomic>
 #include <vector>
 
-// The registry and the per-observer bits live here, not in the leaves: this is
-// bookkeeping every observed type needs and none of them should write twice.
+// ---------------------------------------------------------------------------
+// Tunables. Local to this family on purpose -- the width is a property of how
+// this trait stores its edges, not of the runtime's shape, so it does not
+// belong in ETCS_API.h where it would read as something other subsystems are
+// meant to care about.
 //
-// One vector, not a map. An entity has a handful of observers -- a scene has
-// one or two cameras -- so a linear scan beats a hash, and the dirty bit rides
-// beside the RID rather than in a second container that can disagree with it.
+// EDGE_BITS is one machine word and should stay one: the whole design is that
+// every edge's state is a single atomic load or store. CHAIN_SLOTS are the
+// reserved tail used to extend capacity past one word (see the chain note
+// below); DIRECT_SLOTS is what is left for real observers.
+// ---------------------------------------------------------------------------
+#define ETCS_OBSERVABLE_EDGE_BITS     64
+#define ETCS_OBSERVABLE_CHAIN_SLOTS    8
+#define ETCS_OBSERVABLE_DIRECT_SLOTS  (ETCS_OBSERVABLE_EDGE_BITS - ETCS_OBSERVABLE_CHAIN_SLOTS)
+
+// ---------------------------------------------------------------------------
+// The edge registry, and the bookkeeping every observed type would otherwise
+// write itself -- the same reason Pixels_ owns its buffer and Resizable_ owns
+// its size.
 //
-// Locked, because the marking side and the reading side are genuinely different
-// threads: a script moves a node while a frame edge asks whether it changed.
+// BIT POSITION IS EDGE IDENTITY. m_slot[i] and bit i of m_dirty/m_occupied are
+// the same edge, index-aligned, one to one. That alignment is what makes every
+// operation on the edge SET a mask op on a single word:
+//
+//     mark all but the cause    m_dirty |= m_occupied & ~originBit
+//     is anything stale         m_dirty != 0
+//     is anyone watching        m_occupied != 0
+//
+// and it is why carrying provenance costs nothing here. "A change is news to
+// every edge except the one that caused it" is one shift and one OR, where the
+// vector this replaces had to compare every entry's RID.
+//
+// SET IS THE DEFAULT STATE OF AN EDGE. A fresh edge has never been read, so it
+// has nothing to claim and must answer yes; a CLEARED bit is the exceptional
+// state, meaning "this reader is current as of now". That is also why a reused
+// slot inheriting a set bit is correct by construction rather than by luck --
+// it is the initial condition, not a leftover. The true/false naming runs
+// against the direction entropy actually flows, which is the only thing
+// confusing about it.
+//
+// NO MUTEX. Two atomic words and a slot table, so marking -- the hot path, hit
+// by every Pixels_ write and every tag transition -- is one OR rather than a
+// lock acquire plus a walk over a heap-allocated vector.
+// ---------------------------------------------------------------------------
 ETCS_SUPERTYPE_BASE(Observable)
 {
     ETCS_MAKE_INSTANCE(Observable)
 
-    void Observe(uint64_t observer_rid) override
+    /*
+ * Register, and hand back the observer's own end of the edge.
+ *
+ * RETURNING THE HANDLE IS THE TRAIT DOING ITS JOB. A slot the caller had to
+ * remember and index correctly would be a convention, and a trait exists to
+ * abolish conventions -- the boundary between observer and observed is part of
+ * the causal structure this family defines, so this family defines what one
+ * looks like (ObserverEdge, Observable.h) rather than leaving each type to
+ * invent its own bookkeeping.
+ *
+ * PUBLICATION ORDER IS LOAD-BEARING: the dirty bit is set BEFORE the RID lands
+ * in the slot. A concurrent reader then either does not see the slot at all
+ * (unregistered, told true, safe) or sees it already dirty. The other order
+ * admits a window where an edge reads as registered-and-clean, which is an
+ * under-report -- the one thing this structure must never do.
+ */
+    ETCS::ObserverEdge Observe(uint64_t observer_rid) override
     {
-        if (!observer_rid) return;
-        std::lock_guard<std::mutex> lock(m_obsMutex);
-        for (auto& o : m_observers) if (o.rid == observer_rid) return;
-        // Starts DIRTY: an observer that has never looked has nothing cached,
-        // so its first question must answer yes or it renders nothing.
-        m_observers.push_back(Watcher{observer_rid, true});
+        if (!observer_rid) return ETCS::ObserverEdge{};
+
+        // Already registered? Hand back the edge it already has.
+        for (unsigned i = 0; i < ETCS_OBSERVABLE_DIRECT_SLOTS; ++i)
+            if (m_slot[i].load(std::memory_order_acquire) == observer_rid)
+                return ETCS::ObserverEdge{observer_rid, static_cast<uint8_t>(i)};
+
+        for (unsigned i = 0; i < ETCS_OBSERVABLE_DIRECT_SLOTS; ++i)
+        {
+            uint64_t expected = 0;
+            const uint64_t bit = 1ull << i;
+            m_dirty.fetch_or(bit, std::memory_order_release);      // dirty first
+            if (m_slot[i].compare_exchange_strong(expected, observer_rid,
+                                                  std::memory_order_acq_rel))
+            {
+                m_occupied.fetch_or(bit, std::memory_order_release);
+                if (observer_rid == static_cast<Derived*>(this)->getRID())
+                    m_selfSlot.store(static_cast<int8_t>(i), std::memory_order_release);
+                return ETCS::ObserverEdge{observer_rid, static_cast<uint8_t>(i)};
+            }
+        }
+        // Full. Refused loudly rather than aliased silently -- see the chain
+        // note in Observable.h for how capacity is meant to grow.
+        ETCS_LOG("Observable", "RID:" << static_cast<Derived*>(this)->getRID()
+                 << " has no free edge slot for observer RID:" << observer_rid
+                 << " (" << ETCS_OBSERVABLE_DIRECT_SLOTS << " direct slots in use).");
+        return ETCS::ObserverEdge{};
     }
 
+    // Clears the bit as well as the slot, so a slot's bit always describes its
+    // CURRENT occupant rather than usually doing so.
     void Unobserve(uint64_t observer_rid) override
     {
-        std::lock_guard<std::mutex> lock(m_obsMutex);
-        m_observers.erase(std::remove_if(m_observers.begin(), m_observers.end(),
-                              [observer_rid](const Watcher& w){ return w.rid == observer_rid; }),
-                          m_observers.end());
+        if (!observer_rid) return;
+        for (unsigned i = 0; i < ETCS_OBSERVABLE_DIRECT_SLOTS; ++i)
+        {
+            if (m_slot[i].load(std::memory_order_acquire) != observer_rid) continue;
+            const uint64_t bit = 1ull << i;
+            m_slot[i].store(0, std::memory_order_release);
+            m_occupied.fetch_and(~bit, std::memory_order_release);
+            m_dirty.fetch_and(~bit, std::memory_order_release);
+            if (m_selfSlot.load(std::memory_order_acquire) == static_cast<int8_t>(i))
+                m_selfSlot.store(-1, std::memory_order_release);
+            return;
+        }
     }
 
     /*
- * Mark every registered observer, then hand the same statement to the nearest
- * Observable ancestor.
+ * Mark every registered observer but the cause, then hand the same statement to
+ * the nearest Observable ancestor.
  *
  * Only the NEAREST -- it does the same for its own, so the change reaches the
  * root by composition rather than by this walking the whole chain. That is
  * also what makes the propagation correct under re-parenting: nobody holds a
  * path, everyone holds one edge.
+ *
+ * origin_rid travels UNCHANGED through every hop. It is a property of the
+ * change, not of the hop: re-deriving it as "me" at each level would make a
+ * compositor skip its own edge when a descendant changed, which is exactly the
+ * stale-forever case this exists to prevent.
  */
-    void MarkObserved() override
+    void MarkObserved(uint64_t origin_rid) override
     {
-        {
-            std::lock_guard<std::mutex> lock(m_obsMutex);
-            for (auto& o : m_observers) o.dirty = true;
-        }
+        MarkObservedLocal(origin_rid);
         for (ETCS::Entity* n = static_cast<Derived*>(this)->getParent(); n; n = n->getParent())
         {
             void* p = n->getInterfacePointer(ETCS::Buffer("Observable"));
             if (!p) continue;
-            static_cast<ETCS::IWireObservable*>(p)->MarkObserved();
+            static_cast<ETCS::IWireObservable*>(p)->MarkObserved(origin_rid);
             return;
         }
     }
 
-    // Read-and-clear, for one observer only. An unregistered observer gets
-    // true: it has never been told anything, so it cannot assume it is current.
+    /*
+ * Mine only, no walk. The primitive both directions are built from.
+ *
+ * The self-slot cache is what keeps this O(1). Nearly every origin in the
+ * system is the marking entity itself (etcs_mark_observed passes from->getRID()),
+ * and without the cache that RID would be searched for across every slot and
+ * usually not found -- a full walk on the hottest path in the family, to
+ * discover nothing. With it, the common case is a load and a mask.
+ */
+    void MarkObservedLocal(uint64_t origin_rid) override
+    {
+        uint64_t exclude = 0;
+        if (origin_rid)
+        {
+            if (origin_rid == static_cast<Derived*>(this)->getRID())
+            {
+                const int8_t s = m_selfSlot.load(std::memory_order_acquire);
+                if (s >= 0) exclude = 1ull << static_cast<unsigned>(s);
+            }
+            else
+            {
+                for (unsigned i = 0; i < ETCS_OBSERVABLE_DIRECT_SLOTS; ++i)
+                    if (m_slot[i].load(std::memory_order_acquire) == origin_rid)
+                    { exclude = 1ull << i; break; }
+            }
+        }
+        const uint64_t live = m_occupied.load(std::memory_order_acquire);
+        m_dirty.fetch_or(live & ~exclude, std::memory_order_release);
+    }
+
+    /*
+ * THE OTHER DIRECTION OF THE SAME CONTAINMENT EDGE.
+ *
+ * Containment is one relation carrying two different statements. Upward: "what
+ * I contain changed", so whoever holds a merged copy of me is stale. Downward:
+ * "the frame I hand you changed", so whatever you derive FROM me is stale.
+ * Neither implies the other -- a compositor rebuilding its pixels tells its
+ * parent something and its children nothing; a compositor MOVING tells its
+ * children something and its parent something else.
+ *
+ * Both are intrinsic, because containment is what makes them true. A child does
+ * not register to be told its parent moved, any more than a parent registers to
+ * be told a descendant changed.
+ *
+ * ONE LEVEL, and the rest by composition -- the same rule MarkObserved follows
+ * going up. A child that acts on this mark calls this in turn, so the subtree is
+ * reached by everyone holding one edge rather than by anyone walking a path.
+ * That keeps it right under re-parenting, and keeps a settled subtree free:
+ * marking stops wherever nobody is pulling.
+ *
+ * What the child does with it is the child's business -- Observable states the
+ * causal structure and no more. The intended shape is the lazy pull the rest of
+ * this family uses: the bit says there is something readable over here, and the
+ * child reads the parent's state when IT next runs, so a derived value is
+ * recomputed at the rate the SOURCE changes rather than once per frame forever.
+ */
+    void MarkObservedBelow()
+    {
+        std::vector<std::pair<ETCS::Buffer, ETCS::RID>> kids;
+        static_cast<Derived*>(this)->getTypedChildren(kids);
+        for (const auto& entry : kids)
+        {
+            ETCS::Entity* child = static_cast<Derived*>(this)->getTypedChild(entry.first, entry.second);
+            if (!child) continue;
+            void* p = child->getInterfacePointer(ETCS::Buffer("Observable"));
+            if (!p) continue;
+            static_cast<ETCS::IWireObservable*>(p)->MarkObservedLocal(
+                static_cast<Derived*>(this)->getRID());
+        }
+    }
+
+    /*
+ * The fast read: index, verify, test-and-clear. No search anywhere.
+ *
+ * The verify is not defensive clutter. It is what keeps the RID the real
+ * identity and makes the slot a CACHE of the inversion rather than a
+ * replacement for it -- a handle into a slot that has since been vacated and
+ * reused reads as a mismatch and is reported honestly, instead of silently
+ * addressing a stranger's edge.
+ */
+    bool TakeObserved(const ETCS::ObserverEdge& e) override
+    {
+        if (!e.valid() || e.slot >= ETCS_OBSERVABLE_DIRECT_SLOTS) return true;
+        if (m_slot[e.slot].load(std::memory_order_acquire) != e.observer_rid)
+            return true;                       // stale handle: no live edge, no claim
+        const uint64_t bit = 1ull << e.slot;
+        return (m_dirty.fetch_and(~bit, std::memory_order_acq_rel) & bit) != 0;
+    }
+
+    /*
+ * The inversion, for a caller holding no handle. Carries a semantic the handle
+ * form structurally cannot: an observer with NO edge is told true, because an
+ * edge that does not exist carries nothing and so cannot support a claim to be
+ * current.
+ */
     bool TakeObserved(uint64_t observer_rid) override
     {
-        std::lock_guard<std::mutex> lock(m_obsMutex);
-        for (auto& o : m_observers)
-            if (o.rid == observer_rid) { const bool was = o.dirty; o.dirty = false; return was; }
+        for (unsigned i = 0; i < ETCS_OBSERVABLE_DIRECT_SLOTS; ++i)
+            if (m_slot[i].load(std::memory_order_acquire) == observer_rid)
+                return TakeObserved(ETCS::ObserverEdge{observer_rid, static_cast<uint8_t>(i)});
         return true;
     }
 
@@ -75,56 +251,42 @@ ETCS_SUPERTYPE_BASE(Observable)
  * an observer of that subtree like any other, and the subtree is below it, so
  * the bubble already arrives here -- this is what gives it somewhere to land.
  *
- * TakeObserved(getRID()) is then the node's own "is my cache stale", which is
- * what the single dirty flag used to answer. Not a compositor convenience: a
- * merkle hash is exactly this shape, a cache of everything underneath that
- * recomputes when its own bit is set, so self-observation is the general form
- * and the compositor's raster is its first user.
+ * Not a compositor convenience: a merkle hash is exactly this shape, a cache of
+ * everything underneath that recomputes when its own edge is set, so
+ * self-observation is the general form and the compositor's raster is its first
+ * user.
  *
- * Registration is explicit and must not be forgotten -- an unregistered
- * observer is told true forever (see TakeObserved), so a node that skips this
- * recomputes every frame and nothing reports it. The ontology tester checks
- * that a self-observing node SETTLES for exactly that reason.
+ * No clear is needed after a self-write. The node's own marks carry origin=itself
+ * and are excluded at the source, so its own edge only ever carries somebody
+ * else's change.
  */
-    void ObserveSelf() { Observe(static_cast<Derived*>(this)->getRID()); }
-
-    /*
- * My own write is not news to me. Called by a self-observing node AFTER it
- * rebuilds its cache, to drop the marks that rebuild just caused.
- *
- * The single flag did not need this and the per-observer form does, which is
- * worth stating because it is the one place the two are not equivalent. With
- * one bool the order did the work: the node took the flag (clearing it), then
- * wrote, and the write re-set the flag FOR THE UPLOADER, who took it in turn.
- * One consumer handed it to the next. With independent bits a write marks
- * every observer including this node's own, nobody clears that one, and the
- * node rebuilds every frame forever -- a silent loss of exactly the skip the
- * cache exists for, with correct output the whole time.
- */
-    void ClearSelfObserved() { (void)TakeObserved(static_cast<Derived*>(this)->getRID()); }
+    ETCS::ObserverEdge ObserveSelf()
+    { return Observe(static_cast<Derived*>(this)->getRID()); }
 
     // A snapshot of who is watching, for a caller that has to do something per
     // observer beyond asking whether it changed. Family-level rather than on
     // the wire: the runtime never needs the list, only the answer.
     void ObserverRids(std::vector<uint64_t>& out) const
     {
-        std::lock_guard<std::mutex> lock(m_obsMutex);
-        out.reserve(out.size() + m_observers.size());
-        for (const auto& o : m_observers) out.push_back(o.rid);
+        for (unsigned i = 0; i < ETCS_OBSERVABLE_DIRECT_SLOTS; ++i)
+        {
+            const uint64_t r = m_slot[i].load(std::memory_order_acquire);
+            if (r) out.push_back(r);
+        }
     }
 
-    // Family-level, not on the interface -- see Observable.h. A node with no
-    // observers can skip work whose only purpose is to be looked at.
-    bool Observed() const
-    {
-        std::lock_guard<std::mutex> lock(m_obsMutex);
-        return !m_observers.empty();
-    }
+    // One load each, where the vector form had to take a lock and look at a
+    // container. Family-level, not on the interface -- see Observable.h.
+    bool Observed()  const { return m_occupied.load(std::memory_order_acquire) != 0; }
+    bool AnyStale()  const { return m_dirty.load(std::memory_order_acquire)    != 0; }
 
 private:
-    struct Watcher { uint64_t rid; bool dirty; };
-    mutable std::mutex   m_obsMutex;
-    std::vector<Watcher> m_observers;
+    std::atomic<uint64_t> m_occupied{0};   // slot i holds a live edge
+    std::atomic<uint64_t> m_dirty{0};      // slot i has entropy to flow
+    std::atomic<uint64_t> m_slot[ETCS_OBSERVABLE_DIRECT_SLOTS]{};
+    // Which slot is this entity's own edge, or -1. Cached because "the origin is
+    // me" is nearly every mark in the system; see MarkObservedLocal.
+    std::atomic<int8_t>   m_selfSlot{-1};
 };
 
 #endif

@@ -930,15 +930,48 @@ int main()
         check(!node->TakeObserved(node->getRID()),
               "...and SETTLES -- an unregistered one would answer true forever");
 
-        node->FillRect(0, 0, 2, 2, 0.f, 0.f, 1.f, 1.f);
+        // A CHILD changing is what a self-observer is watching for. Its own
+        // write is not -- see below.
+        PixelNode* kid = node->addTag<PixelNode>();
+        kid->Allocate(2, 2);
+        (void)node->TakeObserved(node->getRID());
+        kid->FillRect(0, 0, 1, 1, 0.f, 0.f, 1.f, 1.f);
         check(node->TakeObserved(node->getRID()), "its own subtree changing wakes it");
 
         node->FillRect(0, 0, 1, 1, 1.f, 1.f, 1.f, 1.f);
-        node->ClearSelfObserved();
         check(!node->TakeObserved(node->getRID()),
-              "a node's own write is not news to it -- else it rebuilds every frame");
+              "a node's own write is not news to it -- skipped at the source, no clear needed");
 
         ETCS::MemoryArena::getInstance().deleteEntity(node, true);
+    }
+
+    // -- 13b. The edge handle: addressing without a search -------------------
+    {
+        PixelNode* src = arena.allocate<PixelNode>();
+        src->Allocate(4, 4);
+
+        const uint64_t devA = 7001, devB = 7002;
+        ETCS::ObserverEdge ea = src->Observe(devA);
+        ETCS::ObserverEdge eb = src->Observe(devB);
+        check(ea.valid() && eb.valid(), "Observe hands back the observer's end of the edge");
+        check(ea.slot != eb.slot, "distinct observers get distinct slots");
+        check(ea.observer_rid == devA, "and the RID stays the identity the slot caches");
+
+        check(src->TakeObserved(ea), "a fresh edge is set -- that is its default state");
+        check(!src->TakeObserved(ea), "...and reading it clears that one edge");
+        check(src->TakeObserved(eb), "...leaving the other observer's edge untouched");
+
+        // Re-registering is idempotent and returns the SAME edge, not a second one.
+        ETCS::ObserverEdge again = src->Observe(devA);
+        check(again.slot == ea.slot, "re-observing hands back the edge already held");
+
+        // A handle into a vacated slot verifies rather than aliasing a stranger.
+        src->Unobserve(devA);
+        check(src->TakeObserved(ea),
+              "a stale handle reports true -- no live edge, so no claim to be current");
+        check(!src->Observed() == false, "the other observer is still watching");
+
+        ETCS::MemoryArena::getInstance().deleteEntity(src, true);
     }
 
     // -- 14. Observable: parent/child edges are intrinsic -------------------
@@ -1165,6 +1198,99 @@ int main()
         check(parent->ClosureSize() == 1, "...and nothing is bound as a side effect");
 
         ETCS::MemoryArena::getInstance().deleteEntity(parent, true);
+    }
+
+    // -- 22. Observable: the containment edge runs BOTH ways -----------------
+    //
+    // Upward and downward are different statements about the same edge, and the
+    // whole point of separating them is that neither implies the other.
+    {
+        PixelNode* parent = arena.allocate<PixelNode>();
+        parent->Allocate(16, 16);
+        PixelNode* child = parent->addTag<PixelNode>();
+        child->Allocate(4, 4);
+        PixelNode* grandchild = child->addTag<PixelNode>();
+        grandchild->Allocate(2, 2);
+
+        const uint64_t above = 4001;
+        parent->Observe(above);
+        child->ObserveSelf();
+        grandchild->ObserveSelf();
+        (void)parent->TakeObserved(above);
+        (void)child->TakeObserved(child->getRID());
+        (void)grandchild->TakeObserved(grandchild->getRID());
+
+        // Downward: the frame the children sit in moved.
+        parent->MarkObservedBelow();
+        check(child->TakeObserved(child->getRID()),
+              "a downward mark reaches the direct child");
+        check(!parent->TakeObserved(above),
+              "...and does NOT travel up -- moving is not the same as changing content");
+        check(!grandchild->TakeObserved(grandchild->getRID()),
+              "...nor past one level: the rest is reached by composition, as upward is");
+
+        // The child continuing the statement is what carries it the rest of the way.
+        child->MarkObservedBelow();
+        check(grandchild->TakeObserved(grandchild->getRID()),
+              "a child that acts on the mark passes it on, and the subtree is covered");
+
+        // Upward is unchanged, and still does not leak downward.
+        (void)child->TakeObserved(child->getRID());
+        grandchild->FillRect(0, 0, 1, 1, 1.f, 0.f, 0.f, 1.f);
+        check(parent->TakeObserved(above),
+              "a change below still bubbles to an observer above");
+        check(child->TakeObserved(child->getRID()),
+              "...marking the compositors on the way, which is the upward path");
+
+        ETCS::MemoryArena::getInstance().deleteEntity(parent, true);
+    }
+
+    // -- 23. Observable: MarkObservedLocal is the primitive, and it stays put --
+    {
+        PixelNode* parent = arena.allocate<PixelNode>();
+        parent->Allocate(8, 8);
+        PixelNode* child = parent->addTag<PixelNode>();
+        child->Allocate(2, 2);
+
+        const uint64_t above = 5001;
+        parent->Observe(above);
+        child->ObserveSelf();
+        (void)parent->TakeObserved(above);
+        (void)child->TakeObserved(child->getRID());
+
+        child->MarkObservedLocal(0);
+        check(child->TakeObserved(child->getRID()), "a local mark marks my own observers");
+        check(!parent->TakeObserved(above), "...and walks nowhere at all");
+
+        ETCS::MemoryArena::getInstance().deleteEntity(parent, true);
+    }
+
+    // -- 24. A concurrent foreign mark survives a node's own write ----------
+    //
+    // The lost update the origin exists to prevent, kept as a test because it
+    // was real: with a bare flag, a node recomposing marked ITSELF along with
+    // everyone else, so it cleared its own bit afterwards -- and that clear
+    // could not tell its own mark from one a concurrent writer had left during
+    // the write. This is that exact interleaving.
+    {
+        PixelNode* node = arena.allocate<PixelNode>();
+        node->Allocate(4, 4);
+        node->ObserveSelf();
+        (void)node->TakeObserved(node->getRID());          // the gate settles it
+
+        node->FillRect(0, 0, 2, 2, 1.f, 0.f, 0.f, 1.f);    // my own write, mid-recompose
+        check(!node->TakeObserved(node->getRID()),
+              "my own write does not mark my own edge");
+
+        // Meanwhile another thread changes a child, which bubbles to me. Under
+        // the old shape this and the line above were indistinguishable.
+        node->MarkObservedLocal(0);                         // origin: not me
+        node->FillRect(0, 0, 1, 1, 0.f, 1.f, 0.f, 1.f);    // recompose keeps writing
+
+        check(node->TakeObserved(node->getRID()),
+              "a foreign mark arriving during my own write SURVIVES it");
+
+        ETCS::MemoryArena::getInstance().deleteEntity(node, true);
     }
 
     ETCS::MemoryArena::getInstance().deleteEntity(canvas, true);

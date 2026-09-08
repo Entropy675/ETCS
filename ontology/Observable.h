@@ -2,6 +2,8 @@
 #define SUPERTYPE_OBSERVABLE_H__
 
 #include "../core_defs.h"
+#include <utility>
+#include <vector>
 
 // ---------------------------------------------------------------------------
 // Observable — something records the state of another and wants to know when
@@ -26,11 +28,28 @@
 //     unregistered observer is told true: it has no edge to have been told
 //     along, so it cannot claim to be current.
 //
-// EDGES ARE INTRINSIC ONLY FOR PARENT/CHILD. An ancestor observes its
-// descendants by construction -- the containment IS the edge -- so a change
-// bubbles up the parent chain with nothing registered. EVERY other edge is
-// declared with Observe(): a camera naming a scene it does not contain, a
-// device caching an image, a follower tracking a size.
+// EDGES ARE INTRINSIC ONLY FOR PARENT/CHILD, AND THEY RUN BOTH WAYS. Containment
+// is one relation carrying two different statements, and each is news to the
+// opposite side:
+//
+//   upward    MarkObserved       "what I contain changed" -- so anything holding
+//                                a merged copy of me is stale. Bubbles to the
+//                                nearest Observable ancestor, which does the same.
+//   downward  MarkObservedBelow  "the frame I hand you changed" -- so anything
+//                                you derive FROM me is stale. Marks direct
+//                                children; each continues when it acts.
+//
+// Neither implies the other, which is why they are two calls. A compositor
+// rebuilding its own pixels tells its parent something and its children nothing;
+// a compositor MOVING tells its children their coordinates shifted and tells its
+// parent something else entirely. One call for both would make every recompose
+// look like a reparenting to everything underneath it.
+//
+// Both directions are intrinsic because containment is what makes them true: a
+// child no more registers to hear that its parent moved than an ancestor
+// registers to hear that a descendant changed. EVERY OTHER edge is declared with
+// Observe(): a camera naming a scene it does not contain, a device caching an
+// image, a follower tracking a size.
 //
 // SELF-OBSERVATION IS REGISTERED, not intrinsic, and the distinction is not
 // pedantic. A node watching its own subtree is not its own parent; the edge
@@ -46,9 +65,10 @@ class Observable_ : public ETCS::IWireObservable, virtual public ETCS::Entity
 public:
     virtual ~Observable_() = default;
 
-    void Observe(uint64_t observer_rid) override   = 0;
+    ETCS::ObserverEdge Observe(uint64_t observer_rid) override = 0;
     void Unobserve(uint64_t observer_rid) override = 0;
-    void MarkObserved() override                   = 0;
+    void MarkObserved(uint64_t origin_rid) override = 0;
+    bool TakeObserved(const ETCS::ObserverEdge& edge) override = 0;
     bool TakeObserved(uint64_t observer_rid) override = 0;
 
     // NOTHING ELSE. The four above are the wire, answered by the base for
@@ -93,7 +113,33 @@ inline ETCS::IWireObservable* etcs_observable_of(ETCS::Entity* e)
 inline void etcs_mark_observed(ETCS::Entity* from)
 {
     for (ETCS::Entity* n = from; n; n = n->getParent())
-        if (ETCS::IWireObservable* o = etcs_observable_of(n)) { o->MarkObserved(); return; }
+        if (ETCS::IWireObservable* o = etcs_observable_of(n))
+        { o->MarkObserved(from->getRID()); return; }
+}
+
+/*
+ * The downward counterpart: say that what `from` hands its children has moved.
+ *
+ * Free-function form for the same reason etcs_mark_observed has one -- a caller
+ * holding a Drawable2D_* or writing from outside the tree has no route to the
+ * family, and a leaf that never claimed Observable should degrade rather than
+ * drop the statement.
+ *
+ * Deliberately NOT a walk to the leaves. One level, and each child that acts on
+ * the mark passes it on; see ObservableBase::MarkObservedBelow.
+ */
+inline void etcs_mark_observed_below(ETCS::Entity* from)
+{
+    if (!from) return;
+    std::vector<std::pair<ETCS::Buffer, ETCS::RID>> kids;
+    from->getTypedChildren(kids);
+    for (const auto& entry : kids)
+    {
+        ETCS::Entity* child = from->getTypedChild(entry.first, entry.second);
+        if (!child) continue;
+        if (ETCS::IWireObservable* o = etcs_observable_of(child))
+            o->MarkObservedLocal(from->getRID());
+    }
 }
 
 #endif // SUPERTYPE_OBSERVABLE_H__
