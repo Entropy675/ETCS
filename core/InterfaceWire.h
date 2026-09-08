@@ -178,6 +178,40 @@ struct IWireThread
     virtual bool Halted() const = 0;
 };
 
+// ---------------------------------------------------------------------------
+// IWireObservable — the observation slot. Fulfilled by the Observable
+// family (ontology/Observable.h).
+//
+// The general causal structure: something records the state of another and
+// wants to know when that changes. Nothing about pixels, cameras or hashes --
+// those are USERS of it. The merkle hash in particular is its own independently
+// updated structure that happens to fit this shape exactly; it observes and
+// marks through here rather than living on this surface.
+//
+// Dirty is PER OBSERVER, which is the whole reason this is a wire and not a
+// bool. Two cameras viewing one scene each need telling once; a single
+// read-and-clear flag lets whichever looks first consume the other's
+// invalidation.
+// ---------------------------------------------------------------------------
+struct IWireObservable
+{
+    virtual ~IWireObservable() = default;
+
+    // Register/forget something that watches this entity. An observer that is
+    // an ancestor does not need this -- see MarkObserved.
+    virtual void Observe(uint64_t observer_rid) = 0;
+    virtual void Unobserve(uint64_t observer_rid) = 0;
+
+    // This entity changed. Marks every registered observer, then bubbles to the
+    // nearest Observable ancestor, which does the same -- so a change reaches
+    // the root by composition rather than by anyone walking the whole tree.
+    virtual void MarkObserved() = 0;
+
+    // Has this changed since `observer` last looked? Read-and-clear, and only
+    // for that observer.
+    virtual bool TakeObserved(uint64_t observer_rid) = 0;
+};
+
 } // namespace ETCS
 
 #endif

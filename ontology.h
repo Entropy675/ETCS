@@ -64,6 +64,9 @@
 // unclaimed. Beside Lifecycle because they are used together: retiring an
 // entity asks its bodies to stop before it tells the type to let go.
 #include "ontology/ThreadedBase.h"
+// Observable is the general observer/dirty structure the render tree already
+// had twice by hand. See ontology/Observable.h.
+#include "ontology/ObservableBase.h"
 #include "ontology/EphemeralBase.h"
 #include "ontology/ParserBase.h"
 #include "ontology/WrapperBase.h"
