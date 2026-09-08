@@ -310,6 +310,47 @@ public:
 // families compose, register, and hand a leaf the shared behaviour they
 // promise, not that anyone can rasterise a font.
 // ---------------------------------------------------------------------------
+// A CPU-backed surface, which is all this needs to be: Drawable2D gives it
+// Surface, Surface gives it Resizable, and Resizable gives it Observable. So
+// the observation tests below reach it exactly the way a device would.
+class PixelNode : public Drawable2DBase<PixelNode>,
+                  public PixelsBase<PixelNode>
+{
+public:
+    WIRE_TYPE_IDENTITY(PixelNode)
+
+    int32_t z = 0;
+    int32_t Order() override { return z; }
+    bool operator<(const PixelNode& o) const { return z < o.z; }
+
+    Rect2D BoundsConcrete() { return Rect2D{0, 0, PixelWidth(), PixelHeight()}; }
+    bool   ContainsLocalConcrete(int32_t, int32_t) { return true; }
+    WindowSize GetSizeConcrete() { return WindowSize{PixelWidth(), PixelHeight()}; }
+
+    // Resizable's verb, so PollResize has something to land on.
+    bool resized = false;
+    bool ResizeTo(WindowSize s) override
+    {
+        Allocate(s.width, s.height);
+        resized = true;
+        return true;
+    }
+
+    // A stand-in for a window manager delivering a size, so the settle
+    // countdown can be driven without one.
+    void deliverSize(WindowSize s) { notifyResize(s); }
+
+    // Resizable_'s own record, which is what a follower would read. Distinct
+    // from GetSize here only because this leaf's size is its pixel buffer.
+    WindowSize recordedSize() const { return m_size; }
+
+    void ClearConcrete(float r, float g, float b, float a) { ClearTo(r, g, b, a); }
+    void DrawRectConcrete(int32_t x, int32_t y, uint32_t w, uint32_t h,
+                          float r, float g, float b, float a) { FillRect(x, y, w, h, r, g, b, a); }
+    void BlitConcrete(Surface_*, int32_t, int32_t, uint32_t, uint32_t, float) {}
+    void DrawIntoConcrete(Surface_*) {}
+};
+
 class Instrument : public ClippableBase<Instrument>,
                    public GlyphsBase<Instrument>,
                    public PointerBase<Instrument>
@@ -810,6 +851,220 @@ int main()
         check(ins->PointerInside(), "PointerInside is a separate question from the coordinates");
 
         ETCS::MemoryArena::getInstance().deleteEntity(ins, true);
+    }
+
+    // -- 12. Observable: the dirty bit is an EDGE, not a state -------------
+    //
+    // The whole reason the family exists. Everything here fails against a
+    // single read-and-clear flag on the observed, which is what this replaced.
+    {
+        PixelNode* src = arena.allocate<PixelNode>();
+        src->Allocate(8, 8);
+
+        void* op = src->getInterfacePointer(ETCS::Buffer("Observable"));
+        check(op != nullptr, "a Pixels leaf is Observable (via Surface -> Resizable)");
+        ETCS::IWireObservable* obs = static_cast<ETCS::IWireObservable*>(op);
+
+        // Two devices over one image -- paint_two_windows in miniature.
+        const uint64_t devA = 1001, devB = 1002;
+        obs->Observe(devA);
+        obs->Observe(devB);
+
+        check(obs->TakeObserved(devA), "a new observer starts dirty -- it has nothing cached");
+        check(obs->TakeObserved(devB), "...and so does the second, independently");
+        check(!obs->TakeObserved(devA), "reading clears it FOR THAT OBSERVER");
+
+        src->FillRect(0, 0, 4, 4, 1.f, 0.f, 0.f, 1.f);
+        check(obs->TakeObserved(devA), "a write tells the first observer");
+        check(obs->TakeObserved(devB),
+              "AND the second -- one flag let whichever looked first eat the other's");
+        check(!obs->TakeObserved(devB), "...and both settle again");
+
+        check(obs->TakeObserved(9999),
+              "an unregistered observer is told true: no edge, so no claim to be current");
+
+        // Registration is what an edge IS, so dropping it drops the bit.
+        obs->Unobserve(devA);
+        src->FillRect(0, 0, 2, 2, 0.f, 1.f, 0.f, 1.f);
+        check(obs->TakeObserved(devB), "an observer still registered still hears");
+        check(src->Observed(), "Observed() is 'is anyone watching'");
+        obs->Unobserve(devB);
+        check(!src->Observed(), "...and false once the last edge is gone");
+
+        ETCS::MemoryArena::getInstance().deleteEntity(src, true);
+    }
+
+    // -- 13. Observable: self-observation settles --------------------------
+    //
+    // A node caching something derived from its own subtree registers an edge
+    // to ITSELF -- not intrinsic, since a node is not its own parent. This is
+    // the check that catches a forgotten ObserveSelf, whose only other symptom
+    // is recomposing every frame forever with correct output the whole time.
+    {
+        PixelNode* node = arena.allocate<PixelNode>();
+        node->Allocate(4, 4);
+        node->ObserveSelf();
+
+        check(node->TakeObserved(node->getRID()), "a self-observer starts dirty");
+        check(!node->TakeObserved(node->getRID()),
+              "...and SETTLES -- an unregistered one would answer true forever");
+
+        node->FillRect(0, 0, 2, 2, 0.f, 0.f, 1.f, 1.f);
+        check(node->TakeObserved(node->getRID()), "its own subtree changing wakes it");
+
+        node->FillRect(0, 0, 1, 1, 1.f, 1.f, 1.f, 1.f);
+        node->ClearSelfObserved();
+        check(!node->TakeObserved(node->getRID()),
+              "a node's own write is not news to it -- else it rebuilds every frame");
+
+        ETCS::MemoryArena::getInstance().deleteEntity(node, true);
+    }
+
+    // -- 14. Observable: parent/child edges are intrinsic -------------------
+    {
+        PixelNode* parent = arena.allocate<PixelNode>();
+        parent->Allocate(16, 16);
+        PixelNode* child = parent->addTag<PixelNode>();
+        child->Allocate(4, 4);
+
+        const uint64_t watcher = 2001;
+        parent->Observe(watcher);
+        (void)parent->TakeObserved(watcher);          // settle
+
+        child->FillRect(0, 0, 2, 2, 1.f, 0.f, 1.f, 1.f);
+        check(parent->TakeObserved(watcher),
+              "a change below bubbles up with NOTHING registered between them");
+
+        ETCS::MemoryArena::getInstance().deleteEntity(parent, true);
+    }
+
+    // -- 15. Observable: a tag change is a state transition ----------------
+    {
+        PixelNode* node = arena.allocate<PixelNode>();
+        node->Allocate(4, 4);
+        const uint64_t watcher = 3001;
+        node->Observe(watcher);
+        (void)node->TakeObserved(watcher);            // settle
+
+        check(node->addTag(ETCS::Buffer("hot")), "adding a new flag reports the transition");
+        check(node->TakeObserved(watcher), "...and marks observers: tags ARE the state surface");
+
+        check(!node->addTag(ETCS::Buffer("hot")), "re-adding a present flag moves nothing");
+        check(!node->TakeObserved(watcher), "...so it must not wake anyone");
+
+        check(node->removeTag(ETCS::Buffer("hot")), "removing it is a transition too");
+        check(node->TakeObserved(watcher), "...and marks");
+
+        check(!node->removeTag(ETCS::Buffer("hot")), "removing an absent flag moves nothing");
+        check(!node->TakeObserved(watcher), "...so it must not wake anyone either");
+
+        ETCS::MemoryArena::getInstance().deleteEntity(node, true);
+    }
+
+    // -- 16. Resizable is a pull: FollowResize builds an EDGE ---------------
+    //
+    // The delivery half cannot be exercised here: PollResize resolves its
+    // source by RID (a follower outlives its source, so a captured pointer is
+    // the bug ontology/Resizable.h documents), and a type allocated straight
+    // out of the arena in this translation unit is not in the module family
+    // lists that resolve reads -- probed: MISS. The OLD FollowResize resolved
+    // at fire time for the same reason and would miss identically, so this is
+    // the tester's reach, not a change in behaviour. The full pull is covered
+    // where entities are loader-spawned (VulkanSurface follows GLFWWindow).
+    //
+    // What IS checkable here is the part that used to be a callback list: that
+    // following registers an observation edge on the SOURCE, and that a resize
+    // marks along it.
+    {
+        PixelNode* source   = arena.allocate<PixelNode>();
+        PixelNode* follower = arena.allocate<PixelNode>();
+        source->Allocate(100, 50);
+        follower->Allocate(10, 10);
+
+        check(!source->Observed(), "a source nobody follows has no observers");
+        follower->FollowResize(source);
+        check(source->Observed(), "FollowResize registers on the SOURCE, where the size lives");
+
+        check(source->TakeObserved(follower->getRID()),
+              "the follower starts dirty -- this is what the initial layout rides on");
+        check(!source->TakeObserved(follower->getRID()), "...and settles");
+
+        // Sixty events during a drag are sixty marks and ONE read of the last
+        // size. Coalescing by construction, which the push needed a staging
+        // slot and a mutex to approximate.
+        source->ResizeTo(WindowSize{200, 80});
+        source->ResizeTo(WindowSize{300, 90});
+        source->ResizeTo(WindowSize{400, 120});
+        check(source->TakeObserved(follower->getRID()),
+              "three resizes wake the follower");
+        check(!source->TakeObserved(follower->getRID()),
+              "...ONCE -- the bit coalesces where a callback list would replay three");
+        check(source->GetSize().width == 400 && source->GetSize().height == 120,
+              "and the size it would read is the latest, not an intermediate one");
+
+        ETCS::MemoryArena::getInstance().deleteEntity(follower, true);
+        ETCS::MemoryArena::getInstance().deleteEntity(source, true);
+    }
+
+    // -- 17. Pushed delivery defers until the size SETTLES ------------------
+    //
+    // The follower here has no clock, so it cannot ask; the source wakes it
+    // instead. What makes that safe is that the wake carries nothing -- the
+    // follower still reads the size, so a late wake reads the current value.
+    // Which in turn is what makes DEFERRING the wake free.
+    {
+        PixelNode* source   = arena.allocate<PixelNode>();
+        PixelNode* follower = arena.allocate<PixelNode>();
+        source->Allocate(100, 50);
+        follower->Allocate(10, 10);
+
+        follower->FollowResize(source, ResizeDelivery::Pushed);
+        check(!source->settleResize(), "an idle source counts down nothing");
+
+        source->deliverSize(WindowSize{200, 80});
+        for (int i = 1; i < RESIZE_SETTLE_FRAMES; ++i)
+            check(!source->settleResize(), "a resize does not wake on the same pass it arrives");
+        check(source->settleResize(), "...it wakes once the pump has been quiet");
+        check(!source->settleResize(), "...and exactly once");
+
+        // A drag: every event re-arms, so the wake is deferred for as long as
+        // it lasts. This is the whole difference from a rate limit, which
+        // would have fired mid-drag on a size already superseded.
+        for (int i = 0; i < 20; ++i)
+        {
+            source->deliverSize(WindowSize{ 200u + i, 80u });
+            check(!source->settleResize(), "a continuing drag keeps deferring");
+        }
+        // Bounded rather than exact: the loop above already spent passes of
+        // the countdown, and the claim under test is "it fires once the pump
+        // goes quiet", not which pass it lands on.
+        int woke = 0;
+        for (int i = 0; i < RESIZE_SETTLE_FRAMES; ++i) if (source->settleResize()) ++woke;
+        check(woke == 1, "one wake for the whole drag, when it stops");
+        check(source->recordedSize().width == 219,
+              "and the size waiting to be read is where the drag ENDED");
+
+        ETCS::MemoryArena::getInstance().deleteEntity(follower, true);
+        ETCS::MemoryArena::getInstance().deleteEntity(source, true);
+    }
+
+    // -- 18. Polled delivery asks for no wake ------------------------------
+    {
+        PixelNode* source   = arena.allocate<PixelNode>();
+        PixelNode* follower = arena.allocate<PixelNode>();
+        source->Allocate(64, 64);
+        follower->Allocate(8, 8);
+
+        follower->FollowResize(source);          // Polled is the default
+        source->deliverSize(WindowSize{128, 128});
+        for (int i = 0; i < RESIZE_SETTLE_FRAMES + 2; ++i)
+            check(!source->settleResize(),
+                  "a polled follower arms no countdown -- it will ask on its own tick");
+        check(source->TakeObserved(follower->getRID()),
+              "the EDGE is identical either way; only the delivery differs");
+
+        ETCS::MemoryArena::getInstance().deleteEntity(follower, true);
+        ETCS::MemoryArena::getInstance().deleteEntity(source, true);
     }
 
     ETCS::MemoryArena::getInstance().deleteEntity(canvas, true);

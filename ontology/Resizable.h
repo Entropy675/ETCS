@@ -3,9 +3,10 @@
 
 
 #include "../core_defs.h"
+#include "Observable.h"
 #include <cstdint>
-#include <functional>
-#include <map>
+#include <mutex>
+#include <vector>
 
 // ---------------------------------------------------------------
 // WindowSize
@@ -34,6 +35,31 @@ struct WindowSize
 // (SurfaceBase.h) because swapchain recreation on resize is not an
 // optional per-backend concern the way, say, Deletable is.
 
+/*
+ * HOW A FOLLOWER WANTS THE EDGE DELIVERED. Observable states the causal
+ * structure -- there is something readable over here -- and stops there; what
+ * an instance does about it is the instance's own business. This is that
+ * choice, made once at the point of following.
+ *
+ * Polled: the follower asks, on its own tick. For anything with a clock, and
+ * mandatory for anything whose ResizeTo must not run on a foreign thread --
+ * VulkanSurface rebuilds a swapchain, so its resize belongs to the frame
+ * thread and nowhere else.
+ *
+ * Pushed: the source calls PollResize on the follower once the size has
+ * SETTLED. For a follower with no clock of its own -- a layout solver, which
+ * is not in any frame loop and would otherwise never ask. Safe precisely
+ * because the push carries no payload: it is a wake, and the follower still
+ * reads the size itself, so a wake that arrives late still reads the current
+ * value rather than replaying a stale one.
+ */
+enum class ResizeDelivery { Polled, Pushed };
+
+// How many pump passes of quiet before a pushed follower is woken. Small
+// enough to feel immediate, large enough that a drag is one wake and not
+// sixty. See settleResize.
+static constexpr int RESIZE_SETTLE_FRAMES = 3;
+
 class Resizable_ : virtual public ETCS::Entity
 {
 public:
@@ -58,66 +84,140 @@ public:
      */
     virtual bool ResizeTo(WindowSize) { return false; }
 
-    // Callback fires immediately on registration (with the current size)
-    // as well as on every future resize -- callers don't need a separate
-    // "get initial size" call before subscribing.
-    void OnResize(std::function<void(WindowSize)> callback, int priority = 0)
-    {
-        m_resizeListeners.insert({priority, callback});
-        callback(GetSize());
-    }
-
     /*
      * Track `source`: whenever it resizes, so does this.
      *
-     * The two halves above joined into the thing everyone actually wanted,
-     * so the chain from the WM down to a canvas is one line per link rather
-     * than a lambda per link written four times.
+     * THE EDGE IS THE SAME EITHER WAY; only the delivery differs, and the
+     * follower picks it (see ResizeDelivery).
      *
-     * RESOLVED BY RID AT FIRE TIME, NOT CAPTURED AS A POINTER. The listener
-     * outlives its registration by definition, and the follower can be
-     * deleted while the source is still being dragged -- a captured `this`
-     * is then a call into freed memory on the very next mouse move. The hold
-     * is the same one every other cross-entity walk takes (Entity.h): falsy
-     * means gone or going, and a follower that is going wants no more sizes.
+     * This used to hand the source a std::function and the source used to run
+     * it. What was wrong with that was never the pushing -- it was that the
+     * push CARRIED THE SIZE. Carrying it meant a listener list to hold, an
+     * ordering to define over that list, a coalescer at the far end because a
+     * drag delivers sixty, and a callback running on whichever thread noticed.
      *
-     * Registered on the SOURCE, because that is where the size arrives. The
-     * initial fire OnResize does for free is the initial layout.
+     * A resize is not a message. The size is already state on the source,
+     * readable by anyone holding its RID, so the only thing worth sending is
+     * that it moved -- one bit per observer. Once the payload is gone the
+     * delivery question gets small: whoever wakes, whenever they wake, reads
+     * the LATEST size rather than replaying an old one. That is what makes
+     * both Polled and Pushed correct, and what makes deferring a push safe.
+     *
+     * Registered on the SOURCE because that is where the bit is set, and the
+     * source is named by RID because the follower can outlive it.
      */
-    void FollowResize(Resizable_* source)
+    void FollowResize(Resizable_* source, ResizeDelivery how = ResizeDelivery::Polled)
     {
         if (!source || source == this) return;
-        const ETCS::RID me = getRID();
-        source->OnResize([me](WindowSize s)
+        if (ETCS::IWireObservable* o = etcs_observable_of(source))
+            o->Observe(getRID());
+        m_resizeSource = source->getRID();
+
+        if (how == ResizeDelivery::Pushed)
         {
-            ETCS::Held<Resizable_> f = ETCS::resolve_held<Resizable_>("Resizable", me);
-            if (!f) return;
-            f->ResizeTo(s);
-        });
+            std::lock_guard<std::mutex> lock(source->m_pushMutex);
+            for (ETCS::RID r : source->m_pushFollowers) if (r == getRID()) return;
+            source->m_pushFollowers.push_back(getRID());
+        }
+    }
+
+    /*
+     * Has my source resized, and if so become that size. Called by the
+     * follower on its own tick.
+     *
+     * Returns whether it acted, so a caller with work of its own to do on a
+     * resize (rebuilding a swapchain) has the one bit it needs without
+     * comparing sizes itself.
+     *
+     * A new observer starts dirty (ObservableBase), so the FIRST poll after
+     * FollowResize always fires -- that is the initial layout, which the old
+     * fire-on-registration bought by running the callback inline. Same
+     * guarantee, taken on the follower's thread instead of the registrar's.
+     */
+    bool PollResize()
+    {
+        if (!m_resizeSource) return false;
+        ETCS::Held<Resizable_> src = ETCS::resolve_held<Resizable_>("Resizable", m_resizeSource);
+        if (!src) { m_resizeSource = 0; return false; }   // source gone: stop asking
+
+        ETCS::IWireObservable* o = etcs_observable_of(static_cast<ETCS::Entity*>(src.get()));
+        if (o && !o->TakeObserved(getRID())) return false;
+        return ResizeTo(src->GetSize());
+    }
+
+    /*
+     * One pump pass of the settle countdown. Called by whatever already pumps
+     * this source's events -- GLFWPump::poll, via GLFWWindow::afterPoll.
+     *
+     * NOT A TICK, and worth being exact about that, because a tick is what
+     * this design is trying not to need. Nothing new runs on a schedule: the
+     * event pump was already going round every frame, and this rides it. A
+     * source nobody pushes to, or one that has not resized, does nothing here
+     * but read an int.
+     *
+     * DEFER, DON'T RATE-LIMIT. Every resize re-arms the counter, so a drag
+     * defers the wake for as long as it lasts and delivers exactly one when it
+     * stops -- rather than N wakes at some interval, each reading a size that
+     * is already wrong. That is the same argument the cursor delta makes one
+     * level down (GLFWWindow::PollEventsConcrete): coalesce to what a consumer
+     * can actually use, not to what the hardware reports.
+     *
+     * The trailing edge is the one that matters and it cannot be lost, because
+     * the counter only ever reaches zero after a pass in which nothing
+     * re-armed it. There is no burst-ends-mid-window hole of the kind a
+     * leading-edge debounce has.
+     *
+     * Returns whether this pass was the one that woke -- the pump ignores it,
+     * the ontology tester drives the countdown with it.
+     */
+    bool settleResize()
+    {
+        std::vector<ETCS::RID> wake;
+        {
+            std::lock_guard<std::mutex> lock(m_pushMutex);
+            if (m_settle < 0) return false;       // idle
+            if (--m_settle > 0) return false;     // still moving
+            m_settle = -1;
+            wake = m_pushFollowers;
+        }
+        for (ETCS::RID r : wake)
+        {
+            ETCS::Held<Resizable_> f = ETCS::resolve_held<Resizable_>("Resizable", r);
+            if (f) f->PollResize();
+        }
+        return true;
     }
 
 protected:
-    // Fires every registered listener, not just the size update: pulled
-    // out during the Window_ split (was `m_size = newSize;` only, so
-    // m_resizeListeners was populated on OnResize but never consulted
-    // again -- a real bug, not just dead code, since RenderProvider::Surface
-    // depends on an ACTUAL resize (not just the initial OnResize call)
-    // recreating its swapchain. Fixed here rather than left for whoever
-    // first needed post-registration resize delivery to hit it.
+    /*
+     * Record the new size and say so. Was a listener fan-out; the fan-out is
+     * now the observers' own business (see FollowResize).
+     *
+     * Still named notify because it is still the announcement -- what changed
+     * is that the announcement no longer carries the news, it points at it.
+     * Nothing happens on this thread beyond a store, some bits, and re-arming
+     * the countdown; the wake itself lands on the pump, one settled interval
+     * later, and reads the size fresh when it does.
+     */
     void notifyResize(WindowSize newSize)
     {
         m_size = newSize;
-        for (auto& [priority, callback] : m_resizeListeners)
-        {
-            (void)priority;
-            callback(newSize);
-        }
+        etcs_mark_observed(this);
+        std::lock_guard<std::mutex> lock(m_pushMutex);
+        if (!m_pushFollowers.empty()) m_settle = RESIZE_SETTLE_FRAMES;
     }
 
     WindowSize m_size = {};
 
 private:
-    std::multimap<int, std::function<void(WindowSize)>, std::greater<int>> m_resizeListeners;
+    ETCS::RID m_resizeSource = 0;
+
+    // Followers that asked to be woken rather than to ask. Resizable's own
+    // policy, deliberately not on the Observable edge: the edge says a change
+    // happened, this says who wants to be told about it without asking.
+    mutable std::mutex     m_pushMutex;
+    std::vector<ETCS::RID> m_pushFollowers;
+    int                    m_settle = -1;   // pump passes left; -1 = idle
 };
 
 #endif

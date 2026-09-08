@@ -2150,7 +2150,40 @@ private:
  * refusal to remove a foundational name, and a scope interrupt -- which
  * REQUESTS that a call stop and does not itself remove anything (see below).
  */
+    /*
+ * The funnel, so the "did it move" bit has exactly one place to be acted on
+ * rather than one per return of the body below.
+ *
+ * A TAG GOING ON OR OFF IS A STATE TRANSITION, so anything observing this
+ * entity is now out of date -- that is the whole justification, and it is the
+ * one the body's own comment already gives for computing the bit at all. The
+ * false answers are load-bearing here: re-adding a flag that is present, or
+ * removing one that is absent, moves nothing and must not wake a hash.
+ *
+ * Marked through IWireObservable (core/InterfaceWire.h), not through the
+ * ontology family -- core declares the wire and does not know what claimed it.
+ * Nearest claimant at or above target, which then bubbles; the walk is
+ * ontology/Observable.h's etcs_mark_observed, spelled out here because core
+ * cannot include ontology.
+ *
+ * Outside every lock: the body has returned, and MarkObserved takes its own
+ * mutex and walks parents.
+ */
     static bool tagModifyImpl(Entity* target, const ETCS::Buffer& key, bool is_remove)
+    {
+        const bool changed = tagModifyBody(target, key, is_remove);
+        if (!changed || !target) return changed;
+        for (Entity* n = target; n; n = n->getParent())
+        {
+            void* p = n->getInterfacePointer(ETCS::Buffer("Observable"));
+            if (!p) continue;
+            static_cast<ETCS::IWireObservable*>(p)->MarkObserved();
+            break;
+        }
+        return changed;
+    }
+
+    static bool tagModifyBody(Entity* target, const ETCS::Buffer& key, bool is_remove)
     {
         if (!is_remove)
         {

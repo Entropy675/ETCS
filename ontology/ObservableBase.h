@@ -70,6 +70,39 @@ ETCS_SUPERTYPE_BASE(Observable)
         return true;
     }
 
+    /*
+ * Watch yourself. A node that caches a result derived from its own subtree is
+ * an observer of that subtree like any other, and the subtree is below it, so
+ * the bubble already arrives here -- this is what gives it somewhere to land.
+ *
+ * TakeObserved(getRID()) is then the node's own "is my cache stale", which is
+ * what the single dirty flag used to answer. Not a compositor convenience: a
+ * merkle hash is exactly this shape, a cache of everything underneath that
+ * recomputes when its own bit is set, so self-observation is the general form
+ * and the compositor's raster is its first user.
+ *
+ * Registration is explicit and must not be forgotten -- an unregistered
+ * observer is told true forever (see TakeObserved), so a node that skips this
+ * recomputes every frame and nothing reports it. The ontology tester checks
+ * that a self-observing node SETTLES for exactly that reason.
+ */
+    void ObserveSelf() { Observe(static_cast<Derived*>(this)->getRID()); }
+
+    /*
+ * My own write is not news to me. Called by a self-observing node AFTER it
+ * rebuilds its cache, to drop the marks that rebuild just caused.
+ *
+ * The single flag did not need this and the per-observer form does, which is
+ * worth stating because it is the one place the two are not equivalent. With
+ * one bool the order did the work: the node took the flag (clearing it), then
+ * wrote, and the write re-set the flag FOR THE UPLOADER, who took it in turn.
+ * One consumer handed it to the next. With independent bits a write marks
+ * every observer including this node's own, nobody clears that one, and the
+ * node rebuilds every frame forever -- a silent loss of exactly the skip the
+ * cache exists for, with correct output the whole time.
+ */
+    void ClearSelfObserved() { (void)TakeObserved(static_cast<Derived*>(this)->getRID()); }
+
     // A snapshot of who is watching, for a caller that has to do something per
     // observer beyond asking whether it changed. Family-level rather than on
     // the wire: the runtime never needs the list, only the answer.

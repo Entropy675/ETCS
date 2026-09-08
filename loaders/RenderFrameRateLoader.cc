@@ -187,7 +187,7 @@ int main(int argc, char** argv)
 
     const Timing dirty = run_phase("blit-dirty", [&]
     {
-        px->MarkDirty();   // forces a full re-upload of the layer this frame
+        etcs_mark_observed(layer); // forces a full re-upload of the layer this frame
         surface->call("Surface.Clear", "0.05 0.05 0.08 1.0", ctx);
         surface->call("Surface.Blit", blitArgs.c_str(), ctx);
     });
