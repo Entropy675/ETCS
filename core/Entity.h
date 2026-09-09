@@ -265,17 +265,10 @@ private:
  * Held as a pointer because MemoryArena's copy ctor/assignment are
  * deleted and it has no move ctor either.
  *
- * NOTE: this is exclusively an Entity concept. Root (standalone,
- * below) has no local_arena_ at all -- it never has typed children,
- * tags, or flags_, so there was never anything for a sub-arena to
- * back. An earlier version of Root inherited this field (and the
- * unconditional global-arena allocation in Entity's own constructor
- * below) purely as a side effect of publicly inheriting Entity, with
- * nothing in ~Entity()'s own body ever reclaiming it early -- every
- * Root ever constructed leaked exactly one 4KB MemoryArena off the
- * global arena until actual process exit. Root no longer having this
- * field at all is what closes that leak structurally, rather than by
- * adding cleanup code for a resource Root never actually needed.
+ * NOTE: exclusively an Entity concept. Root (below) has no local_arena_ at
+ * all -- it never has typed children, tags or flags_, so there is nothing
+ * for a sub-arena to back. See Root's own comment for the leak that field
+ * caused while Root still inherited Entity.
  * ---------------------------------------------------------------------
  */
     MemoryArena*                        local_arena_;
@@ -796,17 +789,11 @@ public:
  * Takes no tag parameter: T alone yields the contract name, via
  * T::CONTRACT_TAG (ETCS_API.h). CONTRACT_TAG and not T::TAG -- TAG is the
  * concrete class name, which a Contract_*.h typedef leaves unchanged.
- * This also fixed a real
- * allocation bug from an earlier version: every actual call site used
- * to construct the child via MemoryArena::getInstance().allocate<Name>()
- * (the module-wide singleton) and pass the already-built pointer in,
- * meaning a child's own outer object was NEVER actually reachable from
- * its parent's arena at all. Now addTag<T> constructs the child ITSELF,
- * from getArena() (this entity's own arena) - via s_pending_parent_arena_,
- * that call also correctly routes the CHILD's own local_arena_ to draw
- * from the SAME parent arena, so a child's entire footprint (outer
- * object + its own local_arena_) lives inside its parent's arena tree,
- * reachable in one place.
+ *
+ * addTag<T> constructs the child ITSELF, out of getArena(), which is what
+ * puts a child's whole footprint inside its parent's arena tree -- see
+ * local_arena_ and s_pending_parent_arena_ for why that matters and how
+ * the child's own sub-arena is routed to the same place.
  *
  * Returning T* rather than RID preserves full type information all the
  * way back to the call site - the caller already knows T (they wrote
@@ -2682,58 +2669,29 @@ public:
  * The race the old condition was really guarding -- ~Root's vacate
  * firing a RequestUnloadEvent whose recheck thread then dlclose'd
  * under still-running workers -- is closed at its own level now, by
- * PendingUnloadRegistry's join barrier (DynamicLoader.h): a recheck
- * cannot be started after the barrier, and every one started before
- * it is joined. Guarding it a second time here, with a condition
- * that also drops registry bookkeeping, cost more than it bought.
+ * PendingUnloadRegistry's join barrier (DynamicLoader.h). Guarding it
+ * a second time here, with a condition that also drops registry
+ * bookkeeping, cost more than it bought.
  *
- * If a signal-driven shutdown is already in progress, skip the
- * normal graceful vacate/unload dance entirely -- there is no
- * safe way to synchronously wait for an asynchronous module
- * unload's own worker threads to finish while the PROCESS
- * itself is concurrently mid-teardown; the OS reclaims
- * everything regardless the instant this process actually
- * exits. Attempting the ordinary path here (ChangeModuleEvent's
- * own synchronous vacate, which can itself go on to fire a
- * RequestUnloadEvent) is exactly what raced dlclose() against
- * still-running worker threads and produced a real, reproduced
- * SIGSEGV. PendingUnloadRegistry (DynamicLoader.h) closes the
- * equivalent race for an ORDINARY exit path (main() actually
- * returning, wait_for_environment_drain unblocking normally),
- * but a signal arriving mid-navigation doesn't reliably route
- * through that return path in time for the join to matter --
- * this stops the race from ever starting in the first place,
- * for this specific case, rather than trying to win it after
- * the fact.
- *
- * ctx_ is still carried and still load-bearing -- every entity
- * this Root hosts reaches it as signal authority -- it is just
- * no longer what decides this branch. See the note above the
- * condition for why.
+ * ctx_ is still carried and still load-bearing -- every entity this
+ * Root hosts reaches it as signal authority -- it is just no longer
+ * what decides this branch.
  */
         if (!ETCS::EventNode::alive())
         {
             /*
- * This body returning early is NOT enough on its own --
- * module_ is a MEMBER, not something this body controls the
- * destruction of. C++ destroys members in reverse
- * declaration order regardless of what this body does, so
- * module_'s own ~Module() runs immediately after this
- * function returns either way, and ~Module() has its OWN,
- * completely independent path to the identical cascade (its
- * own "Root going out of scope -- relinquishing/
- * unregistering" branch, DynamicLoader.h, gated only on
- * `parent && hosting_entity.kind == LifetimeOwner::Kind::
- * Root`) -- a real, reproduced second instance of the same
- * SIGSEGV traced to exactly that: the check above alone
- * silenced ~Root()'s own attempt, but ~Module()'s fired
- * moments later regardless, via a code path this class
- * never touches directly. Nulling parent here makes that
- * branch's own condition false, so ~Module() safely skips
- * it -- without Module itself needing any SignalContext
- * awareness of its own. hosting_entity is deliberately left
- * alone: nothing else in ~Module() reads it once parent is
- * null, and leaving it intact costs nothing.
+ * RETURNING EARLY IS NOT ENOUGH. module_ is a MEMBER, destroyed in
+ * reverse declaration order regardless of what this body does, and
+ * ~Module() has its OWN independent path to the identical cascade
+ * (its "Root going out of scope" branch, DynamicLoader.h, gated only
+ * on `parent && hosting_entity.kind == Root`). A reproduced second
+ * instance of the same SIGSEGV came from exactly that: the check
+ * above silenced ~Root()'s attempt and ~Module()'s fired anyway.
+ *
+ * Nulling parent makes that branch's condition false, so ~Module()
+ * skips it without Module needing any SignalContext awareness.
+ * hosting_entity is left alone -- nothing reads it once parent is
+ * null.
  */
             module_.parent = nullptr;
             return;

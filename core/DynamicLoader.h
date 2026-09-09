@@ -1416,24 +1416,14 @@ bool ETCS::EventNode::LoaderStream::attachModule(
     const std::string& spawn_tag)
 {
     /*
- * An entity's or Root's module_ starts vacant (constructed that way
- * by Entity's/Root's own ctor) and is meant to be bound to exactly
- * one module for its whole lifetime -- this is what makes "an entity
- * can only ever host or proxy one module" an enforced invariant
- * rather than an assumption the rest of this function silently
- * relies on. Re-resolving the SAME module against an already-bound
- * entity is a harmless no-op (the common case: a script referencing
- * one module across many lines, each one independently calling
- * resolveImpl) and succeeds immediately without touching anything
- * further below. Requesting a DIFFERENT module against an
- * already-bound entity is what actually gets dropped: rebinding it
- * would silently orphan whatever it already pointed at. Dropping
- * that request outright, rather than erroring, is deliberate: the
- * correct way to target a different module is a fresh entity/Root
- * (Root gets reconstructed on the stack each time a new one is
- * needed specifically so this is always available, never a real
- * constraint in practice) -- or, for a Root that specifically needs
- * to migrate in place, Root::changeModule().
+ * Step 1. ONE MODULE PER ENTITY, FOR ITS WHOLE LIFETIME -- an enforced
+ * invariant, not an assumption the rest of this function relies on.
+ *
+ * Dropping a different-module request rather than erroring is the
+ * deliberate part: rebinding would orphan whatever module_ already pointed
+ * at. The correct way to target a different module is a fresh entity/Root
+ * -- Root is reconstructed on the stack whenever one is needed, so this is
+ * never a real constraint -- or Root::changeModule() to migrate in place.
  */
     bool already_valid = entity.module().parent != nullptr;
     if (already_valid && entity.module().parent->name == module_name)
@@ -1445,14 +1435,10 @@ bool ETCS::EventNode::LoaderStream::attachModule(
             << ") -- dropping this request for '" << module_name << "'.");
         return false;
     }
-    /*
- * Look up (or bootstrap) the ONE, PERMANENT, loader-owned global
- * Module instance for this name -- never an entity's own member.
- * Every entity's own module_ is now ALWAYS just a forwarding proxy
- * onto this single object, for as long as the module is loaded at
- * all; there is no more "transfer" of real content between entities,
- * since no per-entity Module ever holds any real content to move.
- */
+    // Step 2. The one permanent loader-owned instance for this name. No
+    // per-entity Module ever holds real content, so nothing is ever
+    // transferred between entities -- they are all proxies onto this.
+
     auto reg_it = module_registry.find(module_name);
     Module* global_mod = (reg_it != module_registry.end()) ? reg_it->second : nullptr;
     if (!global_mod)
@@ -1465,50 +1451,26 @@ bool ETCS::EventNode::LoaderStream::attachModule(
  */
         global_mod = MemoryArena::getInstance().allocate<Module>(module_name);
         /*
- * Everything in this bootstrap sequence -- dlopen/LoadLibrary,
- * registerLoader (which calls discoverTags), catalogTypes (which
- * calls discoverActions via getTagAddress) -- can throw
- * std::runtime_error for perfectly ORDINARY, expected reasons: a
- * typo'd module name with no matching .so/.dll, a module file
- * that exists but is missing an expected export, etc.
+ * CAUGHT HERE BECAUSE NO CALLER CAN CATCH IT. Everything in this
+ * bootstrap -- dlopen, registerLoader/discoverTags,
+ * catalogTypes/discoverActions -- throws std::runtime_error for
+ * ordinary reasons: a typo'd module name, a missing export.
  *
- * This function runs EXCLUSIVELY on the loader's own single
- * ordering thread (LoaderStream's consumer), which services
- * attachModule for the ENTIRE remaining lifetime of the process.
- * Letting an exception escape this function past on_event does
- * not just fail this one request -- it terminates the ordering
- * thread outright (an uncaught exception unwinds to the top of
- * THAT thread's own call stack, finds no handler, and calls
- * std::terminate() -- "Aborted"), permanently breaking every
- * future Load/Resolve/Destroy/AddTag/ChangeModule call for the
- * rest of the process. Critically, this can NEVER be caught by
- * any caller's own try/catch around its own blocking evt() call
- * (ResolveEvent::operator()(), LoadEvent::operator()(), etc.) --
- * those just enqueue onto this same ordering thread and spin on
- * an atomic; the throw happens on a DIFFERENT thread than the
- * one spinning, and a try/catch can only ever catch an exception
- * thrown on its own thread. This is exactly what crashed the
- * navigator on a mistyped module name (Root> exot): the root loop's own
- * try/catch around ResolveEvent{...}() was never capable of
- * catching this, structurally, no matter how it was written.
+ * This runs on the loader's ONE ordering thread, which services
+ * attachModule for the rest of the process. An escaping exception
+ * unwinds to the top of THAT thread, finds no handler, and calls
+ * std::terminate -- killing every future Load/Resolve/Destroy/
+ * AddTag/ChangeModule. A caller's try/catch around its blocking
+ * evt() cannot help: it enqueues and spins on an atomic, and the
+ * throw is on a different thread. That is exactly what crashed the
+ * navigator on `Root> exot`.
  *
- * Deliberately NOT the same class of failure
- * RegisterDynamicLoader's own abort()-on-exception guards against
- * (see that function's own comment, this file) -- that one
- * covers a module that ALREADY dlopen'd successfully turning out
- * to violate a structural invariant (ABI/manifest mismatch, a
- * zombie DLL, genuine OOM), where continuing would silently
- * violate the determinism guarantee this whole system is built
- * on. "The requested module doesn't exist, or is missing an
- * export" is the ordinary, expected failure attachModule's own
- * bool return type already exists to represent -- every single
- * caller in this codebase (resolveImpl, loadImpl,
- * CommandExecutor.h's resolve_module/spawn_entity and its navigator)
- * already checks that bool and prints a friendly message. The
- * throw here was simply unreachable from any of them; converting
- * it to the same bool contract everything else already expects
- * is what actually makes graceful handling possible -- no change
- * needed on any caller's side at all.
+ * NOT the class of failure RegisterDynamicLoader's abort() guards:
+ * that one covers a module that loaded and then violated a
+ * structural invariant, where continuing breaks determinism. "Does
+ * not exist, or is missing an export" is the ordinary failure
+ * attachModule's bool return already represents, and every caller
+ * already checks it.
  */
         library_handle_t handle = nullptr;
         try
@@ -1573,11 +1535,9 @@ bool ETCS::EventNode::LoaderStream::attachModule(
  * one; determinism is already violated the moment two builds that
  * disagree on the contract both keep running.
  *
- * unmapLibrary rather than a bare close: discoverTags() runs inside
- * registerLoader() BEFORE RegisterDynamicLoader (see that reordering),
- * so nothing reaches this catch with module threads actually running
- * today -- but the full teardown stays correct if that ever changes,
- * and its steps no-op cleanly when nothing was started.
+ * unmapLibrary rather than a bare close -- see the catalogTypes catch
+ * below for the hazard. Nothing reaches THIS catch with module threads
+ * running today, but the full teardown no-ops cleanly either way.
  */
             global_mod->unmapLibrary(owner);
             /*
@@ -1633,7 +1593,7 @@ bool ETCS::EventNode::LoaderStream::attachModule(
         }
     }
  
-    // Every attach, bootstrap or not, is now structurally just a proxy.
+    // Step 3.
     entity.module().parent = global_mod;
  
     /*

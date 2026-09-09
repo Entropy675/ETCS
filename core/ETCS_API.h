@@ -44,12 +44,8 @@
 // same-type operations (which must serialize against each other) from
 // different-type ones (which may commit independently).
 //
-// These three ceilings used to be independent numbers that quietly
-// disagreed: the mask was 64 bits, the Tags string was capped at 2048
-// bytes, and the static_assert said 64. Crossing 64 tags was a build
-// error; the 2048-byte cap would have bound first for any realistic tag
-// name anyway; and nothing tied either to the mask width. Deriving them
-// from one constant is what makes "the Tags string is allowed to carry
+// The three ceilings were once independent numbers that quietly disagreed.
+// Deriving them from one constant is what makes "the Tags string carries
 // exactly as many tags as the mask can represent" true rather than
 // approximately true.
 //
@@ -111,7 +107,7 @@
 // ====================================================================
 // PLATFORM-SPECIFIC HEADER INCLUDES
 // ====================================================================
-#ifdef _WIN32HASH_TYPE
+#ifdef _WIN32
     #include <windows.h>
     #include <direct.h> // For _getcwd
     using library_handle_t = HMODULE;

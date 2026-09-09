@@ -194,8 +194,7 @@ struct ExecutionContext
     ETCS::RID lost_rid = 0;
 
     // True for the root executor — owns DetachedRegistry::join_all() on exit,
-    // and owns GlobalNames: only a root executor publishes into it, and only
-    // a root executor clears it.
+    // and owns GlobalNames (see that struct).
     bool is_root = true;
 
     /*

@@ -44,17 +44,12 @@
 // the compiler command line, or #define before including this header) to
 // enable the child-page pool's own verbose per-slab/per-chunk/per-page
 // tracing: every slab mint and unmap, every Chunk creation, every carved-
-// page acquire and release. Added during a real investigation (a cross-
-// DSO singleton-mismatch bug -- MemoryArena::getInstance() silently
-// resolving to the wrong DSO's own instance depending on which compiled
-// code happened to be calling it; see global_arena_'s own comment for the
-// full story) and left available behind this flag rather than deleted
-// once fixed -- the same CLASS of bug (a page minted or resolved against
-// the wrong arena instance) could resurface after some future change,
-// and this exact tracing is what actually found it: reasoning about raw
-// addresses across a dozen log excerpts by hand, without it, cost real
-// turns. Off by default -- at real per-connection churn rates this is far
-// too verbose for anything but active investigation. The pool's own
+// page acquire and release. Added during, and what actually found, the
+// cross-DSO singleton mismatch global_arena_ documents. Kept behind this
+// flag rather than deleted, because the same CLASS of bug -- a page minted
+// or resolved against the wrong arena instance -- could resurface. Off by
+// default: at real churn rates it is far too verbose for anything but an
+// active investigation. The pool's own
 // always-on diagnostics (the "no owning slab found" warning, the
 // hugepage-fallback notice, and memoryTeardown()'s own per-arena
 // teardown/release lines) are NOT gated by this flag -- those signal a
@@ -309,16 +304,11 @@ private:
         // here.
         std::string owner_scope_tag;
 
-        // THE actual cross-DSO fix -- see MemoryArena::global_arena_'s
-        // own comment for the full reasoning. Cached here, at
-        // construction (same moment owner_scope_tag is captured, same
-        // reasoning: guaranteed-correct DSO context NOW, not necessarily
-        // later), rather than having ~Chunk() call MemoryArena::
-        // getInstance() itself -- which could resolve to the WRONG DSO's
-        // singleton if this Chunk's own destructor happens to run from
-        // loader-compiled code (destroyImpl and friends) acting on a
-        // module-owned entity. nullptr for a non-pooled (from_pool ==
-        // false) Chunk, which never reaches releaseChildPage at all.
+        // The cross-DSO fix -- see MemoryArena::global_arena_. Cached at
+        // construction, the same moment and for the same reason as
+        // owner_scope_tag: the DSO context is guaranteed correct now and not
+        // necessarily when ~Chunk() runs. nullptr for a non-pooled Chunk,
+        // which never reaches releaseChildPage.
         MemoryArena* release_target = nullptr;
 
         Chunk(char* buf, long long sz, bool pooled, std::string tag, MemoryArena* target)
@@ -540,19 +530,15 @@ private:
     // for the same object correctly used the MODULE's -- two entirely
     // separate pools, silently, for the same logical arena.
     //
-    // The fix: never re-resolve MemoryArena::getInstance() from a call site
-    // that might be running as the wrong DSO's code. Resolve it EXACTLY
-    // ONCE, at construction time -- which is guaranteed correct, since
-    // entity/arena construction only ever happens via the OWNING module's
-    // own addTag<T>/allocate<T> flow -- and cache the resulting pointer
-    // here. allocateNewChunk and Chunk's own release path both route
-    // through THIS pointer thereafter, never a fresh getInstance() call.
-    // Once we hold a real MemoryArena* to the correct underlying object,
-    // WHICH DSO's compiled copy of acquireChildPage/releaseChildPage
-    // actually executes stops mattering at all -- poolMutex_/page_registry_/
-    // etc. are ordinary instance data, identical in every DSO's copy of the
-    // class layout, not per-DSO state; the only thing that was ever wrong
-    // was getInstance() picking the wrong OBJECT, never the method logic.
+    // The fix: never re-resolve getInstance() from a call site that might be
+    // running as the wrong DSO's code. Resolve it EXACTLY ONCE, at
+    // construction time -- guaranteed correct, since arena construction only
+    // ever happens via the OWNING module's addTag<T>/allocate<T> flow -- and
+    // cache it here. Once we hold a real MemoryArena* to the correct object,
+    // which DSO's compiled copy of acquireChildPage/releaseChildPage runs
+    // stops mattering: poolMutex_/page_registry_ are ordinary instance data,
+    // identical in every copy of the class layout. getInstance() picking the
+    // wrong OBJECT was the only thing ever wrong; the method logic never was.
     //
     // nullptr for the true global root itself (never needs to route
     // anywhere) and for every DEDICATED/blob chunk (bypasses the pool
@@ -1204,10 +1190,8 @@ public:
                 // OWNING module's own compiled code (construction only
                 // ever happens via that module's own addTag<T>/allocate<T>
                 // flow), so this resolves to the correct DSO's singleton.
-                // Threaded through as global_arena_ and cached on the new
-                // instance -- see that field's own comment for why this
-                // one-time resolution, done here, is what closes the
-                // cross-DSO pool-mismatch bug outright.
+                // Threaded through as global_arena_ -- this one-time
+                // resolution is what closes the cross-DSO pool mismatch.
                 obj = new (mem) T(std::forward<Args>(args)..., this, &MemoryArena::getInstance());
             else
                 obj = new (mem) T(std::forward<Args>(args)...);
@@ -2063,16 +2047,9 @@ inline MemoryArena::Chunk::~Chunk()
 {
     if (!buffer) return;
     if (from_pool)
-        // release_target, NEVER MemoryArena::getInstance() called fresh
-        // here -- this destructor can run from loader-compiled code
-        // (destroyImpl and friends, acting on a module-owned entity's
-        // arena) just as easily as the owning module's own code, and
-        // getInstance() would silently resolve to whichever DSO happens
-        // to be executing AT THIS POINT, not whichever DSO actually
-        // owns this Chunk's own pool. release_target is a real pointer
-        // to the correct underlying object, cached at construction time
-        // when the DSO context was guaranteed correct -- see
-        // global_arena_'s own comment for the full reasoning.
+        // release_target, NEVER a fresh MemoryArena::getInstance(): this
+        // destructor can run from loader-compiled code acting on a
+        // module-owned arena. See global_arena_.
         release_target->releaseChildPage(buffer, size, owner_scope_tag);
     else
         freePage(buffer, size);

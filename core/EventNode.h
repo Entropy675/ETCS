@@ -36,23 +36,15 @@ struct DLInEvent
     ETCS::RID                   rid         = 0;       // Destroy only — instance to remove
     bool                        destroy_children = false; // Destroy only — see DestroyEvent's own comment
     std::atomic<ETCS::Entity*>* entity_out  = nullptr; // Load
-    // Load only — non-null means "this entity is ALREADY constructed" (via
-    // spawn<T>/spawn<T>(arena), on the calling thread,
-    // before this event ever fired — same principle addTagTrampoline<T>
-    // already uses: construct first, since a bare function pointer can't
-    // capture arbitrary constructor arguments the way a lambda could).
-    // When set, the handler calls attachModule(module_name, *this,
-    // spawn_tag) instead of resolving/calling Make() — conjugate_key still
-    // carries "module:tag" in the usual form, parsed the same way.
+    // Load only — carries LoadEvent::prebuilt. When set, the handler calls
+    // attachModule instead of resolving and calling Make(); conjugate_key
+    // still carries "module:tag" and is parsed the same way.
     ETCS::Entity*               prebuilt_entity = nullptr;
-    // Load only, vacant-registry case — the entity or Root to bootstrap the
-    // module against when NOTHING exists yet at all (see LoadEvent::root
-    // for the full rationale). Unused whenever prebuilt_entity is set.
-    // LifetimeOwner, not a bare Entity* -- the bootstrap anchor supplied
-    // here is, in current practice, always a Root (see CommandExecutor.h's
-    // spawn_entity), but addTagImpl's own vacant branch bootstraps against
-    // a genuine Entity's getRootAncestor() instead, so this field
-    // genuinely receives both kinds depending on the call site.
+    // Load only, vacant-registry case — carries LoadEvent::root. Unused
+    // whenever prebuilt_entity is set. LifetimeOwner rather than Entity*
+    // because it genuinely receives both kinds: a Root from
+    // CommandExecutor.h's spawn_entity, an Entity from addTagImpl's own
+    // vacant branch via getRootAncestor().
     ETCS::LifetimeOwner         bootstrap_root;
     // TagModify only — addTag(Buffer flag)/removeTag(Buffer tag), ordered
     // LOCALLY within the emitting entity's own module (see ModuleProxy::
@@ -223,10 +215,12 @@ struct Event
 struct LoadEvent : Event
 {
     std::atomic<ETCS::Entity*> result{nullptr};
-    // Non-null means "already constructed — just attach a Module
-    // reference" (see prebuilt_entity on DLInEvent for the full
-    // rationale). nullptr (the default) is the ORIGINAL runtime-string
-    // path, unchanged: resolve conjugate_key's tag via Make().
+    // Non-null means "ALREADY constructed -- just attach a Module reference",
+    // built on the calling thread before this event fired (spawn<T>,
+    // spawn<T>(arena)). Same principle addTagTrampoline<T> uses: construct
+    // first, because a bare function pointer cannot capture arbitrary
+    // constructor arguments the way a lambda could. nullptr is the original
+    // runtime-string path: resolve conjugate_key's tag via Make().
     ETCS::Entity* prebuilt = nullptr;
     // Set by the runtime-string spawn(module,tag,root) — the entity or
     // Root to bootstrap the module against IF the registry turns out
@@ -236,8 +230,6 @@ struct LoadEvent : Event
     // spawn<T>(arena) always construct a genuine root-level entity
     // (parent_ == nullptr by construction), so attachModule uses
     // prebuilt directly with nothing further to bootstrap against.
-    // LifetimeOwner, not a bare Entity* -- see DLInEvent::bootstrap_root's
-    // own comment for why this needs to hold either kind.
     ETCS::LifetimeOwner root;
     using Event::Event;
     ETCS::Entity* operator()();

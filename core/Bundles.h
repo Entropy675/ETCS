@@ -509,11 +509,10 @@ struct PairScope
 // process. So `SetPosition` and `Render` emit the SAME ordering mask, and a
 // position write serializes against a projection it cannot touch.
 //
-// That is measurable, and it measures badly. The EventStream suite bursts real
-// module masks against a control that picks a uniform bit in a 64-wide word on
-// one event in ten -- a distribution where almost nothing depends on anything.
-// The control wins by ~8x. A real mask losing to noise is not the price of the
-// guarantee; it is the union being far wider than the dependency it stands for.
+// That is measurable, and it measures badly: against a control picking one
+// uniform bit in ten events, real module masks lose by ~8x (EventStream
+// suite). A real mask losing to noise is not the price of the guarantee; it is
+// the union being far wider than the dependency it stands for.
 //
 // ── WHAT REPLACES IT ───────────────────────────────────────────────────────
 //
@@ -526,12 +525,10 @@ struct PairScope
 // loses ordering.
 //
 // It does not have to be declared, because every acquisition already passes
-// through machinery we own. Entity::call is the only execution model in the
-// substrate, addTagTrampoline<T> is the only place an acquisition is recorded
-// (Entity.h: noteAcquires "is called only from" there), and the work-function
-// trampolines already push thread-local RAII scopes -- ScopeTag and PairScope,
-// immediately above. This is that same pattern, generalised from a CARRIER to
-// an ACCUMULATOR.
+// through machinery we own -- Entity::call, addTagTrampoline<T>, and the
+// work-function trampolines that already push thread-local RAII scopes
+// (ScopeTag and PairScope, above). This is that pattern, generalised from a
+// CARRIER to an ACCUMULATOR.
 //
 // ── EDGES, NOT CLOSURE ─────────────────────────────────────────────────────
 //
@@ -1094,10 +1091,9 @@ public:
         (void)vec;
         return nullptr;
     }
-    // Manifest tokens are UNQUALIFIED ("<Action>_Work" / "<Action>_Stream").
-    // The exported SYMBOLS are Type-qualified to avoid collisions when two
-    // tags in one module share an action name -- the qualification is
-    // reconstructed here, where `tag` is already in scope.
+    // Manifest tokens are UNQUALIFIED; the exported SYMBOLS are
+    // Type-qualified (ETCS_MODULE_EXPORT_WORK explains why). The
+    // qualification is reconstructed here, where `tag` is already in scope.
     Manifest* discoverActions(std::string tag, ETCS::FlatMap<ETCS::Buffer, WorkBundle>& actions)
     {
 #ifdef ETCS_LOADER
