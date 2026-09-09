@@ -18,10 +18,53 @@ ETCS_SUPERTYPE_BASE(Threaded)
 {
     ETCS_MAKE_INSTANCE(Threaded)
 
-    // True if THIS call placed the request, false if one was already standing.
+    /*
+ * True if THIS call placed the request, false if one was already standing.
+ *
+ * THE REQUEST IS RECORDED AS A TAG, because the tag surface is the state
+ * surface. Halting is a transition on it, so it belongs there for the same
+ * reason a flag does -- and putting it there is what makes it observable, with
+ * no Observable code here at all: addTag routes through Entity::tagModifyImpl,
+ * which marks the nearest claimant at or above this entity
+ * (Entity::markStateChange). A Threaded type that also claims Observable gets
+ * that for free; one that does not loses nothing.
+ *
+ * THE LATCH IS STILL THE ATOMIC, and it is what Halted() reads. Two reasons,
+ * both load-bearing:
+ *
+ *   the exchange is the claim. "Did I place this request" has to be answered
+ *   atomically for three genuinely concurrent callers (the arena's retire, a
+ *   script's Delete, the body's own poll), and it has to be answered before
+ *   the tag write, which can be refused.
+ *
+ *   Halted() is polled from frame loops -- VulkanSurface::Retired() is the
+ *   first question ProduceFrames and ConsumeFrames ask on every tick. That is
+ *   an atomic load; hasTag is a mutex and a map lookup.
+ *
+ * So the flag is the RECORD and the atomic is the LATCH, written together on
+ * the one winning transition. Removing the flag afterwards does not un-halt
+ * anything -- a halt is one-way, and the flag is a statement about this entity
+ * rather than the control input, exactly as removing a family marker does not
+ * remove the family.
+ *
+ * ORDERING-THREAD FALLBACK, and it is not optional. addTag emits a
+ * TagModifyEvent and blocks on it, so calling it from an ordering thread
+ * deadlocks against the very thread that would service it --
+ * ETCS_ASSERT_NOT_ORDERING_THREAD says so, and etcs_retire_entity reaches Halt
+ * from exactly there (destroyImpl -> deleteEntity -> reclaimEntity). Same for
+ * a live lifetime hold. In those cases the tag is skipped and the mark is made
+ * directly, so the observable guarantee holds unconditionally even where the
+ * record cannot be written.
+ */
     bool Halt() override final
     {
-        return !m_halted.exchange(true, std::memory_order_acq_rel);
+        if (m_halted.exchange(true, std::memory_order_acq_rel)) return false;
+        ETCS::Entity* self = static_cast<Derived*>(this);
+        if (!ETCS::EventNode::on_ordering_thread && ETCS::lifetime_hold_depth == 0)
+            self->addTag(ETCS::Buffer("halted"));
+        else
+            ETCS::Entity::markStateChange(self, self->getRID());
+        return true;
     }
 
     bool Halted() const override

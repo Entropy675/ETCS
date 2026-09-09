@@ -2280,7 +2280,21 @@ ETCS::RID ETCS::EventNode::LoaderStream::addTagImpl(
                  << child_type_tag << "' -- child will have no callable actions.");
     }
  
-    return trampoline(parent, child, tag);
+    /*
+ * A CHILD ENTERING IS A SUBTREE CHANGE, the mirror of etcs_retire_entity's
+ * mark for one leaving. This is the funnel: every addTag<T>, module-side or
+ * loader-side, arrives here through AddTagEvent, so marking once here covers
+ * every creation rather than relying on each leaf type's Create body
+ * happening to set a flag.
+ *
+ * After the trampoline, deliberately -- it is what inserts into
+ * typed_children_ and sets parent_, and an observer woken any earlier could
+ * walk a tree the child is not in yet. It also holds parent->m_tagMutex for
+ * its whole body, and MarkObserved takes its own lock and walks parents.
+ */
+    const ETCS::RID rid = trampoline(parent, child, tag);
+    ETCS::Entity::markStateChange(parent, rid);
+    return rid;
 }
  
 bool ETCS::EventNode::LoaderStream::isTypedActionStream(

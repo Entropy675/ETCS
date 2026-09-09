@@ -2144,17 +2144,61 @@ private:
  * Outside every lock: the body has returned, and MarkObserved takes its own
  * mutex and walks parents.
  */
+    /*
+ * THE ONE PLACE A STATE CHANGE BECOMES A DIRTY EDGE.
+ *
+ * Observable is declared in core, ahead of any family that claims it, so that
+ * the runtime's OWN state transitions register as dirty edges without a type
+ * having to opt into anything. Claiming Observable is therefore enough to
+ * inherit observation of the whole state surface -- and the state surface is
+ * the tags: the origin-affixed ones (a typed child appearing or leaving) and
+ * the flags. Bare is-a markers are not part of it, because they are not
+ * runtime-mutable in either direction (addTypeTag runs only from a
+ * constructor; tagModifyBody refuses to remove one).
+ *
+ * Every funnel that moves that surface calls THIS, and there are four:
+ *
+ *   tagModifyImpl           a flag or a tag going on or off
+ *   addTagImpl              a typed child entering        (DynamicLoader.h)
+ *   etcs_retire_entity      an entity leaving the tree    (below)
+ *   LifecycleBase::Release  a type releasing what it held (ontology/)
+ *
+ * `from` is where the search for a claimant starts, NOT necessarily what
+ * changed: an entity that is leaving passes its parent, because the nearest
+ * claimant at or above ITSELF is about to stop existing. `origin` is always
+ * what changed, and MarkObserved excludes only the edge whose observer IS the
+ * origin -- which is how a node's own write stays out of its own self-edge.
+ *
+ * Nearest claimant only, then stop: MarkObserved bubbles upward itself
+ * (ontology/ObservableBase.h), so walking past the first one would mark the
+ * ancestors twice.
+ *
+ * isDestructed stops the walk rather than skipping the link -- past a
+ * half-destroyed ancestor there is nothing trustworthy left to climb. Only
+ * reachable under arena teardown, which is the one context tag modification
+ * never sees.
+ *
+ * Callers hold no lock here. MarkObserved takes its own and walks parents.
+ */
+public:
+    static void markStateChange(Entity* from, RID origin)
+    {
+        for (Entity* n = from; n; n = n->getParent())
+        {
+            if (n->isDestructed()) return;
+            void* p = n->getInterfacePointer(ETCS::Buffer("Observable"));
+            if (!p) continue;
+            static_cast<ETCS::IWireObservable*>(p)->MarkObserved(origin);
+            return;
+        }
+    }
+private:
+
     static bool tagModifyImpl(Entity* target, const ETCS::Buffer& key, bool is_remove)
     {
         const bool changed = tagModifyBody(target, key, is_remove);
         if (!changed || !target) return changed;
-        for (Entity* n = target; n; n = n->getParent())
-        {
-            void* p = n->getInterfacePointer(ETCS::Buffer("Observable"));
-            if (!p) continue;
-            static_cast<ETCS::IWireObservable*>(p)->MarkObserved(target->getRID());
-            break;
-        }
+        markStateChange(target, target->getRID());
         return changed;
     }
 
@@ -2223,6 +2267,34 @@ private:
         {
             std::lock_guard<std::mutex> lock(target->m_tagMutex);
             auto it = target->tags.find(key);
+            /*
+ * A BARE IS-A MARKER IS NOT REMOVABLE, and this is the other half of
+ * addTag(Buffer)'s lowercase-only rule. That rule already makes such a marker
+ * impossible to CREATE at runtime -- addTypeTag runs only from
+ * ETCS_MAKE_INSTANCE's generated constructor -- but removal reached it,
+ * because this lookup finds `tags` before falling through to flags_ and the
+ * foundational-name check above only covers myTag()/getSourceTag().
+ *
+ * Removing one does not remove the family: the interface pointer is fixed at
+ * construction and the type is still downcastable to it. All it does is
+ * desynchronise hasTag from what the entity actually IS, so a
+ * hasTag("Wrapper")-style membership check (MirrorBuffer's wrap-chain
+ * resolution, verify_tag, a `requires` bracket) starts answering no about a
+ * type that fulfils it. Measured: removeTag returned true, hasTag went false,
+ * getInterfacePointer stayed non-null.
+ *
+ * Identified structurally rather than by case -- null bundle AND null child is
+ * exactly what addTypeTag inserts, and exactly what a dispatch entry or an
+ * entity relation is not.
+ */
+            if (it != target->tags.end()
+                && it->second.bundle == nullptr && it->second.child == nullptr)
+            {
+                ETCS_LOG("Entity", "removeTag: '" << key_str
+                         << "' is a family marker, not a relation -- refusing to "
+                            "remove. The type still fulfils it.");
+                return false;
+            }
             if (it != target->tags.end())
             {
                 child_to_delete = it->second.child;
@@ -3020,6 +3092,34 @@ inline bool etcs_retire_entity(Entity* e)
  * is gone, so neither path has to know about the other.
  */
     e->detachFromParent();
+    /*
+ * A CHILD LEAVING IS A SUBTREE CHANGE, and nothing was saying so.
+ *
+ * tagModifyImpl already marks for a tag going on or off, on the argument that
+ * tags are the state surface and a transition on it makes every observer out
+ * of date. A node being removed from the tree is the same claim with a larger
+ * delta: what its parent would compose is no longer what it composed last
+ * time. Nothing else covered it -- reparentChildrenTo, detachFromParent and
+ * removeTypedChild are all pure bookkeeping, and none of the drawable leaf
+ * types drop their own "active" tag on the way out -- so a compositor's
+ * TakeObserved answered false and it re-blitted a raster still containing the
+ * deleted node until something unrelated (a moving scene, an FPS label) woke
+ * it for its own reasons.
+ *
+ * FROM THE PARENT, not from e: e is what changed, but e is also what is going
+ * away, so the nearest claimant at or above the PARENT is who needs telling.
+ * Origin stays e's RID -- MarkObserved excludes only the edge whose observer
+ * is the origin, and that edge belongs to e, which is leaving anyway. A
+ * self-observing parent is keyed on its OWN rid, so it hears this.
+ *
+ * AFTER detachFromParent, deliberately: an observer woken here and walking
+ * immediately must not still find e among the children.
+ *
+ * Guarded on isDestructed because this path also runs under arena teardown,
+ * where an ancestor may already have run ~Entity() -- the one context tag
+ * modification never reaches.
+ */
+    Entity::markStateChange(e->getParent(), e->getRID());
     // And leave every registry it was published into, keyed the way it was
     // admitted. This is what turns "the RID resolved" into "it is alive".
     etcs_supertype_fanin(e);

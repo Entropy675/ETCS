@@ -96,6 +96,37 @@ public:
 };
 
 // ---------------------------------------------------------------------------
+// A 2D node that also claims Lifecycle and Threaded, so the two lifecycle
+// funnels that mark -- Release and Halt -- have something to fire on. Nothing
+// else in this file claims either alongside Observable, which is what the
+// checks below need.
+// ---------------------------------------------------------------------------
+class ReleasableNode : public Drawable2DBase<ReleasableNode>,
+                       public LifecycleBase<ReleasableNode>,
+                       public ThreadedBase<ReleasableNode>
+{
+public:
+    WIRE_TYPE_IDENTITY(ReleasableNode)
+
+    int32_t z = 0;
+    int32_t Order() override { return z; }
+    bool operator<(const ReleasableNode& o) const { return z < o.z; }
+
+    Rect2D     BoundsConcrete() { return Rect2D{0, 0, 1, 1}; }
+    bool       ContainsLocalConcrete(int32_t, int32_t) { return true; }
+    WindowSize GetSizeConcrete() { return WindowSize{1, 1}; }
+
+    void ClearConcrete(float, float, float, float) {}
+    void DrawRectConcrete(int32_t, int32_t, uint32_t, uint32_t,
+                          float, float, float, float) {}
+    void BlitConcrete(Surface_*, int32_t, int32_t, uint32_t, uint32_t, float) {}
+    void DrawIntoConcrete(Surface_* dst) { drawChildren(dst); }
+
+    bool released_ran = false;
+    void ReleaseConcrete() { released_ran = true; }
+};
+
+// ---------------------------------------------------------------------------
 // A triangular 2D node. Identical obligations, identical verbs; the only
 // difference anywhere in this class is which points of its bounding box it
 // actually occupies.
@@ -942,7 +973,112 @@ int main()
         check(!node->TakeObserved(node->getRID()),
               "a node's own write is not news to it -- skipped at the source, no clear needed");
 
+        /*
+         * A CHILD BEING DELETED IS A SUBTREE CHANGE, exactly as much as that
+         * child writing a pixel was two checks ago. Nothing in the tree can
+         * tell the difference from the outside: in both cases what the parent
+         * would compose is no longer what it composed last time.
+         *
+         * Deliberately settled first, so this asserts the DELETE woke it and
+         * not something earlier. Symmetric with the FillRect check above,
+         * which is the same assertion for the other kind of change.
+         */
+        // getOwningArena(), not getInstance(): a child allocated through
+        // addTag<T> lives in its PARENT's arena, and deleteEntity only walks
+        // the dtor list of the arena it is called on -- so the global one is
+        // a silent no-op here, which is exactly how this check first passed
+        // for the wrong reason.
+        (void)node->TakeObserved(node->getRID());
+        kid->getOwningArena().deleteEntity(kid, true);
+        check(node->TakeObserved(node->getRID()),
+              "a child being DELETED wakes its parent -- a subtree that lost a "
+              "node composes differently than one that did not");
+
         ETCS::MemoryArena::getInstance().deleteEntity(node, true);
+    }
+
+    // -- 13a2. The rest of the state surface -------------------------------
+    //
+    // Observable is declared in core ahead of the families that claim it so a
+    // type inherits observation of the runtime's OWN transitions. The surface
+    // is the tags: origin-affixed ones and flags. These are the funnels that
+    // move it, other than the tag write already covered above.
+    {
+        PixelNode* parent = arena.allocate<PixelNode>();
+        parent->Allocate(4, 4);
+        parent->ObserveSelf();
+        (void)parent->TakeObserved(parent->getRID());
+
+        // CREATION. The mirror of the delete check: a typed child is an
+        // origin-affixed tag appearing, so it moves the surface. Marked in the
+        // one funnel every addTag<T> passes through, not by each leaf type's
+        // Create body happening to set a flag.
+        PixelNode* born = parent->addTag<PixelNode>();
+        check(parent->TakeObserved(parent->getRID()),
+              "a child ENTERING wakes its parent -- creation is a tag edge");
+
+        // A BARE IS-A MARKER IS NOT PART OF THE SURFACE, because it is not
+        // mutable in either direction. Removing it would not remove the
+        // family -- the interface pointer is fixed at construction -- it would
+        // only desynchronise hasTag from what the type actually is.
+        check(born->hasTag(ETCS::Buffer("Drawable2D")),
+              "a leaf carries its family markers");
+        check(!born->removeTag(ETCS::Buffer("Drawable2D")),
+              "a family marker refuses removal -- it is a capability, not a relation");
+        check(born->hasTag(ETCS::Buffer("Drawable2D")),
+              "...and is still there afterwards");
+        check(born->getInterfacePointer(ETCS::Buffer("Drawable2D")) != nullptr,
+              "...which is what the interface pointer said all along");
+
+        born->getOwningArena().deleteEntity(born, true);
+        ETCS::MemoryArena::getInstance().deleteEntity(parent, true);
+    }
+
+    // RELEASE. A type letting go of what it held is a state change whether or
+    // not it goes on to leave the tree, so it marks from the entity itself
+    // rather than from its parent.
+    {
+        PixelNode* watcher = arena.allocate<PixelNode>();
+        watcher->Allocate(2, 2);
+        ReleasableNode* r = watcher->addTag<ReleasableNode>();
+
+        ETCS::ObserverEdge e = r->Observe(watcher->getRID());
+        (void)r->TakeObserved(e);
+        check(!r->TakeObserved(e), "the observer of a live node settles");
+
+        check(r->Release(), "Release runs once");
+        check(r->released_ran, "...and reached the leaf's own body");
+        check(r->TakeObserved(e),
+              "releasing wakes whatever observes the released node");
+
+        r->getOwningArena().deleteEntity(r, true);
+        ETCS::MemoryArena::getInstance().deleteEntity(watcher, true);
+    }
+
+    // HALT, recorded the way every other state transition is: as a tag. That
+    // is what makes it observable without ThreadedBase referring to Observable
+    // at all -- addTag goes through tagModifyImpl, which marks.
+    {
+        PixelNode* watcher = arena.allocate<PixelNode>();
+        watcher->Allocate(2, 2);
+        ReleasableNode* h = watcher->addTag<ReleasableNode>();
+
+        ETCS::ObserverEdge e = h->Observe(watcher->getRID());
+        (void)h->TakeObserved(e);
+        check(!h->hasTag(ETCS::Buffer("halted")),
+              "a running body carries no halt request");
+
+        check(h->Halt(), "the first Halt places the request");
+        check(h->Halted(), "the latch answers the body's poll");
+        check(h->hasTag(ETCS::Buffer("halted")),
+              "...and the request is ON THE TAG SURFACE, not beside it");
+        check(h->TakeObserved(e),
+              "halting wakes whatever observes the halted node");
+
+        check(!h->Halt(), "a second Halt finds one already standing");
+
+        h->getOwningArena().deleteEntity(h, true);
+        ETCS::MemoryArena::getInstance().deleteEntity(watcher, true);
     }
 
     // -- 13b. The edge handle: addressing without a search -------------------
