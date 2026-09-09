@@ -161,6 +161,37 @@ public:
  */
     virtual bool Animating() { return false; }
 
+    /*
+ * The recursion the comment above calls the point, written once.
+ *
+ * Every compositing node needs the same walk -- "is anything under me still
+ * moving" -- over the same ordered child list collectDrawableChildren already
+ * builds, so it lives beside it rather than in each node that composites.
+ * CompositeDrawable2D and Camera3D both had their own copy; the second one was
+ * missing for a while, which is how an FPS label under a camera stayed frozen
+ * while the same label under a compositor did not.
+ *
+ * NO FAMILY IS SKIPPED. A camera's copy used to skip Drawable3D children on
+ * the grounds that scenery is reached through the bound scene -- true of
+ * DRAWING, where painting a 3D child flat would be wrong, and not true of this
+ * question. Asking a 3D child whether it is moving is a fair question with a
+ * real answer (Scene3D::Animating is InMotion), this is a boolean OR so
+ * agreeing with sceneInMotion costs nothing, and skipping would miss a moving
+ * 3D child that is not the bound scene.
+ *
+ * Public for the same reason collectDrawableChildren is: the caller may be a
+ * sibling family reaching in through getInterfacePointer rather than a
+ * subclass.
+ */
+    bool anyChildAnimating()
+    {
+        std::vector<Drawable_*> ordered;
+        collectDrawableChildren(ordered);
+        for (Drawable_* child : ordered)
+            if (child->Animating()) return true;
+        return false;
+    }
+
 protected:
     /*
  * The recursion, written once. A leaf's DrawInto draws ITSELF and then
