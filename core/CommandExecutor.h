@@ -1070,19 +1070,31 @@ struct DetachedRegistry
         exec->local_sig.terminate = &exec->local_terminate;
         exec->local_sig.user1     = &exec->local_user1;
 
-        // ACTIVE edge: the process root, ALWAYS -- never parent_sig. A
-        // detached job's lifetime is dictated by its own state machine, not
-        // by the frame that launched it, so the one context its chain can
-        // safely terminate at is the one guaranteed to outlive every thread.
-        //
-        // This is also a real dangling-pointer fix. parent_sig is whatever
-        // ctx.sig was at the detach site, and for a detach issued from inside
-        // a `run` that is &RunSignalScope::local_sig -- a STACK local. `run`
-        // is synchronous, so that frame returns as soon as the child's lines
-        // are exhausted, while anything it detached keeps running: every
-        // isInterrupted() from that thread afterward walked into a freed
-        // frame.
-        exec->local_sig.setParent(&ETCS::RootSignalContext());
+        /*
+ * ACTIVE edge: the nearest CLOSURE ROOT, or the process root when there is
+ * none. Never parent_sig itself.
+ *
+ * Never parent_sig, because a detached job's lifetime is dictated by its own
+ * state machine rather than by the frame that launched it -- and because that
+ * frame may be gone. parent_sig is whatever ctx.sig was at the detach site,
+ * and for a detach issued from inside a `run` that is a STACK local
+ * (RunSignalScope::local_sig): `run` is synchronous, so the frame returns as
+ * soon as the child's lines are exhausted while anything it detached keeps
+ * running, and every isInterrupted() from that thread afterward walked into a
+ * freed frame.
+ *
+ * But the process root was too far. A job detached by a script a SHELL is
+ * running belongs to that Shell's closure -- it is one of the things "drop
+ * what this script started" has to be able to reach -- and parenting past the
+ * boundary put it structurally outside. closureRoot() finds the boundary if
+ * the detach site is inside one; the lifetime argument survives unchanged,
+ * because a closure root is a Thread entity's own context and its flags come
+ * from the ROOT ARENA (ThreadBase::ensureFlag), outliving every thread that
+ * can read them.
+ */
+        const ETCS::SignalContext* closure =
+            parent_sig ? parent_sig->closureRoot() : nullptr;
+        exec->local_sig.setParent(closure ? closure : &ETCS::RootSignalContext());
 
         // PASSIVE edge: the detaching parent, but ONLY when its lifetime is
         // structurally guaranteed -- which here means "it is one of THIS

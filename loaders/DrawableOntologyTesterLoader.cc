@@ -1292,6 +1292,74 @@ int main()
         ETCS::MemoryArena::getInstance().deleteEntity(w, true);
     }
 
+    // -- 20b. The closure boundary ----------------------------------------
+    //
+    // raiseClosure means "end the closure this call belongs to", and before a
+    // boundary existed it could not: every chain is pinned to
+    // RootSignalContext() by construction and the root's interrupt IS
+    // g_sig_int, so the outermost authority had one reachable value and every
+    // closure raise from anywhere was a process-wide SIGINT. Clicking a
+    // window's X ended the runtime.
+    //
+    // g_sig_int IS ASSERTED UNTOUCHED, not merely unread. That is the whole
+    // claim, and a test that only checked the Thread's own flag would pass
+    // just as well on the broken version -- both flags end up raised there.
+    {
+        check(g_sig_int.load(std::memory_order_acquire) == 0,
+              "the process interrupt starts clear");
+
+        // A Worker, because it claims Thread. ReleasableNode claims only
+        // Threaded, whose Signals() is the refusing default -- owning a body
+        // is not being an actor, and only an actor bounds a closure.
+        Worker* boundary = arena.allocate<Worker>();
+        ETCS::SignalContext shell = boundary->Signals();
+        check(shell.closure_root, "a Thread's context IS a closure boundary");
+        check(shell.interrupt != nullptr,
+              "...and holds real interrupt authority to end it with");
+        ETCS::SignalContext threaded_only = ETCS::SignalContext{};
+        {
+            ReleasableNode* merely_threaded = arena.allocate<ReleasableNode>();
+            threaded_only = merely_threaded->Signals();
+            check(!threaded_only.closure_root,
+                  "a Threaded that is not a Thread bounds nothing -- it owns a body, "
+                  "it is not an actor");
+            merely_threaded->getOwningArena().deleteEntity(merely_threaded, true);
+        }
+        if (!shell.interrupt) { check(false, "cannot continue without authority"); return g_fail; }
+
+        // A call nested inside that closure, the shape a script line has.
+        ETCS::SignalFlag inner_flag{0};
+        ETCS::SignalContext inner;
+        inner.interrupt = &inner_flag;
+        inner.setParent(&shell);
+
+        check(inner.raiseClosureInterrupt(),
+              "a raise inside the closure finds an authority");
+        check(shell.interrupt->load(std::memory_order_acquire) != 0,
+              "...and it is the BOUNDARY's, not the call's own");
+        check(inner_flag.load(std::memory_order_acquire) == 0,
+              "...not the nearest one -- nearest is the call this verb exists not to end");
+        check(g_sig_int.load(std::memory_order_acquire) == 0,
+              "...and the process interrupt is UNTOUCHED -- the closure ended, not the runtime");
+
+        // Reads cross the boundary in both directions: bounding who a raise
+        // REACHES must not bound who hears one, or a real SIGTERM would stop
+        // at the same edge.
+        check(inner.isInterrupted(),
+              "everything inside the closure still hears the raise");
+
+        // Outside any closure, the old behaviour is the right one and stands.
+        ETCS::SignalContext loose;
+        loose.setParent(&ETCS::RootSignalContext());
+        check(loose.closureRoot() == nullptr, "a chain with no boundary reports none");
+        check(inner.closureRoot() == &shell, "...and one with a boundary names it");
+
+        shell.interrupt->store(0, std::memory_order_release);
+        boundary->getOwningArena().deleteEntity(boundary, true);
+        check(g_sig_int.load(std::memory_order_acquire) == 0,
+              "the process interrupt is still clear when this test is done");
+    }
+
     // -- 21. Thread: the closure travels by value --------------------------
     //
     // The reason it is family state and not a local: a detached job outlives

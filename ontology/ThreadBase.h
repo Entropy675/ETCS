@@ -59,6 +59,21 @@ ETCS_SUPERTYPE_BASE(Thread), public ThreadedBase<Derived>
         c.terminate = this->ensureFlag(m_terminate);
         c.user1     = this->ensureFlag(m_user1);
 
+        /*
+ * A THREAD IS A CLOSURE BOUNDARY. Root is the entry point for the ontology;
+ * a Thread is the entry point for lifetimes and signals, so everything it
+ * runs and everything it detaches belongs to its closure and a raise inside
+ * that closure stops HERE rather than reaching g_sig_int
+ * (SignalContext::closure_root). Closing a window used to end the runtime for
+ * exactly this reason: nothing named an edge, so every closure was the
+ * process.
+ *
+ * Still parented to the process root, and that is not a contradiction: reads
+ * cross the boundary in both directions, so a real SIGTERM still stops
+ * everything inside here. The marker bounds who a raise REACHES, not who
+ * hears one.
+ */
+        c.closure_root = true;
         c.setParent(&ETCS::RootSignalContext());
         return c;
     }
