@@ -2516,7 +2516,8 @@ inline std::ostream& repl_err() { return ETCS::log_sink ? *ETCS::log_sink : std:
  * caller that genuinely is somewhere else. Same formatting as ETCS_LOG, on
  * purpose: it is the same shell, not a new voice.
  */
-#define ETCS_SHELL(type, msg) ETCS_LOG_LINE(type, msg, repl_out())
+// Never stamped: this is a prompt, not a record -- see ETCS_LOG_LINE (Log.h).
+#define ETCS_SHELL(type, msg) ETCS_LOG_LINE(type, msg, repl_out(), false)
 
 inline bool repl_is_module(const std::filesystem::directory_entry& entry)
 {
@@ -2833,6 +2834,144 @@ inline void repl_shell_print_live_modules(std::vector<std::string>& all_mods)
 // `e` past a read without it. That was true of a human at a keyboard and is no
 // less true of a remote session -- the wait is what matters, not what is being
 // waited on.
+/*
+ * WHERE THE LOG GOES, changed while it is running, FOR THE THING YOU ARE
+ * STANDING IN.
+ *
+ * It matters most exactly at a prompt: a prompt sharing stdout with a frame
+ * loop's logging is a prompt you cannot read, and the answer used to be a
+ * rebuild. Then it became `log file`, which moved EVERY loaded module's lines
+ * at once -- and that is the trade this replaces, because the thing drowning
+ * the prompt is one module and silencing all of them to be rid of it takes
+ * away the output you were actually reading.
+ *
+ * The flag was already per-binary (ETCS::log_to_file, Log.h); only the verb
+ * was global. `here` is what closes that gap: empty at the Root prompt, which
+ * means the LOADER's own flag, and the module's name inside a module, which is
+ * the navigator's own position doing the addressing rather than the operator
+ * retyping it.
+ *
+ *   log                  what every binary is doing right now
+ *   log file | term      the one you are in
+ *   log all file | term  every one of them, the old behaviour, still spelled
+ *   log <module> file    one by name, from anywhere
+ *
+ * Returns true if the line WAS a log command, so each loop can `continue`.
+ */
+inline bool repl_handle_log(const std::string& line, const std::string& here)
+{
+    if (line != "log" && line.rfind("log ", 0) != 0) return false;
+
+    std::string rest = (line.size() > 4) ? line.substr(4) : "";
+    {
+        size_t b0 = rest.find_first_not_of(" \t");
+        size_t b1 = rest.find_last_not_of(" \t");
+        rest = (b0 == std::string::npos) ? "" : rest.substr(b0, b1 - b0 + 1);
+    }
+
+    // "<target> <where>" or just one word. A lone "file"/"term" targets `here`.
+    std::string target, where;
+    {
+        size_t sp = rest.find_first_of(" \t");
+        if (sp == std::string::npos) where = rest;
+        else { target = rest.substr(0, sp);
+               size_t b0 = rest.find_first_not_of(" \t", sp);
+               where = (b0 == std::string::npos) ? "" : rest.substr(b0); }
+    }
+    auto is_dest = [](const std::string& s)
+        { return s == "file" || s == "term" || s == "terminal"; };
+    // "log RenderProvider" with no destination is a status query, not a typo.
+    if (target.empty() && !where.empty() && !is_dest(where) && where != "status" && where != "all")
+        { target = where; where.clear(); }
+
+    if (where.empty() || where == "status")
+    {
+        if (!target.empty() && target != "all")
+        {
+            bool found = false;
+            const bool f = ETCS::module_log_destination_is_file(target, found);
+            if (!found)
+                repl_err() << COLOR_WARN << "log: '" << target
+                           << "' is not a loaded module" << COLOR_RESET << "\n";
+            else
+                ETCS_SHELL("Navigator", COLOR_DIR << "log " << target << ": "
+                         << (f ? "logs/" + target + ".log" : std::string("terminal"))
+                         << COLOR_RESET);
+            return true;
+        }
+
+        // ENUMERATED, not generalised. One answer described every binary only
+        // while one verb moved them together; it no longer does.
+        //
+        // The COLOR_* macros are ternaries rather than string literals (they
+        // ask isatty), so they cannot be juxtaposed into one -- this is built
+        // once instead of pasted at each row.
+        const std::string mark = std::string(COLOR_RID) + "   (you are here)" + COLOR_RESET;
+        const std::string none;
+
+        ETCS_SHELL("Navigator", COLOR_DIR << "log destinations:" << COLOR_RESET);
+        ETCS_SHELL("Navigator", COLOR_LIB << "  loader" << COLOR_RESET << "  -> "
+                 << (ETCS::log_destination_is_file() ? "logs/<loader>.log"
+                                                     : std::string("terminal"))
+                 << (here.empty() ? mark : none));
+        for (const std::string& s : ETCS::module_log_scopes())
+        {
+            bool found = false;
+            const bool f = ETCS::module_log_destination_is_file(s, found);
+            ETCS_SHELL("Navigator", COLOR_LIB << "  " << s << COLOR_RESET << "  -> "
+                     << (f ? "logs/" + s + ".log" : std::string("terminal"))
+                     << (s == here ? mark : none));
+        }
+        ETCS_SHELL("Navigator", COLOR_DIR
+                 << "  (log file | log term | log all file | log <module> file)" << COLOR_RESET);
+        return true;
+    }
+
+    if (!is_dest(where))
+    {
+        repl_err() << COLOR_WARN << "log: expected 'file', 'term', a module name, or nothing"
+                   << COLOR_RESET << "\n";
+        return true;
+    }
+
+    const bool to_file = (where == "file");
+
+    if (target == "all")
+    {
+        ETCS::set_log_destination(to_file);
+        ETCS_SHELL("Navigator", COLOR_LIB << "log (everything) -> "
+                 << (to_file ? "logs/<Module>.log (one file per binary)" : "this terminal")
+                 << COLOR_RESET);
+        return true;
+    }
+
+    // No target named: the one you are standing in.
+    const std::string scope = target.empty() ? here : target;
+
+    if (scope.empty())
+    {
+        // The Root prompt IS the loader, so this is not a fallback.
+        ETCS::set_log_to_file(to_file);
+        ETCS_SHELL("Navigator", COLOR_LIB << "log (loader) -> "
+                 << (to_file ? "logs/<loader>.log" : "this terminal") << COLOR_RESET
+                 << COLOR_DIR << "   (log all " << where << " for every module too)"
+                 << COLOR_RESET);
+        return true;
+    }
+
+    if (!ETCS::set_module_log_destination(scope, to_file))
+    {
+        repl_err() << COLOR_WARN << "log: '" << scope
+                   << "' is not a loaded module -- nothing to redirect"
+                   << COLOR_RESET << "\n";
+        return true;
+    }
+    ETCS_SHELL("Navigator", COLOR_LIB << "log " << scope << " -> "
+             << (to_file ? "logs/" + scope + ".log" : std::string("this terminal"))
+             << COLOR_RESET);
+    return true;
+}
+
 inline void repl_shell_action_loop(ETCS::Entity* e, ETCS::Root& nav_root,
                                    ETCS::SignalContext& sig, ReplLineSource& in)
 {
@@ -3228,12 +3367,17 @@ inline void repl_shell_instance_loop(const std::string& mod_name, const std::str
             }
         }
         ETCS_SHELL("Navigator",
-            "  [n] Select   [spawn <name>] Create and name   [back] Return");
+            "  [n] Select   [spawn <name>] Create and name   [log file|term] This module"
+            "   [back] Return");
 
         std::string i_in;
         if (!in(tag_name + " Inst> ", i_in)) break;
         if (i_in == "back")                   { break; }
         if (i_in == "exit" || i_in == "quit") { return; }
+
+        // Still inside mod_name, so `log` still addresses it -- the position
+        // is the navigator's, not the depth's.
+        if (repl_handle_log(i_in, mod_name)) continue;
 
         // spawn <name> -- the name is REQUIRED, and goes into GlobalNames.
         //
@@ -3374,11 +3518,17 @@ inline void repl_shell_tag_loop(const std::string& mod_name, ETCS::Root& nav_roo
             }
         }
 
-        ETCS_SHELL("Navigator", "  [back] Return   [detach] Detach   [exit] Quit");
+        ETCS_SHELL("Navigator",
+            "  [back] Return   [detach] Detach   [log file|term] This module   [exit] Quit");
 
         std::string t_in;
         if (!in(mod_name + " Tag> ", t_in)) break;
         if (t_in.empty()) continue;
+
+        // Standing in a module, `log file` means THIS module -- which is the
+        // whole reason the flag is per-binary. See repl_handle_log.
+        if (repl_handle_log(t_in, mod_name)) continue;
+
         if (t_in == "back")   { break; }
         if (t_in == "detach") { detach_module = true; break; }
         if (t_in == "exit" || t_in == "quit") { return; }
@@ -3444,45 +3594,7 @@ inline void repl_shell_loop_with(ETCS::SignalContext& sig, ReplLineSource& in)
             continue;
         }
 
-        /*
-         * WHERE THE LOG GOES, changed while it is running.
-         *
-         * It matters most exactly here: a prompt sharing stdout with a frame
-         * loop's logging is a prompt you cannot read, and the answer used to
-         * be a rebuild. Each module keeps its own destination (ETCS::
-         * log_to_file, Log.h) and writes to logs/<ModuleName>.log, so this
-         * visits every loaded one rather than flipping a single global.
-         */
-        if (mod_input == "log" || mod_input.rfind("log ", 0) == 0)
-        {
-            std::string arg = (mod_input.size() > 4) ? mod_input.substr(4) : "";
-            size_t b0 = arg.find_first_not_of(" \t");
-            size_t b1 = arg.find_last_not_of(" \t");
-            arg = (b0 == std::string::npos) ? "" : arg.substr(b0, b1 - b0 + 1);
-
-            if (arg == "file" || arg == "term" || arg == "terminal")
-            {
-                const bool to_file = (arg == "file");
-                ETCS::set_log_destination(to_file);
-                ETCS_SHELL("Navigator", COLOR_LIB << "log -> "
-                         << (to_file ? "logs/<Module>.log (one file per provider)"
-                                     : "this terminal")
-                         << COLOR_RESET);
-            }
-            else if (arg.empty() || arg == "status")
-            {
-                ETCS_SHELL("Navigator", COLOR_DIR << "log destination: "
-                         << (ETCS::log_destination_is_file()
-                             ? "logs/<Module>.log" : "terminal")
-                         << COLOR_RESET << "   (log file | log term)");
-            }
-            else
-            {
-                repl_err() << COLOR_WARN << "log: expected 'file', 'term', or nothing"
-                           << COLOR_RESET << "\n";
-            }
-            continue;
-        }
+        if (repl_handle_log(mod_input, "")) continue;
 
         if (mod_input == "jobs")
         {

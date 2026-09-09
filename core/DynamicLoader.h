@@ -50,8 +50,8 @@ namespace ETCS {
         return nodes;
     }
 
-    // The switch behind `log file` / `log term`. The loader's own flag first,
-    // then every module's, through the trampoline each registered.
+    // Everything at once -- `log all file` / `log all term`. The loader's own
+    // flag first, then every module's, through the trampoline each registered.
     inline void set_log_destination(bool to_file)
     {
         ETCS::set_log_to_file(to_file);
@@ -59,9 +59,55 @@ namespace ETCS {
             if (node && node->set_log_to_file) node->set_log_to_file(to_file);
     }
 
-    // What the loader is doing right now. Modules are kept in step by the
-    // setter above, so one answer describes all of them.
+    /*
+ * ONE MODULE'S, which is what the per-binary flag was always for.
+ *
+ * Setting them together was never a policy, it was the only reachable
+ * operation: the shell had one verb and the verb visited the whole map. But a
+ * frame loop drowning a prompt is ONE module's lines, and moving all of them
+ * to files to get rid of it takes away every other module's output too --
+ * which is the trade the person at the prompt was trying not to make.
+ *
+ * Returns false for a scope nothing has registered, rather than silently doing
+ * nothing: "RenderProvider is not loaded" and "RenderProvider now logs to a
+ * file" are different answers and the shell prints them differently.
+ */
+    inline bool set_module_log_destination(const std::string& scope, bool to_file)
+    {
+        auto it = module_log_nodes().find(scope);
+        if (it == module_log_nodes().end() || !it->second || !it->second->set_log_to_file)
+            return false;
+        it->second->set_log_to_file(to_file);
+        return true;
+    }
+
+    // Same shape for the read. `found` distinguishes "not loaded" from "on the
+    // terminal", which a bare bool cannot.
+    inline bool module_log_destination_is_file(const std::string& scope, bool& found)
+    {
+        auto it = module_log_nodes().find(scope);
+        found = (it != module_log_nodes().end() && it->second && it->second->get_log_to_file);
+        return found ? it->second->get_log_to_file() : false;
+    }
+
+    // What THE LOADER is doing -- its own flag and nothing else's. It used to
+    // be able to say "and every module's too", because the only setter moved
+    // them together; with the targeted one above that is no longer true, and a
+    // reader that assumed it would report the loader's answer for a module
+    // that had been set the other way.
     inline bool log_destination_is_file() { return ETCS::get_log_to_file(); }
+
+    // Every registered scope, for `log status` -- which now has to enumerate
+    // rather than generalise, for the reason just above.
+    inline std::vector<std::string> module_log_scopes()
+    {
+        std::vector<std::string> out;
+        out.reserve(module_log_nodes().size());
+        for (auto& [name, node] : module_log_nodes())
+            if (node && node->get_log_to_file) out.push_back(name);
+        std::sort(out.begin(), out.end());
+        return out;
+    }
 }
 namespace ETCS
 {
