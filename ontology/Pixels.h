@@ -4,6 +4,7 @@
 
 #include "../core_defs.h"
 #include "Observable.h"
+#include "Raster.h"
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -12,11 +13,23 @@
 // Pixels
 // ---------------------------------------------------------------
 //
-// A surface whose bytes live in CPU memory and can be read and
+// A raster whose bytes live in CPU memory and can be read and
 // written directly. Split from Surface for the same reason
 // Presentable was: a swapchain-backed surface has no CPU bytes to
 // hand out, and only some surfaces are meant to be edited a pixel
 // at a time.
+//
+// ONE OF TWO, and the other is Renderable (ontology/Renderable.h).
+// Everything below is a consequence of the bytes being addressable
+// by the host; a device-resident raster has none of it. What the
+// two share is that they have a SIZE, which is Raster
+// (ontology/Raster.h) -- inherited VIRTUALLY and directly, which
+// that header explains: Raster has no base of its own to be reached
+// twice through, so this is the one lineage in the ontology that
+// belongs in the interface rather than in the Base. The practical
+// consequence is that a Pixels_* answers its own dimensions, and
+// the two families remain mutually exclusive anyway -- by the
+// final-overrider rule, on the two accessors implemented just below.
 //
 // This family OWNS its buffer rather than declaring an interface to
 // one, the same way InputSource_ owns its event ring instead of
@@ -48,10 +61,18 @@
 // A writer calls etcs_mark_observed (Observable.h); a reader asks
 // TakeObserved(its own RID) and, if told yes, reads PixelData().
 
-class Pixels_ : virtual public ETCS::Entity
+class Pixels_ : virtual public Raster_
 {
 public:
     virtual ~Pixels_() = default;
+
+    // Raster_'s two questions, answered from the buffer's own dimensions
+    // rather than from a number kept beside it -- so the size a consumer is
+    // told and the size the bytes actually have cannot drift apart. This is
+    // also the pair whose overrider a leaf claiming Renderable as well would
+    // make ambiguous, which is where the exclusivity is enforced.
+    uint32_t PixelWidth()  const override { return m_pw; }
+    uint32_t PixelHeight() const override { return m_ph; }
 
     // Zero-fills (fully transparent). Idempotent for the same size, so
     // re-Allocating an unchanged image is not a silent realloc.
@@ -64,10 +85,13 @@ public:
         etcs_mark_observed(this);
     }
 
+    // Everything that is only true of a host-addressable buffer -- where it
+    // starts, how far apart its rows are, and how much of it there is. A
+    // device image answers none of these: its row pitch is the driver's
+    // business and its bytes have no address in this process. That is the
+    // whole of what separates this family from Renderable.
     uint8_t*        PixelData()             { return m_pixels.empty() ? nullptr : m_pixels.data(); }
     const uint8_t*  PixelData()       const { return m_pixels.empty() ? nullptr : m_pixels.data(); }
-    uint32_t        PixelWidth()      const { return m_pw; }
-    uint32_t        PixelHeight()     const { return m_ph; }
     uint32_t        PixelStride()     const { return m_pw * 4; }
     size_t          PixelBytes()      const { return m_pixels.size(); }
 

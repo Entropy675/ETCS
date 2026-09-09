@@ -38,7 +38,20 @@
 #include "ontology/ClippableBase.h"
 #include "ontology/SurfaceBase.h"
 #include "ontology/PresentableBase.h"
+
+// The raster split: Raster is a grid of pixels with a size, and the two
+// families under it are where those pixels live -- Pixels in host memory,
+// Renderable in a device's. Mutually exclusive by the final-overrider rule
+// rather than by a written one, so a leaf that claimed both would not
+// compile.
+//
+// There is deliberately no RasterBase to include, and it is the only parent
+// in this ontology with no base of its own: a leaf claiming only Raster
+// would have a size, no bytes, no device, and no way to reach a screen --
+// not an incomplete type but an incoherent one. Raster.h says the rest,
+// including why the lineage sits in those two interfaces instead.
 #include "ontology/PixelsBase.h"
+#include "ontology/RenderableBase.h"
 
 // The Drawable lineage: Surface refined into a node that occupies space in
 // a parent and nests. DrawableBase composes SurfaceBase, the two leaf bases

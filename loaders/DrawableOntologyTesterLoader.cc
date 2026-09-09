@@ -382,6 +382,51 @@ public:
     void DrawIntoConcrete(Surface_*) {}
 };
 
+// ---------------------------------------------------------------------------
+// The other side of the raster split (ontology/Raster.h): a Drawable2D whose
+// pixels are somewhere this process cannot address. VulkanSurface is the real
+// one; this is the same claim with the device replaced by two numbers, which
+// is all the ontology can see of a device anyway.
+//
+// Drawable2D as well as Renderable, deliberately -- the coordinate-origin walk
+// in RenderProvider stops at the first ancestor that is a RASTER, and the case
+// that used to be walked straight past is exactly this one: a drawable node
+// with a raster that is not a Pixels.
+//
+// It does NOT claim PixelsBase, and it cannot: both families inherit Raster_
+// virtually, so the two collapse to ONE Raster_ with PixelWidth() overridden
+// in two sibling branches and neither dominating -- no unique final overrider,
+// which is a compile error rather than a runtime check. So no test below
+// asserts it; this class not compiling if the line were added IS the test.
+// ---------------------------------------------------------------------------
+class DeviceNode : public Drawable2DBase<DeviceNode>,
+                   public RenderableBase<DeviceNode>
+{
+public:
+    WIRE_TYPE_IDENTITY(DeviceNode)
+
+    uint64_t device = 0;
+    uint32_t dw = 0, dh = 0;
+
+    int32_t z = 0;
+    int32_t Order() override { return z; }
+    bool operator<(const DeviceNode& o) const { return z < o.z; }
+
+    uint64_t DeviceKeyConcrete()   const { return device; }
+    uint32_t PixelWidthConcrete()  const { return dw; }
+    uint32_t PixelHeightConcrete() const { return dh; }
+
+    Rect2D BoundsConcrete() { return Rect2D{0, 0, dw, dh}; }
+    bool   ContainsLocalConcrete(int32_t, int32_t) { return true; }
+    WindowSize GetSizeConcrete() { return WindowSize{dw, dh}; }
+
+    void ClearConcrete(float, float, float, float) {}
+    void DrawRectConcrete(int32_t, int32_t, uint32_t, uint32_t,
+                          float, float, float, float) {}
+    void BlitConcrete(Surface_*, int32_t, int32_t, uint32_t, uint32_t, float) {}
+    void DrawIntoConcrete(Surface_*) {}
+};
+
 // A minimal actor: claims Thread, so it gets Threaded (Halt/Halted/Shape), a
 // SignalContext and a closure without writing any of them.
 class Worker : public ThreadBase<Worker>
@@ -1601,6 +1646,102 @@ int main()
             *stale.terminate = 0;
         }
         for (Worker* w : later) ETCS::MemoryArena::getInstance().deleteEntity(w, true);
+    }
+
+    /*
+     * -- 27. The raster split: one question about size, two about storage ----
+     *
+     * Pixels used to be asked two different things at once. "How big is this"
+     * and "where are its bytes" have the same answer only while every raster
+     * in the system is CPU-backed, and RenderProvider had three consumers
+     * relying on that: two coordinate-origin walks asking for "Pixels" to mean
+     * "is this node a raster", and a blit path that refused everything without
+     * host bytes with one message covering two unrelated causes.
+     *
+     * Raster is the first question. Pixels and Renderable are the second, and
+     * they are mutually exclusive by composition -- see DeviceNode above for
+     * why that is a compile error rather than anything asserted here.
+     */
+    {
+        PixelNode* cpu = ETCS::MemoryArena::getInstance().allocate<PixelNode>();
+        DeviceNode* gpu = ETCS::MemoryArena::getInstance().allocate<DeviceNode>();
+        check(cpu && gpu, "a host-resident node and a device-resident one");
+
+        if (cpu && gpu)
+        {
+            cpu->Allocate(64, 32);
+            gpu->device = 0xD1CE; gpu->dw = 128; gpu->dh = 96;
+
+            Raster_* rc = static_cast<Raster_*>(cpu->getInterfacePointer(ETCS::Buffer("Raster")));
+            Raster_* rg = static_cast<Raster_*>(gpu->getInterfacePointer(ETCS::Buffer("Raster")));
+
+            check(rc && rg,
+                  "BOTH answer \"Raster\" -- the size question does not depend on "
+                  "whose memory the answer lives in");
+            check(rc && rc->PixelWidth() == 64 && rc->PixelHeight() == 32,
+                  "a CPU raster's size is its buffer's, answered through Raster");
+            check(rg && rg->PixelWidth() == 128 && rg->PixelHeight() == 96,
+                  "a device raster's size is the device image's, answered the same way");
+
+            // The disjointness, from both sides. Not the exclusivity itself --
+            // that is the compile -- but the thing every consumer branches on.
+            check(cpu->getInterfacePointer(ETCS::Buffer("Pixels")) != nullptr
+               && cpu->getInterfacePointer(ETCS::Buffer("Renderable")) == nullptr,
+                  "a host raster is Pixels and not Renderable");
+            check(gpu->getInterfacePointer(ETCS::Buffer("Renderable")) != nullptr
+               && gpu->getInterfacePointer(ETCS::Buffer("Pixels")) == nullptr,
+                  "a device raster is Renderable and not Pixels -- so \"no Pixels\" "
+                  "is a statement about locality, not about being a picture");
+
+            // The origin walk's question, in the form it is actually asked.
+            // Answering "Pixels" here was the bug: a device-resident drawable
+            // ancestor is a coordinate origin and was walked straight past.
+            check(gpu->getInterfacePointer(ETCS::Buffer("Drawable2D")) != nullptr
+               && gpu->getInterfacePointer(ETCS::Buffer("Raster")) != nullptr,
+                  "a device-resident DRAWABLE stops an origin walk, because the walk "
+                  "asks Raster");
+
+            // Empty is "not sized yet", which is a real state and not an error.
+            DeviceNode* unborn = ETCS::MemoryArena::getInstance().allocate<DeviceNode>();
+            if (unborn)
+            {
+                Raster_* ru = static_cast<Raster_*>(
+                    unborn->getInterfacePointer(ETCS::Buffer("Raster")));
+                check(ru && ru->RasterEmpty(),
+                      "a raster with no size yet reports empty rather than lying about one");
+                check(rg && !rg->RasterEmpty(),
+                      "...and a sized one does not");
+
+                // DeviceKey's only defined operation. Equal and non-zero is
+                // the one case a device-to-device copy would be legal in;
+                // zero is "no device yet", which must never compare equal to
+                // a real one just because both sides are unset.
+                Renderable_* nu = static_cast<Renderable_*>(
+                    unborn->getInterfacePointer(ETCS::Buffer("Renderable")));
+                Renderable_* ng = static_cast<Renderable_*>(
+                    gpu->getInterfacePointer(ETCS::Buffer("Renderable")));
+                check(nu && nu->DeviceKey() == 0,
+                      "an uncreated device raster names no device");
+                check(ng && nu && ng->DeviceKey() != nu->DeviceKey(),
+                      "and does not read as being on the same device as a created one");
+
+                DeviceNode* sibling = ETCS::MemoryArena::getInstance().allocate<DeviceNode>();
+                if (sibling)
+                {
+                    sibling->device = gpu->device;
+                    Renderable_* ns = static_cast<Renderable_*>(
+                        sibling->getInterfacePointer(ETCS::Buffer("Renderable")));
+                    check(ns && ng && ns->DeviceKey() == ng->DeviceKey(),
+                          "two rasters on one device say so, which is the whole of what "
+                          "DeviceKey is for");
+                    ETCS::MemoryArena::getInstance().deleteEntity(sibling, true);
+                }
+                ETCS::MemoryArena::getInstance().deleteEntity(unborn, true);
+            }
+
+            ETCS::MemoryArena::getInstance().deleteEntity(gpu, true);
+            ETCS::MemoryArena::getInstance().deleteEntity(cpu, true);
+        }
     }
 
     ETCS::MemoryArena::getInstance().deleteEntity(canvas, true);
