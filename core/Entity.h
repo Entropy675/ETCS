@@ -840,7 +840,6 @@ public:
         T* child = getArena().allocate<T>(std::forward<Args>(args)...);
         s_pending_parent_arena_ = saved;
         child->getArena().setScopeTag(T::CONTRACT_TAG);   /*
- * <-- new line
  * CONTRACT_TAG -- not getSourceTag(), still empty here (setModuleSource
  * runs later, inside addTagImpl, as part of this same blocking call),
  * and not T::TAG, the concrete class name a typedef never renames.
@@ -1991,7 +1990,7 @@ public:
         (void)ptr;
     }
  
-    ID_SIZE_TYPE getID() const                      { return 67; } // will be the sum hash of the types
+    ID_SIZE_TYPE getID() const                      { return 67; }
  
     virtual bool myTagInto(ETCS::Buffer& buffer)
     {
@@ -2135,30 +2134,19 @@ private:
  * -----------------------------------------------------------------------
  */
     /*
- * ANSWERS WHETHER THE SURFACE ACTUALLY CHANGED, which is the half this was
- * missing rather than a convenience.
- *
- * Tags ARE the state surface, so a tag going on or off is the recorded form
- * of a state transition -- and the question anything downstream of that
- * surface asks is not "was a tag operation ordered" but "did the surface
- * move". A hash surface recomputing lazily needs exactly that bit to know
- * whether it has anything to recompute; a caller claiming a transition needs
- * exactly that bit to know whether it was the one that made it.
- *
- * false is the honest answer for every path that leaves flags_/tags as it
- * found them: an add of a flag already present, a remove of one absent, a
- * refusal to remove a foundational name, and a scope interrupt -- which
- * REQUESTS that a call stop and does not itself remove anything (see below).
- */
-    /*
- * The funnel, so the "did it move" bit has exactly one place to be acted on
+ * THE FUNNEL, so the "did it move" bit has exactly one place to be acted on
  * rather than one per return of the body below.
  *
- * A TAG GOING ON OR OFF IS A STATE TRANSITION, so anything observing this
- * entity is now out of date -- that is the whole justification, and it is the
- * one the body's own comment already gives for computing the bit at all. The
- * false answers are load-bearing here: re-adding a flag that is present, or
- * removing one that is absent, moves nothing and must not wake a hash.
+ * A TAG GOING ON OR OFF IS A STATE TRANSITION: tags ARE the state surface, so
+ * anything observing this entity is now out of date. What downstream asks is
+ * not "was a tag operation ordered" but "did the surface move" -- a lazily
+ * recomputing hash needs exactly that bit, and so does a caller claiming it
+ * was the one that made the transition.
+ *
+ * The false answers are load-bearing. Every path that leaves flags_/tags as
+ * it found them returns false: an add of a flag already present, a remove of
+ * one absent, a refusal to remove a foundational name, and a scope interrupt
+ * -- which REQUESTS that a call stop and removes nothing itself.
  *
  * Marked through IWireObservable (core/InterfaceWire.h), not through the
  * ontology family -- core declares the wire and does not know what claimed it.
@@ -2500,7 +2488,7 @@ inline ETCS::ScopeTag::ScopeTag(ETCS::Entity* entity, const char* label,
  *
  * Null means gone -- a real answer, not an error.
  */
-ETCS::EventNode* etcs_loader_event_node();   // defined below
+ETCS::EventNode* etcs_loader_event_node();   // defined in DynamicLoader.h
 inline Entity* etcs_resolve_by_key(const ETCS::Buffer& conjugate_key, RID rid)
 {
     if (rid == 0 || conjugate_key.written == 0) return nullptr;

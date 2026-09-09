@@ -172,7 +172,7 @@ struct ExecutionContext
 
     // This script's own names: what it introduced, plus what it was passed.
     // NOT the globals -- those are consulted as a second, separate lookup
-    // (see resolve/resolve_binding below), never merged in here, so a script
+    // (see lookup/resolve_name below), never merged in here, so a script
     // can always tell its own names from the root's.
     std::unordered_map<std::string, NameBinding> names;
 
@@ -401,7 +401,7 @@ struct CmdKill
 //
 // Removes a FLAG -- the freely-mutable lowercase set. Routed through
 // Entity::removeTag, which means it goes through the same TagModifyEvent /
-// Scope::interruptOne path any other flag removal does: if `flag` names an
+// Scope::interruptLabel path any other flag removal does: if `flag` names an
 // active_scope_* label (ScopeTag, Bundles.h), this reaches in and interrupts
 // that stream call's own SignalContext rather than merely removing
 // bookkeeping.

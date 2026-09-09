@@ -1502,7 +1502,7 @@ inline ExecuteResult execute_command(const Command& cmd,
                 return {ctx.lost_rid ? ExecuteStatus::Vanished : ExecuteStatus::Error,
                         "unflag: receiver unavailable."};
             // removeTag routes through the SAME TagModifyEvent /
-            // Scope::interruptOne path any other removal does -- if c.flag
+            // Scope::interruptLabel path any other removal does -- if c.flag
             // names an active_scope_* label this reaches in and interrupts
             // that stream call's own SignalContext, not merely bookkeeping.
             try { r->entity->removeTag(ETCS::Buffer(c.flag.c_str())); }
@@ -2269,56 +2269,27 @@ inline void shutdown_detached_executors()
 // ===========================================================================
 // THE NAVIGATOR -- the browse surface over the executor.
 //
-// This arrived here from ShellREPL.h, which no longer exists. That file was two
-// things wedged together: a NAVIGATOR over the live entity graph, which is a
-// client of this file and of nothing else, and a TERMINAL, which is an OS
-// facility and now lives in a provider (modules/ShellProvider/Linux).
+// A client of this file and of nothing else: it builds Command values directly
+// and hands them to execute_command. "No terminal I/O" at the top of this file
+// still holds -- nothing below reads a keystroke, sets raw mode or knows what a
+// terminal is. It renders through repl_out() and asks for lines.
 //
-// THE SEAM WAS ALREADY NAMED. ReplLineSource was invented so a socket session
-// and a tty could drive the same loops; splitting on it costs nothing
-// structurally, because the navigator already only ever asks for a line. What
-// changed is that the tty's answer now arrives through a module's export table
-// (four ordinary actions on the Shell tag) instead of through an #ifdef.
-//
-// "EXECUTION ONLY, NO TERMINAL I/O" AT THE TOP OF THIS FILE STILL HOLDS.
-// Nothing below reads a keystroke, sets raw mode, opens /dev/tty or knows what
-// a terminal is. It renders text through repl_out() and asks for lines.
-//
-// ---------------------------------------------------------------------------
-// THE GATING SPLIT
-//
-// Navigation is a RUNTIME CAPABILITY, gated on ETCS_LOADER -- it reads
+// GATING. Navigation is ETCS_LOADER-only: it reads
 // LoaderStream::module_registry and the live entity graph, neither of which a
-// module has. The terminal is one INPUT SOURCE for it, and is no longer gated
-// at all: whether one exists is a runtime question now -- did a Shell spawn.
+// module has. The terminal driving it is not gated at all -- whether one exists
+// is a runtime question, answered by whether a Shell spawned. A remote session
+// gets the SAME navigator, rendered by the side holding the entity graph rather
+// than proxied to it.
 //
-// A remote session is handed the SAME navigator the local console uses,
-// rendered by the side that actually has the entity graph -- no proxying, no
-// mirrored surface, because the process answering the questions is the one
-// holding the answers.
-//
-// ---------------------------------------------------------------------------
-// THE BROWSE / SCRIPT SPLIT
-//
-// This surface does not execute .etcs lines. A session used to be able to type
-// raw trace lines at a prompt and have them interpreted by the same parser a
-// file goes through. That is gone, and its absence is what makes the script
-// grammar affordable.
-//
-// The two surfaces want opposite things. A script is written by someone who
-// already knows the types, is read long after it ran, and benefits from a
-// grammar that refuses everything it cannot resolve statically. Someone at a
-// prompt is doing the opposite -- finding out what exists -- and every rule
-// that makes a trace trustworthy makes exploration worse: naming a receiver
+// THE BROWSE / SCRIPT SPLIT. This surface does not execute .etcs lines, and its
+// absence is what makes the script grammar affordable. A script is read long
+// after it ran and benefits from refusing anything it cannot resolve
+// statically; someone at a prompt is finding out what exists, and every rule
+// that makes a trace trustworthy makes exploration worse -- naming a receiver
 // you are still looking for, bracketing arguments to an action you have not
-// found yet, declaring a type before you know which one you want.
-//
-// So the navigator keeps its own input vocabulary, which was never script
-// syntax anyway: bare numbers select, `back`/`up` move, `c0` descends into a
-// child, `s0` interrupts by position, and a bare action name dispatches. It
-// builds Command values DIRECTLY and hands them to execute_command. What the
-// two surfaces share is execution -- one implementation of what an action
-// does -- not a parser for two grammars with different jobs.
+// found yet. So the navigator keeps its own vocabulary: bare numbers select,
+// `back`/`up` move, `c0` descends into a child, `s0` interrupts by position, a
+// bare action name dispatches. The two surfaces share EXECUTION, not a parser.
 // ===========================================================================
 
 #ifdef ETCS_EXECUTOR_HOST
@@ -2326,17 +2297,14 @@ inline void shutdown_detached_executors()
 /*
  * ANSI OR NOT IS A RUNTIME FACT, NOT A BUILD ONE.
  *
- * These used to be #ifdef ETCS_REPL_SHELL: real codes in the interactive
- * binary, empty strings in every other. That was wrong in both directions -- a
- * drain build run at a terminal printed no colour, and an interactive build
- * piped into a file wrote escape bytes into it. The build flag was never the
- * question; whether stdout is a terminal is, and that is only knowable at
- * runtime. Now that the terminal is a provider rather than a compile mode,
- * there is no flag left to ask anyway.
+ * These were #ifdef ETCS_REPL_SHELL, which was wrong in both directions: a
+ * drain build at a terminal printed no colour, an interactive build piped to a
+ * file wrote escape bytes into it. Whether stdout is a terminal is the only
+ * question, and it is only answerable at runtime.
  *
  * One isatty() at first use, cached, overridable. Each DSO gets its own copy of
- * the static under -Bsymbolic and they cannot disagree, because they all ask
- * the same file descriptor the same question.
+ * the static under -Bsymbolic; they cannot disagree, since they ask the same
+ * descriptor the same question.
  *
  * Each macro stays usable inside the `<<` chains that already carry it: a
  * conditional expression of two const char*, not a literal.
@@ -2467,56 +2435,37 @@ inline thread_local ETCS::Entity* repl_console_shell = nullptr;
 namespace ETCS {
 
 /*
- * THE SHELL SEAM.
+ * THE SHELL SEAM -- and there is no seam, which is the design.
  *
- * A terminal is one INPUT SOURCE for the navigator. That was always the claim;
- * the terminal living in a module is what finally holds this file to it.
- *
- * THERE IS NO SEAM. That is the whole of the design, and it took two worse
- * versions to arrive at. A terminal is a thing a Shell DOES, so it is four
- * ordinary actions on the Shell tag -- ReadLine, Attach, OpenConsole,
- * CloseConsole -- reached by ordinary dispatch:
+ * A terminal is a thing a Shell DOES, so it is four ordinary actions on the
+ * Shell tag -- ReadLine, Attach, OpenConsole, CloseConsole -- reached by
+ * ordinary dispatch. No export, no dlsym, no registry:
  *
  *     ETCS::Buffer data("Root> ");
  *     shell->call(ETCS::Buffer("Shell.ReadLine"), data, sig);
  *
- * WorkFunc is already `void(Entity*, Buffer& data, SignalContext)`: the buffer
- * is in/out and the context crosses by value, which is exactly the shape a
- * prompt-in/line-out call wants and is not a coincidence -- it is what every
- * action in the system has always taken. Entity::call's own comment names the
- * Buffer& overload as THE return path.
+ * WorkFunc is already `void(Entity*, Buffer& data, SignalContext)` -- buffer
+ * in/out, context by value -- which is what every action in the system has
+ * always taken, and Entity::call names the Buffer& overload as THE return path.
+ * No wire either: `Shell` is the contract tag every OS backend unifies under
+ * (Contract_ShellProvider.h), so the name is the compile-time handle.
  *
  * SYNCHRONOUS, ON THE CALLING THREAD. Entity::call -> ModuleBundle::operator()
- * -> WorkBundle::operator() -> the work function, with no queue and no
- * ordering thread anywhere in it. So a ReadLine that parks for as long as the
- * operator takes to type parks THIS thread, which is main, which is the thread
- * that should be waiting. Nothing else in the runtime is behind it.
+ * -> WorkBundle::operator() -> the work function, with no queue and no ordering
+ * thread in it. A ReadLine that parks for as long as the operator takes to type
+ * parks main, which is the thread that should be waiting; nothing is behind it.
  *
- * WHAT THE EARLIER VERSIONS COST, recorded because both looked reasonable:
- * exporting four Shell_Terminal* symbols was an ABI addition for something the
- * dispatch table already carries; publishing four function pointers onto
- * EventNode kept the ABI but put a shell-shaped hole in core's per-DSO hub that
- * every module could reach, and made "which module is the shell" a question
- * with a wrong answer available. Addressing a named action on a named entity
- * has neither problem: the loader spawns ShellProvider::Shell and asks THAT.
- *
- * NO WIRE, EITHER. The loader needs to know the Shell's shape before any
- * provider exists, and it does -- `Shell` is the contract tag every OS backend
- * unifies under (Contract_ShellProvider.h), so the name is the compile-time
- * handle and an IWireShell would only replace a string lookup once per line.
- *
- * THE LINE PROTOCOL. Buffer is TBuffer<MAX_TAG_BUFFER_SIZE> -- 256 bytes -- so
- * the reply is one status byte and up to 254 characters of line:
+ * THE LINE PROTOCOL. Buffer is 256 bytes, so the reply is one status byte and
+ * up to 254 characters:
  *
  *     in    the prompt
  *     out   '+' <line>   a line was read; the line may legitimately be empty
  *           '-'          the source is finished (signal, stdin gone, no console)
  *           <nothing>    the action never dispatched -- also finished
  *
- * The status byte exists because pressing enter at a prompt is a legitimate
- * no-op the loop must continue on, so "wrote nothing" cannot mean "empty
- * line". Entity::call returns void and drops ModuleBundle's bool, which is
- * where that distinction would otherwise have come from.
+ * The status byte exists because pressing enter is a legitimate no-op the loop
+ * must continue on, so "wrote nothing" cannot mean "empty line" -- Entity::call
+ * returns void and drops the bool that would otherwise carry it.
  */
 inline constexpr char SHELL_LINE_OK   = '+';
 inline constexpr char SHELL_LINE_DONE = '-';
@@ -2559,16 +2508,12 @@ inline ETCS::Entity* ensure_session_shell(ETCS::Root& host, ETCS::SignalContext&
 } // namespace ETCS
 
 /*
- * A Shell, as a ReplLineSource.
+ * A Shell, as a ReplLineSource -- the mirror of repl_session_navigator's socket
+ * source. Ends the loop it drives when a signal lands.
  *
- * The mirror image of repl_session_navigator's socket source: both turn "some
- * way of getting a line" into the one shape the loops take. Ends the loop it
- * drives when a signal lands, which is what the old inline isInterrupted()
- * checks after each read did.
- *
- * Re-resolves nothing and caches nothing beyond the entity: a Shell that is
- * deleted underneath this stops answering, and an unanswered call leaves the
- * buffer untouched, which reads as finished.
+ * Caches nothing beyond the entity: a Shell deleted underneath this stops
+ * answering, and an unanswered call leaves the buffer untouched, which reads as
+ * finished.
  */
 inline ReplLineSource repl_shell_line_source(ETCS::Entity* shell, ETCS::SignalContext& sig)
 {
@@ -3723,45 +3668,32 @@ inline void shell_startup()
     // games between translation units.
     ETCS::g_session_navigator = &repl_session_navigator;
 #endif
-    // The terminal is NOT opened here any more, and that is the change. This
-    // used to enable virtual terminal mode and read .etcs_history at process
-    // start in every interactive binary, whether or not a prompt was ever
-    // shown. Both belong to the moment a terminal actually starts, which is
-    // drive_main_loop_then_exit below, and both now live in the provider that
-    // owns the terminal.
+    // The terminal is NOT opened here. Vterm mode and .etcs_history belong to
+    // the moment a console actually starts (Shell.OpenConsole), not to process
+    // start in a binary that may never show a prompt.
 }
 
 /*
  * WHAT -DETCS_REPL_SHELL MEANS NOW.
  *
- * It is a LOADER flag, and only a loader flag: "this binary should give the
- * operator a terminal". It no longer selects which code compiles -- the
- * terminal is a provider either way -- so the interactive and the drain binary
- * differ in what they DO with the same objects rather than in what is in them.
+ * A LOADER flag and nothing else: "this binary should give the operator a
+ * terminal". It selects no code -- the terminal is a provider either way -- so
+ * the interactive and the drain binary differ in what they DO, not in what is
+ * in them. With it: ask the session's Shell for a console and drive the
+ * navigator from it. Without it: run the target script and drain, or accept
+ * control sessions on a socket. The Shell is spawned either way.
  *
- * With it: ask the session's Shell to open a console and drive the navigator
- * from it. Without it: run the target script and drain, or accept control
- * sessions on a socket. The Shell itself is spawned either way -- see
- * ensure_session_shell.
- *
- * A SHELL IS A DEPENDENCY NOW, and the failure says so rather than dropping a
- * prompt-less binary into a wait. Root is the entry point for the ontology;
- * Shell is the entry point for lifetimes and signals -- a control structure --
- * so an interactive runtime that cannot find one has lost the thing it was
- * built to be, and falls back to drain with that stated.
+ * An interactive runtime that cannot find one has lost the thing it was built
+ * to be, and falls back to drain with that stated rather than silently.
  *
  * control_socket, when non-empty, replaces the drain wait with a control
- * listener -- the headless build's substitute for stdin. Empty keeps the
- * drain-until-finished behavior, which is still correct for genuine batch work
- * (run a script, wait for what it detached, exit).
+ * listener -- the headless build's substitute for stdin.
  *
  * Either branch runs shutdown_detached_executors() and
- * PendingUnloadRegistry::join_all() exactly once before returning.
- *
- * The join fixes a reproduced SIGSEGV: main() could return, and process exit
- * proceed, while a module's RequestUnloadEvent 200ms-delay recheck was still
- * in flight on an untracked thread -- racing dlclose() against that module's
- * own still-running workers. An empty registry (the common case) costs nothing.
+ * PendingUnloadRegistry::join_all() exactly once before returning. The join
+ * fixes a reproduced SIGSEGV: main() returning let process exit race a module's
+ * still-in-flight RequestUnload recheck, and its dlclose, against that module's
+ * own running workers.
  */
 inline int drive_main_loop_then_exit(ETCS::SignalContext& ctx, int code,
                                      const std::string& control_socket = "")

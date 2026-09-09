@@ -218,7 +218,7 @@ inline bool ETCS_SLEEP_MS(uint32_t ms)
 //
 // TAG_MASK is this TYPE's own tag_closure_mask -- static, so it is reachable
 // as type information (Foo::TAG_MASK) with no instance in hand, exactly like
-// TAG immediately above it. Declared here but ASSIGNED by ETCS_TAG_DECLARE
+// TAG in the same macro body. Declared here but ASSIGNED by ETCS_TAG_DECLARE
 // (below), because the bit position comes from the module's own Tags string,
 // which only exists in the module's .cc after ETCS_MODULE_EXPORT_MAIN has run
 // -- it is not visible while this header is being parsed.
@@ -483,7 +483,7 @@ public: \
 // _implWork_ signature regardless of the tuple's stored type. This is what
 // lets the developer body mutate a field (including an OUT field like
 // NBuffer content) in place, without _DECL_ ever declaring a *local of
-// reference type* — which is exactly the unbindable case above. The
+// reference type*, which cannot be bound at the point _DECL_ runs. The
 // tuple's T stays a plain value type; only the call signature gets the &.
 #define _PARAM_REF(pair)        _PARAM_REF_ pair
 #define _PARAM_REF_(T, name)    T& name
@@ -662,7 +662,6 @@ public: \
  \
     void _implConsume_##Type##_##Name(Type& self, ETCS::MirrorBuffer stream, ETCS::Buffer data, ETCS::SignalContext ctx)
 
-// DEFINE_WORK_FUNC provides self&, Buffer&, and SignalContext
 /*
  * ETCS_CAUSAL_EDGE_STORE / ETCS_CAUSAL_SCOPE
  *
@@ -1066,9 +1065,9 @@ namespace ETCS
         return handler; \
     }
 /**
- * ETCS_TAG_BLOCK
- * Declares a Tag and automatically maps all its work functions.
- * Converts comma-separated __VA_ARGS__ into a space-separated manifest string.
+ * ETCS_TAG_BLOCK_BASIC
+ * Declares a Tag and maps its work functions, converting the comma-separated
+ * __VA_ARGS__ into the space-separated manifest string discoverActions reads.
  */
 #define ETCS_TAG_BLOCK_BASIC(TagName, ...) \
     ETCS_TAG_DECLARE(TagName) \

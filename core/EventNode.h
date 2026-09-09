@@ -76,16 +76,10 @@ struct DLInEvent
     // ETCS_API.h) rather than looked up by string in whichever EventNode
     // ends up servicing this event.
     //
-    // That distinction is load-bearing, not an optimisation.
-    // RegisterTagBitIndex is only ever called from
-    // ETCS_MODULE_EXPORT_MAIN, which no loader build expands -- so the
-    // LOADER's own tag_bit_index is permanently empty, and
-    // LoaderStream::on_event's old owner->GetTagBit(...) returned an
-    // empty mask for every TagModifyEvent that originated in
-    // loader-compiled code. Those serialized against nothing at all.
-    // Carrying the bit with the event makes the answer independent of
-    // which side handles it, and drops a std::string construction plus a
-    // hash lookup off the ordering thread on the way.
+    // Load-bearing, not an optimisation: the loader's own tag_bit_index is
+    // permanently empty (see EventNode::tag_bit_index), so a string lookup
+    // there answers with a mask that serializes against nothing. Carrying
+    // the bit makes the answer independent of which side handles it.
     ETCS::TagMask      tagmodify_mask{};
     // PairMask only -- see PairMaskEvent below. conjugate_key carries the
     // first contract tag, this the second; the handler resolves each through
@@ -157,12 +151,11 @@ struct DLInEvent
     // pointing at &EventNode::getInstance() as seen from THAT module's own
     // compiled code. nullptr for a loader-originated call (the loader
     // never needs to sync back with itself). After the loader finishes
-    // its own work for one of these five kinds, if reply_to is non-null
-    // it enqueues a lightweight Ack event onto reply_to->stream and
-    // blocks on it — a happen-before edge guaranteeing the calling
-    // module's own ordering thread has fully processed a sync point
-    // before the original blocking call returns to its caller. Safe to
-    // cross the dlopen boundary as a raw EventNode* for the same reason
+    // its own work for one of these five kinds, if reply_to is non-null it
+    // enqueues a lightweight Ack onto reply_to->stream and returns; being
+    // ORDERED behind the module's own queued work is the whole point, so
+    // there is nothing left to wait for. Safe to cross the dlopen boundary
+    // as a raw EventNode* for the same reason
     // getLoader() already is: only ever used to call enqueue(), a method
     // on the shared EventStream<> base whose layout doesn't depend on
     // which Derived (LoaderStream vs ModuleProxy) actually instantiated
@@ -171,26 +164,18 @@ struct DLInEvent
     // for an ack that would never come.
     ETCS::EventNode*   reply_to = nullptr;
     // RequestUnload only — the ONE, PERMANENT, loader-owned global Module
-    // instance to re-check after RequestUnloadEvent's own 200ms delay.
-    // Raw pointer is safe: this instance never moves and is never freed
-    // until the loader itself exits, regardless of how many times its own
-    // lifetime_owner gets reassigned in the meantime.
+    // instance to re-check after the delay. Raw pointer is safe: this
+    // instance never moves and is never freed until the loader itself
+    // exits, however often its lifetime_owner is reassigned.
     ETCS::Module*      request_unload_target = nullptr;
-    // false = initial fire (RequestUnloadEvent's own operator()()) --
-    // on_event spawns a detached std::thread that sleeps 200ms then
-    // re-enqueues this same kind with this set true. true = the delayed
-    // recheck itself -- on_event does the actual re-verify-and-unload
-    // work synchronously, no further threading involved.
+    // false = initial fire; on_event hands the delay to
+    // PendingUnloadRegistry::spawn, which re-enqueues this kind with the
+    // flag set. true = the recheck itself, done synchronously.
     bool                request_unload_recheck = false;
-    // RequestUnload, recheck fire only — lets the spawned 200ms-delay
-    // thread (see LoaderStream::on_event's own Kind::RequestUnload case,
-    // DynamicLoader.h) know once THIS specific recheck has actually,
-    // fully finished (requestUnloadImpl returned -- cleanupModule/
-    // dlclose included), so that thread can be genuinely joined rather
-    // than fired detached and never waited on by anything at all. Null
-    // for the first fire (request_unload_recheck == false) -- that one
-    // never needs to be waited on itself, since its own only job is to
-    // spawn the delayed recheck.
+    // Recheck fire only — tells the delay thread that THIS recheck has
+    // fully finished (requestUnloadImpl returned, dlclose included), so it
+    // can be joined. Null on the first fire: its only job is to spawn the
+    // recheck, and nothing waits on that.
     std::atomic<bool>* request_unload_done = nullptr;
     // (ack_done removed.) The Ack carries no result slot at all now: nothing
     // waits on it. sendAckIfNeeded enqueues a heap-allocated Ack and returns
@@ -286,10 +271,10 @@ struct ResolveEvent : Event
 // reached by RID lookup through the RIDListHandle already held in ridMap
 // instead of a caller-supplied Entity*.
 //
-// delete_children (default false) forwards straight to deleteEntity's
-// own same-named parameter -- true cascades the target's whole subtree
-// instead of reparenting its children. See registerDtor<T>'s own
-// comment (MemoryArena.h); meaningless for a global-scope target.
+// delete_children (default TRUE, see the constructors below) forwards to
+// deleteEntity's same-named parameter: true cascades the target's whole
+// subtree instead of reparenting its children. See registerDtor<T>
+// (MemoryArena.h); meaningless for a global-scope target.
 //
 // result is int8_t rather than bool specifically so the caller can
 // distinguish "not written yet" (-1) from a legitimately false answer (0) —
@@ -354,8 +339,7 @@ struct AddTagEvent : Event
 // Acquired at the emit site rather than resolved by the HANDLER, and that
 // distinction is a fix rather than a refactor: the handler used to call
 // GetTagBit on whichever EventNode serviced the event, and the LOADER's own
-// tag_bit_index is never populated by anything, so loader-originated tag
-// modifications silently got an empty mask. See DLInEvent::tagmodify_mask.
+// tag_bit_index is never populated there. See DLInEvent::tagmodify_mask.
 //
 // extra_mask is the only mask a CALLER supplies — TAG-scope bits beyond the
 // entity's own, which ScopeTag uses to order a flag against both halves of a
@@ -482,9 +466,8 @@ struct ChangeModuleEvent : Event
 // anywhere, including synchronously inside a memory arena's own teardown
 // walk (exactly where the old, blocking EntityUnloadEvent path used to
 // deadlock): there is no wait here for anything else to still be alive.
-// The loader processes this asynchronously (via ThreadPool, not by
-// blocking its own ordering thread for the delay) — see on_event's own
-// Kind::RequestUnload case for the 200ms-then-recheck logic.
+// The loader runs the delay on a PendingUnloadRegistry thread rather than
+// blocking its ordering thread — see on_event's Kind::RequestUnload case.
 struct RequestUnloadEvent : Event
 {
     ETCS::Module* target;
@@ -846,10 +829,10 @@ public:
                 if (e != exclude) return e;
             return nullptr;
         }
-        // CRTP callbacks — bodies in DynamicLoader.h. RequestUnload's own
-        // 200ms delay uses a detached std::thread that re-enqueues onto
-        // this same stream when it wakes, not DispatchKind::Async/
-        // ThreadPool/on_completion -- this stays a trivial no-op.
+        // CRTP callbacks — bodies in DynamicLoader.h. RequestUnload's delay
+        // runs on a PendingUnloadRegistry thread that re-enqueues onto this
+        // same stream when it wakes, not DispatchKind::Async/ThreadPool/
+        // on_completion -- this stays a trivial no-op.
         ETCS::DispatchResult on_event(DLState&, const DLInEventPtr& evt, uint64_t seq);
         void on_completion(DLState&, ETCS::WorkResult*, uint64_t) {}
         // Resolved BEFORE dispatch, from the event alone. Body in
@@ -968,8 +951,8 @@ public:
                                     ETCS::LifetimeOwner entity,
                                     const std::string& spawn_tag);
         // THE Kind::RequestUnload delayed-recheck handler -- called after
-        // the 200ms delay (see DLInEvent::request_unload_recheck's own
-        // comment). Re-verifies lifetime_owner is still nullptr before
+        // the delay (see DLInEvent::request_unload_recheck).
+        // Re-verifies lifetime_owner is still nullptr before
         // actually unloading; a no-op if anything claimed it in the
         // meantime. Ordering-thread only.
         void          requestUnloadImpl(ETCS::Module* target);
@@ -1002,12 +985,8 @@ public:
         void registerTypeOwnership(const std::string& module_name, Module* mod);
         // Called from each of Load/Resolve/Destroy/AddTag/EntityUnload's
         // own case in on_event, right before they return -- see
-        // DLInEvent::reply_to's own comment (EventNode.h) for the full
-        // reasoning. A no-op if evt.reply_to is null (a loader-originated
-        // call, never needing to sync back with itself). Blocks on the
-        // ack UNLESS reply_to's own stream refuses the enqueue (already
-        // cleaning up), in which case there's nothing to wait for and
-        // this returns immediately.
+        // DLInEvent::reply_to for the reasoning. A no-op if evt.reply_to is
+        // null (loader-originated, nothing to sync back with). Never blocks.
         void sendAckIfNeeded(DLInEvent& evt);
     } stream;
 #else

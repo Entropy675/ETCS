@@ -127,9 +127,7 @@ struct IWireLifecycle
 //   IT CANNOT TELL A PASSING BODY FROM A HELD ONE. A work function that
 //   returns promptly and a stream producer that loops for a window's lifetime
 //   are scheduled identically, so two long-lived producers on a four-worker
-//   pool take half of it permanently and nothing anywhere says so. Every
-//   comment in this codebase that warns about that warns a HUMAN, because
-//   there is no field for it.
+//   pool take half of it permanently and nothing anywhere says so.
 //
 //   IT CANNOT ASK A BODY TO STOP. Shutdown raises a signal and hopes: the
 //   closure drain waits a bounded five seconds, then joins; the pool sleeps a
@@ -143,10 +141,10 @@ struct IWireLifecycle
 // carries. Deliberately NOT a priority or an affinity: those are policy, and
 // policy belongs to whatever schedules, not to the thing being scheduled.
 //
-// Left unclaimed on purpose. Adding the interface is cheap and reversible;
-// adding call sites inside ThreadPool changes when every stream body in the
-// system is asked to stop, and that deserves its own pass rather than riding
-// along with a memory-release change.
+// The POOL-side call sites are still outstanding: the arena's reclaim funnel
+// halts a body before releasing what it uses, but ThreadPool itself does not
+// yet ask. Changing when every stream body in the system is told to stop
+// deserves its own pass.
 // ---------------------------------------------------------------------------
 enum class WorkShape : uint8_t
 {

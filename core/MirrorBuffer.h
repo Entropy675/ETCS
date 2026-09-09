@@ -19,7 +19,9 @@
 #include "SharedPage.h"
 #include "LMAXSequentialSharedPage.h"
 
-// TODO/Warn: currently wrap logic is untested, I see a potential bug within the LMAX path... (which is the most common)
+// TODO/Warn: the LMAX wrap path is the least exercised of the three and the
+// most used. Re-read emitWrapped and the scratch-pool reuse rule before
+// trusting it under churn.
 
 namespace ETCS
 {
@@ -1379,6 +1381,9 @@ private:
     }
 };
 // ---------------------------------------------------------------------------
+// The two produce-side guards. ProducerLiveGuard is defined first and
+// destructs last; StreamWriteGuard follows it, below.
+//
 // StreamWriteGuard — closes a producer's write end when its body returns by
 // ANY path: normal completion, an early `return`, or an exception.
 //

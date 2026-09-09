@@ -101,9 +101,9 @@ bool etcs_retire_entity(Entity* e);
  * Reproduced under ASAN on both exit paths, from the current dev branch:
  *
  *   heap-use-after-free ... READ of size 8
- *     formatBytesToString  MemoryArena.h:90
- *     MemoryArena::memoryTeardown  MemoryArena.h:1676
- *     ~MemoryArena  MemoryArena.h:903
+ *     formatBytesToString
+ *     MemoryArena::memoryTeardown
+ *     ~MemoryArena
  *     __cxa_finalize                     <- module unloaded mid-run
  *
  *   heap-use-after-free ... READ of size 2
@@ -1325,15 +1325,7 @@ public:
                                 // does reclaimEntity run this entity's ~T().
                                 own_arena->destroyChildEntitiesFirst();
                                 parentArena.reclaimEntity(e, sizeof(T), alignof(T));
-                                // reclaimArena, not evokeDestructor: the arena
-                                // object itself was allocate<MemoryArena>'d out
-                                // of parentArena, so its own outer bytes belong
-                                // back on parentArena's free list exactly as the
-                                // entity's do. evokeDestructor runs the dtor and
-                                // unlinks the record but returns nothing --
-                                // leaking sizeof(MemoryArena) per deleted child,
-                                // which under connection churn is unbounded
-                                // growth in a parent that never tears down.
+                                // reclaimArena, not evokeDestructor -- see above.
                                 parentArena.reclaimArena(own_arena);
                             }
                             else

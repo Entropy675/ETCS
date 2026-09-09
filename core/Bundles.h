@@ -238,29 +238,21 @@ inline bool compareManifests(Manifest& ours, Manifest* theirs, const std::string
         /*
      * CORE COUNTS AS A CONTRACT, and leaving it out was the hole.
      *
-     * ONTOLOGY and HEADER are contracts because they define DISPATCH SHAPES --
-     * disagree and a call goes to the wrong place. Core headers were treated as
-     * informational on the reasoning that they are implementation, but that is
-     * the wrong distinction: core is where the types that CROSS THE DSO BOUNDARY
-     * live. RIDListHandle says so against itself -- "a slot added in the middle
-     * shifts every later one, and a single translation unit built against the
-     * older layout calls the wrong function pointer through a valid-looking
-     * self". A layout disagreement is not milder than a contract disagreement,
-     * it is the same failure one level down, and it presents worse: a wrong
-     * vtable slot usually crashes, a wrong function-pointer slot in a
-     * plain struct just quietly does something else.
+     * ONTOLOGY and HEADER are contracts because they define DISPATCH SHAPES.
+     * Core was treated as informational on the reasoning that it is
+     * implementation -- the wrong distinction, because core is where the types
+     * that CROSS THE DSO BOUNDARY live. A layout disagreement is the same
+     * failure one level down and presents worse: a wrong vtable slot usually
+     * crashes, a wrong function-pointer slot in a plain struct quietly does
+     * something else.
      *
-     * Which is exactly how it was found. Adding a slot to RIDListHandle and
-     * rebuilding only the loader left every module calling through the old
-     * layout. Nothing crashed. The renderer simply presented zero frames and
-     * the window stayed blank -- and the handshake printed CORE:RIDList.h with
-     * a visible difference and marked it OK.
+     * Found exactly that way. Adding a slot to RIDListHandle and rebuilding
+     * only the loader left every module calling through the old layout.
+     * Nothing crashed; the renderer presented zero frames, the window stayed
+     * blank, and the handshake printed CORE:RIDList.h as [ OK ].
      *
-     * The cost of this being a hard failure is that a partial rebuild after a
-     * core change now refuses to run instead of running wrongly. That is the
-     * trade being made deliberately: `ace make modules --force` is a minute,
-     * and the alternative is a silent behavioural bug with no symptom pointing
-     * anywhere near its cause.
+     * The cost is that a partial rebuild after a core change refuses to run
+     * instead of running wrongly. Deliberate trade.
      */
         bool is_contract = (key.rfind("ONTOLOGY:", 0) == 0 || key.rfind("HEADER:", 0) == 0
                          || key.rfind("CORE:", 0) == 0);
@@ -283,33 +275,6 @@ inline bool compareManifests(Manifest& ours, Manifest* theirs, const std::string
         for (auto const& [key_c, their_hash_c] : *theirs)
         {
             std::string key(key_c);
-            /*
-     * CORE COUNTS AS A CONTRACT, and leaving it out was the hole.
-     *
-     * ONTOLOGY and HEADER are contracts because they define DISPATCH SHAPES --
-     * disagree and a call goes to the wrong place. Core headers were treated as
-     * informational on the reasoning that they are implementation, but that is
-     * the wrong distinction: core is where the types that CROSS THE DSO BOUNDARY
-     * live. RIDListHandle says so against itself -- "a slot added in the middle
-     * shifts every later one, and a single translation unit built against the
-     * older layout calls the wrong function pointer through a valid-looking
-     * self". A layout disagreement is not milder than a contract disagreement,
-     * it is the same failure one level down, and it presents worse: a wrong
-     * vtable slot usually crashes, a wrong function-pointer slot in a
-     * plain struct just quietly does something else.
-     *
-     * Which is exactly how it was found. Adding a slot to RIDListHandle and
-     * rebuilding only the loader left every module calling through the old
-     * layout. Nothing crashed. The renderer simply presented zero frames and
-     * the window stayed blank -- and the handshake printed CORE:RIDList.h with
-     * a visible difference and marked it OK.
-     *
-     * The cost of this being a hard failure is that a partial rebuild after a
-     * core change now refuses to run instead of running wrongly. That is the
-     * trade being made deliberately: `ace make modules --force` is a minute,
-     * and the alternative is a silent behavioural bug with no symptom pointing
-     * anywhere near its cause.
-     */
         bool is_contract = (key.rfind("ONTOLOGY:", 0) == 0 || key.rfind("HEADER:", 0) == 0
                          || key.rfind("CORE:", 0) == 0);
             if (is_contract && ours.count(key_c) && ours[key_c] != their_hash_c)
@@ -369,8 +334,8 @@ struct Scope
     //
     // Previously Scope stored a copy of the CALLER's context. For a REPL
     // dispatch that comes from WIRE_CONTEXT(), whose .interrupt is null, so
-    // the old `if (ctx.interrupt)` guard was false and interruptOne/All
-    // silently did nothing. Had it been non-null it would have been
+    // the old `if (ctx.interrupt)` guard was false and interruptLabel/
+    // interruptAll silently did nothing. Had it been non-null it would have been
     // &g_sig_int -- interrupting one scope would have raised a process-wide
     // SIGINT.
     struct Entry
@@ -708,7 +673,7 @@ inline ETCS::TagMask CausalEdgeMask(const ETCS::TagMask& own,
 }
 // ScopeTag — RAII guard around one stream call's body, auto-injected by
 // DEFINE_STREAM_FUNC_PRODUCE/_CONSUME. Construction flips the REPL-visible
-// "active_scope_<label>_<addr>" flag AND registers this call's context into
+// "active_scope_<label>" flag AND registers this call's context into
 // the owning entity's Scope; destruction reverses both.
 //
 // Move-constructible, not move-assignable. That is what lets PRODUCE's

@@ -68,7 +68,7 @@ namespace ETCS
 using namespace ETCS;
 /*
  * -- PendingUnloadRegistry ------------------------------------------------------
- * Tracks every RequestUnloadEvent-spawned 200ms-delay-then-recheck thread
+ * Tracks every RequestUnloadEvent-spawned delay-then-recheck thread
  * joinably, rather than the raw std::thread(...).detach() this used to
  * be (see the Kind::RequestUnload case below). A detached thread has NO
  * handle anywhere at all, meaning nothing -- including, critically, the
@@ -410,17 +410,6 @@ void ETCS::Module::promoteOrVacate(LifetimeOwner survivor)
         << "' lifetime_owner vacated -- RequestUnloadEvent fired.");
 }
 /*
- * ~Module() - pure dlclose/cleanupModule cleanup now, no election call at
- * all: that's fully decided, synchronously, before this destructor ever
- * runs (see promoteOrVacate's own comment above). Reached only by the
- * ONE, PERMANENT GLOBAL instance, and only at actual process shutdown
- * (the loader's own MemoryArena::getInstance() tearing down) --
- * per-entity tokens never have library_handle set, so this branch is
- * structurally unreachable for them. If the module was still loaded at
- * process exit (nobody ever triggered an unload), clean it up directly
- * here rather than through RequestUnloadEvent's own async delay
- * machinery -- there's no reason to wait 100ms when the process is
- * exiting anyway.
  * ~Module() - two genuinely separate cases now, not one:
  *
  * 1. The ONE, PERMANENT GLOBAL instance, at actual process shutdown (the
@@ -887,12 +876,7 @@ bool ETCS::WorkBundle::operator()(ETCS_RID_SIZE rid, const ETCS::Buffer& conjuga
 bool ETCS::WorkBundle::operator()(ETCS_RID_SIZE rid, const ETCS::Buffer& conjugate_key,
                                   ETCS::MBuffer& tagbuff, ETCS::SignalContext ctx)
 {
-    /*
- * THE RESOLUTION IS THE LIVENESS CHECK -- see WorkBundle's own comment.
- * Either the RID names something the loader still holds, in which case the
- * pointer is good for the whole of this frame, or it does not and there is
- * nothing to dispatch to. No flag, no second question, one early exit.
- */
+    // Same resolution-is-the-liveness-check as the Buffer overload above.
     ETCS::Entity* child = ETCS::etcs_resolve_by_key(conjugate_key, rid);
     if (!child)
     {
@@ -1258,8 +1242,8 @@ ETCS::DispatchResult ETCS::EventNode::LoaderStream::on_event(
  * ~Root() to fire a SYNCHRONOUS vacate (ChangeModuleEvent)
  * that itself fires THIS non-blocking RequestUnloadEvent;
  * ~Root() returns the instant the vacate is acknowledged,
- * with no idea the asynchronous 200ms recheck it just
- * triggered hasn't even started yet. The REPL loop then
+ * with no idea the asynchronous recheck it just triggered
+ * hasn't even started yet. The REPL loop then
  * exits (interrupt flag still set) and main() returns,
  * letting the process's own exit sequence proceed
  * concurrently with -- and easily outrun -- that
@@ -1888,22 +1872,13 @@ void ETCS::EventNode::LoaderStream::entityUnloadImpl(ETCS::Entity* target, bool 
  
 /*
  * requestUnloadImpl - THE Kind::RequestUnload delayed-recheck handler.
- * Runs 100ms after promoteOrVacate() found no survivor at all and vacated
- * target->lifetime_owner (see RequestUnloadEvent's own comment for why
- * that delay happens via a detached thread rather than blocking this
- * ordering thread). Re-verifies lifetime_owner is STILL vacant before
- * doing anything irreversible: if some attachModule call claimed it in
- * the meantime (a fresh spawn from this same module, during the 100ms
- * window), this is correctly a no-op -- the module stays loaded, nothing
- * here contradicts that later claim.
+ * Runs 100ms after promoteOrVacate() found no survivor and vacated
+ * target->lifetime_owner; the delay runs on a PendingUnloadRegistry thread
+ * rather than blocking this ordering thread.
  *
- * The actual unload, when it does proceed: erase every registry entry
- * that pointed at this instance (module_registry, module_arena_registry,
- * type_catalog_registry -- all three, since target's own arena and type
- * catalog are about to be genuinely unmapped along with the library
- * itself), then cleanupModule()/dlclose(), mirroring exactly what
- * Module's own destructor used to do directly before this whole
- * mechanism existed.
+ * Re-verifies lifetime_owner is STILL vacant before doing anything
+ * irreversible: if an attachModule call claimed it during the window (a
+ * fresh spawn from this same module), this is correctly a no-op.
  */
 void ETCS::EventNode::LoaderStream::requestUnloadImpl(ETCS::Module* target)
 {
@@ -1965,14 +1940,8 @@ void ETCS::EventNode::LoaderStream::requestUnloadImpl(ETCS::Module* target)
 /*
  * sendAckIfNeeded - see its own declaration comment (EventNode.h). A
  * no-op if evt.reply_to is null (loader-originated call). Otherwise
- * enqueues a lightweight Kind::Ack DLInEvent onto reply_to->stream
- * (the ORIGINATING module's own ordering thread) and blocks on it --
- * stack-allocated here, safe because this function doesn't return until
- * the wait is over, exactly the same pattern every blocking event in
- * this file already relies on. If reply_to's own stream refuses the
- * enqueue (already cleaning up -- e.g. that module is mid-teardown right
- * now), there is nothing left alive to ever set ack_done, so this
- * returns immediately rather than hanging.
+ * enqueues a Kind::Ack onto reply_to->stream and returns -- see the body
+ * below for why it no longer waits, and why the event is heap-allocated.
  */
 void ETCS::EventNode::LoaderStream::sendAckIfNeeded(DLInEvent& evt)
 {
@@ -2435,16 +2404,10 @@ ETCS::DispatchResult ETCS::EventNode::ModuleProxy::on_event(
         return {ETCS::DispatchKind::Inline, nullptr};
     }
  
-    /*
- * Fallback path only -- Load/Resolve/Destroy/AddTag/EntityUnload no
- * longer route through here at all (they enqueue directly onto
- * getLoader().stream from their own operator()(), regardless of
- * which side fires them -- see each one's own comment for why routing
- * through this module's own, possibly already-stopped stream first
- * was the actual cause of a real hang this session traced and fixed).
- * This forward remains only for whatever else might still enqueue
- * onto EventNode::getInstance().stream directly on the module side.
- */
+    // Fallback path only: Load/Resolve/Destroy/AddTag/EntityUnload enqueue
+    // straight onto getLoader().stream themselves (EntityUnloadEvent explains
+    // why). This forward remains for anything else still enqueuing onto
+    // EventNode::getInstance().stream from the module side.
     getLoader().stream.enqueue(ref);
     /*
  * No completion HERE: the event is the loader's now, and its on_emit
@@ -2683,14 +2646,9 @@ inline ETCS::Entity* ETCS::LoadEvent::operator()()
     evt.reply_to = &ETCS::EventNode::getInstance();
     evt.origin_extra_mask = ETCS::ActivePairModuleMask();
 #endif
-    /*
- * Straight to the loader's own stream, regardless of which side
- * fires this -- never through this side's own (potentially already
- * torn down) local stream. See EntityUnloadEvent's own comment
- * below, and this session's own notes, for why routing memory-
- * altering events through a possibly-dead local stream first was the
- * actual cause of the hang this fixes.
- */
+    // Straight to the loader's own stream, never this side's own possibly
+    // torn-down local one -- see EntityUnloadEvent below for the hang that
+    // routing memory-altering events through a dead local stream caused.
     if (!getLoader().stream.enqueue(DLInEventPtr{&evt}))
     {
         /*
@@ -2936,8 +2894,7 @@ inline bool ETCS::TagModifyEvent::operator()()
 /*
  * PairMaskEvent - blocking, same spin pattern as everything here. Straight onto
  * getLoader().stream for the same reason the five memory-altering kinds go
- * direct: the local stream may already be stopped, and routing through it first
- * was a real hang.
+ * direct (EntityUnloadEvent).
  *
  * The loader holds type_owner_index, so this is the one question a module has
  * to ask it. Callers memoize (Entity::resolvePairModuleMask), so it fires once

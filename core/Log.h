@@ -48,8 +48,9 @@ namespace ETCS {
     inline std::atomic<bool> log_to_file{ ETCS_LOG_TO_FILE_DEFAULT };
 
     // Set THIS DSO's destination. The loader reaches a module's copy through
-    // that module's own EventNode (EventNode::SetLogToFile), which is compiled
-    // into the module and so writes the module's variable, not the loader's.
+    // that module's own EventNode::set_log_to_file trampoline (EventNode.h),
+    // which is compiled into the module and so writes the module's variable,
+    // not the loader's.
     inline void set_log_to_file(bool on) { log_to_file.store(on, std::memory_order_relaxed); }
     inline bool get_log_to_file()        { return log_to_file.load(std::memory_order_relaxed); }
 
@@ -71,9 +72,6 @@ namespace ETCS {
         LogSinkGuard& operator=(const LogSinkGuard&) = delete;
     };
 }
-
-// Lives here because TBuffer is the only thing guaranteed included everywhere,
-// arena and threadpool included.
 
 #define GET_LOG_MACRO(_1, _2, NAME, ...) NAME
 
