@@ -118,7 +118,7 @@ struct DLInEvent
     // may see it.
     uint64_t           release_value = 0;
     // Resolve: entity or Root whose module_ slot gets filled. LifetimeOwner
-    // -- ShellREPL's own nav_root (a Root) and CommandExecutor's ordinary
+    // -- the navigator's own nav_root (a Root) and CommandExecutor's ordinary
     // module-context resolution (a real Entity in the general case) both
     // route through the identical ResolveEvent/DLInEvent path.
     ETCS::LifetimeOwner         resolve_target;

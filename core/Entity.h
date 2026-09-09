@@ -933,7 +933,7 @@ public:
  * getTypedChildren(out) - read-only enumeration of this entity's own
  * addTag<T> children as (tag, RID) pairs, in addTag call order
  * (typed_child_order_). Same walk shape reparentChildrenTo already
- * uses; added so a caller (ShellREPL's own parent/child navigation)
+ * uses; added so a caller (the navigator's own parent/child walk)
  * can inspect what's actually live without touching typed_children_
  * directly.
  */
@@ -2594,7 +2594,7 @@ inline HASH_TYPE GenerateEnvironmentSignature(const ETCS::Buffer& uniqueName)
  * arena-resident entities. A Root never has typed children, is never
  * dispatched through any tag, and is never arena-resident (it lives
  * wherever its own caller constructed it -- typically the stack, per
- * ShellREPL.h's own nav_root and CommandExecutor.h's detached_root/
+ * the navigator's own nav_root and CommandExecutor.h's detached_root/
  * run_root/local_root, but nothing about Root itself requires that).
  *
  * Root previously inherited Entity purely so it could satisfy
@@ -2610,6 +2610,17 @@ inline HASH_TYPE GenerateEnvironmentSignature(const ETCS::Buffer& uniqueName)
  * tagged to hold either an Entity* or a Root* -- Root has no reason to
  * masquerade as an Entity at all, and simply doesn't have local_arena_
  * (or tags/flags_/typed_children_) to leak in the first place.
+ *
+ * ROOT IS THE ENTRY POINT FOR THE ONTOLOGY; SHELL IS THE ENTRY POINT
+ * FOR LIFETIMES AND SIGNALS. A Root is where a module gets attached and
+ * where typed entities come from -- it answers "what exists". It holds
+ * no signal authority of its own and starts no control thread, so it
+ * cannot answer "what is running, and how do I stop it": that is a
+ * Shell, which is a Thread (ontology/Thread.h) and therefore the one
+ * kind of entity that can produce another control thread. A Root spawns
+ * a Shell; everything the Shell runs, and every job it detaches, hangs
+ * off the Shell rather than off the Root, which is what makes a
+ * session's history a subtree instead of a list.
  *
  * Tag is deliberately lowercase ("root") - the ONE exception to the
  * TitleCase convention every other entity tag follows in this codebase.

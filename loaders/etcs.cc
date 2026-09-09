@@ -1,38 +1,38 @@
-// ETCS_REPL_SHELL is now a BUILD-CONTROLLED switch, not hardcoded here --
-// pass -DETCS_REPL_SHELL on the compiler command line for the interactive
-// binary target; omit it for a non-interactive "environment" binary that
-// runs an initial script, then blocks until every `detach`ed job it
-// spawned has finished (see wait_for_environment_drain, CommandExecutor.h)
-// instead of dropping to a prompt. Both binaries compile from this exact
-// same source file -- only the flag differs.
+// ETCS_REPL_SHELL says what this binary should DO, not what compiles into it.
 //
-// IMPORTANT, BUILD-SIDE: this file used to #define ETCS_REPL_SHELL
-// unconditionally, right here, meaning no Makefile rule building this file
-// was ever actually supplying the flag itself -- the behavior was fixed at
-// source level regardless of build target. Now that the #define is gone,
-// whichever Makefile target is meant to keep today's interactive behavior
-// (almost certainly whatever currently produces the `etcs` binary) MUST
-// have -DETCS_REPL_SHELL added to its own compile flags, or it will
-// silently switch to non-interactive drain-mode instead. A NEW target,
-// without that flag, is what actually gets you the daemon/environment
-// binary this change was for.
+// With it: load the Shell provider, take the terminal it exports, and drop the
+// operator into the navigator. Without it: run the initial script, then block
+// until every `detach`ed job it spawned has finished (wait_for_environment
+// _drain, CommandExecutor.h), or accept control sessions on --listen. Both
+// binaries compile from this source file and contain the same code -- only the
+// top-level loop differs.
+//
+// It USED to select code, back when the terminal was ShellREPL.h beside core.
+// It no longer can: the terminal is ShellProvider.so, an ordinary module the
+// loader dlopens, so an interactive runtime needs that file present at RUNTIME
+// rather than a flag present at build time. A build carrying the flag with no
+// provider to find says so and drains instead of prompting.
+//
+// BUILD-SIDE, unchanged: whichever Makefile target produces the interactive
+// `etcs` must pass -DETCS_REPL_SHELL. A target without it is the
+// daemon/environment binary.
 #undef ETCS_PRODUCTION_BUILD
 #include "../ETCS.h"
 #include <fstream>
 #include <iostream>
 #include <string>
 
-// COLOR_WARN/COLOR_RESET (and every other COLOR_* macro) now come
-// unconditionally from ShellREPL.h, which ETCS.h always includes in a
-// loader build regardless of ETCS_REPL_SHELL -- real ANSI codes under
-// the interactive build, empty strings under drain mode. No fallback
-// needed here anymore.
+// COLOR_WARN/COLOR_RESET (and every other COLOR_* macro) come from
+// core/CommandExecutor.h, which arrives with ETCS.h in any executor host.
+// They are RUNTIME conditionals now rather than build-mode literals: real
+// ANSI codes when stdout is a terminal, empty strings when it is a pipe or a
+// file, in either binary. No fallback needed here.
 
 int main(int argc, char* argv[])
 {
     shell_startup();
     WIRE_CONTEXT();
-    // drive_main_loop_then_exit (ShellREPL.h) is what every path through
+    // drive_main_loop_then_exit (CommandExecutor.h) is what every path through
     // main() funnels through so that, once whichever top-level loop
     // applies actually returns -- the user leaving the REPL (`exit`/
     // `quit`, or Ctrl+C breaking repl_shell_loop's own signal check), or
@@ -45,7 +45,7 @@ int main(int argc, char* argv[])
     if (argc < 2)
     {
         // ── No script given ───────────────────────────────────────────────────
-        // REPL build: straight to the interactive prompt, as before.
+        // REPL build: load the Shell provider and prompt.
         // Drain build: nothing was ever run, so DetachedRegistry is empty and
         // wait_for_environment_drain returns immediately (see its own comment,
         // CommandExecutor.h, on why an empty registry is correct-and-trivial,

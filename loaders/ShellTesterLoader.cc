@@ -23,10 +23,13 @@
 // entity that can produce another control thread, and the jobs it starts are
 // its CHILDREN rather than rows in a registry beside it.
 //
-// What the terminal half needs -- raw mode, prompts, line editing under a real
-// TTY -- is still worth a process test, and it belongs with the OS backend once
-// ShellREPL.h finishes moving into LinuxShell. This file deliberately does not
-// pretend to cover it.
+// The second of those complaints is now structurally impossible rather than
+// merely avoided: ShellREPL.h is gone, -DETCS_REPL_SHELL no longer selects any
+// code, and the terminal is a .so this loader could dlopen like any other. What
+// still needs a process test is the terminal ITSELF under a real TTY -- raw
+// mode, prompts, line editing -- and that belongs beside the OS backend
+// (modules/ShellProvider/Linux/LinuxTerminal.h). This file deliberately does
+// not pretend to cover it.
 // ===========================================================================
 
 #include "../ETCS.h"
@@ -469,6 +472,72 @@ int main()
     // -- 6. Report is a read, not a mutation --------------------------------
     sh->call("Shell.Report", "", ctx);
     check(has_iface(sh, "Thread"), "the shell is intact after reporting");
+
+    /*
+     * -- The console is a process resource, claimed by ONE shell -------------
+     *
+     * A Shell is an ordinary entity of which there can be many -- every
+     * detached script is one -- and there is exactly one stdin. So the console
+     * is claimed by RID, and a shell that was never handed it cannot take it
+     * by asking. Not a security boundary; the same kind of statement Pixels_
+     * makes about owning its buffer.
+     *
+     * ReadLine is only ever exercised HERE on the refusal path. The owner's
+     * ReadLine blocks on stdin by design, so a test that called it would hang
+     * rather than fail -- which is why the console is claimed by `first` and
+     * every read below is issued by `second`.
+     *
+     * The reply protocol is the thing under test as much as the guard:
+     *   '+' <line>  a line (possibly empty)     '-' finished
+     *   <nothing>   never dispatched -- which is what a refusal looks like
+     */
+    {
+        ETCS::Entity* first  = ETCS::spawn_entity("ShellProvider", "Shell", env, loader);
+        ETCS::Entity* second = ETCS::spawn_entity("ShellProvider", "Shell", env, loader);
+        check(first && second, "two Shells spawn independently");
+        if (first && second)
+        {
+            first->call("Shell.Create", "", ctx);
+            second->call("Shell.Create", "", ctx);
+
+            ETCS::Buffer r;
+            first->call(ETCS::Buffer("Shell.OpenConsole"), r, ctx);
+            check(r.toString() == "+", "the first Shell to ask is given the console");
+
+            r.clear();
+            second->call(ETCS::Buffer("Shell.OpenConsole"), r, ctx);
+            check(r.toString().empty(), "a second Shell asking for the console is refused");
+
+            r.clear();
+            r.writeString("prompt> ");
+            second->call(ETCS::Buffer("Shell.ReadLine"), r, ctx);
+            check(r.toString().empty(),
+                  "a Shell that does not hold the console reads nothing "
+                  "-- and an empty reply is 'finished', not 'you typed nothing'");
+
+            r.clear();
+            r.writeString("/tmp/nowhere.sock");
+            second->call(ETCS::Buffer("Shell.Attach"), r, ctx);
+            check(r.toString().empty(),
+                  "attach is refused from a Shell without the console "
+                  "-- the relay borrows a line editor it is not holding");
+
+            // Released, so nothing later in this process inherits a claim on
+            // stdin that no live shell is actually driving.
+            r.clear();
+            first->call(ETCS::Buffer("Shell.CloseConsole"), r, ctx);
+
+            r.clear();
+            second->call(ETCS::Buffer("Shell.OpenConsole"), r, ctx);
+            check(r.toString() == "+",
+                  "the console is claimable again once its holder closes it");
+            r.clear();
+            second->call(ETCS::Buffer("Shell.CloseConsole"), r, ctx);
+
+            first->call("Shell.Delete", "", ctx);
+            second->call("Shell.Delete", "", ctx);
+        }
+    }
 
     sh->call("Shell.Delete", "", ctx);
 

@@ -57,7 +57,8 @@ extern "C" inline void global_signal_handler(int sig)
 //
 // The non-TTY stdin case that originally motivated SA_RESTART -- read(2)
 // returning -1/EINTR on SIGINT instead of delivering the typed line -- is
-// fixed by polling (repl_shell_get_char_unix, ShellREPL.h) and does not
+// fixed by polling (lsh::get_char, modules/ShellProvider/Linux/LinuxTerminal.h)
+// and does not
 // need global syscall restart.
 #define WIRE_ROOT_SIGNAL_CONTEXT()                              \
     do {                                                        \

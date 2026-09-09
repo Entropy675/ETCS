@@ -86,7 +86,7 @@ using namespace ETCS;
  * worker threads may still be mid-flight, tearing code out from under a
  * thread that's still executing it.
  *
- * Joined from drive_main_loop_then_exit (ShellREPL.h), right alongside
+ * Joined from drive_main_loop_then_exit (CommandExecutor.h), right alongside
  * shutdown_detached_executors() -- the process is never allowed to
  * actually exit while any recheck is still in progress. An empty
  * registry (nothing was ever mid-unload, the overwhelmingly common
@@ -1266,7 +1266,7 @@ ETCS::DispatchResult ETCS::EventNode::LoaderStream::on_event(
  * still-pending recheck's own eventual dlclose() on a
  * module whose worker threads may still be mid-flight.
  * Tracking this thread (and joining every tracked entry
- * from drive_main_loop_then_exit, ShellREPL.h, right
+ * from drive_main_loop_then_exit, CommandExecutor.h, right
  * alongside shutdown_detached_executors()) closes that
  * window: the process is never allowed to actually exit
  * while any recheck is still in progress. An empty
@@ -1504,7 +1504,7 @@ bool ETCS::EventNode::LoaderStream::attachModule(
  * an atomic; the throw happens on a DIFFERENT thread than the
  * one spinning, and a try/catch can only ever catch an exception
  * thrown on its own thread. This is exactly what crashed the
- * REPL on a mistyped module name (Root> exot): ShellREPL.h's own
+ * navigator on a mistyped module name (Root> exot): the root loop's own
  * try/catch around ResolveEvent{...}() was never capable of
  * catching this, structurally, no matter how it was written.
  *
@@ -1519,7 +1519,7 @@ bool ETCS::EventNode::LoaderStream::attachModule(
  * export" is the ordinary, expected failure attachModule's own
  * bool return type already exists to represent -- every single
  * caller in this codebase (resolveImpl, loadImpl,
- * CommandExecutor.h's resolve_module/spawn_entity, ShellREPL.h)
+ * CommandExecutor.h's resolve_module/spawn_entity and its navigator)
  * already checks that bool and prints a friendly message. The
  * throw here was simply unreachable from any of them; converting
  * it to the same bool contract everything else already expects
@@ -1776,7 +1776,7 @@ bool ETCS::EventNode::LoaderStream::attachModule(
  * this branch is the only way a root-level entity can end up
  * that way. attachModule's own bool contract already exists for
  * exactly this -- every caller (resolveImpl, loadImpl,
- * CommandExecutor.h's resolve_module/spawn_entity, ShellREPL.h)
+ * CommandExecutor.h's resolve_module/spawn_entity and its navigator)
  * checks it and reports gracefully, and both loadImpl call sites
  * return nullptr on false, so the unreachable entity is never
  * handed back to anyone.
@@ -1920,7 +1920,7 @@ void ETCS::EventNode::LoaderStream::requestUnloadImpl(ETCS::Module* target)
  * holds EVERY Root that ever attached to this module (attachModule's
  * own registerRoot call, unconditional -- not only whichever one
  * happened to claim ownership), so an ordinary proxying Root that
- * was never the owner -- e.g. ShellREPL's own nav_root, still open
+ * was never the owner -- e.g. the navigator's own nav_root, still open
  * on some stack -- is exactly as valid a rescue candidate here as
  * one that was previously promoted and later gave the token back.
  * Safe here, unambiguously, because this function only ever exists
