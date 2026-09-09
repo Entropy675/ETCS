@@ -198,6 +198,26 @@ struct IWireThread
      * checks the return instead of first asking what kind of thing it holds.
      */
     virtual uint64_t Detach(const ETCS::Buffer& script) = 0;
+
+    /*
+     * This thread's own signal authority, or null if it has none.
+     *
+     * On the wire for the same reason Detach is: core has to reach it and
+     * cannot own it. CommandExecutor's detach has to parent a child job's
+     * signals somewhere, and under the entity model that somewhere is the child
+     * Thread itself -- but SignalContext is a core type held by an ontology
+     * family, so the pointer crosses out through here.
+     *
+     * BY VALUE, like every other SignalContext in the runtime -- WorkFunc and
+     * StreamFunc already take one that way across the DSO boundary. A copy also
+     * cannot dangle into an entity's shell after a reclaim, which a pointer
+     * could.
+     *
+     * A Threaded that is not a Thread returns a default-constructed context
+     * with no local authority, exactly as Detach returns 0: owning a body to
+     * stop does not make you an authority over signals.
+     */
+    virtual SignalContext Signals() = 0;
 };
 
 // ---------------------------------------------------------------------------

@@ -133,7 +133,37 @@ inline void exec_warn(const ExecSource& src, const std::string& msg)
         out << msg << "\n";
 }
 
-#ifdef ETCS_LOADER
+/*
+ * WHO COMPILES THE EXECUTOR.
+ *
+ * Historically this was the loader alone -- nothing else ran scripts, so
+ * everything below sat behind ETCS_LOADER. A Shell is a provider type now
+ * (ShellProvider), and a type that runs scripts needs the engine compiled where
+ * it lives, so the gate is on being an executor HOST rather than on being the
+ * loader.
+ *
+ * Not opened to every module: a DSO that compiles this gets its own copies of
+ * GlobalNames and DetachedRegistry (inline function-local statics, -Bsymbolic),
+ * which is right for the one module hosting a shell and pure footgun for the
+ * rest. ShellProvider declares itself a host; nothing else does.
+ *
+ * TWO OPERATIONS STAY LOADER-ONLY, because they reach machinery a module does
+ * not have rather than because of policy:
+ *
+ *   receiver-scoped spawn   make_typed_child dlsyms <Tag>_MakeChild off
+ *                           EventNode::stream.module_registry -- which only
+ *                           LoaderStream has; a module's ModuleProxy does not.
+ *   stream pairs (a -> b)   Entity::call(producer, ...) is itself inside
+ *                           ETCS_LOADER (Entity.h).
+ *
+ * Both refuse with a message in a non-loader host rather than silently doing
+ * nothing, so a script that needs them says so.
+ */
+#if defined(ETCS_LOADER) || defined(ETCS_SHELL_HOST)
+    #define ETCS_EXECUTOR_HOST 1
+#endif
+
+#ifdef ETCS_EXECUTOR_HOST
 
 inline const ETCS::RIDListHandle* get_handle(const std::string& module,
                                              const std::string& tag)
@@ -238,16 +268,58 @@ inline ETCS::Entity* spawn_entity(const std::string& module, const std::string& 
                        "a top-level entry point failed to wire one in before this ran.");
         return nullptr;
     }
-    if (!resolve_module(module, src, ctx.root_entity)) return nullptr;
-    if (!verify_tag(ctx.root_entity, module, tag, src)) return nullptr;
+    /*
+ * THE BOOTSTRAP HOST IS NOT ALWAYS THE EXECUTION ROOT, and conflating them is
+ * a bug that predates any of this -- it was simply unreachable while every
+ * execution root was a bare Root.
+ *
+ * loadImpl's vacant branch bootstraps a module against whatever `root` names,
+ * and attachModule enforces one module per entity for that entity's whole life
+ * (DynamicLoader.h): asking an already-bound entity for a DIFFERENT module is
+ * dropped, deliberately, because rebinding would orphan what it pointed at.
+ *
+ * A Root has a vacant slot and gets reconstructed on the stack whenever one is
+ * needed -- which is exactly why attachModule's own comment names "a fresh
+ * entity/Root" as the correct way to target a different module. But an
+ * execution root that is a real ENTITY (a Shell running a script) already has
+ * its own module bound, so it can never host a second one. Every `spawn` of a
+ * foreign module from such a root was therefore refused before it began.
+ *
+ * So the bootstrap goes on a Root, which CAN migrate in place --
+ * Root::changeModule, the path attachModule's own comment names. One per
+ * execution and reused (ExecutionContext::spawn_host), not one per spawn: a
+ * stack Root destroyed right after the load runs ~Root and vacates the module
+ * if it still holds the token.
+ *
+ * Nothing else changes -- the created entity takes ownership itself via
+ * loadImpl's second attachModule call, so what the script gets back is
+ * identical either way, and a Root-rooted execution never allocates a host at
+ * all and keeps its existing path exactly.
+ */
+    ETCS::LifetimeOwner host = ctx.root_entity;
+    if (host.kind == ETCS::LifetimeOwner::Kind::Entity)
+    {
+        const ETCS::Module& m = host.module();
+        if (m.parent != nullptr && m.parent->name != module)
+        {
+            if (!ctx.spawn_host)
+                ctx.spawn_host = std::make_shared<ETCS::Root>(
+                    ctx.sig ? *ctx.sig : ETCS::SignalContext{});
+            ctx.spawn_host->changeModule(module);   // migrate in place
+            host = ctx.spawn_host.get();
+        }
+    }
+
+    if (!resolve_module(module, src, host)) return nullptr;
+    if (!verify_tag(host, module, tag, src)) return nullptr;
 
     try
     {
         ETCS::LoadEvent evt{(module + ":" + tag).c_str()};
-        // Lets loadImpl's vacant branch bootstrap the module against
-        // ctx.root_entity before Make()'ing the real entity and transferring
-        // ownership to IT via a second attachModule call.
-        evt.root = ctx.root_entity;
+        // Lets loadImpl's vacant branch bootstrap the module against the host
+        // before Make()'ing the real entity and transferring ownership to IT
+        // via a second attachModule call.
+        evt.root = host;
         return evt();
     }
     catch (const std::exception& ex)
@@ -271,6 +343,14 @@ inline ETCS::Entity* spawn_entity(const std::string& module, const std::string& 
 inline ETCS::Entity* make_typed_child(const std::string& module, const std::string& tag,
                                       ETCS::Entity* parent, const ExecSource& src)
 {
+#ifndef ETCS_LOADER
+    // module_registry lives on LoaderStream; a module's ModuleProxy has no such
+    // member, so this one operation cannot be served from a module host.
+    (void)module; (void)tag; (void)parent;
+    exec_warn(src, "spawn/ensure child: receiver-scoped spawn needs the loader; "
+                   "this host cannot dlsym a module's _MakeChild.");
+    return nullptr;
+#else
     auto& registry = ETCS::EventNode::getInstance().stream.module_registry;
     auto it = registry.find(module);
     if (it == registry.end() || !it->second)
@@ -293,6 +373,7 @@ inline ETCS::Entity* make_typed_child(const std::string& module, const std::stri
         exec_warn(src, std::string("spawn/ensure child: ") + ex.what());
         return nullptr;
     }
+#endif  // ETCS_LOADER
 }
 
 // resolve_receiver — the ONE place a name becomes an entity, and so the one
@@ -442,7 +523,7 @@ inline std::string substitute_name_tokens(const std::string& payload,
     return out;
 }
 
-#endif // ETCS_LOADER
+#endif // ETCS_EXECUTOR_HOST
 
 // ---------------------------------------------------------------------------
 // Script path resolution — #IMPORT / #EXPORT, unchanged.
@@ -1092,7 +1173,7 @@ inline bool run_script(std::istream& in,
                        ExecutionContext& ctx,
                        ExecuteStatus* out_status = nullptr);
 
-#ifdef ETCS_LOADER
+#ifdef ETCS_EXECUTOR_HOST
 // ---------------------------------------------------------------------------
 // resolve_run_bindings — resolves every binding against the CURRENT ctx and
 // returns child_names ready to hand to a fresh ExecutionContext.
@@ -1230,7 +1311,7 @@ inline bool check_requirements(const std::vector<ScriptLine>& lines,
     for (const auto& u : unmet) out << "  " << u << "\n";
     return false;
 }
-#endif // ETCS_LOADER
+#endif // ETCS_EXECUTOR_HOST
 
 // ===========================================================================
 // execute_command
@@ -1239,7 +1320,7 @@ inline ExecuteResult execute_command(const Command& cmd,
                                      ExecutionContext& ctx,
                                      const ExecSource& src)
 {
-    (void)ctx;   // every arm touching it is #ifdef ETCS_LOADER; a module build reads none
+    (void)ctx;   // every arm touching it is #ifdef ETCS_EXECUTOR_HOST; a module build reads none
 
     return std::visit([&](auto&& c) -> ExecuteResult
     {
@@ -1261,7 +1342,7 @@ inline ExecuteResult execute_command(const Command& cmd,
 
         if constexpr (std::is_same_v<T, CmdAcquire>)
         {
-#ifdef ETCS_LOADER
+#ifdef ETCS_EXECUTOR_HOST
             if (ctx.introduced(c.name))
                 return {ExecuteStatus::Error,
                     "'" + c.name + "' is already introduced in this script."};
@@ -1335,7 +1416,7 @@ inline ExecuteResult execute_command(const Command& cmd,
 
         if constexpr (std::is_same_v<T, CmdChildAcquire>)
         {
-#ifdef ETCS_LOADER
+#ifdef ETCS_EXECUTOR_HOST
             // Same rule as top-level spawn -- a child spawn introduces a name
             // too, and the ambiguity is the same whoever's child it is.
             if (c.verb == AcquireVerb::Spawn)
@@ -1404,7 +1485,7 @@ inline ExecuteResult execute_command(const Command& cmd,
 
         if constexpr (std::is_same_v<T, CmdUnflag>)
         {
-#ifdef ETCS_LOADER
+#ifdef ETCS_EXECUTOR_HOST
             auto r = ETCS::resolve_receiver(c.receiver, ctx, src);
             if (!r)
                 return {ctx.lost_rid ? ExecuteStatus::Vanished : ExecuteStatus::Error,
@@ -1427,7 +1508,7 @@ inline ExecuteResult execute_command(const Command& cmd,
 
         if constexpr (std::is_same_v<T, CmdKill>)
         {
-#ifdef ETCS_LOADER
+#ifdef ETCS_EXECUTOR_HOST
             auto r = ETCS::resolve_receiver(c.receiver, ctx, src);
             if (!r)
                 return {ctx.lost_rid ? ExecuteStatus::Vanished : ExecuteStatus::Error,
@@ -1467,7 +1548,7 @@ inline ExecuteResult execute_command(const Command& cmd,
 
         if constexpr (std::is_same_v<T, CmdAction>)
         {
-#ifdef ETCS_LOADER
+#ifdef ETCS_EXECUTOR_HOST
             auto r = ETCS::resolve_receiver(c.receiver, ctx, src);
             if (!r)
                 return {ctx.lost_rid ? ExecuteStatus::Vanished : ExecuteStatus::Error,
@@ -1483,6 +1564,7 @@ inline ExecuteResult execute_command(const Command& cmd,
             // pair is built on the consumer and the producer is handed in.
             // That is also what lets the two ends live on different entities,
             // and therefore different modules.
+#ifdef ETCS_LOADER   // Entity::call(producer, ...) is itself loader-gated (Entity.h)
             if (c.is_stream)
             {
                 auto cons = ETCS::resolve_receiver(c.consumer_receiver, ctx, src);
@@ -1525,6 +1607,7 @@ inline ExecuteResult execute_command(const Command& cmd,
                 }
                 return {ExecuteStatus::Ok, ""};
             }
+#endif  // ETCS_LOADER -- stream pairs need Entity::call(producer, ...)
 
             // ---- ordinary action -----------------------------------------
             ETCS::Buffer act_buf;
@@ -1565,12 +1648,62 @@ inline ExecuteResult execute_command(const Command& cmd,
 
         if constexpr (std::is_same_v<T, CmdDetach>)
         {
-#ifdef ETCS_LOADER
+#ifdef ETCS_EXECUTOR_HOST
             std::unordered_map<std::string, NameBinding> child_names;
             if (!ETCS::resolve_run_bindings(c.bindings, ctx, src, child_names))
                 return {ExecuteStatus::Error, "detach: binding resolution failed."};
  
             std::string script_path = ETCS::resolve_script_path(src.origin, c.script);
+            /*
+ * IF THIS SCRIPT IS RUNNING UNDER A THREAD, THE JOB IS ITS CHILD.
+ *
+ * A detached script IS a control thread, and a control thread is an entity --
+ * so what should exist here is a child Thread of whatever is running us, not a
+ * row in a registry beside the entity graph. Core cannot allocate one (ontology
+ * depends on core, never the reverse), so it asks through IWireThread::Detach
+ * and the leaf makes one of itself.
+ *
+ * What that buys: identity is the child's RID rather than a hand-issued
+ * integer, "which jobs did this shell start" is its typed-child list, and the
+ * child's signal authority is its own SignalContext -- parented on the
+ * ownership edge the entity graph already maintains, rather than pinned to the
+ * process root at creation and unable to follow a reparent.
+ *
+ * THE FALLBACK IS TRANSITIONAL, not a design. A script started by
+ * run_root_script still gets a bare Root, which is not an Entity and so has no
+ * Thread half -- there is nothing to detach FROM. Those keep the old
+ * Root-per-child path. It goes when a Root spawning a Shell is the only way a
+ * script starts.
+ */
+            ETCS::IWireThread* parent_thread = nullptr;
+            if (ctx.root_entity
+             && ctx.root_entity.kind == ETCS::LifetimeOwner::Kind::Entity)
+            {
+                void* tp = ctx.root_entity.asEntity()
+                             .getInterfacePointer(ETCS::Buffer("Threaded"));
+                if (tp) parent_thread = static_cast<ETCS::IWireThread*>(tp);
+            }
+
+            ETCS::Entity*       child_entity = nullptr;
+            ETCS::SignalContext child_sig{};      // by value; see IWireThread
+            if (parent_thread)
+            {
+                const uint64_t kid =
+                    parent_thread->Detach(ETCS::Buffer(script_path.c_str()));
+                if (!kid)
+                    return {ExecuteStatus::Error,
+                            "detach: the running thread refused to start '"
+                            + c.script + "' (halted, or out of capacity)."};
+                child_entity = ETCS::resolve_entity_anywhere(kid);
+                if (child_entity)
+                {
+                    void* tp = child_entity->getInterfacePointer(ETCS::Buffer("Threaded"));
+                    if (tp) child_sig = static_cast<ETCS::IWireThread*>(tp)->Signals();
+                }
+                ETCS_LOG("CommandExecutor", "detach: launching " << script_path
+                         << " as child RID:" << kid);
+            }
+
             DetachedExecutor* exec = DetachedRegistry::getInstance().create(c.script, ctx.sig);
             uint64_t exec_id = exec->id;
             ETCS_LOG("CommandExecutor", "detach: launching " << script_path
@@ -1585,7 +1718,8 @@ inline ExecuteResult execute_command(const Command& cmd,
             // shared root and the others got nothing. Each detached thread
             // now constructs its OWN fresh Root, and binds "root" to THAT
             // Root's RID.
-            std::thread child_thread([script_path, child_names, exec]() mutable
+            std::thread child_thread([script_path, child_names, exec,
+                                      child_entity, child_sig]() mutable
             {
                 std::ifstream in(script_path);
                 if (!in.is_open())
@@ -1595,14 +1729,29 @@ inline ExecuteResult execute_command(const Command& cmd,
                     exec->finished.store(true, std::memory_order_release);
                     return;
                 }
-                ETCS::Root detached_root(exec->local_sig);
-                child_names["root"] = NameBinding{detached_root.getRID(), "", ""};
- 
+                // The child Thread entity is this job's root when there is
+                // one: everything the script spawns is then owned by the job
+                // that ran it, which is what makes a session's history a
+                // subtree rather than a flat list. The Root is the fallback.
+                ETCS::Root detached_root(child_entity ? child_sig : exec->local_sig);
+
                 ExecutionContext child_ctx;
-                child_ctx.sig         = &exec->local_sig;
-                child_ctx.names       = child_names;
-                child_ctx.root_entity = &detached_root;
-                child_ctx.is_root     = false;   // never publishes globals
+                if (child_entity)
+                {
+                    child_names["root"] = NameBinding{child_entity->getRID(), "", ""};
+                    // Address of the thread's OWN copy, so nothing here points
+                    // into a frame or a shell that can go away underneath it.
+                    child_ctx.sig         = &child_sig;
+                    child_ctx.root_entity = child_entity;
+                }
+                else
+                {
+                    child_names["root"] = NameBinding{detached_root.getRID(), "", ""};
+                    child_ctx.sig         = &exec->local_sig;
+                    child_ctx.root_entity = &detached_root;
+                }
+                child_ctx.names   = child_names;
+                child_ctx.is_root = false;   // never publishes globals
  
                 // Injected RIDs count in the closure exactly as spawned ones
                 // do -- tested for liveness AT CAPTURE, which is also what
@@ -1621,7 +1770,7 @@ inline ExecuteResult execute_command(const Command& cmd,
  
         if constexpr (std::is_same_v<T, CmdRun>)
         {
-#ifdef ETCS_LOADER
+#ifdef ETCS_EXECUTOR_HOST
             std::unordered_map<std::string, NameBinding> child_names;
             if (!ETCS::resolve_run_bindings(c.bindings, ctx, src, child_names))
                 return {ExecuteStatus::Error, "run: binding resolution failed."};
@@ -1736,7 +1885,7 @@ inline bool run_script(std::istream& in,
         }
     }
  
-#ifdef ETCS_LOADER
+#ifdef ETCS_EXECUTOR_HOST
     // Whole-file, before line one. Placement of a `requires` is a readability
     // choice, not a positional rule.
     if (!check_requirements(lines, ctx, origin))
@@ -1746,7 +1895,7 @@ inline bool run_script(std::istream& in,
     }
 #endif
  
-#ifdef ETCS_LOADER
+#ifdef ETCS_EXECUTOR_HOST
     // A closure ends once -- see the block below.
     bool closure_ended = false;
 #endif
@@ -1773,7 +1922,7 @@ inline bool run_script(std::istream& in,
             return false;
         }
  
-#ifdef ETCS_LOADER
+#ifdef ETCS_EXECUTOR_HOST
         /*
  * TOTAL CLOSURE. The rule is on the closure, not on the lines.
  *

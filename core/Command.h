@@ -198,6 +198,27 @@ struct ExecutionContext
     // a root executor clears it.
     bool is_root = true;
 
+    /*
+     * The module BOOTSTRAP HOST for this execution, when the execution root
+     * cannot be one.
+     *
+     * attachModule binds an entity to one module for its whole life, so an
+     * execution rooted on a real ENTITY (a Shell running a script) can never
+     * host a second module and every foreign `spawn` from it is refused. A Root
+     * can migrate in place -- Root::changeModule -- which is the designed path
+     * for exactly this.
+     *
+     * ONE PER EXECUTION, REUSED. Not one per spawn: a stack Root destroyed
+     * right after the load runs ~Root, which vacates the module if it still
+     * holds the token. Living as long as the execution removes that window, and
+     * a script naming five modules migrates one Root five times rather than
+     * building five.
+     *
+     * Null until something needs it, so a Root-rooted execution never allocates
+     * one and its path is untouched.
+     */
+    std::shared_ptr<ETCS::Root> spawn_host;
+
     void own(ETCS::RID rid)        { if (rid) owned_.insert(rid); }
     bool owns(ETCS::RID rid) const { return owned_.count(rid) > 0; }
     void note_lost(ETCS::RID rid)  { lost_rid = rid; }

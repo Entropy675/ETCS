@@ -1347,6 +1347,58 @@ int main()
         ETCS::MemoryArena::getInstance().deleteEntity(src, true);
     }
 
+    // -- 26. A reclaimed Thread's signal bits are not handed to the next -----
+    //
+    // A SignalContext is copied and carried -- a detached job holds one for as
+    // long as it runs -- so the bits it points at must outlive the entity that
+    // published them. Entity members cannot: reclaimEntity memsets the whole
+    // outer shell and pushes it onto the exact-(size, alignment) free list,
+    // where the next allocate of the SAME concrete type takes it. A held copy
+    // then addresses a DIFFERENT LIVE THREAD's stop flag -- not a crash, a
+    // silent misrouting, the hazard SignalContext::provider documents for
+    // itself.
+    //
+    // MEASURED, not argued: with the flags as entity members this reports
+    // "shell reused: yes, signal bits aliased: YES" on the first retry. The
+    // flags come from the root arena instead, whose memory is released only at
+    // module unload -- which cannot happen while anything holds the lifetime
+    // token, so a flag always outlives every reader of it.
+    {
+        Worker* first = arena.allocate<Worker>();
+        ETCS::SignalContext stale = first->Signals();
+        void* first_addr = static_cast<void*>(first);
+        ETCS::MemoryArena::getInstance().deleteEntity(first, true);
+
+        // Several, because the free list need not hand the very next allocation
+        // the reclaimed shell. One alias anywhere is the bug.
+        bool reused = false, aliased = false;
+        std::vector<Worker*> later;
+        for (int i = 0; i < 8; ++i)
+        {
+            Worker* w = arena.allocate<Worker>();
+            if (!w) break;
+            later.push_back(w);
+            if (static_cast<void*>(w) == first_addr) reused = true;
+            if (w->Signals().terminate == stale.terminate) aliased = true;
+        }
+
+        // Reported so a future reader can tell a PASS from a vacuous one: if the
+        // shell is never reused, this test is not exercising anything.
+        std::cout << "    [note] reclaimed shell reused: " << (reused ? "yes" : "no") << "\n";
+        check(reused, "the reclaimed shell IS recycled -- so this test is not vacuous");
+        check(!aliased, "a reclaimed Thread's signal bits are handed to no later Thread");
+
+        if (stale.terminate)
+        {
+            *stale.terminate = 1;
+            bool any = false;
+            for (Worker* w : later) if (w->Signals().isTerminated()) any = true;
+            check(!any, "so a stale copy from a dead job terminates no live one");
+            *stale.terminate = 0;
+        }
+        for (Worker* w : later) ETCS::MemoryArena::getInstance().deleteEntity(w, true);
+    }
+
     ETCS::MemoryArena::getInstance().deleteEntity(canvas, true);
     ETCS::MemoryArena::getInstance().deleteEntity(sink, true);
 

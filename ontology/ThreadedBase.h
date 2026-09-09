@@ -37,6 +37,9 @@ ETCS_SUPERTYPE_BASE(Threaded)
     // Resizable_::ResizeTo defaulting false.
     uint64_t Detach(const ETCS::Buffer&) override { return 0; }
 
+    // No signal authority either, and for the same reason. See IWireThread.
+    ETCS::SignalContext Signals() override { return ETCS::SignalContext{}; }
+
 private:
     std::atomic<bool> m_halted{false};
 };
