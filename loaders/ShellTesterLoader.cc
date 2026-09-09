@@ -276,6 +276,207 @@ int main()
     // recycle, which is where the aliasing is actually observable and where the
     // test now asserts that the shell WAS reused before claiming anything.
 
+    /*
+     * -- 4d. ENDING a closure, which is the half that did not exist ----------
+     *
+     * A Thread's context is a closure boundary (SignalContext::closure_root),
+     * so a raise from inside a script a shell is running stops at the shell
+     * rather than reaching g_sig_int. That settles who HEARS it. What ending a
+     * closure actually DOES had no implementation at all: a signalled script
+     * had its detached members wound up and its entities left standing, which
+     * is why closing the window on scene3d.etcs left the whole scene graph
+     * resident with nothing left naming it.
+     *
+     * ExecutionContext::owned_ was always the record of what a script brought
+     * into being. It had simply never been read as a teardown -- its own
+     * comment called itself "provenance, not a sweep", which was right while
+     * nothing could end a closure. dissolve_closure is that read.
+     */
+    {
+        ETCS::Entity* host      = ETCS::spawn_entity("ShellProvider", "Shell", env, loader);
+        ETCS::Entity* member    = ETCS::spawn_entity("ShellProvider", "Shell", env, loader);
+        ETCS::Entity* bystander = ETCS::spawn_entity("ShellProvider", "Shell", env, loader);
+        check(host && member && bystander,
+              "an execution anchor, a closure member, and an unrelated shell");
+
+        if (host && member && bystander)
+        {
+            host->call("Shell.Create", "", ctx);
+            member->call("Shell.Create", "", ctx);
+            bystander->call("Shell.Create", "", ctx);
+
+            // A child of the member, so the sweep has something to reach that
+            // the owned set never names.
+            ETCS::IWireThread* mw = static_cast<ETCS::IWireThread*>(
+                member->getInterfacePointer(ETCS::Buffer("Threaded")));
+            const ETCS::RID kid = mw ? mw->Detach(ETCS::Buffer("st_swept.etcs")) : 0;
+            check(kid != 0 && ETCS::resolve_entity_anywhere(kid) != nullptr,
+                  "the member has a child of its own");
+
+            const ETCS::RID host_rid = host->getRID();
+            const ETCS::RID mem_rid  = member->getRID();
+            const ETCS::RID by_rid   = bystander->getRID();
+
+            ETCS::SignalContext hsig{};
+            void* hw = host->getInterfacePointer(ETCS::Buffer("Threaded"));
+            if (hw) hsig = static_cast<ETCS::IWireThread*>(hw)->Signals();
+
+            ETCS::ExecutionContext hctx(host, &hsig);
+            hctx.is_root = true;
+            hctx.own(host_rid);   // exactly as a `root` binding would put it there
+            hctx.own(mem_rid);
+
+            const ETCS::ExecSource src{"st_sweep", 0};
+            const size_t gone = ETCS::dissolve_closure(hctx, src);
+
+            check(gone == 1,
+                  "the sweep deletes the closure's members and reports how many");
+            check(ETCS::resolve_entity_anywhere(mem_rid) == nullptr,
+                  "an owned entity is gone");
+            check(ETCS::resolve_entity_anywhere(kid) == nullptr,
+                  "...and so is its child, which the set never named -- the sweep "
+                  "cascades, because nothing owns a subtree once its root is gone");
+            check(ETCS::resolve_entity_anywhere(host_rid) != nullptr,
+                  "the ANCHOR survives its own sweep: root_entity is what GRANTED "
+                  "the closure, not a member of it");
+            check(ETCS::resolve_entity_anywhere(by_rid) != nullptr,
+                  "and an unrelated shell is untouched -- a closure, not a purge");
+
+            check(ETCS::dissolve_closure(hctx, src) == 0,
+                  "a second sweep is a no-op, not a second pass over dead RIDs");
+
+            host->call("Shell.Delete", "", ctx);
+            bystander->call("Shell.Delete", "", ctx);
+        }
+    }
+
+    /*
+     * -- 4d2. A signalled script STOPS, and the shell it ran under does not --
+     *
+     * The same thing from the script side, and the pair is the point: a raise
+     * addressed to the closure has to end the SCRIPT and spare the SHELL, or
+     * the boundary is decorative. Two runs of one file, differing only in
+     * whether the shell's own interrupt was raised first.
+     *
+     * DRIVEN THROUGH run_root_script HERE rather than through Shell.Run, for
+     * the reason 4b already gives: execute_command's spawn arm is inside
+     * #ifdef ETCS_LOADER, so a script run inside ShellProvider.so spawns
+     * nothing and there would be no closure to end. The shell-side half of
+     * this -- clearing the flags so the next Run starts clean -- is
+     * LinuxShell::RunScript, and is exercised by running a real session.
+     */
+    {
+        const char* body = "#!/usr/bin/env etcs\n\n"
+                           "spawn ShellProvider::Shell sweep_a\n"
+                           "spawn ShellProvider::Shell sweep_b\n";
+        check(write_script("st_sweep.etcs", body),
+              "a script that spawns two entities and nothing else");
+
+        // Control: nothing raised. A script that finishes normally leaves what
+        // it made STANDING -- `etcs script.etcs` plus a drain is exactly that,
+        // so a sweep on completion would be the wrong behaviour, not a missing
+        // one.
+        {
+            ETCS::Entity* quiet = ETCS::spawn_entity("ShellProvider", "Shell", env, loader);
+            check(quiet != nullptr, "a shell for the unsignalled run");
+            if (quiet)
+            {
+                quiet->call("Shell.Create", "", ctx);
+                ETCS::GlobalNames::getInstance().clear();
+
+                ETCS::SignalContext qsig{};
+                void* qw = quiet->getInterfacePointer(ETCS::Buffer("Threaded"));
+                if (qw) qsig = static_cast<ETCS::IWireThread*>(qw)->Signals();
+
+                ETCS::ExecutionContext qctx(quiet, &qsig);
+                qctx.is_root = true;
+
+                ETCS::ExecuteStatus st = ETCS::ExecuteStatus::Ok;
+                const bool ok = ETCS::run_root_script("st_sweep.etcs", qctx, &st);
+                check(ok, "it runs to the end when nothing is raised");
+
+                auto a = ETCS::GlobalNames::getInstance().find("sweep_a");
+                auto b = ETCS::GlobalNames::getInstance().find("sweep_b");
+                check(a && b, "both lines ran");
+                check(a && b
+                   && ETCS::resolve_entity_anywhere(a->rid)
+                   && ETCS::resolve_entity_anywhere(b->rid),
+                      "and what it spawned is still standing afterwards");
+
+                if (a) if (ETCS::Entity* e = ETCS::resolve_entity_anywhere(a->rid))
+                    e->getOwningArena().deleteEntity(e, true);
+                if (b) if (ETCS::Entity* e = ETCS::resolve_entity_anywhere(b->rid))
+                    e->getOwningArena().deleteEntity(e, true);
+                quiet->call("Shell.Delete", "", ctx);
+            }
+        }
+
+        // Signalled: the shell's OWN interrupt, which is what a window closing
+        // inside its closure now raises.
+        {
+            ETCS::Entity* runner = ETCS::spawn_entity("ShellProvider", "Shell", env, loader);
+            check(runner != nullptr, "a shell for the signalled run");
+            if (runner)
+            {
+                runner->call("Shell.Create", "", ctx);
+                ETCS::GlobalNames::getInstance().clear();
+
+                ETCS::IWireThread* rw = static_cast<ETCS::IWireThread*>(
+                    runner->getInterfacePointer(ETCS::Buffer("Threaded")));
+                ETCS::SignalContext rsig = rw ? rw->Signals() : ETCS::SignalContext{};
+
+                if (!rsig.interrupt)
+                {
+                    check(false, "a Shell carries its own interrupt authority");
+                }
+                else
+                {
+                    check(!ETCS::SignalContext::raised(&g_sig_int),
+                          "the process interrupt is clear before the run");
+
+                    rsig.interrupt->store(1, std::memory_order_release);
+
+                    ETCS::ExecutionContext rctx(runner, &rsig);
+                    rctx.is_root = true;
+
+                    ETCS::ExecuteStatus st = ETCS::ExecuteStatus::Ok;
+                    const bool ok = ETCS::run_root_script("st_sweep.etcs", rctx, &st);
+
+                    check(!ok && st == ETCS::ExecuteStatus::Vanished,
+                          "a signalled closure stops the script -- Vanished, not a "
+                          "quiet run to the end");
+
+                    auto a = ETCS::GlobalNames::getInstance().find("sweep_a");
+                    auto b = ETCS::GlobalNames::getInstance().find("sweep_b");
+                    check(a && !b,
+                          "it stopped AT the raise: line one ran, line two never did");
+                    check(a && ETCS::resolve_entity_anywhere(a->rid) == nullptr,
+                          "and what line one made was swept -- the closure ended, so "
+                          "its members did");
+                    check(rctx.owned_.empty(),
+                          "the record is spent, so a later sweep cannot re-walk it");
+
+                    check(ETCS::resolve_entity_anywhere(runner->getRID()) != nullptr,
+                          "THE SHELL IS STILL UP: the raise ended the script's closure, "
+                          "not the thing that ran it");
+                    ETCS::IWireThread* rw2 = static_cast<ETCS::IWireThread*>(
+                        runner->getInterfacePointer(ETCS::Buffer("Threaded")));
+                    check(rw2 && !rw2->Halted(),
+                          "...and un-halted, so it can be handed the next script");
+                    check(!ETCS::SignalContext::raised(&g_sig_int),
+                          "and the process interrupt was never touched -- the boundary "
+                          "held for the whole round trip");
+
+                    rsig.interrupt->store(0, std::memory_order_release);
+                }
+                runner->call("Shell.Delete", "", ctx);
+            }
+        }
+
+        std::remove("st_sweep.etcs");
+        ETCS::GlobalNames::getInstance().clear();
+    }
+
     // -- 4e. The detach topology of a script IS the Shell's child tree -------
     //
     // The structural claim, tested as structure rather than as a count. A

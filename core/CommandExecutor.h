@@ -1830,7 +1830,38 @@ inline ExecuteResult execute_command(const Command& cmd,
             auto t1 = std::chrono::steady_clock::now();
             std::string elapsed = ETCS::format_duration_ns(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
- 
+
+            /*
+ * THE CLOSURE IS THE ROOT'S, so what this run made joins the caller's record.
+ *
+ * child_ctx is a stack set that dies at the closing brace below. Everything
+ * the child spawned that does not hang off a name the caller passed in --
+ * anything rooted on the child's own `root` -- would leave the record entirely,
+ * and dissolve_closure would then walk a set that no longer describes the
+ * closure. The scene scripts are exactly that shape: they spawn under an
+ * `anchor` they were handed, so cascading covers them, and a script that
+ * spawns under its own root is the case that was silently unrecorded.
+ *
+ * Safe because `run` is BLOCKING. The caller cannot be doing anything else
+ * with these RIDs while the child holds them, and by here the child is done.
+ *
+ * TWO THINGS ARE FILTERED OUT, and neither is an optimisation.
+ *
+ * run_root is a stack Root destroyed at this brace, and it entered
+ * child_ctx.owned_ through the "root" binding above -- carrying it up would
+ * seed the caller's set with a RID guaranteed to stop resolving, which the
+ * liveness probe in run_script reads as "the closure dissolved". It is skipped
+ * by identity rather than by the resolve test, because it is still very much
+ * alive right here.
+ *
+ * Anything that no longer resolves is skipped too: a child that deleted its own
+ * entity and moved on is not in error, for the reason Command.h already gives,
+ * and a dead RID in the caller's set says the same false thing.
+ */
+            const ETCS::RID run_root_rid = run_root.getRID();
+            for (ETCS::RID rid : child_ctx.owned_)
+                if (rid != run_root_rid && ETCS::resolve_entity_anywhere(rid)) ctx.own(rid);
+
             if (ok)
             {
                 ETCS_LOG("CommandExecutor", "  [run] completed " << c.script
@@ -1876,6 +1907,75 @@ inline ExecuteResult execute_command(const Command& cmd,
     }, cmd);
 }
  
+#ifdef ETCS_EXECUTOR_HOST
+/*
+ * dissolve_closure -- delete everything this execution created.
+ *
+ * The teardown ExecutionContext::owned_ never had. That set has always been
+ * the record of what a script brought into being; it was read in exactly one
+ * place, as a liveness probe, and its own comment called itself "provenance,
+ * not a sweep". Which was right while nothing could end a closure: a script
+ * that finishes normally SHOULD leave its entities standing -- that is what
+ * `etcs script.etcs` plus a drain is -- so a sweep on completion would be
+ * wrong. A closure that is ENDED is the case that had no answer.
+ *
+ * CASCADING, and that reaches past the set on purpose. deleteEntity(e, true)
+ * takes the whole subtree, including children some other execution spawned
+ * underneath one of ours -- because once the node they hang off is gone there
+ * is nothing left that owns them, and leaving them is how the resident scene
+ * graph in a closed window survived.
+ *
+ * Order does not matter, so the unordered set stays as it is: a parent deleted
+ * first takes its children with it, and their RIDs then fail to resolve on
+ * their own turn and are skipped. A miss is the ordinary case, not an error.
+ *
+ * EXCEPT THE THING IT RAN UNDER. root_entity is what GRANTED the closure, not
+ * a member of it -- a Shell anchoring the execution is bound as `root` and
+ * therefore sits in owned_ like anything else, and sweeping it would have the
+ * shell delete itself the first time a script it ran was signalled. The
+ * boundary that makes the raise stop at the shell and the guard that keeps the
+ * shell out of its own sweep are the same statement from two sides.
+ *
+ * WHAT THE RECORD STILL MISSES, said here rather than left to be found. `run`
+ * is blocking, so a nested script's owned_ is merged into its caller's when it
+ * returns (CmdRun above) and the root's set is total for that whole branch.
+ * `detach` is not: a detached member's owned_ lives on its own DetachedExecutor
+ * and is gone by the time join_all returns, so anything it spawned that does
+ * NOT hang off a RID handed out of the root's set is reachable from no record
+ * at all. Cascading covers the ordinary case -- a detached job draws into an
+ * anchor it was passed -- and a job that spawns from its own root is the case
+ * that survives a sweep. The fix is a merge on join, which needs a parent link
+ * DetachedExecutor does not carry; it is not in this patch.
+ *
+ * Clears owned_ afterwards, so a second call is a no-op rather than a second
+ * pass over dead RIDs.
+ */
+inline size_t dissolve_closure(ExecutionContext& ctx, const ExecSource& src)
+{
+    const ETCS::RID anchor = ctx.root_entity ? ctx.root_entity.getRID() : 0;
+
+    size_t gone = 0;
+    for (ETCS::RID rid : ctx.owned_)
+    {
+        if (rid == anchor) continue;
+        ETCS::Entity* e = ETCS::resolve_entity_anywhere(rid);
+        if (!e) continue;
+        try
+        {
+            e->getOwningArena().deleteEntity(e, true);
+            ++gone;
+        }
+        catch (const std::exception& ex)
+        {
+            exec_warn(src, std::string("dissolve: RID ") + std::to_string(rid)
+                         + " refused deletion -- " + ex.what());
+        }
+    }
+    ctx.owned_.clear();
+    return gone;
+}
+#endif // ETCS_EXECUTOR_HOST
+
 // ===========================================================================
 // run_script
 // ===========================================================================
@@ -1989,24 +2089,32 @@ inline bool run_script(std::istream& in,
  * started it. What was missing was raising it where they could see it, and
  * then waiting for them to notice.
  *
- * Cost: the dissolved test is a resolve per owned RID, and it runs only
- * while the closure actually HAS live detached members -- a script with
- * nothing detached can invalidate whatever it likes for free, which is
- * also the only case the old "provenance, not a sweep" note (Command.h)
- * was protecting.
+ * WHICH OF THE TWO IS ASKED DEPENDS ON THE DETACHED MEMBERS, and only that.
+ * A raise is two atomic loads, so it is asked at every line whether or not
+ * anything is detached -- a signalled closure with nothing detached is still
+ * a closure that ended, and letting it run on was the same gap one arm
+ * shorter. The dissolved test is a resolve per owned RID, so it is asked
+ * only while the closure actually HAS live detached members: a script with
+ * nothing detached can invalidate whatever it likes for free, which is also
+ * the only case the old "provenance, not a sweep" note (Command.h) was
+ * protecting.
  *
- * Bounded, and a timeout is a warning rather than a hang: a detached member
- * that ignores its interrupt is a bug in that member, and turning it into
- * a deadlock here would hide it behind the wrong symptom.
+ * Winding up is likewise conditional on there being members to wind up, and
+ * bounded when there are -- a timeout is a warning rather than a hang: a
+ * detached member that ignores its interrupt is a bug in that member, and
+ * turning it into a deadlock here would hide it behind the wrong symptom.
  */
-        if (ctx.is_root && !closure_ended && !DetachedRegistry::getInstance().all_finished())
+        if (ctx.is_root && !closure_ended)
         {
+            const bool detached = !DetachedRegistry::getInstance().all_finished();
+
             const char* why = nullptr;
+            bool signalled = false;
             if (ctx.sig && (ctx.sig->isInterrupted() || ctx.sig->isTerminated()))
-                why = "signalled";
+                { why = "signalled"; signalled = true; }
 
             ETCS::RID dissolved = 0;
-            if (!why)
+            if (!why && detached)
                 for (ETCS::RID rid : ctx.owned_)
                     if (!ETCS::resolve_entity_anywhere(rid)) { dissolved = rid; why = "dissolved"; break; }
 
@@ -2016,29 +2124,64 @@ inline bool run_script(std::istream& in,
                 ETCS_LOG("CommandExecutor", "closure " << why
                          << (dissolved ? " (RID:" + std::to_string(dissolved) + " no longer resolves)"
                                        : std::string())
-                         << " -- winding up detached members before the rest of "
-                         << origin << " runs.");
+                         << " -- " << (detached ? "winding up detached members before"
+                                                : "stopping")
+                         << " the rest of " << origin << ".");
 
                 // A dissolved closure has not signalled anyone yet -- say so
                 // through the same authority a signalled one used, so the
                 // members stop for the same reason and by the same means.
-                if (dissolved && ctx.sig && !ctx.sig->raiseClosureInterrupt())
-                    exec_warn(src, "closure has no interrupt authority on its active chain -- "
-                                   "its detached members cannot be told to stop.");
-
-                const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-                while (!DetachedRegistry::getInstance().all_finished())
+                if (detached)
                 {
-                    if (std::chrono::steady_clock::now() > deadline)
+                    if (dissolved && ctx.sig && !ctx.sig->raiseClosureInterrupt())
+                        exec_warn(src, "closure has no interrupt authority on its active chain -- "
+                                       "its detached members cannot be told to stop.");
+
+                    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                    while (!DetachedRegistry::getInstance().all_finished())
                     {
-                        exec_warn(src, "closure drain timed out after 5s -- a detached member is "
-                                       "not observing its interrupt. Continuing, but anything this "
-                                       "script deletes below may still be referenced by it.");
-                        break;
+                        if (std::chrono::steady_clock::now() > deadline)
+                        {
+                            exec_warn(src, "closure drain timed out after 5s -- a detached member is "
+                                           "not observing its interrupt. Continuing, but anything this "
+                                           "script deletes below may still be referenced by it.");
+                            break;
+                        }
+                        std::this_thread::sleep_for(std::chrono::milliseconds(2));
                     }
-                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    DetachedRegistry::getInstance().join_all();
                 }
-                DetachedRegistry::getInstance().join_all();
+
+                /*
+ * AND THEN DELETE WHAT THE CLOSURE MADE, which is the half that did not exist.
+ *
+ * Winding up the detached members stops THREADS, and only threads. It leaves
+ * every entity the script spawned standing, with nothing left that names them
+ * -- which is exactly the state a signalled script used to end in: the window
+ * gone, the jobs joined, and a scene graph still resident with no closure
+ * around it. Unconditional, because entities are what a closure holds whether
+ * or not it ever detached anything.
+ *
+ * SIGNALLED ONLY. A dissolved closure has already lost something it depended
+ * on; the script keeps its remaining lines and its remaining entities, because
+ * "a RID vanished" is a liveness fact, not an instruction to tear down what is
+ * still working. A SIGNALLED closure is the instruction.
+ */
+                if (signalled)
+                {
+                    const size_t gone = dissolve_closure(ctx, src);
+                    ETCS_LOG("CommandExecutor", "closure of " << origin
+                             << " dissolved -- " << gone << " entit"
+                             << (gone == 1 ? "y" : "ies") << " deleted.");
+                    /*
+ * And stop. A signalled closure running its remaining lines was the other
+ * half of the same gap: the members were told to stop, the entities are now
+ * gone, and the next line would be executing against a closure that no longer
+ * exists. Vanished is what that already means everywhere else in this file.
+ */
+                    if (out_status) *out_status = ExecuteStatus::Vanished;
+                    return false;
+                }
             }
         }
 #endif
