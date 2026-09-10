@@ -473,6 +473,108 @@ int main()
             }
         }
 
+        /*
+         * -- AND THE SHELL CAN RUN IT AGAIN, which is the point of the whole
+         * boundary. -------------------------------------------------------
+         *
+         * Ending a closure that leaves the shell unable to re-enter it is not
+         * a boundary, it is a slower exit. So the test is the round trip: run,
+         * signal, sweep, run the SAME FILE again and have it work -- with
+         * fresh entities, because the old ones are gone.
+         *
+         * THE NAMES ARE WHAT MAKE THIS NON-OBVIOUS. A root script publishes
+         * what it introduces into GlobalNames, and `spawn` refuses a name that
+         * is already in scope -- so a swept closure whose names were still
+         * standing would refuse its own second run, on the grounds that it
+         * clashes with entities it deleted. lookup_live retracts a global the
+         * moment it stops resolving, which is what makes the second run see
+         * the names as free; this asserts that the two halves actually meet.
+         */
+        {
+            ETCS::Entity* again = ETCS::spawn_entity("ShellProvider", "Shell", env, loader);
+            check(again != nullptr, "a shell to run one script twice");
+            if (again)
+            {
+                again->call("Shell.Create", "", ctx);
+                ETCS::GlobalNames::getInstance().clear();
+
+                ETCS::IWireThread* aw = static_cast<ETCS::IWireThread*>(
+                    again->getInterfacePointer(ETCS::Buffer("Threaded")));
+                ETCS::SignalContext asig = aw ? aw->Signals() : ETCS::SignalContext{};
+
+                if (!asig.interrupt) { check(false, "the shell carries its own interrupt"); }
+                else
+                {
+                    /*
+                     * 1. THE RUN THAT IS SIGNALLED, and it has to be this way
+                     *    round. Running it cleanly first and signalling the
+                     *    SECOND run tests nothing: `spawn` refuses a name
+                     *    already in scope, so the second run would fail on its
+                     *    first line with a clash and never reach the raise --
+                     *    and the sweep would then have to be made by hand,
+                     *    which is not what is under test.
+                     *
+                     *    So the raise stands before the first line runs. Line
+                     *    one spawns, the end-of-line check sees the closure
+                     *    signalled, and the sweep is made BY the run.
+                     */
+                    asig.interrupt->store(1, std::memory_order_release);
+                    ETCS::ExecutionContext c1(again, &asig);
+                    c1.is_root = true;
+                    ETCS::ExecuteStatus st1 = ETCS::ExecuteStatus::Ok;
+                    const bool ok1 = ETCS::run_root_script("st_sweep.etcs", c1, &st1);
+                    check(!ok1 && st1 == ETCS::ExecuteStatus::Vanished,
+                          "the signalled run stops where the raise was seen");
+
+                    auto first = ETCS::GlobalNames::getInstance().find("sweep_a");
+                    const ETCS::RID first_rid = first ? first->rid : 0;
+                    check(first_rid != 0,
+                          "line one had already run, so the closure really had a member");
+                    check(!ETCS::resolve_entity_anywhere(first_rid),
+                          "and the run swept it on the way out -- unwound by the "
+                          "closure ending, not by anything here");
+
+                    // 2. The shell clears its own flag, which is the whole of
+                    //    what LinuxShell::RunScript does for itself.
+                    asig.interrupt->store(0, std::memory_order_release);
+
+                    /*
+                     * 3. THE RE-RUN, with nothing else reset by hand.
+                     *
+                     * The names are what make this non-obvious: `sweep_a` is
+                     * still a global row pointing at the entity just swept, and
+                     * `spawn` refuses a name already in scope. lookup_live
+                     * retracting a global the moment it stops resolving is what
+                     * frees it -- this is where that meets the sweep.
+                     */
+                    ETCS::ExecutionContext c3(again, &asig);
+                    c3.is_root = true;
+                    ETCS::ExecuteStatus st3 = ETCS::ExecuteStatus::Ok;
+                    const bool re_ok = ETCS::run_root_script("st_sweep.etcs", c3, &st3);
+
+                    check(re_ok,
+                          "THE SAME SCRIPT RUNS AGAIN -- a swept closure leaves the "
+                          "shell able to re-enter it, which is the whole difference "
+                          "between a boundary and an exit");
+
+                    auto second = ETCS::GlobalNames::getInstance().find("sweep_a");
+                    check(second && ETCS::resolve_entity_anywhere(second->rid),
+                          "...and its names bind to entities that are actually there");
+                    check(second && second->rid != first_rid,
+                          "to NEW ones: the names were reused, the entities were not");
+                    auto second_b = ETCS::GlobalNames::getInstance().find("sweep_b");
+                    check(second_b && ETCS::resolve_entity_anywhere(second_b->rid),
+                          "and the line the signalled run never reached ran this time");
+
+                    ETCS::IWireThread* aw2 = static_cast<ETCS::IWireThread*>(
+                        again->getInterfacePointer(ETCS::Buffer("Threaded")));
+                    check(aw2 && !aw2->Halted(),
+                          "and the shell went through all of it un-halted");
+                }
+                again->call("Shell.Delete", "", ctx);
+            }
+        }
+
         std::remove("st_sweep.etcs");
         ETCS::GlobalNames::getInstance().clear();
     }

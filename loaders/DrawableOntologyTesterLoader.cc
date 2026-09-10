@@ -1853,6 +1853,69 @@ int main()
         }
     }
 
+    /*
+     * -- 29. Halting is a transition; stopped is the destination -------------
+     *
+     * One tag was carrying both. "halted" was written when a stop was ASKED
+     * FOR, so an entity mid-wind-down and an entity whose loop had actually
+     * left were indistinguishable on the state surface -- and the tag's name
+     * claimed the second while recording the first.
+     *
+     * Halt is a request from outside; Stop is a notification from the body,
+     * the same split Delete/Release already draws (ontology/Lifecycle.h). Only
+     * the body knows when its loop has gone, so only the body can say it.
+     */
+    {
+        Worker* w = ETCS::MemoryArena::getInstance().allocate<Worker>();
+        check(w != nullptr, "an actor with a body to stop");
+
+        if (w)
+        {
+            check(!w->Halted() && !w->Stopped(),
+                  "a fresh actor is neither asked to stop nor stopped");
+            check(!w->hasTag(ETCS::Buffer("halted")) && !w->hasTag(ETCS::Buffer("stopped")),
+                  "...and says neither on its tag surface");
+
+            check(w->Halt(), "the halt is taken by the caller that placed it");
+            check(w->Halted(), "the request stands");
+            check(w->hasTag(ETCS::Buffer("halted")),
+                  "and it is ON THE TAG SURFACE, which is what makes it observable "
+                  "with no Observable code in the halt path at all");
+            check(!w->Stopped() && !w->hasTag(ETCS::Buffer("stopped")),
+                  "BUT IT HAS NOT STOPPED -- being asked and having gone are "
+                  "different facts, and this is the one that used to be unsayable");
+
+            check(w->Stop(), "the body reports that it has left");
+            check(w->Stopped(), "so the destination is reached");
+            check(w->hasTag(ETCS::Buffer("stopped")),
+                  "and recorded where the request was");
+            check(!w->hasTag(ETCS::Buffer("halted")),
+                  "REPLACING the request rather than sitting beside it: carrying "
+                  "both would claim to be winding down and finished at once");
+
+            check(!w->Stop(), "a second Stop is not a second transition");
+            check(!w->Halt(), "and the halt was already standing");
+            check(w->Halted() && w->Stopped(),
+                  "both latches still read true -- a halt is one-way, and so is "
+                  "leaving");
+
+            ETCS::MemoryArena::getInstance().deleteEntity(w, true);
+        }
+
+        // A body that finishes its own work was never asked to stop, and is no
+        // less stopped for it. Removing a tag that was never written is a
+        // no-op, so this path costs a lookup and says the true thing.
+        Worker* q = ETCS::MemoryArena::getInstance().allocate<Worker>();
+        if (q)
+        {
+            check(q->Stop() && q->Stopped(),
+                  "a body can stop without ever having been asked");
+            check(q->hasTag(ETCS::Buffer("stopped")) && !q->Halted(),
+                  "...and says so without claiming a request that never happened");
+            ETCS::MemoryArena::getInstance().deleteEntity(q, true);
+        }
+    }
+
     ETCS::MemoryArena::getInstance().deleteEntity(canvas, true);
     ETCS::MemoryArena::getInstance().deleteEntity(sink, true);
 

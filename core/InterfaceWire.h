@@ -176,6 +176,31 @@ struct IWireThread
     virtual bool Halted() const = 0;
 
     /*
+     * THE BODY REPORTING THAT IT ACTUALLY LEFT, which is a different fact from
+     * having been asked to.
+     *
+     * Halt/Halted was carrying both and could only mean one: an entity asked to
+     * stop and an entity whose loop had already gone were the same answer, and
+     * the tag written for it said "halted" while recording a REQUEST. Halting
+     * is the transition, stopped is the destination.
+     *
+     * SAME SHAPE AS Delete/Release on IWireLifecycle -- Halt is a request from
+     * outside, Stop is a notification from the body, and only the body can make
+     * it because nothing else knows when a loop has ended. So Stop is called BY
+     * a body on its way out, never commanded at one.
+     *
+     * ON THE WIRE, beside the pair it completes. The drain is the caller that
+     * needs it: shutdown_detached_executors and etcs_retire_entity ask bodies
+     * to stop from the LOADER side, across the boundary, and "did it actually
+     * go" is the question they have to answer before reclaiming anything the
+     * body was touching. A readback whose only useful caller sits on the far
+     * side of the wire belongs on the wire, for the reason Halted() already
+     * gives one line up.
+     */
+    virtual bool Stop() = 0;
+    virtual bool Stopped() const = 0;
+
+    /*
      * Start `script` as a child of this entity. Returns the child's RID, or 0
      * if refused.
      *

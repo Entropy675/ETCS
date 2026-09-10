@@ -56,6 +56,30 @@ public:
     // What a running body polls. Cheap, and readable without touching state a
     // reclaim is about to take apart -- which is the entire point.
     bool Halted() const override = 0;
+
+    /*
+ * THE BODY REPORTING THAT IT ACTUALLY STOPPED, which is a different fact from
+ * having been asked to.
+ *
+ * Halt/Halted was carrying both and could only mean one. The tag it wrote said
+ * "halted" while recording a REQUEST, so an entity that had been asked to stop
+ * and an entity whose loop had actually left it were indistinguishable -- and
+ * a drain that wanted to know whether it was safe to reclaim had nothing to
+ * read. Halting is the transition; being stopped is the destination.
+ *
+ * SAME SHAPE AS Delete/Release (ontology/Lifecycle.h): Halt is a request from
+ * outside, Stop is a notification from the body itself, and only the body can
+ * make it -- nothing else knows when a loop has left. So this is called BY a
+ * body on its way out, not commanded at one.
+ *
+ * ON THE WIRE (core/InterfaceWire.h), beside the Halt/Halted pair it
+ * completes, so the drain can ask it from the loader side -- which is the
+ * caller that needs it, since reclaiming what a body was touching depends on
+ * knowing the body has gone. Declared here only as the family's restatement of
+ * the wire's slot, exactly as Shape/Halt/Halted are.
+ */
+    bool Stop() override = 0;
+    bool Stopped() const override = 0;
 };
 
 #endif // SUPERTYPE_THREADED_H__

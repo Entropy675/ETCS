@@ -22,7 +22,12 @@ ETCS_SUPERTYPE_BASE(Threaded)
  * True if THIS call placed the request, false if one was already standing.
  *
  * THE REQUEST IS RECORDED AS A TAG, because the tag surface is the state
- * surface. Halting is a transition on it, so it belongs there for the same
+ * surface. HALTING is a transition on it -- the tag "halted" means a stop has
+ * been ASKED FOR and the body has not finished leaving; "stopped" replaces it
+ * when the body says it has (Stop, below). Two tags because they are two
+ * facts, and one of them used to be unrepresentable: an entity asked to stop
+ * and an entity that had stopped both read as "halted", so nothing could tell
+ * a wind-down from a finished one. It belongs on the tag surface for the same
  * reason a flag does -- and putting it there is what makes it observable, with
  * no Observable code here at all: addTag routes through Entity::tagModifyImpl,
  * which marks the nearest claimant at or above this entity
@@ -72,6 +77,48 @@ ETCS_SUPERTYPE_BASE(Threaded)
         return m_halted.load(std::memory_order_acquire);
     }
 
+    /*
+ * THE BODY SAYING IT HAS LEFT -- see Threaded.h on why that is a separate
+ * fact from having been asked to.
+ *
+ * REPLACES the tag rather than adding beside it: "halted" is the transition
+ * and "stopped" is the destination, so an entity carrying both would be
+ * claiming to be mid-wind-down and finished at once. That is the one shape
+ * the pair exists to make impossible.
+ *
+ * IDEMPOTENT, and true only for the caller that made the transition -- the
+ * same claim-by-exchange Halt uses, and for the same reason: several bodies
+ * under one entity can finish concurrently and only one of them is the one
+ * that stopped it.
+ *
+ * DOES NOT REQUIRE A HALT FIRST. A body that finishes its own work and leaves
+ * was never asked to stop and is no less stopped for it; removeTag on a tag
+ * that was never written is a no-op, so the ordinary case costs a lookup.
+ *
+ * SAME ORDERING-THREAD FALLBACK as Halt, and it is not optional there either.
+ *
+ * final, like Halt: the latch and the tag transition are the family's to keep
+ * consistent, and a leaf overriding half of it is how they come apart.
+ */
+    bool Stop() override final
+    {
+        if (m_stopped.exchange(true, std::memory_order_acq_rel)) return false;
+        ETCS::Entity* self = static_cast<Derived*>(this);
+        if (!ETCS::EventNode::on_ordering_thread && ETCS::lifetime_hold_depth == 0)
+        {
+            self->removeTag(ETCS::Buffer("halted"));
+            self->addTag(ETCS::Buffer("stopped"));
+        }
+        else
+            ETCS::Entity::markStateChange(self, self->getRID());
+        return true;
+    }
+
+    bool Stopped() const override final
+    {
+        return m_stopped.load(std::memory_order_acquire);
+    }
+
     ETCS::WorkShape Shape() const override { return ETCS::WorkShape::Held; }
 
     // Refused, because owning a body is not being an actor. A Thread overrides
@@ -85,6 +132,9 @@ ETCS_SUPERTYPE_BASE(Threaded)
 
 private:
     std::atomic<bool> m_halted{false};
+    // The destination, latched separately from the request -- an entity can be
+    // asked and not yet gone, or gone without ever being asked.
+    std::atomic<bool> m_stopped{false};
 };
 
 #endif
