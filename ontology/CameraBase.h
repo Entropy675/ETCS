@@ -36,6 +36,10 @@ ETCS_SUPERTYPE_BASE(Camera), public Drawable2DBase<Derived>
     ETCS_DISPATCH_METHOD(void,        SetScene, (ETCS::RID, scene));
     ETCS_DISPATCH_METHOD(ETCS::RID,   GetScene);
     ETCS_DISPATCH_METHOD(bool,        Render);
+    // The request half of the device toggle -- Camera.h on why only the
+    // request is stored and the effective mode is derived.
+    ETCS_DISPATCH_METHOD(bool,        SetDeviceProjection, (bool, on));
+    ETCS_DISPATCH_METHOD_CONST(bool,  DeviceProjectionRequested);
 };
 
 #endif

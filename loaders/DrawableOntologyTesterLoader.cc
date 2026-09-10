@@ -192,6 +192,11 @@ public:
     // Resolve, hand over self, done. By RID and by family name, so a scene
     // built in another module is reached on identical terms -- and a scene
     // that has been destroyed fails to resolve instead of being dereferenced.
+    // The device toggle: request stored, effective mode derived (Camera.h).
+    bool m_want_device = false;
+    bool SetDeviceProjectionConcrete(bool on) { m_want_device = on; return on == m_want_device; }
+    bool DeviceProjectionRequestedConcrete() const { return m_want_device; }
+
     bool RenderConcrete()
     {
         Drawable3D_* scene = ETCS::resolve_in_family<Drawable3D_>("Drawable3D", scene_rid);
@@ -425,6 +430,19 @@ public:
                           float, float, float, float) {}
     void BlitConcrete(Surface_*, int32_t, int32_t, uint32_t, uint32_t, float) {}
     void DrawIntoConcrete(Surface_*) {}
+};
+
+// A device that is nothing but its own key -- which is all the ontology can
+// see of one. Zero means "not created yet", the ordinary state of an entity
+// between spawn and Create, and the reason DeviceSource skips it.
+class TestDevice : public DeviceBase<TestDevice>
+{
+public:
+    WIRE_TYPE_IDENTITY(TestDevice)
+
+    uint64_t key = 0;
+    uint64_t DeviceKeyConcrete()   const { return key; }
+    bool     DeviceReadyConcrete() const { return key != 0; }
 };
 
 // A minimal actor: claims Thread, so it gets Threaded (Halt/Halted/Shape), a
@@ -1741,6 +1759,94 @@ int main()
 
             ETCS::MemoryArena::getInstance().deleteEntity(gpu, true);
             ETCS::MemoryArena::getInstance().deleteEntity(cpu, true);
+        }
+    }
+
+    /*
+     * -- 28. Device: capability as structure, and the toggle it enables -----
+     *
+     * THERE IS ALWAYS A CPU, so host projection is the floor and needs no
+     * declaration; a device is strictly an addition, and in this ontology an
+     * addition is a child. That makes "can this camera reach a device" a fact
+     * about the entity graph rather than a flag beside it -- enumerable by the
+     * same typed-child walk everything else uses, and true or false for the
+     * same reason anything else here is.
+     *
+     * The toggle stores only the REQUEST. The effective mode is that request
+     * AND a device still being there, derived at read time, so the two cannot
+     * disagree -- which is what makes losing the device a silent, correct
+     * fallback instead of a state to repair.
+     */
+    {
+        TestCamera* cam = ETCS::MemoryArena::getInstance().allocate<TestCamera>();
+        check(cam != nullptr, "a camera with no device under it");
+
+        if (cam)
+        {
+            check(cam->DeviceSource() == nullptr,
+                  "a camera with no Device child reaches no device");
+            check(!cam->DeviceProjection(),
+                  "...so it is projecting on the host, which needed no declaring");
+
+            // The request is refused with nothing to switch to. A leaf may
+            // refuse; what the ontology guarantees is that the derived mode
+            // stays false either way, which is the half under test here.
+            cam->SetDeviceProjection(true);
+            check(!cam->DeviceProjection(),
+                  "asking for a device that is not there does not put the camera "
+                  "in device mode -- the mode is derived, not stored");
+            cam->SetDeviceProjection(false);
+
+            TestDevice* dev = cam->addTag<TestDevice>();
+            check(dev != nullptr, "a Device spawned as a child of the camera");
+
+            if (dev)
+            {
+                // Declared but not ready: the child exists, the device does not.
+                check(cam->DeviceSource() == nullptr,
+                      "an uncreated Device is not a device the camera can reach -- "
+                      "declared and usable are different answers");
+
+                dev->key = 0xD1CE;
+                check(cam->DeviceSource() == dev,
+                      "once ready, the child IS the capability -- found by the "
+                      "ordinary typed-child walk, with nothing registered beside it");
+
+                check(!cam->DeviceProjection(),
+                      "a reachable device is not by itself a mode change");
+                cam->SetDeviceProjection(true);
+                check(cam->DeviceProjection(),
+                      "the request plus the device is what device projection is");
+
+                // WHICH device is the same mechanism as WHETHER -- a second
+                // child is a second device available, no new concept.
+                TestDevice* dev2 = cam->addTag<TestDevice>();
+                if (dev2)
+                {
+                    dev2->key = 0xBEEF;
+                    check(cam->DeviceSource() != nullptr,
+                          "two Devices under one camera is two devices available to it");
+                    // Through its OWN arena: a child made by addTag<T> lives in
+                    // its parent's, and the singleton's deleteEntity is a silent
+                    // no-op on anything that is not its own.
+                    dev2->getOwningArena().deleteEntity(dev2, true);
+                }
+
+                // AND THE FALLBACK IS FREE. Take the device away with the
+                // request still standing.
+                dev->key = 0;
+                check(cam->DeviceProjectionRequested(),
+                      "the request survives the device going away -- it is what "
+                      "was asked, not what is happening");
+                check(!cam->DeviceProjection(),
+                      "...but the camera is back on the host, with nothing to reset: "
+                      "there is always a CPU");
+
+                dev->getOwningArena().deleteEntity(dev, true);
+                check(cam->DeviceSource() == nullptr && !cam->DeviceProjection(),
+                      "and deleting the child is the same answer by the same route");
+            }
+            ETCS::MemoryArena::getInstance().deleteEntity(cam, true);
         }
     }
 

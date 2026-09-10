@@ -63,6 +63,9 @@
 #include "ontology/DrawableBase.h"
 #include "ontology/Drawable2DBase.h"
 #include "ontology/Drawable3DBase.h"
+// Not a refinement of anything: a Device is the place other things' pixels can
+// be. Included before the camera, which asks for one by family name.
+#include "ontology/DeviceBase.h"
 #include "ontology/CameraBase.h"
 #include "ontology/GlyphsBase.h"
 

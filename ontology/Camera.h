@@ -5,7 +5,9 @@
 #include "../core_defs.h"
 #include "Drawable2D.h"
 #include "Drawable3D.h"
+#include "Device.h"
 #include <cstdint>
+#include <vector>
 
 // ---------------------------------------------------------------
 // ViewFrustum
@@ -122,6 +124,56 @@ public:
     // gets false has an empty view for a reason it can log, rather than a
     // stale one it cannot distinguish from a correct one.
     virtual bool Render() = 0;
+
+    /*
+ * WHICH WAY THE PROJECTION LANDS -- host pixels, or through a device.
+ *
+ * A REQUEST, NOT A MODE, and that distinction is the whole design. What a
+ * leaf stores is whether device projection was ASKED FOR; what anything reads
+ * is DeviceProjection() below, which is that request AND a device still being
+ * there. So the two can never disagree, because the second is not stored.
+ *
+ * That falls out of the asymmetry rather than being imposed on it: there is
+ * always a CPU (Device.h), so host projection is the floor and needs no
+ * capability to fall back to. Delete the Device child mid-run and the camera
+ * quietly draws on the host again -- correct, and with nothing to reset.
+ */
+    virtual bool SetDeviceProjection(bool on) = 0;
+    virtual bool DeviceProjectionRequested() const = 0;
+
+    /*
+ * THE DEVICE THIS CAMERA CAN REACH, or null.
+ *
+ * Concrete and here rather than dispatched, for the reason Drawable.h gives
+ * for hoisting anyChildAnimating: every camera needs the identical walk over
+ * the identical child list, and a copy per leaf is how two of them end up
+ * disagreeing. The walk is the one the ontology already uses -- typed
+ * children, asked by family name, resolved at the point of use rather than
+ * cached, since children come and go.
+ *
+ * FIRST READY ONE WINS. Several Devices under one camera is several devices
+ * available to it (Device.h), and picking is a policy no ontology can hold;
+ * what this answers is only "is there one", which is the question the toggle
+ * turns on. A leaf wanting to choose among them walks the same children.
+ */
+    Device_* DeviceSource()
+    {
+        std::vector<std::pair<ETCS::Buffer, ETCS::RID>> kids;
+        this->getTypedChildren(kids);
+        for (const auto& entry : kids)
+        {
+            ETCS::Entity* child = this->getTypedChild(entry.first, entry.second);
+            if (!child) continue;
+            void* iface = child->getInterfacePointer(ETCS::Buffer("Device"));
+            if (!iface) continue;
+            Device_* d = static_cast<Device_*>(iface);
+            if (d->DeviceReady()) return d;
+        }
+        return nullptr;
+    }
+
+    // Asked for AND still available. This is what a projection branches on.
+    bool DeviceProjection() { return DeviceProjectionRequested() && DeviceSource() != nullptr; }
 };
 
 #endif
