@@ -446,6 +446,38 @@ public:
     bool     DeviceReadyConcrete() const { return key != 0; }
 };
 
+// ---------------------------------------------------------------------------
+// A transform stage: one step, and a forward link.
+//
+// Claims MatrixBase, which composes WrapperBase -- so it carries the "Wrapper"
+// tag and interface pointer without asking, and MirrorBuffer's chain
+// resolution finds it as an ordinary Wrapper child. Nothing here registers
+// anything.
+//
+// WRAP MULTIPLIES, UNWRAP DOES NOT, and that asymmetry is the point rather
+// than an omission: the two sides of the boundary are two spaces, so arriving
+// is not undoing (ontology/Matrix.h). Which side does the work is this leaf's
+// choice, not the family's.
+// ---------------------------------------------------------------------------
+class Xform : public MatrixBase<Xform>
+{
+public:
+    WIRE_TYPE_IDENTITY(Xform)
+
+    size_t wraps = 0, unwraps = 0;
+
+    // The stage's own value, loaded through the typed bridge so the shape is
+    // stated once and checked by the compiler.
+    void Become(const Matrix4& m) { Load(m); }
+    void BecomeShape(uint32_t r, uint32_t c) { SetShape(r, c); }
+
+    // The *Concrete half of the family's dispatch, as every other leaf owes.
+    void WrapConcrete(ETCS::MBuffer&, ETCS::SignalContext)   { ++wraps; }
+    void UnwrapConcrete(ETCS::MBuffer&, ETCS::SignalContext) { ++unwraps; }
+    void CloseConcrete(ETCS::MBuffer&, ETCS::SignalContext)  {}
+    ETCS::WireScope ScopeConcrete() const { return ETCS::WireScope::LMAX; }
+};
+
 // A minimal actor: claims Thread, so it gets Threaded (Halt/Halted/Shape), a
 // SignalContext and a closure without writing any of them.
 class Worker : public ThreadBase<Worker>
@@ -1913,6 +1945,112 @@ int main()
             check(q->hasTag(ETCS::Buffer("stopped")) && !q->Halted(),
                   "...and says so without claiming a request that never happened");
             ETCS::MemoryArena::getInstance().deleteEntity(q, true);
+        }
+    }
+
+    /*
+     * -- 31. Matrix: the shape is the constraint, twice ----------------------
+     *
+     * An n-by-m may feed an m-by-p and nothing else. That rule is stated at two
+     * different TIMES, and neither is a weaker copy of the other:
+     *
+     *   COMPILE TIME  Mat<R,C>::operator* takes a Mat<C,P>, so a mismatched
+     *                 product does not bind. Concrete code cannot write one.
+     *   RESOLVE TIME  ChainsInto compares a stage's columns to the next
+     *                 stage's rows. A chain assembled by ATTACHING children is
+     *                 not knowable statically, so this is the only form
+     *                 available where the chain is actually built.
+     *
+     * And the family owns the VALUE, not just the constraint -- m-by-n
+     * elements, the same division Raster_ makes for its buffer. A stage whose
+     * values lived elsewhere could disagree with its own shape, and the shape
+     * is the only thing the chain checks.
+     */
+    {
+        // The value type first: the product's shape is carried by the type.
+        Matrix4 id = Matrix4::Identity();
+        check(id.at(0,0) == 1.0f && id.at(1,1) == 1.0f && id.at(0,1) == 0.0f,
+              "Mat<4,4>::Identity is the identity");
+
+        Matrix4 t = Matrix4::Identity();
+        t.at(0,3) = 5.0f; t.at(1,3) = -2.0f;
+        const Matrix4 once = id * t;
+        check(once == t, "identity times a translation is that translation");
+
+        // n-by-m times m-by-p yields n-by-p, and the SHAPE comes out in the
+        // type -- this would not compile if the inner dimensions disagreed.
+        Mat<2,3> a{}; Mat<3,4> b{};
+        a.at(0,0)=1; a.at(0,1)=2; a.at(0,2)=3;
+        a.at(1,0)=4; a.at(1,1)=5; a.at(1,2)=6;
+        for (uint32_t i=0;i<3;++i) b.at(i,i)=1.0f;
+        Mat<2,4> ab = a * b;
+        check(Mat<2,4>::rows == 2 && Mat<2,4>::cols == 4,
+              "a 2x3 times a 3x4 is a 2x4, and the type says so");
+        check(ab.at(0,0)==1 && ab.at(1,2)==6 && ab.at(0,3)==0,
+              "...with the product actually computed");
+
+        // The OrderVector -> 4x4 function: DERIVED, not reinterpreted. Row 0's
+        // fourth slot is a RID and no product may touch it, which is why this
+        // is a function rather than a cast.
+        OrderVector ov;
+        ov.PlaceAt(3.0f, 4.0f, 5.0f);
+        ov.rid = 12345;
+        const Matrix4 om = ov.ToMatrix4();
+        check(om.at(0,3)==3.0f && om.at(1,3)==4.0f && om.at(2,3)==5.0f,
+              "an OrderVector's position becomes the translation column");
+        check(om.at(3,3)==1.0f && om.at(3,0)==0.0f,
+              "and the bottom row is affine -- the RID is nowhere in the matrix, "
+              "which is the whole reason this is built rather than cast");
+        check(ov.rid == 12345, "...and the vector still knows who it is");
+
+        // Now the family: stages, their values, and the chain rule.
+        Xform* first  = ETCS::MemoryArena::getInstance().allocate<Xform>();
+        Xform* second = ETCS::MemoryArena::getInstance().allocate<Xform>();
+        check(first && second, "two transform stages");
+
+        if (first && second)
+        {
+            check(first->getInterfacePointer(ETCS::Buffer("Matrix")) != nullptr,
+                  "a stage is a Matrix");
+            check(first->getInterfacePointer(ETCS::Buffer("Wrapper")) != nullptr
+               && first->hasTag(ETCS::Buffer("Wrapper")),
+                  "AND A WRAPPER, with nothing registered here -- which is what "
+                  "makes an attached stage part of a chain MirrorBuffer already "
+                  "knows how to resolve and apply");
+
+            first->Become(t);
+            check(first->ShapeIs(4,4) && first->Count() == 16,
+                  "loading a Mat<4,4> gives the stage that shape");
+            check(first->At(0,3) == 5.0f,
+                  "and the family owns the elements, not an interface to them");
+            check(first->As<4,4>() == t,
+                  "which round-trip through the typed bridge unchanged");
+            check(first->As<2,3>() == Mat<2,3>{},
+                  "asking for the wrong shape yields zero rather than a lie");
+
+            // The chain rule.
+            second->Become(Matrix4::Identity());
+            check(first->ChainsInto(*second),
+                  "4x4 feeds 4x4 -- my columns are the next stage's rows");
+            second->BecomeShape(3, 3);
+            check(!first->ChainsInto(*second),
+                  "and a 4x4 does NOT feed a 3x3: the chain is dimensionally "
+                  "constrained even though it was assembled at runtime");
+            second->BecomeShape(4, 2);
+            check(first->ChainsInto(*second) && !second->ChainsInto(*first),
+                  "the relation is DIRECTED -- 4x4 into 4x2 composes, the "
+                  "reverse does not, because a pipeline has a direction");
+
+            // Wrap and Unwrap are not inverses, and nothing here says they are.
+            ETCS::MBuffer io;
+            ETCS::SignalContext sig{};
+            first->Wrap(io, sig);
+            check(first->wraps == 1 && first->unwraps == 0,
+                  "a stage that multiplies on the way out does nothing on the "
+                  "way in -- arriving is not undoing");
+
+            ETCS::MemoryArena::getInstance().deleteEntity(second, true);
+            ETCS::MemoryArena::getInstance().deleteEntity(first, true);
         }
     }
 

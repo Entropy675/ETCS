@@ -91,6 +91,11 @@
 #include "ontology/EphemeralBase.h"
 #include "ontology/ParserBase.h"
 #include "ontology/WrapperBase.h"
+// Matrix refines Wrapper: one step, and a forward link, in a transform chain.
+// The chain is the owner's Wrapper children in attach order, which MirrorBuffer
+// already resolves and applies -- so a pipeline is built by attaching, not by
+// wiring. See ontology/Matrix.h.
+#include "ontology/MatrixBase.h"
 #include "ontology/GateBase.h"
 #include "ontology/SwitchableBase.h"
 #include "ontology/FilterBase.h"
