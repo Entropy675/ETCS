@@ -8,13 +8,15 @@
 #
 # and then, from the prompt while it runs:
 #
-#     Root> eye.SetDeviceProjection(0)     # back to the CPU, live
-#     Root> eye.SetDeviceProjection(1)     # and back again
+#     Root> eye.SetDeviceProjection(0)     # hold it on the CPU deliberately
+#     Root> eye.SetDeviceProjection(1)     # and hand it back (the default)
 #     Root> RenderProvider                 # log file  -- just this module
 #
-# ONE LINE IS THE WHOLE DIFFERENCE from scene3d.etcs, and it is not the toggle:
-# it is the Device spawned under the camera. The toggle only asks; what makes
-# the ask answerable is that child existing (ontology/Device.h).
+# TWO LINES ARE THE WHOLE DIFFERENCE from scene3d.etcs, and neither is a mode:
+# they spawn a Device under the camera and point it at the Instance. There is no
+# third line turning anything on. A camera wants a device by default
+# (ontology/Camera.h), so attaching one IS the switch -- a camera that had the
+# capability and drew on the CPU anyway would just be confusing.
 #
 # WHY A CHILD AND NOT A FLAG. There is always a CPU. Host memory is the floor
 # every raster in this system already stands on, so it needs no declaration --
@@ -29,9 +31,10 @@
 # under one camera is two devices available to it, with no new concept.
 #
 # AND THE FALLBACK IS FREE. Delete the Device child mid-run and the camera
-# quietly draws on the host again -- the effective mode is the request AND a
+# quietly draws on the host again -- the effective mode is the preference AND a
 # device still being there, derived at read time rather than stored, so the two
-# can never disagree (ontology/Camera.h).
+# can never disagree (ontology/Camera.h). Nothing to reset, because the host is
+# what a camera falls back to rather than something it has to be told to use.
 #
 # WHAT ACTUALLY CHANGES DOWNSTREAM. Nothing above the sink: the view, the
 # flatten, the near clip, the perspective divide, the fan and the depth test
@@ -64,7 +67,7 @@ eye.SetBackground(0.07, 0.09, 0.15, 1.0)
 eye.LookAt(0.0, 3.0, -14.0, 0.0, 0.5, 2.0)
 eye.SetLens(60.0, 0.1, 400.0)
 
-# ── the capability, and then the ask ─────────────────────────────────────
+# ── the capability, which is the whole of it ─────────────────────────────
 #
 # Spawned under the camera rather than attached from the root, because `attach`
 # is a pure lookup and does not re-parent (doc/etcs_specification.md): a
@@ -73,7 +76,6 @@ eye.SetLens(60.0, 0.1, 400.0)
 # process, not two -- the child is the capability, not the hardware.
 eye.spawn(RenderProvider::Device dev)
 dev.Create(@gpu)
-eye.SetDeviceProjection(1)
 
 spawn RenderProvider::Scene3D world
 world.Create(1.0, 1.0, 1.0)

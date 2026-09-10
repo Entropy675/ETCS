@@ -192,8 +192,9 @@ public:
     // Resolve, hand over self, done. By RID and by family name, so a scene
     // built in another module is reached on identical terms -- and a scene
     // that has been destroyed fails to resolve instead of being dereferenced.
-    // The device toggle: request stored, effective mode derived (Camera.h).
-    bool m_want_device = false;
+    // The device toggle: preference stored, effective mode derived (Camera.h).
+    // True by default -- a camera uses a device when it has one.
+    bool m_want_device = true;
     bool SetDeviceProjectionConcrete(bool on) { m_want_device = on; return on == m_want_device; }
     bool DeviceProjectionRequestedConcrete() const { return m_want_device; }
 
@@ -1785,17 +1786,12 @@ int main()
         {
             check(cam->DeviceSource() == nullptr,
                   "a camera with no Device child reaches no device");
+            check(cam->DeviceProjectionRequested(),
+                  "a camera WANTS a device by default -- attaching one is meant to "
+                  "be the whole of switching");
             check(!cam->DeviceProjection(),
-                  "...so it is projecting on the host, which needed no declaring");
-
-            // The request is refused with nothing to switch to. A leaf may
-            // refuse; what the ontology guarantees is that the derived mode
-            // stays false either way, which is the half under test here.
-            cam->SetDeviceProjection(true);
-            check(!cam->DeviceProjection(),
-                  "asking for a device that is not there does not put the camera "
-                  "in device mode -- the mode is derived, not stored");
-            cam->SetDeviceProjection(false);
+                  "...and is still on the host, because wanting one is not having "
+                  "one: there is always a CPU and it needed no declaring");
 
             TestDevice* dev = cam->addTag<TestDevice>();
             check(dev != nullptr, "a Device spawned as a child of the camera");
@@ -1812,11 +1808,18 @@ int main()
                       "once ready, the child IS the capability -- found by the "
                       "ordinary typed-child walk, with nothing registered beside it");
 
-                check(!cam->DeviceProjection(),
-                      "a reachable device is not by itself a mode change");
-                cam->SetDeviceProjection(true);
                 check(cam->DeviceProjection(),
-                      "the request plus the device is what device projection is");
+                      "AND THE CAMERA IS ON IT, with nothing else said -- attaching "
+                      "the capability is what switches, so a device that is present "
+                      "and unused is not a state this can be in");
+
+                // The override, which is the only thing the toggle is for now.
+                cam->SetDeviceProjection(false);
+                check(cam->DeviceSource() != nullptr && !cam->DeviceProjection(),
+                      "and it can still be held on the host deliberately -- the "
+                      "device is reachable, the camera just is not using it");
+                cam->SetDeviceProjection(true);
+                check(cam->DeviceProjection(), "...and handed back");
 
                 // WHICH device is the same mechanism as WHETHER -- a second
                 // child is a second device available, no new concept.
