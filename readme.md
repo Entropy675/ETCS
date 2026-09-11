@@ -106,7 +106,7 @@ Example: window.ProduceEvents() → window.ConsumeEvents() is not a loop in the 
 | Type identity | Compile-time ontology + TAG/MASK | Component type IDs | Actor type / behavior | Capability references | IID / versioned interfaces |
 | Capability model | Structural (header presence) | Usually none or external | Message interface | Explicit unforgeable tokens | Interface contracts + versioning |
 | Cross-boundary | Unified MirrorBuffer (LMAX/pipe/socket) | Rarely first-class | Mailboxes / remote actors | Explicit IPC / capability transfer | Marshalling layers |
-| Causal / ordering | Tag-closure masks + streams + planned exhaustion | Systems run in declared order | Mailbox semantics | Rarely central | Rarely central |
+| Causal / ordering | Tag-closure masks + streams + planned causal exhaustion | Systems run in declared order | Mailbox semantics | Rarely central | Rarely central |
 | Script surface | Non-Turing-complete `.etcs` causal traces | Data-oriented queries | Message patterns / supervision | N/A | Often none |
 | Determinism focus | RID sequences, replay of traces | Optional | Varies | Strong in some systems | Generally weak |
 | Scale | OS/VM-like substrate + certification | Game / data-oriented runtime | Distributed concurrency | Security isolation | Extensibility / binary integration |
