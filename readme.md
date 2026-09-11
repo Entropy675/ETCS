@@ -99,6 +99,18 @@ ETCS scripts are a non-Turing-complete description of the nameable environment u
 
 Example: window.ProduceEvents() → window.ConsumeEvents() is not a loop in the script; it is a standing control-thread edge between two work functions.
 
+### Comparison to existing systems
+
+| Aspect | ETCS | Classic ECS (EnTT, flecs, etc.) | Actor systems (Akka, Orleans) | Capability systems (Capsicum, seL4, E) | Plugin systems (COM, XPCOM, LLVM plugins) |
+| --- | --- | --- | --- | --- | --- |
+| Type identity | Compile-time ontology + TAG/MASK | Component type IDs | Actor type / behavior | Capability references | IID / versioned interfaces |
+| Capability model | Structural (header presence) | Usually none or external | Message interface | Explicit unforgeable tokens | Interface contracts + versioning |
+| Cross-boundary | Unified MirrorBuffer (LMAX/pipe/socket) | Rarely first-class | Mailboxes / remote actors | Explicit IPC / capability transfer | Marshalling layers |
+| Causal / ordering | Tag-closure masks + streams + planned exhaustion | Systems run in declared order | Mailbox semantics | Rarely central | Rarely central |
+| Script surface | Non-Turing-complete `.etcs` causal traces | Data-oriented queries | Message patterns / supervision | N/A | Often none |
+| Determinism focus | RID sequences, replay of traces | Optional | Varies | Strong in some systems | Generally weak |
+| Scale | OS/VM-like substrate + certification | Game / data-oriented runtime | Distributed concurrency | Security isolation | Extensibility / binary integration |
+
 Copyright (C) 2026 Sibte Kazmi
 
 This library is free software; you can redistribute it and/or
