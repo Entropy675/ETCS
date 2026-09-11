@@ -111,6 +111,14 @@ Example: window.ProduceEvents() → window.ConsumeEvents() is not a loop in the 
 | Determinism focus | RID sequences, replay of traces | Optional | Varies | Strong in some systems | Generally weak |
 | Scale | OS/VM-like substrate + certification | Game / data-oriented runtime | Distributed concurrency | Security isolation | Extensibility / binary integration |
 
+Replaces:
+- Containers/Docker with capability-typed modules
+- Kubernetes with causal trace orchestration
+- REST/gRPC with MirrorBuffer streams over the ontology
+- React/Vue with declarative scene graphs (the 3D scripts are essentially immediate-mode UI but with persistence atm, persistence todo pending)
+
+Via one compile time artifact.
+
 Copyright (C) 2026 Sibte Kazmi
 
 This library is free software; you can redistribute it and/or
