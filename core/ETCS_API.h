@@ -44,12 +44,8 @@
 // same-type operations (which must serialize against each other) from
 // different-type ones (which may commit independently).
 //
-// These three ceilings used to be independent numbers that quietly
-// disagreed: the mask was 64 bits, the Tags string was capped at 2048
-// bytes, and the static_assert said 64. Crossing 64 tags was a build
-// error; the 2048-byte cap would have bound first for any realistic tag
-// name anyway; and nothing tied either to the mask width. Deriving them
-// from one constant is what makes "the Tags string is allowed to carry
+// The three ceilings were once independent numbers that quietly disagreed.
+// Deriving them from one constant is what makes "the Tags string carries
 // exactly as many tags as the mask can represent" true rather than
 // approximately true.
 //
@@ -111,7 +107,7 @@
 // ====================================================================
 // PLATFORM-SPECIFIC HEADER INCLUDES
 // ====================================================================
-#ifdef _WIN32HASH_TYPE
+#ifdef _WIN32
     #include <windows.h>
     #include <direct.h> // For _getcwd
     using library_handle_t = HMODULE;
@@ -218,7 +214,7 @@ inline bool ETCS_SLEEP_MS(uint32_t ms)
 //
 // TAG_MASK is this TYPE's own tag_closure_mask -- static, so it is reachable
 // as type information (Foo::TAG_MASK) with no instance in hand, exactly like
-// TAG immediately above it. Declared here but ASSIGNED by ETCS_TAG_DECLARE
+// TAG in the same macro body. Declared here but ASSIGNED by ETCS_TAG_DECLARE
 // (below), because the bit position comes from the module's own Tags string,
 // which only exists in the module's .cc after ETCS_MODULE_EXPORT_MAIN has run
 // -- it is not visible while this header is being parsed.
@@ -483,7 +479,7 @@ public: \
 // _implWork_ signature regardless of the tuple's stored type. This is what
 // lets the developer body mutate a field (including an OUT field like
 // NBuffer content) in place, without _DECL_ ever declaring a *local of
-// reference type* — which is exactly the unbindable case above. The
+// reference type*, which cannot be bound at the point _DECL_ runs. The
 // tuple's T stays a plain value type; only the call signature gets the &.
 #define _PARAM_REF(pair)        _PARAM_REF_ pair
 #define _PARAM_REF_(T, name)    T& name
@@ -494,6 +490,7 @@ public: \
  \
     void _implWork_##Type##_##Name(Type& self, ETCS::SignalContext ctx,  \
                                     FOR_EACH_COMMA(_PARAM_REF, __VA_ARGS__)); \
+    ETCS_CAUSAL_EDGE_STORE(Type, Name) \
  \
     void _work_##Type##_##Name(ETCS::Entity* handler, ETCS::Buffer& data, \
                       ETCS::SignalContext ctx) { \
@@ -505,6 +502,7 @@ public: \
                      "data=" << data.buf); \
             return; \
         } \
+        ETCS_CAUSAL_SCOPE(Type, Name); \
         _implWork_##Type##_##Name(*static_cast<Type*>(handler->getTrueType()), ctx, \
                                     FOR_EACH_COMMA(_ARGNAME, __VA_ARGS__)); \
     } \
@@ -576,6 +574,7 @@ public: \
 // would be wrong.
 #define DEFINE_STREAM_FUNC_PRODUCE(Type, Name) \
     void _implProduce_##Type##_##Name(Type& self, ETCS::MirrorBuffer& stream, ETCS::Buffer data, ETCS::SignalContext ctx); \
+    ETCS_CAUSAL_EDGE_STORE(Type, Name) \
     \
     void _stream_##Type##_##Name(ETCS::Entity* handler, ETCS::MBuffer& data, ETCS::SignalContext ctx) { \
         Type* self = static_cast<Type*>(handler->getTrueType()); \
@@ -611,6 +610,7 @@ public: \
         self->getThreadPool().enqueue(ETCS::Priority::Medium, ctx, [self, stream = std::move(stream), config, _pair_mod, _live_token, _auto_scope = std::move(_auto_scope)]() mutable { \
             ETCS::ProducerLiveGuard _auto_live(_live_token); \
             ETCS::PairScope _pair_scope(_pair_mod); \
+            ETCS_CAUSAL_SCOPE(Type, Name); \
             ETCS::StreamWriteGuard _auto_close(stream); \
             _implProduce_##Type##_##Name(*self, stream, config, _auto_scope.ctx()); \
         }); \
@@ -627,6 +627,7 @@ public: \
 
 #define DEFINE_STREAM_FUNC_CONSUME(Type, Name) \
     void _implConsume_##Type##_##Name(Type& self, ETCS::MirrorBuffer stream, ETCS::Buffer data, ETCS::SignalContext ctx); \
+    ETCS_CAUSAL_EDGE_STORE(Type, Name) \
  \
     void _stream_##Type##_##Name(ETCS::Entity* handler, ETCS::MBuffer& data, ETCS::SignalContext ctx) { \
         if(!handler) { \
@@ -651,14 +652,41 @@ public: \
         /* Runs inline, so this thread IS the body's thread. Read before the \
          * move below; PairScope copies. */ \
         ETCS::PairScope _pair_scope(stream.pairModuleMask()); \
+        ETCS_CAUSAL_SCOPE(Type, Name); \
         _implConsume_##Type##_##Name(*self, std::move(stream), config, _auto_scope.ctx()); \
     } \
  \
     void _implConsume_##Type##_##Name(Type& self, ETCS::MirrorBuffer stream, ETCS::Buffer data, ETCS::SignalContext ctx)
 
-// DEFINE_WORK_FUNC provides self&, Buffer&, and SignalContext
+/*
+ * ETCS_CAUSAL_EDGE_STORE / ETCS_CAUSAL_SCOPE
+ *
+ * The per-(Type, Action) record of what one work function touches, and the
+ * RAII frame that fills it. Bundles.h::CausalEdgeFrame carries the whole
+ * argument; the short version is that a mask should be the edges of ONE
+ * invocation rather than the union of everything its type has ever reached.
+ *
+ * The statics are per translation unit and per action, which is the grain the
+ * mask wants -- the same grain the trampoline symbols already have, so the
+ * naming falls out of what these macros do anyway.
+ *
+ * Atomic because a work function runs on arbitrary pool workers and several
+ * may be inside the same action at once. fetch_or is the only write, so there
+ * is no writer-writer case to lose; the settled flag is released after the
+ * words and acquired before them, so a reader either sees the previous
+ * settled answer or the fallback, never a half-written one.
+ */
+#define ETCS_CAUSAL_EDGE_STORE(Type, Name) \
+    static std::atomic<uint64_t> _edge_w_##Type##_##Name[ETCS::TAG_WORDS]{}; \
+    static std::atomic<bool>     _edge_set_##Type##_##Name{false};
+
+#define ETCS_CAUSAL_SCOPE(Type, Name) \
+    ETCS::CausalScope _causal_edge_scope( \
+        _edge_w_##Type##_##Name, &_edge_set_##Type##_##Name)
+
 #define DEFINE_WORK_FUNC(Type, Name) \
     void _implWork_##Type##_##Name(Type& self, ETCS::Buffer& data, ETCS::SignalContext ctx); \
+    ETCS_CAUSAL_EDGE_STORE(Type, Name) \
     \
     void _work_##Type##_##Name(ETCS::Entity* handler, ETCS::Buffer& data, ETCS::SignalContext ctx) { \
         if(!handler) { \
@@ -667,6 +695,7 @@ public: \
                      "to dispatch."); \
             return; \
         } \
+        ETCS_CAUSAL_SCOPE(Type, Name); \
         _implWork_##Type##_##Name(*static_cast<Type*>(handler->getTrueType()), data, ctx); \
     } \
     \
@@ -1032,9 +1061,9 @@ namespace ETCS
         return handler; \
     }
 /**
- * ETCS_TAG_BLOCK
- * Declares a Tag and automatically maps all its work functions.
- * Converts comma-separated __VA_ARGS__ into a space-separated manifest string.
+ * ETCS_TAG_BLOCK_BASIC
+ * Declares a Tag and maps its work functions, converting the comma-separated
+ * __VA_ARGS__ into the space-separated manifest string discoverActions reads.
  */
 #define ETCS_TAG_BLOCK_BASIC(TagName, ...) \
     ETCS_TAG_DECLARE(TagName) \

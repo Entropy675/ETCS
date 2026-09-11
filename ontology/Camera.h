@@ -5,7 +5,9 @@
 #include "../core_defs.h"
 #include "Drawable2D.h"
 #include "Drawable3D.h"
+#include "Device.h"
 #include <cstdint>
+#include <vector>
 
 // ---------------------------------------------------------------
 // ViewFrustum
@@ -122,6 +124,72 @@ public:
     // gets false has an empty view for a reason it can log, rather than a
     // stale one it cannot distinguish from a correct one.
     virtual bool Render() = 0;
+
+    /*
+ * WHICH WAY THE PROJECTION LANDS -- host pixels, or through a device.
+ *
+ * A STANDING PREFERENCE, NOT A MODE, and that distinction is the whole design.
+ * What a leaf stores is whether it WANTS a device; what anything reads is
+ * DeviceProjection() below, which is that preference AND a device still being
+ * there. The two can never disagree, because the second is not stored.
+ *
+ * IT DEFAULTS TO YES, so attaching a Device is the whole of switching. A
+ * camera that has one and does not use it is the confusing case -- you added
+ * the capability and the picture came out of the CPU anyway -- and nothing was
+ * gained by making the caller say so twice.
+ *
+ * WHICH IS ALSO WHY THIS IS STILL A BOOLEAN. The obvious shape for "use it
+ * automatically, but let me override" is three states: auto, forced host,
+ * forced device. Written out, auto and forced-device are the SAME function of
+ * the graph -- both are "a device if there is one" -- so the third state would
+ * have been unobservable, distinguishable only by asking what someone once
+ * typed. Two states, one of them the default, says everything the three did.
+ *
+ * The asymmetry underneath is the same one Device.h states: there is always a
+ * CPU, so the host is what a camera falls BACK to, never what it has to be
+ * told to leave. Delete the Device child mid-run and the camera quietly draws
+ * on the host again -- correct, immediate, and with nothing to reset.
+ */
+    // Setting this false is the only way to keep a camera on the host once it
+    // has a device. Setting it true is a standing preference that takes effect
+    // whenever one appears -- it is the default, so scripts rarely say it.
+    virtual bool SetDeviceProjection(bool on) = 0;
+    virtual bool DeviceProjectionRequested() const = 0;
+
+    /*
+ * THE DEVICE THIS CAMERA CAN REACH, or null.
+ *
+ * Concrete and here rather than dispatched, for the reason Drawable.h gives
+ * for hoisting anyChildAnimating: every camera needs the identical walk over
+ * the identical child list, and a copy per leaf is how two of them end up
+ * disagreeing. The walk is the one the ontology already uses -- typed
+ * children, asked by family name, resolved at the point of use rather than
+ * cached, since children come and go.
+ *
+ * FIRST READY ONE WINS. Several Devices under one camera is several devices
+ * available to it (Device.h), and picking is a policy no ontology can hold;
+ * what this answers is only "is there one", which is the question the toggle
+ * turns on. A leaf wanting to choose among them walks the same children.
+ */
+    Device_* DeviceSource()
+    {
+        std::vector<std::pair<ETCS::Buffer, ETCS::RID>> kids;
+        this->getTypedChildren(kids);
+        for (const auto& entry : kids)
+        {
+            ETCS::Entity* child = this->getTypedChild(entry.first, entry.second);
+            if (!child) continue;
+            void* iface = child->getInterfacePointer(ETCS::Buffer("Device"));
+            if (!iface) continue;
+            Device_* d = static_cast<Device_*>(iface);
+            if (d->DeviceReady()) return d;
+        }
+        return nullptr;
+    }
+
+    // Wanted AND still available. This is what a projection branches on, and
+    // the only thing that should be: it is a fact about the graph right now.
+    bool DeviceProjection() { return DeviceProjectionRequested() && DeviceSource() != nullptr; }
 };
 
 #endif

@@ -172,7 +172,7 @@ struct ExecutionContext
 
     // This script's own names: what it introduced, plus what it was passed.
     // NOT the globals -- those are consulted as a second, separate lookup
-    // (see resolve/resolve_binding below), never merged in here, so a script
+    // (see lookup/resolve_name below), never merged in here, so a script
     // can always tell its own names from the root's.
     std::unordered_map<std::string, NameBinding> names;
 
@@ -194,9 +194,29 @@ struct ExecutionContext
     ETCS::RID lost_rid = 0;
 
     // True for the root executor — owns DetachedRegistry::join_all() on exit,
-    // and owns GlobalNames: only a root executor publishes into it, and only
-    // a root executor clears it.
+    // and owns GlobalNames (see that struct).
     bool is_root = true;
+
+    /*
+     * The module BOOTSTRAP HOST for this execution, when the execution root
+     * cannot be one.
+     *
+     * attachModule binds an entity to one module for its whole life, so an
+     * execution rooted on a real ENTITY (a Shell running a script) can never
+     * host a second module and every foreign `spawn` from it is refused. A Root
+     * can migrate in place -- Root::changeModule -- which is the designed path
+     * for exactly this.
+     *
+     * ONE PER EXECUTION, REUSED. Not one per spawn: a stack Root destroyed
+     * right after the load runs ~Root, which vacates the module if it still
+     * holds the token. Living as long as the execution removes that window, and
+     * a script naming five modules migrates one Root five times rather than
+     * building five.
+     *
+     * Null until something needs it, so a Root-rooted execution never allocates
+     * one and its path is untouched.
+     */
+    std::shared_ptr<ETCS::Root> spawn_host;
 
     void own(ETCS::RID rid)        { if (rid) owned_.insert(rid); }
     bool owns(ETCS::RID rid) const { return owned_.count(rid) > 0; }
@@ -380,7 +400,7 @@ struct CmdKill
 //
 // Removes a FLAG -- the freely-mutable lowercase set. Routed through
 // Entity::removeTag, which means it goes through the same TagModifyEvent /
-// Scope::interruptOne path any other flag removal does: if `flag` names an
+// Scope::interruptLabel path any other flag removal does: if `flag` names an
 // active_scope_* label (ScopeTag, Bundles.h), this reaches in and interrupts
 // that stream call's own SignalContext rather than merely removing
 // bookkeeping.

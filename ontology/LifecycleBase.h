@@ -43,6 +43,37 @@ ETCS_SUPERTYPE_BASE(Lifecycle)
     {
         if (m_released.exchange(true, std::memory_order_acq_rel)) return false;
         static_cast<Derived*>(this)->ReleaseConcrete();
+        // Delete is NOT called from here, and the obvious version of that hangs:
+        //
+        //     DestroyEvent::operator()  <-  VulkanSurface::DeleteConcrete
+        //                               <-  LifecycleBase<VulkanSurface>::Release
+        //
+        // Delete's body is a blocking request to the loader to destroy this RID,
+        // and Release runs from inside the arena walk already destroying it, so
+        // the event waits on this very thread. Delete calls Release instead --
+        // Release is local and returns.
+        //
+        /*
+         * RELEASING IS A STATE CHANGE, and this is the funnel for it.
+         *
+         * `override final` and gated on an exchange, so every path that ends a
+         * type's hold on what it owns -- DeletableBase::Delete, and
+         * etcs_retire_entity's own Release call -- runs this exactly once. That
+         * makes it the lifecycle counterpart to tagModifyImpl and addTagImpl:
+         * anything observing this entity has just gone out of date, whether or
+         * not the entity goes on to leave the tree.
+         *
+         * From the entity itself, not its parent: what changed is this, and it
+         * is still whole here -- etcs_retire_entity's mark starts at the parent
+         * only because it fires once the entity has been unlinked. The two are
+         * complementary rather than duplicate; MarkObserved is idempotent
+         * between reads, so a path taking both costs one extra fetch_or.
+         *
+         * After ReleaseConcrete, so an observer woken here sees the released
+         * state rather than the one being torn down.
+         */
+        ETCS::Entity::markStateChange(static_cast<Derived*>(this),
+                                      static_cast<Derived*>(this)->getRID());
         return true;
     }
 

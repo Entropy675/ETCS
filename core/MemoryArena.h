@@ -44,17 +44,12 @@
 // the compiler command line, or #define before including this header) to
 // enable the child-page pool's own verbose per-slab/per-chunk/per-page
 // tracing: every slab mint and unmap, every Chunk creation, every carved-
-// page acquire and release. Added during a real investigation (a cross-
-// DSO singleton-mismatch bug -- MemoryArena::getInstance() silently
-// resolving to the wrong DSO's own instance depending on which compiled
-// code happened to be calling it; see global_arena_'s own comment for the
-// full story) and left available behind this flag rather than deleted
-// once fixed -- the same CLASS of bug (a page minted or resolved against
-// the wrong arena instance) could resurface after some future change,
-// and this exact tracing is what actually found it: reasoning about raw
-// addresses across a dozen log excerpts by hand, without it, cost real
-// turns. Off by default -- at real per-connection churn rates this is far
-// too verbose for anything but active investigation. The pool's own
+// page acquire and release. Added during, and what actually found, the
+// cross-DSO singleton mismatch global_arena_ documents. Kept behind this
+// flag rather than deleted, because the same CLASS of bug -- a page minted
+// or resolved against the wrong arena instance -- could resurface. Off by
+// default: at real churn rates it is far too verbose for anything but an
+// active investigation. The pool's own
 // always-on diagnostics (the "no owning slab found" warning, the
 // hugepage-fallback notice, and memoryTeardown()'s own per-arena
 // teardown/release lines) are NOT gated by this flag -- those signal a
@@ -77,10 +72,11 @@ namespace ETCS
 // at its own top. MemoryArena.h never dereferences this pointer — only
 // stores/returns/compares it — so an incomplete type is sufficient.
 class Entity;
-// Defined in Entity.h, where Entity is complete. Hands an entity its
-// IWireLifecycle release if it claims the family, and returns whether THIS
-// call did the work. See releaseIfLifecycled below.
-bool etcs_release_lifecycle(Entity* e);
+// Defined in Entity.h, where Entity is complete. Retires an entity at the
+// single reclaim funnel: its IWireLifecycle release if it claims the family,
+// then -- for every entity -- its departure from its parent's child list.
+// Returns whether THIS call did the release. See retireEntity below.
+bool etcs_retire_entity(Entity* e);
 
 /*
  * NO DESTRUCTIBLE STATIC IN HERE, and that is a hard requirement rather than
@@ -100,9 +96,9 @@ bool etcs_release_lifecycle(Entity* e);
  * Reproduced under ASAN on both exit paths, from the current dev branch:
  *
  *   heap-use-after-free ... READ of size 8
- *     formatBytesToString  MemoryArena.h:90
- *     MemoryArena::memoryTeardown  MemoryArena.h:1676
- *     ~MemoryArena  MemoryArena.h:903
+ *     formatBytesToString
+ *     MemoryArena::memoryTeardown
+ *     ~MemoryArena
  *     __cxa_finalize                     <- module unloaded mid-run
  *
  *   heap-use-after-free ... READ of size 2
@@ -308,16 +304,11 @@ private:
         // here.
         std::string owner_scope_tag;
 
-        // THE actual cross-DSO fix -- see MemoryArena::global_arena_'s
-        // own comment for the full reasoning. Cached here, at
-        // construction (same moment owner_scope_tag is captured, same
-        // reasoning: guaranteed-correct DSO context NOW, not necessarily
-        // later), rather than having ~Chunk() call MemoryArena::
-        // getInstance() itself -- which could resolve to the WRONG DSO's
-        // singleton if this Chunk's own destructor happens to run from
-        // loader-compiled code (destroyImpl and friends) acting on a
-        // module-owned entity. nullptr for a non-pooled (from_pool ==
-        // false) Chunk, which never reaches releaseChildPage at all.
+        // The cross-DSO fix -- see MemoryArena::global_arena_. Cached at
+        // construction, the same moment and for the same reason as
+        // owner_scope_tag: the DSO context is guaranteed correct now and not
+        // necessarily when ~Chunk() runs. nullptr for a non-pooled Chunk,
+        // which never reaches releaseChildPage.
         MemoryArena* release_target = nullptr;
 
         Chunk(char* buf, long long sz, bool pooled, std::string tag, MemoryArena* target)
@@ -539,19 +530,15 @@ private:
     // for the same object correctly used the MODULE's -- two entirely
     // separate pools, silently, for the same logical arena.
     //
-    // The fix: never re-resolve MemoryArena::getInstance() from a call site
-    // that might be running as the wrong DSO's code. Resolve it EXACTLY
-    // ONCE, at construction time -- which is guaranteed correct, since
-    // entity/arena construction only ever happens via the OWNING module's
-    // own addTag<T>/allocate<T> flow -- and cache the resulting pointer
-    // here. allocateNewChunk and Chunk's own release path both route
-    // through THIS pointer thereafter, never a fresh getInstance() call.
-    // Once we hold a real MemoryArena* to the correct underlying object,
-    // WHICH DSO's compiled copy of acquireChildPage/releaseChildPage
-    // actually executes stops mattering at all -- poolMutex_/page_registry_/
-    // etc. are ordinary instance data, identical in every DSO's copy of the
-    // class layout, not per-DSO state; the only thing that was ever wrong
-    // was getInstance() picking the wrong OBJECT, never the method logic.
+    // The fix: never re-resolve getInstance() from a call site that might be
+    // running as the wrong DSO's code. Resolve it EXACTLY ONCE, at
+    // construction time -- guaranteed correct, since arena construction only
+    // ever happens via the OWNING module's addTag<T>/allocate<T> flow -- and
+    // cache it here. Once we hold a real MemoryArena* to the correct object,
+    // which DSO's compiled copy of acquireChildPage/releaseChildPage runs
+    // stops mattering: poolMutex_/page_registry_ are ordinary instance data,
+    // identical in every copy of the class layout. getInstance() picking the
+    // wrong OBJECT was the only thing ever wrong; the method logic never was.
     //
     // nullptr for the true global root itself (never needs to route
     // anywhere) and for every DEDICATED/blob chunk (bypasses the pool
@@ -1203,10 +1190,8 @@ public:
                 // OWNING module's own compiled code (construction only
                 // ever happens via that module's own addTag<T>/allocate<T>
                 // flow), so this resolves to the correct DSO's singleton.
-                // Threaded through as global_arena_ and cached on the new
-                // instance -- see that field's own comment for why this
-                // one-time resolution, done here, is what closes the
-                // cross-DSO pool-mismatch bug outright.
+                // Threaded through as global_arena_ -- this one-time
+                // resolution is what closes the cross-DSO pool mismatch.
                 obj = new (mem) T(std::forward<Args>(args)..., this, &MemoryArena::getInstance());
             else
                 obj = new (mem) T(std::forward<Args>(args)...);
@@ -1324,15 +1309,7 @@ public:
                                 // does reclaimEntity run this entity's ~T().
                                 own_arena->destroyChildEntitiesFirst();
                                 parentArena.reclaimEntity(e, sizeof(T), alignof(T));
-                                // reclaimArena, not evokeDestructor: the arena
-                                // object itself was allocate<MemoryArena>'d out
-                                // of parentArena, so its own outer bytes belong
-                                // back on parentArena's free list exactly as the
-                                // entity's do. evokeDestructor runs the dtor and
-                                // unlinks the record but returns nothing --
-                                // leaking sizeof(MemoryArena) per deleted child,
-                                // which under connection churn is unbounded
-                                // growth in a parent that never tears down.
+                                // reclaimArena, not evokeDestructor -- see above.
                                 parentArena.reclaimArena(own_arena);
                             }
                             else
@@ -1455,7 +1432,7 @@ public:
     {
         DestructorRecord* rec = unlinkRecord(target);
         if (!rec) return false;
-        rec->dtor(rec->ptr);
+        runRecordDtor(rec);
         return true;
     }
  
@@ -1491,7 +1468,7 @@ public:
      * the graph is alive -- costs one atomic read here and no second
      * teardown.
      */
-        etcs_release_lifecycle(target);
+        etcs_retire_entity(target);
 
         DestructorRecord* rec = unlinkRecord(target);
         if (!rec)
@@ -1503,7 +1480,7 @@ public:
         //ETCS_LOG("MemoryArena", "reclaimEntity: reclaiming " << (void*)target
         //         << " size=" << size << " align=" << alignment);
         void* raw = rec->ptr;
-        rec->dtor(raw);
+        runRecordDtor(rec);
  
         // rec itself -- unlinkRecord only removed it from dtorHead_'s own
         // linked list; that's bookkeeping, not reclaim. registerDtorLocked
@@ -1548,7 +1525,7 @@ public:
         DestructorRecord* rec = unlinkRecord(static_cast<void*>(target));
         if (!rec) return false;
         void* raw = rec->ptr;
-        rec->dtor(raw);
+        runRecordDtor(rec);
         releaseToFreeList(raw, static_cast<long long>(sizeof(MemoryArena)),
                                 static_cast<long long>(alignof(MemoryArena)));
         releaseToFreeList(rec,
@@ -1627,7 +1604,31 @@ public:
  * nothing else -- which is what lets this be unconditional rather than
  * something the destroy path has to reason about.
  */
-    static void releaseIfLifecycled(Entity* e) { etcs_release_lifecycle(e); }
+    static void retireEntity(Entity* e) { etcs_retire_entity(e); }
+
+    /*
+ * runRecordDtor — the cleanup path, and the only place this arena runs a
+ * destructor.
+ *
+ * Memory teardown and lifecycle are the same arena-side hook, and they were
+ * split across seven call sites that each ran rec->dtor themselves. Three --
+ * the whole-chain walks in reset(), clearEntities() and memoryTeardown() -- ran
+ * destructors with no retire at all.
+ *
+ * Measured: a traced composited_scenes created 13 entities, destructed 13 and
+ * retired 3. The other ten were addTag<T> children reclaimed by memoryTeardown's
+ * raw walk, so none of the lifecycle machinery ran for the entities that make up
+ * a scene graph. Now 13 of 13.
+ *
+ * A record with no entity behind it (a Module, a nested arena) takes the same
+ * path with that step skipped.
+ */
+    static void runRecordDtor(DestructorRecord* rec)
+    {
+        if (!rec) return;
+        if (rec->as_entity) etcs_retire_entity(rec->as_entity(rec->ptr));
+        rec->dtor(rec->ptr);
+    }
 
     void destroyChildEntitiesFirst()
     {
@@ -1652,9 +1653,9 @@ public:
             // The release goes BEFORE the destroy callback, while the entity is
             // still whole and everything around it still resolves -- which is
             // the only moment a release can do what a release is for. See
-            // releaseIfLifecycled. Outside the lock, deliberately: the callback
+            // retireEntity. Outside the lock, deliberately: the callback
             // below already re-enters this arena, and a release may too.
-            if (to_entity) releaseIfLifecycled(to_entity(rawPtr));
+            if (to_entity) retireEntity(to_entity(rawPtr));
             callback(rawPtr, *this, true);
         }
     }
@@ -1698,7 +1699,7 @@ public:
     {
         DestructorRecord* rec = unlinkRecord(target);
         if (!rec) return false; // not found — already evoked/forgotten, or never existed here
-        rec->dtor(rec->ptr);    // unlocked — matches allocate<T>'s own philosophy
+        runRecordDtor(rec);     // unlocked — matches allocate<T>'s own philosophy
         return true;
     }
  
@@ -1749,7 +1750,7 @@ public:
         if (isTeardown_) return;
  
         DestructorRecord* rec = dtorHead_;
-        while (rec) { rec->dtor(rec->ptr); rec = rec->prev; }
+        while (rec) { runRecordDtor(rec); rec = rec->prev; }
         dtorHead_ = nullptr;
     }
  
@@ -1780,7 +1781,7 @@ public:
         // of the same map). This was invisible before ArenaAllocator's
         // own deallocate() actually did anything -- the reentrant call
         // was always POSSIBLE, just inert.
-        while (rec) { rec->dtor(rec->ptr); rec = rec->prev; }
+        while (rec) { runRecordDtor(rec); rec = rec->prev; }
  
         std::lock_guard<std::mutex> lock(allocationMutex_);
         // Every chunk goes back to used=0 below -- any block this arena's
@@ -1829,7 +1830,7 @@ public:
         // std::mutex from the same thread -- undefined behavior, and
         // exactly what a real, reproduced SIGFPE inside std::
         // unordered_map's own operator[] traced back to.
-        while (rec) { rec->dtor(rec->ptr); rec = rec->prev; }
+        while (rec) { runRecordDtor(rec); rec = rec->prev; }
  
         std::lock_guard<std::mutex> lock(allocationMutex_);
         free_blocks_.clear(); // every chunk backing these addresses is about
@@ -2046,16 +2047,9 @@ inline MemoryArena::Chunk::~Chunk()
 {
     if (!buffer) return;
     if (from_pool)
-        // release_target, NEVER MemoryArena::getInstance() called fresh
-        // here -- this destructor can run from loader-compiled code
-        // (destroyImpl and friends, acting on a module-owned entity's
-        // arena) just as easily as the owning module's own code, and
-        // getInstance() would silently resolve to whichever DSO happens
-        // to be executing AT THIS POINT, not whichever DSO actually
-        // owns this Chunk's own pool. release_target is a real pointer
-        // to the correct underlying object, cached at construction time
-        // when the DSO context was guaranteed correct -- see
-        // global_arena_'s own comment for the full reasoning.
+        // release_target, NEVER a fresh MemoryArena::getInstance(): this
+        // destructor can run from loader-compiled code acting on a
+        // module-owned arena. See global_arena_.
         release_target->releaseChildPage(buffer, size, owner_scope_tag);
     else
         freePage(buffer, size);

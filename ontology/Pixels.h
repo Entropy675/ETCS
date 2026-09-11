@@ -3,6 +3,8 @@
 
 
 #include "../core_defs.h"
+#include "Observable.h"
+#include "Raster.h"
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -11,18 +13,30 @@
 // Pixels
 // ---------------------------------------------------------------
 //
-// A surface whose bytes live in CPU memory and can be read and
+// A raster whose bytes live in CPU memory and can be read and
 // written directly. Split from Surface for the same reason
 // Presentable was: a swapchain-backed surface has no CPU bytes to
 // hand out, and only some surfaces are meant to be edited a pixel
 // at a time.
 //
+// ONE OF TWO, and the other is Renderable (ontology/Renderable.h).
+// Everything below is a consequence of the bytes being addressable
+// by the host; a device-resident raster has none of it. What the
+// two share is that they have a SIZE, which is Raster
+// (ontology/Raster.h) -- inherited VIRTUALLY and directly, which
+// that header explains: Raster has no base of its own to be reached
+// twice through, so this is the one lineage in the ontology that
+// belongs in the interface rather than in the Base. The practical
+// consequence is that a Pixels_* answers its own dimensions, and
+// the two families remain mutually exclusive anyway -- by the
+// final-overrider rule, on the two accessors implemented just below.
+//
 // This family OWNS its buffer rather than declaring an interface to
 // one, the same way InputSource_ owns its event ring instead of
-// making every window reimplement it. The buffer, the dirty flag
-// and the CPU raster below are backend-independent by construction,
-// so a second rendering backend inherits all of it unchanged and
-// only has to implement upload.
+// making every window reimplement it. The buffer and the CPU raster
+// below are backend-independent by construction, so a second
+// rendering backend inherits all of it unchanged and only has to
+// implement upload.
 //
 // FORMAT, stated exactly because a projection layer depends on it:
 // 8 bits per channel, R,G,B,A in ascending byte order, NOT
@@ -34,15 +48,31 @@
 // one obvious format rather than growing a format enum that every
 // backend then has to handle every case of.
 //
-// DIRTY: writers call MarkDirty(); whoever uploads calls TakeDirty(),
-// which consumes the flag. One consumer is assumed -- the surface
-// that blits these pixels to a device -- which is true today and
-// will need revisiting the moment two devices share one image.
+// DIRTY IS NOT HERE. It used to be: one bool, MarkDirty to set,
+// TakeDirty to read-and-clear, and a comment saying one consumer
+// was assumed and that two devices sharing an image would need
+// revisiting. Two devices sharing an image is paint_two_windows,
+// and the second surface's TakeDirty returned false forever.
+//
+// So a Pixels leaf claims Observable and the edge lives there,
+// per observer. What that leaves here is the readable state, which
+// is the honest division: the mark says only that there is
+// something to read on this side, and this buffer IS the something.
+// A writer calls etcs_mark_observed (Observable.h); a reader asks
+// TakeObserved(its own RID) and, if told yes, reads PixelData().
 
-class Pixels_ : virtual public ETCS::Entity
+class Pixels_ : virtual public Raster_
 {
 public:
     virtual ~Pixels_() = default;
+
+    // Raster_'s two questions, answered from the buffer's own dimensions
+    // rather than from a number kept beside it -- so the size a consumer is
+    // told and the size the bytes actually have cannot drift apart. This is
+    // also the pair whose overrider a leaf claiming Renderable as well would
+    // make ambiguous, which is where the exclusivity is enforced.
+    uint32_t PixelWidth()  const override { return m_pw; }
+    uint32_t PixelHeight() const override { return m_ph; }
 
     // Zero-fills (fully transparent). Idempotent for the same size, so
     // re-Allocating an unchanged image is not a silent realloc.
@@ -52,18 +82,18 @@ public:
         m_pw = w;
         m_ph = h;
         m_pixels.assign(static_cast<size_t>(w) * h * 4, 0);
-        m_dirty = true;
+        etcs_mark_observed(this);
     }
 
+    // Everything that is only true of a host-addressable buffer -- where it
+    // starts, how far apart its rows are, and how much of it there is. A
+    // device image answers none of these: its row pitch is the driver's
+    // business and its bytes have no address in this process. That is the
+    // whole of what separates this family from Renderable.
     uint8_t*        PixelData()             { return m_pixels.empty() ? nullptr : m_pixels.data(); }
     const uint8_t*  PixelData()       const { return m_pixels.empty() ? nullptr : m_pixels.data(); }
-    uint32_t        PixelWidth()      const { return m_pw; }
-    uint32_t        PixelHeight()     const { return m_ph; }
     uint32_t        PixelStride()     const { return m_pw * 4; }
     size_t          PixelBytes()      const { return m_pixels.size(); }
-
-    void MarkDirty() { m_dirty = true; }
-    bool TakeDirty() { bool d = m_dirty; m_dirty = false; return d; }
 
     // REPLACES every pixel, including alpha -- this is what a surface's
     // Clear means, and it is deliberately not FillRect over the whole
@@ -76,7 +106,7 @@ public:
         const uint8_t px[4] = { toByte(r), toByte(g), toByte(b), toByte(a) };
         for (size_t i = 0; i < m_pixels.size(); i += 4)
             std::memcpy(m_pixels.data() + i, px, 4);
-        m_dirty = true;
+        etcs_mark_observed(this);
     }
 
     // Source-over fill of an axis-aligned rect, clipped to the buffer.
@@ -102,7 +132,7 @@ public:
             for (int64_t px = x0; px < x1; ++px)
                 blendPixel(row + px * 4, sr, sg, sb, sa);
         }
-        m_dirty = true;
+        etcs_mark_observed(this);
     }
 
     // Source-over composite of another Pixels_ into this one at (x, y),
@@ -131,14 +161,13 @@ public:
                 blendPixel(drow + dx * 4, s[0], s[1], s[2], alpha);
             }
         }
-        m_dirty = true;
+        etcs_mark_observed(this);
     }
 
 protected:
     std::vector<uint8_t> m_pixels;
     uint32_t             m_pw    = 0;
     uint32_t             m_ph    = 0;
-    bool                 m_dirty = false;
 
 private:
     static uint8_t toByte(float v)
@@ -168,36 +197,5 @@ private:
         d[3] = static_cast<uint8_t>(oa);
     }
 };
-
-/*
- * WHOEVER HOLDS A MERGED COPY OF WHAT CHANGED IS OUT OF DATE, AND EVERY PIXEL
- * OWNER ABOVE YOU HOLDS ONE.
- *
- * That is the entire upward half of the dirty flag, and it is what lets a
- * compositor skip a whole subtree safely: a node that changes is responsible
- * for saying so, and it says so to exactly the caches that could hold it --
- * the pixel owners on the path from here to the root, and nothing on a
- * sibling branch.
- *
- * Walks PAST a pixel owner rather than stopping at the first. A compositor
- * nested in a compositor caches this node transitively and both must be told.
- * This is the difference between this walk and the coordinate one in
- * Drawable2D: coordinates are relative to the NEAREST origin, staleness
- * propagates to EVERY cache.
- *
- * `from` is included, so a brush that wrote into a buffer from outside the
- * tree passes the node it wrote to; a node that changed itself passes `this`.
- * Both are the same statement. Reached by family name, so this needs to know
- * nothing about any concrete type -- it marks anything that owns pixels,
- * which is exactly the set of things that could have cached the caller.
- */
-inline void etcs_mark_pixel_path(ETCS::Entity* from)
-{
-    for (ETCS::Entity* n = from; n; n = n->getParent())
-    {
-        void* p = n->getInterfacePointer(ETCS::Buffer("Pixels"));
-        if (p) static_cast<Pixels_*>(p)->MarkDirty();
-    }
-}
 
 #endif

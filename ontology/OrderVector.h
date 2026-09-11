@@ -4,6 +4,7 @@
 
 #include "../core_defs.h"
 #include <cmath>
+#include "Mat.h"
 #include <cstdint>
 #include <cstring>
 
@@ -229,6 +230,40 @@ struct OrderVector
     uint64_t uncertainty = 0;
 
     // ── readings of the relation ────────────────────────────────────────
+
+    /*
+ * THE 4x4 THIS VECTOR IMPLIES, built rather than reinterpreted.
+ *
+ * The rows here are a CAUSAL record -- point plus identity, order plus energy,
+ * pivot plus reach, axis plus angle -- and they are deliberately not the four
+ * rows of a transform: row 0's fourth slot is a RID, because identity is a
+ * coordinate in this vector, and no product should ever touch it. So the
+ * renderer's matrix is a FUNCTION of this vector, not a cast of it, and the
+ * vector stays the one authoritative statement of where and how a thing is.
+ *
+ * Translation from row 0, rotation from row 3 by Rodrigues about a unit axis.
+ * A zero axis is the identity rotation with no sentinel, which is row 3's own
+ * stated convention. Radius, energy and force do not appear: they are not
+ * placement, and a transform that folded them in would be answering a question
+ * nobody asked of it.
+ */
+    Matrix4 ToMatrix4() const
+    {
+        Matrix4 m = Matrix4::Identity();
+
+        const float len = std::sqrt(sx * sx + sy * sy + sz * sz);
+        if (len > 0.0f && theta != 0.0f)
+        {
+            const float ax = sx / len, ay = sy / len, az = sz / len;
+            const float c = std::cos(theta), s = std::sin(theta), t = 1.0f - c;
+            m.at(0,0) = t*ax*ax + c;    m.at(0,1) = t*ax*ay - s*az; m.at(0,2) = t*ax*az + s*ay;
+            m.at(1,0) = t*ax*ay + s*az; m.at(1,1) = t*ay*ay + c;    m.at(1,2) = t*ay*az - s*ax;
+            m.at(2,0) = t*ax*az - s*ay; m.at(2,1) = t*ay*az + s*ax; m.at(2,2) = t*az*az + c;
+        }
+
+        m.at(0,3) = x; m.at(1,3) = y; m.at(2,3) = z;
+        return m;
+    }
 
     float KineticFraction() const { return std::sqrt(ox * ox + oy * oy + oz * oz); }
     float KineticEnergy()   const { return KineticFraction() * energy; }

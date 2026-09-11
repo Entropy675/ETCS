@@ -57,7 +57,8 @@ extern "C" inline void global_signal_handler(int sig)
 //
 // The non-TTY stdin case that originally motivated SA_RESTART -- read(2)
 // returning -1/EINTR on SIGINT instead of delivering the typed line -- is
-// fixed by polling (repl_shell_get_char_unix, ShellREPL.h) and does not
+// fixed by polling (lsh::get_char, modules/ShellProvider/Linux/LinuxTerminal.h)
+// and does not
 // need global syscall restart.
 #define WIRE_ROOT_SIGNAL_CONTEXT()                              \
     do {                                                        \
@@ -122,6 +123,34 @@ struct SignalContext
     // governs (global -> detach -> run -> scope). Dynamic, per-call,
     // rebuilt every time a context is forwarded.
     const SignalContext* up = nullptr;
+
+    /*
+ * IS THIS LEVEL THE OUTER EDGE OF A CLOSURE?
+ *
+ * raiseClosure means "end the closure this call belongs to", and until this
+ * existed it could not: the walk ran to the end of the ACTIVE chain, every
+ * chain in the system is pinned to RootSignalContext() by construction (four
+ * setParent sites -- WIRE_CONTEXT, CmdDetach, module signals,
+ * ThreadBase::Signals), and the root's interrupt IS g_sig_int. So the
+ * outermost authority had exactly one reachable value and every closure raise
+ * from anywhere was a process-wide SIGINT. Closing a window ended the runtime.
+ *
+ * A closure needs an OUTER EDGE to be a closure rather than the process, and
+ * nothing named one. This is that name. Set by whatever is the local-to-global
+ * boundary -- today ThreadBase::Signals(), because a Thread is a control
+ * structure and a Shell is the entry point for lifetimes: everything a Shell
+ * runs, and every job it detaches, belongs to its closure and stops at it.
+ *
+ * READS ARE UNAFFECTED. walk() still crosses this level and keeps going, up
+ * and provider both: a boundary bounds who a raise REACHES, never who hears
+ * one. A process-wide terminate must still stop everything inside every
+ * closure, which is exactly what shutdown_detached_executors depends on.
+ *
+ * Default false, so a context that says nothing behaves as it always did --
+ * the raise runs to the root, which is still correct for anything genuinely
+ * outside a closure.
+ */
+    bool closure_root = false;
 
     // PASSIVE edge -- the ownership chain. Which entity structurally owns
     // the entity this context belongs to. Static across an entity's life,
@@ -266,14 +295,47 @@ struct SignalContext
     // const: the walk reads pointers-to-flag, and writing THROUGH one of them
     // does not modify any SignalContext -- the flags live outside, which is
     // also why a const chain can still be signalled at all.
+    /*
+ * OUTERMOST WITHIN THIS CLOSURE. The walk still keeps the LAST authority it
+ * saw rather than the first -- nearest is the call's own scope again, the
+ * thing this verb exists not to be -- but it now stops at a closure_root
+ * instead of running to the process root.
+ *
+ * The boundary level is INCLUDED before stopping: a Shell holds real
+ * interrupt authority (ThreadBase::ensureFlag) and is the right place for a
+ * closure to end, so its flag is the answer, not the last one below it.
+ *
+ * A chain with no boundary anywhere behaves exactly as before and ends at
+ * g_sig_int -- which is correct for a raise that genuinely is outside every
+ * closure, and is what a bare `etcs script.etcs` with no Shell in the chain
+ * still gets.
+ */
     bool raiseClosure(SignalFlag* const SignalContext::* flag) const
     {
         SignalFlag* outermost = nullptr;
         for (const SignalContext* c = this; c; c = c->up)
+        {
             if (c->*flag) outermost = c->*flag;
+            if (c->closure_root) break;
+        }
         if (!outermost) return false;
         outermost->store(1, std::memory_order_release);
         return true;
+    }
+
+    /*
+ * The closure this context belongs to, or null if it is not inside one.
+ *
+ * What anything wanting to JOIN a closure parents to, rather than reaching
+ * for RootSignalContext() and landing outside every boundary -- which is what
+ * CmdDetach did, and why a detached job was structurally not part of the
+ * Shell that started it even once boundaries existed.
+ */
+    const SignalContext* closureRoot() const
+    {
+        for (const SignalContext* c = this; c; c = c->up)
+            if (c->closure_root) return c;
+        return nullptr;
     }
 
     bool raiseClosureInterrupt() const { return raiseClosure(&SignalContext::interrupt); }

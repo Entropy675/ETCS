@@ -50,8 +50,8 @@ namespace ETCS {
         return nodes;
     }
 
-    // The switch behind `log file` / `log term`. The loader's own flag first,
-    // then every module's, through the trampoline each registered.
+    // Everything at once -- `log all file` / `log all term`. The loader's own
+    // flag first, then every module's, through the trampoline each registered.
     inline void set_log_destination(bool to_file)
     {
         ETCS::set_log_to_file(to_file);
@@ -59,16 +59,62 @@ namespace ETCS {
             if (node && node->set_log_to_file) node->set_log_to_file(to_file);
     }
 
-    // What the loader is doing right now. Modules are kept in step by the
-    // setter above, so one answer describes all of them.
+    /*
+ * ONE MODULE'S, which is what the per-binary flag was always for.
+ *
+ * Setting them together was never a policy, it was the only reachable
+ * operation: the shell had one verb and the verb visited the whole map. But a
+ * frame loop drowning a prompt is ONE module's lines, and moving all of them
+ * to files to get rid of it takes away every other module's output too --
+ * which is the trade the person at the prompt was trying not to make.
+ *
+ * Returns false for a scope nothing has registered, rather than silently doing
+ * nothing: "RenderProvider is not loaded" and "RenderProvider now logs to a
+ * file" are different answers and the shell prints them differently.
+ */
+    inline bool set_module_log_destination(const std::string& scope, bool to_file)
+    {
+        auto it = module_log_nodes().find(scope);
+        if (it == module_log_nodes().end() || !it->second || !it->second->set_log_to_file)
+            return false;
+        it->second->set_log_to_file(to_file);
+        return true;
+    }
+
+    // Same shape for the read. `found` distinguishes "not loaded" from "on the
+    // terminal", which a bare bool cannot.
+    inline bool module_log_destination_is_file(const std::string& scope, bool& found)
+    {
+        auto it = module_log_nodes().find(scope);
+        found = (it != module_log_nodes().end() && it->second && it->second->get_log_to_file);
+        return found ? it->second->get_log_to_file() : false;
+    }
+
+    // What THE LOADER is doing -- its own flag and nothing else's. It used to
+    // be able to say "and every module's too", because the only setter moved
+    // them together; with the targeted one above that is no longer true, and a
+    // reader that assumed it would report the loader's answer for a module
+    // that had been set the other way.
     inline bool log_destination_is_file() { return ETCS::get_log_to_file(); }
+
+    // Every registered scope, for `log status` -- which now has to enumerate
+    // rather than generalise, for the reason just above.
+    inline std::vector<std::string> module_log_scopes()
+    {
+        std::vector<std::string> out;
+        out.reserve(module_log_nodes().size());
+        for (auto& [name, node] : module_log_nodes())
+            if (node && node->get_log_to_file) out.push_back(name);
+        std::sort(out.begin(), out.end());
+        return out;
+    }
 }
 namespace ETCS
 {
 using namespace ETCS;
 /*
  * -- PendingUnloadRegistry ------------------------------------------------------
- * Tracks every RequestUnloadEvent-spawned 200ms-delay-then-recheck thread
+ * Tracks every RequestUnloadEvent-spawned delay-then-recheck thread
  * joinably, rather than the raw std::thread(...).detach() this used to
  * be (see the Kind::RequestUnload case below). A detached thread has NO
  * handle anywhere at all, meaning nothing -- including, critically, the
@@ -86,7 +132,7 @@ using namespace ETCS;
  * worker threads may still be mid-flight, tearing code out from under a
  * thread that's still executing it.
  *
- * Joined from drive_main_loop_then_exit (ShellREPL.h), right alongside
+ * Joined from drive_main_loop_then_exit (CommandExecutor.h), right alongside
  * shutdown_detached_executors() -- the process is never allowed to
  * actually exit while any recheck is still in progress. An empty
  * registry (nothing was ever mid-unload, the overwhelmingly common
@@ -410,17 +456,6 @@ void ETCS::Module::promoteOrVacate(LifetimeOwner survivor)
         << "' lifetime_owner vacated -- RequestUnloadEvent fired.");
 }
 /*
- * ~Module() - pure dlclose/cleanupModule cleanup now, no election call at
- * all: that's fully decided, synchronously, before this destructor ever
- * runs (see promoteOrVacate's own comment above). Reached only by the
- * ONE, PERMANENT GLOBAL instance, and only at actual process shutdown
- * (the loader's own MemoryArena::getInstance() tearing down) --
- * per-entity tokens never have library_handle set, so this branch is
- * structurally unreachable for them. If the module was still loaded at
- * process exit (nobody ever triggered an unload), clean it up directly
- * here rather than through RequestUnloadEvent's own async delay
- * machinery -- there's no reason to wait 100ms when the process is
- * exiting anyway.
  * ~Module() - two genuinely separate cases now, not one:
  *
  * 1. The ONE, PERMANENT GLOBAL instance, at actual process shutdown (the
@@ -821,8 +856,23 @@ ETCS::Entity* ETCS::ModuleBundle::operator()()
     return nullptr;
 #endif
 }
-bool ETCS::WorkBundle::operator()(ETCS::Entity* child, ETCS::Buffer& tagbuff, ETCS::SignalContext ctx)
+bool ETCS::WorkBundle::operator()(ETCS_RID_SIZE rid, const ETCS::Buffer& conjugate_key,
+                                  ETCS::Buffer& tagbuff, ETCS::SignalContext ctx)
 {
+    /*
+ * THE RESOLUTION IS THE LIVENESS CHECK -- see WorkBundle's own comment.
+ * Either the RID names something the loader still holds, in which case the
+ * pointer is good for the whole of this frame, or it does not and there is
+ * nothing to dispatch to. No flag, no second question, one early exit.
+ */
+    ETCS::Entity* child = ETCS::etcs_resolve_by_key(conjugate_key, rid);
+    if (!child)
+    {
+        ETCS_LOG("WorkBundle::operator()", "RID:" << rid << " (" << conjugate_key
+            << ") no longer resolves -- the entity was reclaimed before "
+            << module_tag << "." << work_tag << " could dispatch. Refusing.");
+        return false;
+    }
 #ifdef ETCS_LOG_FUNCTION_EVOCATION_PATH
     ETCS_LOG("WorkBundle::operator()", "ENTER module_tag=" << module_tag << " work_tag=" << work_tag
         << " child=" << (void*)child << " workFunc=" << (void*)workFunc);
@@ -869,8 +919,18 @@ bool ETCS::WorkBundle::operator()(ETCS::Entity* child, ETCS::Buffer& tagbuff, ET
  * message even inside the loader, so a stream dispatch failing here was
  * invisible in both scopes rather than only one.
  */
-bool ETCS::WorkBundle::operator()(ETCS::Entity* child, ETCS::MBuffer& tagbuff, ETCS::SignalContext ctx)
+bool ETCS::WorkBundle::operator()(ETCS_RID_SIZE rid, const ETCS::Buffer& conjugate_key,
+                                  ETCS::MBuffer& tagbuff, ETCS::SignalContext ctx)
 {
+    // Same resolution-is-the-liveness-check as the Buffer overload above.
+    ETCS::Entity* child = ETCS::etcs_resolve_by_key(conjugate_key, rid);
+    if (!child)
+    {
+        ETCS_LOG("WorkBundle::operator()", "RID:" << rid << " (" << conjugate_key
+            << ") no longer resolves -- the entity was reclaimed before "
+            << module_tag << "." << work_tag << " could dispatch. Refusing.");
+        return false;
+    }
 #ifdef ETCS_LOG_FUNCTION_EVOCATION_PATH
     ETCS_LOG("WorkBundle::operator()", "ENTER (stream) module_tag=" << module_tag
         << " work_tag=" << work_tag << " child=" << (void*)child
@@ -908,7 +968,8 @@ bool ETCS::WorkBundle::operator()(ETCS::Entity* child, ETCS::MBuffer& tagbuff, E
  * cannot tell "wrote nothing" from "never ran", which is exactly how a missing
  * action came to look like a successful response echoing the request back.
  */
-bool ETCS::ModuleBundle::operator()(ETCS::Entity* child, const ETCS::Buffer& work,
+bool ETCS::ModuleBundle::operator()(ETCS_RID_SIZE rid, const ETCS::Buffer& conjugate_key,
+                                    const ETCS::Buffer& work,
                                     ETCS::Buffer& data, ETCS::SignalContext ctx)
 {
 #ifdef ETCS_LOG_FUNCTION_EVOCATION_PATH
@@ -928,7 +989,7 @@ bool ETCS::ModuleBundle::operator()(ETCS::Entity* child, const ETCS::Buffer& wor
 #ifdef ETCS_LOG_FUNCTION_EVOCATION_PATH
         ETCS_LOG("ModuleBundle::operator()", "about to invoke WorkBundle::operator() for " << work << "...");
 #endif
-        pass = it->second(child, data, ctx);
+        pass = it->second(rid, conjugate_key, data, ctx);
 #ifdef ETCS_LOG_FUNCTION_EVOCATION_PATH
         ETCS_LOG("ModuleBundle::operator()", "EXIT -- WorkBundle::operator()(...) returned normally for " << work);
 #endif
@@ -938,12 +999,13 @@ bool ETCS::ModuleBundle::operator()(ETCS::Entity* child, const ETCS::Buffer& wor
             << " does not provide requested action: " << work);
     return pass;
 }
-bool ETCS::ModuleBundle::operator()(ETCS::Entity* child, const ETCS::Buffer& work,
+bool ETCS::ModuleBundle::operator()(ETCS_RID_SIZE rid, const ETCS::Buffer& conjugate_key,
+                                    const ETCS::Buffer& work,
                                     ETCS::MBuffer& data, ETCS::SignalContext ctx)
 {
     auto it = actions.find(work);
     bool pass = false;
-    if (it != actions.end()) pass = it->second(child, data, ctx);
+    if (it != actions.end()) pass = it->second(rid, conjugate_key, data, ctx);
     else ETCS_LOG("ModuleBundle::operator()", "Tag: " << this->tag
              << " does not provide requested action (stream): " << work);
     return pass;
@@ -1226,15 +1288,15 @@ ETCS::DispatchResult ETCS::EventNode::LoaderStream::on_event(
  * ~Root() to fire a SYNCHRONOUS vacate (ChangeModuleEvent)
  * that itself fires THIS non-blocking RequestUnloadEvent;
  * ~Root() returns the instant the vacate is acknowledged,
- * with no idea the asynchronous 200ms recheck it just
- * triggered hasn't even started yet. The REPL loop then
+ * with no idea the asynchronous recheck it just triggered
+ * hasn't even started yet. The REPL loop then
  * exits (interrupt flag still set) and main() returns,
  * letting the process's own exit sequence proceed
  * concurrently with -- and easily outrun -- that
  * still-pending recheck's own eventual dlclose() on a
  * module whose worker threads may still be mid-flight.
  * Tracking this thread (and joining every tracked entry
- * from drive_main_loop_then_exit, ShellREPL.h, right
+ * from drive_main_loop_then_exit, CommandExecutor.h, right
  * alongside shutdown_detached_executors()) closes that
  * window: the process is never allowed to actually exit
  * while any recheck is still in progress. An empty
@@ -1400,24 +1462,14 @@ bool ETCS::EventNode::LoaderStream::attachModule(
     const std::string& spawn_tag)
 {
     /*
- * An entity's or Root's module_ starts vacant (constructed that way
- * by Entity's/Root's own ctor) and is meant to be bound to exactly
- * one module for its whole lifetime -- this is what makes "an entity
- * can only ever host or proxy one module" an enforced invariant
- * rather than an assumption the rest of this function silently
- * relies on. Re-resolving the SAME module against an already-bound
- * entity is a harmless no-op (the common case: a script referencing
- * one module across many lines, each one independently calling
- * resolveImpl) and succeeds immediately without touching anything
- * further below. Requesting a DIFFERENT module against an
- * already-bound entity is what actually gets dropped: rebinding it
- * would silently orphan whatever it already pointed at. Dropping
- * that request outright, rather than erroring, is deliberate: the
- * correct way to target a different module is a fresh entity/Root
- * (Root gets reconstructed on the stack each time a new one is
- * needed specifically so this is always available, never a real
- * constraint in practice) -- or, for a Root that specifically needs
- * to migrate in place, Root::changeModule().
+ * Step 1. ONE MODULE PER ENTITY, FOR ITS WHOLE LIFETIME -- an enforced
+ * invariant, not an assumption the rest of this function relies on.
+ *
+ * Dropping a different-module request rather than erroring is the
+ * deliberate part: rebinding would orphan whatever module_ already pointed
+ * at. The correct way to target a different module is a fresh entity/Root
+ * -- Root is reconstructed on the stack whenever one is needed, so this is
+ * never a real constraint -- or Root::changeModule() to migrate in place.
  */
     bool already_valid = entity.module().parent != nullptr;
     if (already_valid && entity.module().parent->name == module_name)
@@ -1429,14 +1481,10 @@ bool ETCS::EventNode::LoaderStream::attachModule(
             << ") -- dropping this request for '" << module_name << "'.");
         return false;
     }
-    /*
- * Look up (or bootstrap) the ONE, PERMANENT, loader-owned global
- * Module instance for this name -- never an entity's own member.
- * Every entity's own module_ is now ALWAYS just a forwarding proxy
- * onto this single object, for as long as the module is loaded at
- * all; there is no more "transfer" of real content between entities,
- * since no per-entity Module ever holds any real content to move.
- */
+    // Step 2. The one permanent loader-owned instance for this name. No
+    // per-entity Module ever holds real content, so nothing is ever
+    // transferred between entities -- they are all proxies onto this.
+
     auto reg_it = module_registry.find(module_name);
     Module* global_mod = (reg_it != module_registry.end()) ? reg_it->second : nullptr;
     if (!global_mod)
@@ -1449,50 +1497,26 @@ bool ETCS::EventNode::LoaderStream::attachModule(
  */
         global_mod = MemoryArena::getInstance().allocate<Module>(module_name);
         /*
- * Everything in this bootstrap sequence -- dlopen/LoadLibrary,
- * registerLoader (which calls discoverTags), catalogTypes (which
- * calls discoverActions via getTagAddress) -- can throw
- * std::runtime_error for perfectly ORDINARY, expected reasons: a
- * typo'd module name with no matching .so/.dll, a module file
- * that exists but is missing an expected export, etc.
+ * CAUGHT HERE BECAUSE NO CALLER CAN CATCH IT. Everything in this
+ * bootstrap -- dlopen, registerLoader/discoverTags,
+ * catalogTypes/discoverActions -- throws std::runtime_error for
+ * ordinary reasons: a typo'd module name, a missing export.
  *
- * This function runs EXCLUSIVELY on the loader's own single
- * ordering thread (LoaderStream's consumer), which services
- * attachModule for the ENTIRE remaining lifetime of the process.
- * Letting an exception escape this function past on_event does
- * not just fail this one request -- it terminates the ordering
- * thread outright (an uncaught exception unwinds to the top of
- * THAT thread's own call stack, finds no handler, and calls
- * std::terminate() -- "Aborted"), permanently breaking every
- * future Load/Resolve/Destroy/AddTag/ChangeModule call for the
- * rest of the process. Critically, this can NEVER be caught by
- * any caller's own try/catch around its own blocking evt() call
- * (ResolveEvent::operator()(), LoadEvent::operator()(), etc.) --
- * those just enqueue onto this same ordering thread and spin on
- * an atomic; the throw happens on a DIFFERENT thread than the
- * one spinning, and a try/catch can only ever catch an exception
- * thrown on its own thread. This is exactly what crashed the
- * REPL on a mistyped module name (Root> exot): ShellREPL.h's own
- * try/catch around ResolveEvent{...}() was never capable of
- * catching this, structurally, no matter how it was written.
+ * This runs on the loader's ONE ordering thread, which services
+ * attachModule for the rest of the process. An escaping exception
+ * unwinds to the top of THAT thread, finds no handler, and calls
+ * std::terminate -- killing every future Load/Resolve/Destroy/
+ * AddTag/ChangeModule. A caller's try/catch around its blocking
+ * evt() cannot help: it enqueues and spins on an atomic, and the
+ * throw is on a different thread. That is exactly what crashed the
+ * navigator on `Root> exot`.
  *
- * Deliberately NOT the same class of failure
- * RegisterDynamicLoader's own abort()-on-exception guards against
- * (see that function's own comment, this file) -- that one
- * covers a module that ALREADY dlopen'd successfully turning out
- * to violate a structural invariant (ABI/manifest mismatch, a
- * zombie DLL, genuine OOM), where continuing would silently
- * violate the determinism guarantee this whole system is built
- * on. "The requested module doesn't exist, or is missing an
- * export" is the ordinary, expected failure attachModule's own
- * bool return type already exists to represent -- every single
- * caller in this codebase (resolveImpl, loadImpl,
- * CommandExecutor.h's resolve_module/spawn_entity, ShellREPL.h)
- * already checks that bool and prints a friendly message. The
- * throw here was simply unreachable from any of them; converting
- * it to the same bool contract everything else already expects
- * is what actually makes graceful handling possible -- no change
- * needed on any caller's side at all.
+ * NOT the class of failure RegisterDynamicLoader's abort() guards:
+ * that one covers a module that loaded and then violated a
+ * structural invariant, where continuing breaks determinism. "Does
+ * not exist, or is missing an export" is the ordinary failure
+ * attachModule's bool return already represents, and every caller
+ * already checks it.
  */
         library_handle_t handle = nullptr;
         try
@@ -1557,11 +1581,9 @@ bool ETCS::EventNode::LoaderStream::attachModule(
  * one; determinism is already violated the moment two builds that
  * disagree on the contract both keep running.
  *
- * unmapLibrary rather than a bare close: discoverTags() runs inside
- * registerLoader() BEFORE RegisterDynamicLoader (see that reordering),
- * so nothing reaches this catch with module threads actually running
- * today -- but the full teardown stays correct if that ever changes,
- * and its steps no-op cleanly when nothing was started.
+ * unmapLibrary rather than a bare close -- see the catalogTypes catch
+ * below for the hazard. Nothing reaches THIS catch with module threads
+ * running today, but the full teardown no-ops cleanly either way.
  */
             global_mod->unmapLibrary(owner);
             /*
@@ -1617,7 +1639,7 @@ bool ETCS::EventNode::LoaderStream::attachModule(
         }
     }
  
-    // Every attach, bootstrap or not, is now structurally just a proxy.
+    // Step 3.
     entity.module().parent = global_mod;
  
     /*
@@ -1744,7 +1766,7 @@ bool ETCS::EventNode::LoaderStream::attachModule(
  * this branch is the only way a root-level entity can end up
  * that way. attachModule's own bool contract already exists for
  * exactly this -- every caller (resolveImpl, loadImpl,
- * CommandExecutor.h's resolve_module/spawn_entity, ShellREPL.h)
+ * CommandExecutor.h's resolve_module/spawn_entity and its navigator)
  * checks it and reports gracefully, and both loadImpl call sites
  * return nullptr on false, so the unreachable entity is never
  * handed back to anyone.
@@ -1856,22 +1878,13 @@ void ETCS::EventNode::LoaderStream::entityUnloadImpl(ETCS::Entity* target, bool 
  
 /*
  * requestUnloadImpl - THE Kind::RequestUnload delayed-recheck handler.
- * Runs 100ms after promoteOrVacate() found no survivor at all and vacated
- * target->lifetime_owner (see RequestUnloadEvent's own comment for why
- * that delay happens via a detached thread rather than blocking this
- * ordering thread). Re-verifies lifetime_owner is STILL vacant before
- * doing anything irreversible: if some attachModule call claimed it in
- * the meantime (a fresh spawn from this same module, during the 100ms
- * window), this is correctly a no-op -- the module stays loaded, nothing
- * here contradicts that later claim.
+ * Runs 100ms after promoteOrVacate() found no survivor and vacated
+ * target->lifetime_owner; the delay runs on a PendingUnloadRegistry thread
+ * rather than blocking this ordering thread.
  *
- * The actual unload, when it does proceed: erase every registry entry
- * that pointed at this instance (module_registry, module_arena_registry,
- * type_catalog_registry -- all three, since target's own arena and type
- * catalog are about to be genuinely unmapped along with the library
- * itself), then cleanupModule()/dlclose(), mirroring exactly what
- * Module's own destructor used to do directly before this whole
- * mechanism existed.
+ * Re-verifies lifetime_owner is STILL vacant before doing anything
+ * irreversible: if an attachModule call claimed it during the window (a
+ * fresh spawn from this same module), this is correctly a no-op.
  */
 void ETCS::EventNode::LoaderStream::requestUnloadImpl(ETCS::Module* target)
 {
@@ -1888,7 +1901,7 @@ void ETCS::EventNode::LoaderStream::requestUnloadImpl(ETCS::Module* target)
  * holds EVERY Root that ever attached to this module (attachModule's
  * own registerRoot call, unconditional -- not only whichever one
  * happened to claim ownership), so an ordinary proxying Root that
- * was never the owner -- e.g. ShellREPL's own nav_root, still open
+ * was never the owner -- e.g. the navigator's own nav_root, still open
  * on some stack -- is exactly as valid a rescue candidate here as
  * one that was previously promoted and later gave the token back.
  * Safe here, unambiguously, because this function only ever exists
@@ -1933,14 +1946,8 @@ void ETCS::EventNode::LoaderStream::requestUnloadImpl(ETCS::Module* target)
 /*
  * sendAckIfNeeded - see its own declaration comment (EventNode.h). A
  * no-op if evt.reply_to is null (loader-originated call). Otherwise
- * enqueues a lightweight Kind::Ack DLInEvent onto reply_to->stream
- * (the ORIGINATING module's own ordering thread) and blocks on it --
- * stack-allocated here, safe because this function doesn't return until
- * the wait is over, exactly the same pattern every blocking event in
- * this file already relies on. If reply_to's own stream refuses the
- * enqueue (already cleaning up -- e.g. that module is mid-teardown right
- * now), there is nothing left alive to ever set ack_done, so this
- * returns immediately rather than hanging.
+ * enqueues a Kind::Ack onto reply_to->stream and returns -- see the body
+ * below for why it no longer waits, and why the event is heap-allocated.
  */
 void ETCS::EventNode::LoaderStream::sendAckIfNeeded(DLInEvent& evt)
 {
@@ -2151,52 +2158,29 @@ bool ETCS::EventNode::LoaderStream::destroyImpl(const std::string& conjugate_key
  */
     if (target) target->beginRetire();
     /*
- * Fan OUT of every aggregate this entity was fanned INTO. An entity is
- * inserted into its own per-tag RIDList (the conjugate_key one below) AND
- * into one aggregate list per supertype family it declares -- Deletable,
- * Ephemeral, ConnectionState, and so on (ETCS_SUPERTYPE_BASE publishes
- * those under the bare family name; etcs_supertype_fanout inserts on
- * construction). Only the per-tag removal existed, so every aggregate kept
- * a permanent node holding a pointer into an arena that is about to be
- * reclaimed.
+ * Fan in -- the inverse of the fanout that published this entity, replacing the
+ * loop that used to be here.
  *
- * Two consequences, and the second is worse than the leak: those lists grew
- * without bound in the MODULE's root arena (measured at ~94MB over six
- * hours of one polling page), and every entry past the first was a dangling
- * Entity*, so anything iterating an aggregate walked freed memory.
+ * Why the removal matters, kept from what stood here: without it those lists
+ * grow without bound in the module's root arena (measured at ~94MB over six
+ * hours of one polling page), and every entry past the first is a dangling
+ * Entity*, so anything iterating an aggregate walks freed memory.
  *
- * The node bytes DO come back once erased -- ArenaAllocator::deallocate
- * pushes to the arena's free list and every node is identically sized, so
- * the next insert reuses them. Reclamation was never missing; the removal
- * was. Done BEFORE the per-tag remove so `target` is still resolvable.
+ * Why it is a call now: what was here walked getTags() and built "Module:Tag"
+ * keys, while fanout inserts under the bare names getInterfaceFamilies()
+ * returns. The two never named the same key, so the aggregates this was written
+ * to clean were never cleaned by it. etcs_supertype_fanin reads the same
+ * accessor the insert does and covers both scopes. Position unchanged: before
+ * awaitQuiesced, while target still resolves.
  */
-    if (target)
-    {
-        /*
- * conjugate_key is "Module:Tag" -- split here rather than adding a
- * parameter, since on_event's own parse (Kind::Destroy) is a different
- * scope and this is the only other place that needs the module half.
- */
-        const size_t colon = conjugate_key.find(':');
-        const std::string module_name =
-            (colon == std::string::npos) ? conjugate_key : conjugate_key.substr(0, colon);
-        std::vector<ETCS::Buffer> type_tags;
-        target->getTags(type_tags);
-        for (const ETCS::Buffer& t : type_tags)
-        {
-            ETCS::Buffer agg_key(module_name + ":" + t.toString());
-            if (agg_key == key) continue;              // the per-tag list, handled below
-            auto agg = owner->ridMap.find(agg_key);
-            if (agg == owner->ridMap.end()) continue;  // not an aggregate this module publishes
-            if (agg->second.invoke_remove(rid))
-                ETCS_LOG("DynamicLoader", "destroyImpl: removed RID " << rid
-                         << " from aggregate " << agg_key.toString());
-        }
-    }
-    bool removed = it->second.invoke_remove(rid);
-    ETCS_LOG("DynamicLoader", "destroyImpl: removed RID " << rid << " from " << conjugate_key
-        << " -> " << (removed ? "ok" : "failed"));
- 
+    if (target) ETCS::etcs_supertype_fanin(target);
+    // Presence was established by the invoke_contains check above, and fan-in
+    // removed it from everything -- so "did this remove a live entity" is
+    // "was there one to remove".
+    const bool removed = (target != nullptr);
+    ETCS_LOG("DynamicLoader", "destroyImpl: fanned RID " << rid << " out of "
+        << conjugate_key << " -> " << (removed ? "ok" : "no target"));
+
     if (removed && target)
     {
         /*
@@ -2342,7 +2326,21 @@ ETCS::RID ETCS::EventNode::LoaderStream::addTagImpl(
                  << child_type_tag << "' -- child will have no callable actions.");
     }
  
-    return trampoline(parent, child, tag);
+    /*
+ * A CHILD ENTERING IS A SUBTREE CHANGE, the mirror of etcs_retire_entity's
+ * mark for one leaving. This is the funnel: every addTag<T>, module-side or
+ * loader-side, arrives here through AddTagEvent, so marking once here covers
+ * every creation rather than relying on each leaf type's Create body
+ * happening to set a flag.
+ *
+ * After the trampoline, deliberately -- it is what inserts into
+ * typed_children_ and sets parent_, and an observer woken any earlier could
+ * walk a tree the child is not in yet. It also holds parent->m_tagMutex for
+ * its whole body, and MarkObserved takes its own lock and walks parents.
+ */
+    const ETCS::RID rid = trampoline(parent, child, tag);
+    ETCS::Entity::markStateChange(parent, rid);
+    return rid;
 }
  
 bool ETCS::EventNode::LoaderStream::isTypedActionStream(
@@ -2426,16 +2424,10 @@ ETCS::DispatchResult ETCS::EventNode::ModuleProxy::on_event(
         return {ETCS::DispatchKind::Inline, nullptr};
     }
  
-    /*
- * Fallback path only -- Load/Resolve/Destroy/AddTag/EntityUnload no
- * longer route through here at all (they enqueue directly onto
- * getLoader().stream from their own operator()(), regardless of
- * which side fires them -- see each one's own comment for why routing
- * through this module's own, possibly already-stopped stream first
- * was the actual cause of a real hang this session traced and fixed).
- * This forward remains only for whatever else might still enqueue
- * onto EventNode::getInstance().stream directly on the module side.
- */
+    // Fallback path only: Load/Resolve/Destroy/AddTag/EntityUnload enqueue
+    // straight onto getLoader().stream themselves (EntityUnloadEvent explains
+    // why). This forward remains for anything else still enqueuing onto
+    // EventNode::getInstance().stream from the module side.
     getLoader().stream.enqueue(ref);
     /*
  * No completion HERE: the event is the loader's now, and its on_emit
@@ -2674,14 +2666,9 @@ inline ETCS::Entity* ETCS::LoadEvent::operator()()
     evt.reply_to = &ETCS::EventNode::getInstance();
     evt.origin_extra_mask = ETCS::ActivePairModuleMask();
 #endif
-    /*
- * Straight to the loader's own stream, regardless of which side
- * fires this -- never through this side's own (potentially already
- * torn down) local stream. See EntityUnloadEvent's own comment
- * below, and this session's own notes, for why routing memory-
- * altering events through a possibly-dead local stream first was the
- * actual cause of the hang this fixes.
- */
+    // Straight to the loader's own stream, never this side's own possibly
+    // torn-down local one -- see EntityUnloadEvent below for the hang that
+    // routing memory-altering events through a dead local stream caused.
     if (!getLoader().stream.enqueue(DLInEventPtr{&evt}))
     {
         /*
@@ -2888,12 +2875,31 @@ inline bool ETCS::TagModifyEvent::operator()()
     evt.tagmodify_done      = &done;
     evt.tagmodify_changed   = &changed;
     /*
- * Stamped at construction from the emitting type's own static TAG_MASK
- * (Entity::myTagMask), so the handler never has to resolve it -- see
- * DLInEvent::tagmodify_mask's own comment (EventNode.h) for why that
- * lookup was outright wrong on the loader's side.
+ * ACQUIRED HERE, from the thread this event is being emitted on, exactly as
+ * origin_extra_mask is at every other site in this file:
+ *
+ *     own bit          identity, unconditional -- two ops on one entity
+ *                      serialize whatever either of them reaches
+ *   | causal edge      what the WORK FUNCTION running on this thread has
+ *                      been observed to touch (CausalScope, Bundles.h)
+ *   | extra            the one thing a caller supplies: ScopeTag's stream
+ *                      pair, so a flag orders against both halves
+ *
+ * falling back to the type's whole TAG_CLOSURE while no frame has settled.
+ * Resolved at the EMIT site and never by the handler -- see
+ * DLInEvent::tagmodify_mask's own comment (EventNode.h) for why that lookup
+ * was outright wrong on the loader's side.
  */
-    evt.tagmodify_mask      = type_mask;
+    evt.tagmodify_mask      = ETCS::CausalEdgeMask(target->myTagMask(),
+                                                   target->myTagClosure())
+                            | extra_mask;
+    /*
+ * Fail shut. An empty mask means the emitting type has no contract identity
+ * at all, and a type the ordering system has never heard of is the last
+ * thing to grant independence from it -- same reasoning as DispatchResult.
+ */
+    if (!evt.tagmodify_mask.any())
+        evt.tagmodify_mask  = ETCS::TagMask::all();
     /*
  * A REFUSED ENQUEUE ANSWERS "not mine", and that is the right answer: the
  * stream is already cleaning up, so there is no ordering left to join and
@@ -2908,8 +2914,7 @@ inline bool ETCS::TagModifyEvent::operator()()
 /*
  * PairMaskEvent - blocking, same spin pattern as everything here. Straight onto
  * getLoader().stream for the same reason the five memory-altering kinds go
- * direct: the local stream may already be stopped, and routing through it first
- * was a real hang.
+ * direct (EntityUnloadEvent).
  *
  * The loader holds type_owner_index, so this is the one question a module has
  * to ask it. Callers memoize (Entity::resolvePairModuleMask), so it fires once

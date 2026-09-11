@@ -161,6 +161,37 @@ public:
  */
     virtual bool Animating() { return false; }
 
+    /*
+ * The recursion the comment above calls the point, written once.
+ *
+ * Every compositing node needs the same walk -- "is anything under me still
+ * moving" -- over the same ordered child list collectDrawableChildren already
+ * builds, so it lives beside it rather than in each node that composites.
+ * CompositeDrawable2D and Camera3D both had their own copy; the second one was
+ * missing for a while, which is how an FPS label under a camera stayed frozen
+ * while the same label under a compositor did not.
+ *
+ * NO FAMILY IS SKIPPED. A camera's copy used to skip Drawable3D children on
+ * the grounds that scenery is reached through the bound scene -- true of
+ * DRAWING, where painting a 3D child flat would be wrong, and not true of this
+ * question. Asking a 3D child whether it is moving is a fair question with a
+ * real answer (Scene3D::Animating is InMotion), this is a boolean OR so
+ * agreeing with sceneInMotion costs nothing, and skipping would miss a moving
+ * 3D child that is not the bound scene.
+ *
+ * Public for the same reason collectDrawableChildren is: the caller may be a
+ * sibling family reaching in through getInterfacePointer rather than a
+ * subclass.
+ */
+    bool anyChildAnimating()
+    {
+        std::vector<Drawable_*> ordered;
+        collectDrawableChildren(ordered);
+        for (Drawable_* child : ordered)
+            if (child->Animating()) return true;
+        return false;
+    }
+
 protected:
     /*
  * The recursion, written once. A leaf's DrawInto draws ITSELF and then
@@ -194,12 +225,51 @@ protected:
  * reparent), and a cached vector of Drawable_* is a dangling pointer
  * waiting for the first script that removes a layer mid-run.
  */
+    // A child named the way the blit source is: by RID, resolved at the point
+    // of use. Order is snapshotted because only the sort needs it.
+    struct ChildRef { ETCS::Buffer tag; ETCS::RID rid; int32_t order; };
+
+    void collectDrawableChildRefs(std::vector<ChildRef>& out)
+    {
+        std::vector<std::pair<ETCS::Buffer, ETCS::RID>> kids;
+        getOrderedTypedChildren(kids);
+        out.reserve(kids.size());
+        for (const auto& entry : kids)
+        {
+            ETCS::Entity* child = getTypedChild(entry.first, entry.second);
+            if (!child) continue;
+            void* iface = child->getInterfacePointer(ETCS::Buffer("Drawable"));
+            if (!iface) continue;
+            out.push_back(ChildRef{entry.first, entry.second,
+                                   static_cast<Drawable_*>(iface)->Order()});
+        }
+        std::stable_sort(out.begin(), out.end(),
+                         [](const ChildRef& a, const ChildRef& b) { return a.order < b.order; });
+    }
+
+    /*
+ * Resolved per child at the moment of the call, not once into a vector of
+ * pointers that is then walked. The old body held each pointer across an
+ * entire recursive subtree draw, so a frame edge running while a closure's
+ * arena reclaimed that subtree read a vtable coming apart (ASAN: READ at 0x20
+ * in _stream_Surface_ConsumeFrames).
+ *
+ * Same rule the blit source above already follows: resolve at replay, skip
+ * what is gone.
+ */
     void drawChildren(Surface_* dst)
     {
         if (!dst) return;
-        std::vector<Drawable_*> ordered;
-        collectDrawableChildren(ordered);
-        for (Drawable_* child : ordered) child->DrawInto(dst);
+        std::vector<ChildRef> ordered;
+        collectDrawableChildRefs(ordered);
+        for (const ChildRef& c : ordered)
+        {
+            ETCS::Entity* child = getTypedChild(c.tag, c.rid);
+            if (!child) continue;
+            void* iface = child->getInterfacePointer(ETCS::Buffer("Drawable"));
+            if (!iface) continue;
+            static_cast<Drawable_*>(iface)->DrawInto(dst);
+        }
     }
 };
 

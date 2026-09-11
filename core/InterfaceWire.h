@@ -108,10 +108,11 @@ struct IWireLifecycle
 };
 
 // ---------------------------------------------------------------------------
-// IWireThread — the scheduler's slot. DECLARED, NOT YET CLAIMED: there is no
-// Threaded family and ThreadPool does not consult it. It is here because this
-// header is where a wire is pre-declared before it is wired, and because the
-// gap it names is one this codebase has already been bitten by three times.
+// IWireThread — the scheduler's slot. CLAIMED by the Threaded family
+// (ontology/Threaded.h), and called by the arena's reclaim funnel, which halts
+// an entity's bodies before it releases the state those bodies are using. The
+// gap it names stopped being an argument and became a measured crash; see the
+// family header for the reproduction that claimed it.
 //
 // THE PATTERN IT COMPLETES. Each wire pairs a core subsystem with the one
 // question it has to ask an entity that it has no other way to reach:
@@ -126,9 +127,7 @@ struct IWireLifecycle
 //   IT CANNOT TELL A PASSING BODY FROM A HELD ONE. A work function that
 //   returns promptly and a stream producer that loops for a window's lifetime
 //   are scheduled identically, so two long-lived producers on a four-worker
-//   pool take half of it permanently and nothing anywhere says so. Every
-//   comment in this codebase that warns about that warns a HUMAN, because
-//   there is no field for it.
+//   pool take half of it permanently and nothing anywhere says so.
 //
 //   IT CANNOT ASK A BODY TO STOP. Shutdown raises a signal and hopes: the
 //   closure drain waits a bounded five seconds, then joins; the pool sleeps a
@@ -137,15 +136,15 @@ struct IWireLifecycle
 //   the sharp end of exactly that -- a thread that could not be told to stop,
 //   being joined by itself.
 //
-// So the wire would carry two things and no more: what shape of work this is,
-// and a cooperative halt that reports whether it took. Deliberately NOT a
-// priority or an affinity -- those are policy, and policy belongs to whatever
-// schedules, not to the thing being scheduled.
+// So the wire carries what shape of work this is, and a cooperative halt --
+// the request and its readback, the same request/readback pair IWireLifecycle
+// carries. Deliberately NOT a priority or an affinity: those are policy, and
+// policy belongs to whatever schedules, not to the thing being scheduled.
 //
-// Left unclaimed on purpose. Adding the interface is cheap and reversible;
-// adding call sites inside ThreadPool changes when every stream body in the
-// system is asked to stop, and that deserves its own pass rather than riding
-// along with a memory-release change.
+// The POOL-side call sites are still outstanding: the arena's reclaim funnel
+// halts a body before releasing what it uses, but ThreadPool itself does not
+// yet ask. Changing when every stream body in the system is told to stop
+// deserves its own pass.
 // ---------------------------------------------------------------------------
 enum class WorkShape : uint8_t
 {
@@ -171,6 +170,161 @@ struct IWireThread
     // can report which bodies acknowledged and which it is about to wait on
     // blindly, instead of treating both the same and calling it a timeout.
     virtual bool Halt() = 0;
+
+    // The readback, and what a running body polls. On the wire rather than the
+    // family for the reason IWireLifecycle carries Released().
+    virtual bool Halted() const = 0;
+
+    /*
+     * THE BODY REPORTING THAT IT ACTUALLY LEFT, which is a different fact from
+     * having been asked to.
+     *
+     * Halt/Halted was carrying both and could only mean one: an entity asked to
+     * stop and an entity whose loop had already gone were the same answer, and
+     * the tag written for it said "halted" while recording a REQUEST. Halting
+     * is the transition, stopped is the destination.
+     *
+     * SAME SHAPE AS Delete/Release on IWireLifecycle -- Halt is a request from
+     * outside, Stop is a notification from the body, and only the body can make
+     * it because nothing else knows when a loop has ended. So Stop is called BY
+     * a body on its way out, never commanded at one.
+     *
+     * ON THE WIRE, beside the pair it completes. The drain is the caller that
+     * needs it: shutdown_detached_executors and etcs_retire_entity ask bodies
+     * to stop from the LOADER side, across the boundary, and "did it actually
+     * go" is the question they have to answer before reclaiming anything the
+     * body was touching. A readback whose only useful caller sits on the far
+     * side of the wire belongs on the wire, for the reason Halted() already
+     * gives one line up.
+     */
+    virtual bool Stop() = 0;
+    virtual bool Stopped() const = 0;
+
+    /*
+     * Start `script` as a child of this entity. Returns the child's RID, or 0
+     * if refused.
+     *
+     * ON THE WIRE BECAUSE CORE CANNOT DO IT. The dependency runs ontology ->
+     * core and never back, so CommandExecutor's detach can talk to a Thread but
+     * cannot allocate one -- and a detached script IS a Thread. This is the one
+     * capability core structurally lacks and must delegate, which is exactly
+     * what a wire is for.
+     *
+     * It does not contradict this wire's "two things and no more" boundary. That
+     * boundary was drawn against POLICY -- priority, affinity, who runs next --
+     * and this is not policy. It is "make another of you", answered by the only
+     * thing that knows how.
+     *
+     * A Threaded that is not a Thread returns 0, the way Resizable_::ResizeTo
+     * returns false: having a body to stop does not make you an actor, and
+     * refusing is the honest answer rather than an absent method. So a caller
+     * checks the return instead of first asking what kind of thing it holds.
+     */
+    virtual uint64_t Detach(const ETCS::Buffer& script) = 0;
+
+    /*
+     * This thread's own signal authority, or null if it has none.
+     *
+     * On the wire for the same reason Detach is: core has to reach it and
+     * cannot own it. CommandExecutor's detach has to parent a child job's
+     * signals somewhere, and under the entity model that somewhere is the child
+     * Thread itself -- but SignalContext is a core type held by an ontology
+     * family, so the pointer crosses out through here.
+     *
+     * BY VALUE, like every other SignalContext in the runtime -- WorkFunc and
+     * StreamFunc already take one that way across the DSO boundary. A copy also
+     * cannot dangle into an entity's shell after a reclaim, which a pointer
+     * could.
+     *
+     * A Threaded that is not a Thread returns a default-constructed context
+     * with no local authority, exactly as Detach returns 0: owning a body to
+     * stop does not make you an authority over signals.
+     */
+    virtual SignalContext Signals() = 0;
+};
+
+// ---------------------------------------------------------------------------
+// IWireObservable — the observation slot. Fulfilled by the Observable
+// family (ontology/Observable.h).
+//
+// The general causal structure: something records the state of another and
+// wants to know when that changes. Nothing about pixels, cameras or hashes --
+// those are USERS of it. The merkle hash in particular is its own independently
+// updated structure that happens to fit this shape exactly; it observes and
+// marks through here rather than living on this surface.
+//
+// Dirty is PER OBSERVER, which is the whole reason this is a wire and not a
+// bool. Two cameras viewing one scene each need telling once; a single
+// read-and-clear flag lets whichever looks first consume the other's
+// invalidation.
+// ---------------------------------------------------------------------------
+// The observer's own end of one edge. Defined in core because it crosses the
+// wire: two words, trivially copyable, fixed layout -- the same reason TBuffer
+// exists rather than std::string.
+//
+// slot is a CACHE of the RID->position inversion, never a replacement for it.
+// The RID stays the identity; the slot makes reading the edge a load and a
+// compare instead of a search, and a handle whose slot has been vacated and
+// reused fails its verify rather than silently addressing a stranger.
+struct ObserverEdge
+{
+    uint64_t observer_rid = 0;
+    uint16_t slot         = 0;
+    bool valid() const { return observer_rid != 0; }
+};
+
+struct IWireObservable
+{
+    virtual ~IWireObservable() = default;
+
+    // Register something that watches this entity, and hand back its end of the
+    // edge. An observer that is an ancestor does not need this -- see
+    // MarkObserved.
+    virtual ObserverEdge Observe(uint64_t observer_rid) = 0;
+    virtual void Unobserve(uint64_t observer_rid) = 0;
+
+    /*
+     * This entity changed. Marks every registered observer, then bubbles to the
+     * nearest Observable ancestor, which does the same -- so a change reaches
+     * the root by composition rather than by anyone walking the whole tree.
+     *
+     * ORIGIN IS WHO CAUSED IT, and it is carried unchanged through every hop.
+     * The observer whose RID equals it is skipped: you never need telling about
+     * a change you made yourself.
+     *
+     * That one bit of identity is what the bare flag could not express, and its
+     * absence was a lost update rather than an inefficiency. A node that writes
+     * its own cache marks itself along with everyone else, so it had to clear
+     * its own bit afterwards -- and that clear could not tell its own mark from
+     * one a concurrent writer had left during the write, so it swallowed it.
+     * Demonstrated in the ontology tester. Skipping at the source removes the
+     * clear, and with it the race.
+     */
+    virtual void MarkObserved(uint64_t origin_rid) = 0;
+
+    /*
+     * Mark my own observers and STOP -- no walk in either direction.
+     *
+     * The primitive the DOWNWARD edge is built from. MarkObserved says "what I
+     * contain changed", which is news to whoever holds a merged copy of me, so
+     * it travels up. The opposite statement -- "the frame I hand my children
+     * changed" -- is news to what is below me, and the two cannot be the same
+     * call: a compositor recomposing its own pixels is not telling its children
+     * their coordinates moved.
+     *
+     * On the wire because reaching a child's Observable half is a cross-family
+     * hop like any other; the walk that uses it is family-level
+     * (ObservableBase::MarkObservedBelow).
+     */
+    virtual void MarkObservedLocal(uint64_t origin_rid) = 0;
+
+    // Read-and-clear through a held edge: index, verify, test-and-clear. No
+    // search, and a stale handle is detected rather than aliased.
+    virtual bool TakeObserved(const ObserverEdge& edge) = 0;
+
+    // Has this changed since `observer` last looked? Read-and-clear, and only
+    // for that observer.
+    virtual bool TakeObserved(uint64_t observer_rid) = 0;
 };
 
 } // namespace ETCS

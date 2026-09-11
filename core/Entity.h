@@ -265,17 +265,10 @@ private:
  * Held as a pointer because MemoryArena's copy ctor/assignment are
  * deleted and it has no move ctor either.
  *
- * NOTE: this is exclusively an Entity concept. Root (standalone,
- * below) has no local_arena_ at all -- it never has typed children,
- * tags, or flags_, so there was never anything for a sub-arena to
- * back. An earlier version of Root inherited this field (and the
- * unconditional global-arena allocation in Entity's own constructor
- * below) purely as a side effect of publicly inheriting Entity, with
- * nothing in ~Entity()'s own body ever reclaiming it early -- every
- * Root ever constructed leaked exactly one 4KB MemoryArena off the
- * global arena until actual process exit. Root no longer having this
- * field at all is what closes that leak structurally, rather than by
- * adding cleanup code for a resource Root never actually needed.
+ * NOTE: exclusively an Entity concept. Root (below) has no local_arena_ at
+ * all -- it never has typed children, tags or flags_, so there is nothing
+ * for a sub-arena to back. See Root's own comment for the leak that field
+ * caused while Root still inherited Entity.
  * ---------------------------------------------------------------------
  */
     MemoryArena*                        local_arena_;
@@ -751,15 +744,16 @@ public:
  * type tag-list operations serialize against each other in causal
  * sequence; different-type operations commit independently.
  *
- * myTagClosure() supplies the ordering bits: this type's own plus every
- * type in its module it holds a reference to (TAG_CLOSURE, accumulated by
- * addTag<T>). Its own bit alone would be wrong -- an op on a node that owns
- * boards touches those boards, through pointers no mask can see at the
- * point of use.
+ * NO MASK IS PASSED. The ordering bits are acquired by the event itself,
+ * on the thread it is emitted from: this type's own bit, narrowed to what
+ * the work function running here has been observed to touch, falling back
+ * to the whole TAG_CLOSURE until that has settled. Its own bit alone would
+ * be wrong -- an op on a node that owns boards touches those boards,
+ * through pointers no mask can see at the point of use.
  *
- * Carried on the event rather than resolved by whichever EventNode services
- * it -- see DLInEvent::tagmodify_mask (EventNode.h) for why that lookup
- * silently returned nothing on the loader's side.
+ * Acquired at the emit site rather than resolved by whichever EventNode
+ * services it -- see DLInEvent::tagmodify_mask (EventNode.h) for why that
+ * lookup silently returned nothing on the loader's side.
  * -----------------------------------------------------------------------
  */
     // Returns whether this call is the one that put the flag on -- the
@@ -771,8 +765,7 @@ public:
             throw std::invalid_argument(
                 std::string("addTag: flag must start with a lowercase letter: ")
                 + (s ? s : ""));
-        return ETCS::TagModifyEvent{this, flag, false, &Entity::tagModifyImpl,
-                                    myTagClosure()}();
+        return ETCS::TagModifyEvent{this, flag, false, &Entity::tagModifyImpl}();
     }
     /*
  * TAG-scope bits beyond this entity's own closure -- ScopeTag passes a
@@ -787,8 +780,7 @@ public:
             throw std::invalid_argument(
                 std::string("addTag: flag must start with a lowercase letter: ")
                 + (s ? s : ""));
-        return ETCS::TagModifyEvent{this, flag, false, &Entity::tagModifyImpl,
-                                    myTagClosure() | extra}();
+        return ETCS::TagModifyEvent{this, flag, false, &Entity::tagModifyImpl, extra}();
     }
     /*
  * -----------------------------------------------------------------------
@@ -797,17 +789,11 @@ public:
  * Takes no tag parameter: T alone yields the contract name, via
  * T::CONTRACT_TAG (ETCS_API.h). CONTRACT_TAG and not T::TAG -- TAG is the
  * concrete class name, which a Contract_*.h typedef leaves unchanged.
- * This also fixed a real
- * allocation bug from an earlier version: every actual call site used
- * to construct the child via MemoryArena::getInstance().allocate<Name>()
- * (the module-wide singleton) and pass the already-built pointer in,
- * meaning a child's own outer object was NEVER actually reachable from
- * its parent's arena at all. Now addTag<T> constructs the child ITSELF,
- * from getArena() (this entity's own arena) - via s_pending_parent_arena_,
- * that call also correctly routes the CHILD's own local_arena_ to draw
- * from the SAME parent arena, so a child's entire footprint (outer
- * object + its own local_arena_) lives inside its parent's arena tree,
- * reachable in one place.
+ *
+ * addTag<T> constructs the child ITSELF, out of getArena(), which is what
+ * puts a child's whole footprint inside its parent's arena tree -- see
+ * local_arena_ and s_pending_parent_arena_ for why that matters and how
+ * the child's own sub-arena is routed to the same place.
  *
  * Returning T* rather than RID preserves full type information all the
  * way back to the call site - the caller already knows T (they wrote
@@ -841,7 +827,6 @@ public:
         T* child = getArena().allocate<T>(std::forward<Args>(args)...);
         s_pending_parent_arena_ = saved;
         child->getArena().setScopeTag(T::CONTRACT_TAG);   /*
- * <-- new line
  * CONTRACT_TAG -- not getSourceTag(), still empty here (setModuleSource
  * runs later, inside addTagImpl, as part of this same blocking call),
  * and not T::TAG, the concrete class name a typedef never renames.
@@ -907,6 +892,15 @@ public:
  * needing it.
  * -----------------------------------------------------------------------
  */
+    // The child's half of removeTypedChild, so a caller holding only the child
+    // does not need to know how it is registered. Idempotent. Does NOT null
+    // parent_ -- the upward link is still wanted; what ends is being reachable
+    // downward, which is the direction a walker traverses.
+    void detachFromParent()
+    {
+        if (parent_) parent_->removeTypedChild(parent_rid_);
+    }
+
     void removeTypedChild(RID rid)
     {
         std::lock_guard<std::mutex> lock(m_tagMutex);
@@ -925,7 +919,7 @@ public:
  * getTypedChildren(out) - read-only enumeration of this entity's own
  * addTag<T> children as (tag, RID) pairs, in addTag call order
  * (typed_child_order_). Same walk shape reparentChildrenTo already
- * uses; added so a caller (ShellREPL's own parent/child navigation)
+ * uses; added so a caller (the navigator's own parent/child walk)
  * can inspect what's actually live without touching typed_children_
  * directly.
  */
@@ -1277,13 +1271,12 @@ public:
  * alternative for deleting a leaf being an EXPLICIT EntityUnloadEvent
  * targeting a child directly, not a bare `delete` on its pointer.
  *
- * myTagClosure() supplies the ordering bits -- see addTag(Buffer) above.
+ * The event acquires its own ordering bits -- see addTag(Buffer) above.
  * -----------------------------------------------------------------------
  */
     bool removeTag(const ETCS::Buffer& tag)
     {
-        return ETCS::TagModifyEvent{this, tag, true, &Entity::tagModifyImpl,
-                                    myTagClosure()}();
+        return ETCS::TagModifyEvent{this, tag, true, &Entity::tagModifyImpl}();
     }
     /*
  * See addTag's own overload. ScopeTag's destructor must pass the same extra
@@ -1292,8 +1285,7 @@ public:
  */
     bool removeTag(const ETCS::Buffer& tag, const ETCS::TagMask& extra)
     {
-        return ETCS::TagModifyEvent{this, tag, true, &Entity::tagModifyImpl,
-                                    myTagClosure() | extra}();
+        return ETCS::TagModifyEvent{this, tag, true, &Entity::tagModifyImpl, extra}();
     }
     /*
  * -----------------------------------------------------------------------
@@ -1564,7 +1556,10 @@ public:
         ETCS_LOG("Entity::call", "about to invoke (*bundle)(this=" << (void*)this
                  << ", action=" << action << ", data.written=" << data.written << ", forward)...");
 #endif
-        (*self_it->second.bundle)(this, action, data, forward);
+        // Identity from here, where it is unambiguous: `this` is the object whose
+        // member function is executing. Everything below carries the RID and
+        // re-resolves once, at the dispatch boundary.
+        (*self_it->second.bundle)(getRID(), myConjugateKey(), action, data, forward);
 #ifdef ETCS_LOG_FUNCTION_EVOCATION_PATH
         ETCS_LOG("Entity::call", "EXIT -- (*bundle)(...) returned normally for " << tag_type << "." << action);
 #endif
@@ -1695,7 +1690,8 @@ public:
             try
             {
                 if (ModuleBundle* b = producer_entity->safeBundleFor(tag_type, "producer"))
-                    (*b)(producer_entity, action, transportProducer, ctx);
+                    (*b)(producer_entity->getRID(), producer_entity->myConjugateKey(),
+                         action, transportProducer, ctx);
             }
             catch (const std::exception& e)
             {
@@ -1770,7 +1766,7 @@ public:
         try
         {
             if (ModuleBundle* b = safeBundleFor(tag_type_r, "consumer"))
-                (*b)(this, action_r, transportConsumer, ctx);
+                (*b)(getRID(), myConjugateKey(), action_r, transportConsumer, ctx);
         }
         catch (const std::exception& e)
         {
@@ -1879,7 +1875,8 @@ public:
         try
         {
             if (ModuleBundle* b = producer_entity->safeBundleFor(tag_type, "producer"))
-                (*b)(producer_entity, action, transportProducer, ctx);
+                (*b)(producer_entity->getRID(), producer_entity->myConjugateKey(),
+                         action, transportProducer, ctx);
         }
         catch (const std::exception& e)
         {
@@ -1888,7 +1885,7 @@ public:
         try
         {
             if (ModuleBundle* b = safeBundleFor(tag_type_r, "consumer"))
-                (*b)(this, action_r, transportConsumer, ctx);
+                (*b)(getRID(), myConjugateKey(), action_r, transportConsumer, ctx);
         }
         catch (const std::exception& e)
         {
@@ -1980,7 +1977,7 @@ public:
         (void)ptr;
     }
  
-    ID_SIZE_TYPE getID() const                      { return 67; } // will be the sum hash of the types
+    ID_SIZE_TYPE getID() const                      { return 67; }
  
     virtual bool myTagInto(ETCS::Buffer& buffer)
     {
@@ -2030,8 +2027,9 @@ public:
     }
     /*
  * myTagClosure - this type's own bit PLUS every type in its module it holds
- * a reference to (WIRE_TYPE_IDENTITY's TAG_CLOSURE). What addTag/removeTag
- * put on a TagModifyEvent, so what ModuleProxy's buffer admits against.
+ * a reference to (WIRE_TYPE_IDENTITY's TAG_CLOSURE). The WIDE FALLBACK a
+ * TagModifyEvent orders against until its work function's causal edge has
+ * settled, so what ModuleProxy's buffer admits against on a first pass.
  *
  * Empty here, like myTagMask: a type with no tag block has nothing to close
  * over, and TagModifyEvent substitutes all() -- keeping the fail-shut
@@ -2048,7 +2046,22 @@ public:
         return ETCS::TagMask{};
     }
     virtual void noteAcquires(const ETCS::TagMask&) {}
- 
+    /*
+ * Both of the above are the WIDE fallback, and stay that way. The narrow
+ * answer -- what the work function on this thread actually touches -- is
+ * not an entity property at all and is not asked for here: the event
+ * acquires it ambiently at emit, from ETCS::CausalEdgeMask (Bundles.h),
+ * the same way it acquires the stream pair's module mask.
+ */
+
+    // "Module:Tag" -- the key this entity is registered under, and the other
+    // half of every (key, rid) resolution.
+    ETCS::Buffer myConjugateKey() const
+    {
+        return ETCS::Buffer((getSourceModule().toString() + ":"
+                             + getSourceTag().toString()).c_str());
+    }
+
     ETCS::Buffer myTagBuffer()
     {
         return ETCS::Buffer(myTag());
@@ -2108,22 +2121,88 @@ private:
  * -----------------------------------------------------------------------
  */
     /*
- * ANSWERS WHETHER THE SURFACE ACTUALLY CHANGED, which is the half this was
- * missing rather than a convenience.
+ * THE FUNNEL, so the "did it move" bit has exactly one place to be acted on
+ * rather than one per return of the body below.
  *
- * Tags ARE the state surface, so a tag going on or off is the recorded form
- * of a state transition -- and the question anything downstream of that
- * surface asks is not "was a tag operation ordered" but "did the surface
- * move". A hash surface recomputing lazily needs exactly that bit to know
- * whether it has anything to recompute; a caller claiming a transition needs
- * exactly that bit to know whether it was the one that made it.
+ * A TAG GOING ON OR OFF IS A STATE TRANSITION: tags ARE the state surface, so
+ * anything observing this entity is now out of date. What downstream asks is
+ * not "was a tag operation ordered" but "did the surface move" -- a lazily
+ * recomputing hash needs exactly that bit, and so does a caller claiming it
+ * was the one that made the transition.
  *
- * false is the honest answer for every path that leaves flags_/tags as it
- * found them: an add of a flag already present, a remove of one absent, a
- * refusal to remove a foundational name, and a scope interrupt -- which
- * REQUESTS that a call stop and does not itself remove anything (see below).
+ * The false answers are load-bearing. Every path that leaves flags_/tags as
+ * it found them returns false: an add of a flag already present, a remove of
+ * one absent, a refusal to remove a foundational name, and a scope interrupt
+ * -- which REQUESTS that a call stop and removes nothing itself.
+ *
+ * Marked through IWireObservable (core/InterfaceWire.h), not through the
+ * ontology family -- core declares the wire and does not know what claimed it.
+ * Nearest claimant at or above target, which then bubbles; the walk is
+ * ontology/Observable.h's etcs_mark_observed, spelled out here because core
+ * cannot include ontology.
+ *
+ * Outside every lock: the body has returned, and MarkObserved takes its own
+ * mutex and walks parents.
  */
+    /*
+ * THE ONE PLACE A STATE CHANGE BECOMES A DIRTY EDGE.
+ *
+ * Observable is declared in core, ahead of any family that claims it, so that
+ * the runtime's OWN state transitions register as dirty edges without a type
+ * having to opt into anything. Claiming Observable is therefore enough to
+ * inherit observation of the whole state surface -- and the state surface is
+ * the tags: the origin-affixed ones (a typed child appearing or leaving) and
+ * the flags. Bare is-a markers are not part of it, because they are not
+ * runtime-mutable in either direction (addTypeTag runs only from a
+ * constructor; tagModifyBody refuses to remove one).
+ *
+ * Every funnel that moves that surface calls THIS, and there are four:
+ *
+ *   tagModifyImpl           a flag or a tag going on or off
+ *   addTagImpl              a typed child entering        (DynamicLoader.h)
+ *   etcs_retire_entity      an entity leaving the tree    (below)
+ *   LifecycleBase::Release  a type releasing what it held (ontology/)
+ *
+ * `from` is where the search for a claimant starts, NOT necessarily what
+ * changed: an entity that is leaving passes its parent, because the nearest
+ * claimant at or above ITSELF is about to stop existing. `origin` is always
+ * what changed, and MarkObserved excludes only the edge whose observer IS the
+ * origin -- which is how a node's own write stays out of its own self-edge.
+ *
+ * Nearest claimant only, then stop: MarkObserved bubbles upward itself
+ * (ontology/ObservableBase.h), so walking past the first one would mark the
+ * ancestors twice.
+ *
+ * isDestructed stops the walk rather than skipping the link -- past a
+ * half-destroyed ancestor there is nothing trustworthy left to climb. Only
+ * reachable under arena teardown, which is the one context tag modification
+ * never sees.
+ *
+ * Callers hold no lock here. MarkObserved takes its own and walks parents.
+ */
+public:
+    static void markStateChange(Entity* from, RID origin)
+    {
+        for (Entity* n = from; n; n = n->getParent())
+        {
+            if (n->isDestructed()) return;
+            void* p = n->getInterfacePointer(ETCS::Buffer("Observable"));
+            if (!p) continue;
+            static_cast<ETCS::IWireObservable*>(p)->MarkObserved(origin);
+            return;
+        }
+    }
+private:
+
     static bool tagModifyImpl(Entity* target, const ETCS::Buffer& key, bool is_remove)
+    {
+        const bool changed = tagModifyBody(target, key, is_remove);
+        if (!changed || !target) return changed;
+        markStateChange(target, target->getRID());
+        return changed;
+    }
+
+    static bool tagModifyBody(Entity* target, const ETCS::Buffer& key, bool is_remove)
     {
         if (!is_remove)
         {
@@ -2188,6 +2267,34 @@ private:
         {
             std::lock_guard<std::mutex> lock(target->m_tagMutex);
             auto it = target->tags.find(key);
+            /*
+ * A BARE IS-A MARKER IS NOT REMOVABLE, and this is the other half of
+ * addTag(Buffer)'s lowercase-only rule. That rule already makes such a marker
+ * impossible to CREATE at runtime -- addTypeTag runs only from
+ * ETCS_MAKE_INSTANCE's generated constructor -- but removal reached it,
+ * because this lookup finds `tags` before falling through to flags_ and the
+ * foundational-name check above only covers myTag()/getSourceTag().
+ *
+ * Removing one does not remove the family: the interface pointer is fixed at
+ * construction and the type is still downcastable to it. All it does is
+ * desynchronise hasTag from what the entity actually IS, so a
+ * hasTag("Wrapper")-style membership check (MirrorBuffer's wrap-chain
+ * resolution, verify_tag, a `requires` bracket) starts answering no about a
+ * type that fulfils it. Measured: removeTag returned true, hasTag went false,
+ * getInterfacePointer stayed non-null.
+ *
+ * Identified structurally rather than by case -- null bundle AND null child is
+ * exactly what addTypeTag inserts, and exactly what a dispatch entry or an
+ * entity relation is not.
+ */
+            if (it != target->tags.end()
+                && it->second.bundle == nullptr && it->second.child == nullptr)
+            {
+                ETCS_LOG("Entity", "removeTag: '" << key_str
+                         << "' is a family marker, not a relation -- refusing to "
+                            "remove. The type still fulfils it.");
+                return false;
+            }
             if (it != target->tags.end())
             {
                 child_to_delete = it->second.child;
@@ -2337,6 +2444,22 @@ template<typename T>
         {
             parent->noteAcquires(child_bit);
             child->noteAcquires(parent->myTagMask());
+            /*
+     * THE EDGE, recorded against the work function running on this
+     * thread rather than against the types.
+     *
+     * Same acquisition, second consumer. noteAcquires above widens the
+     * TYPE's closure for the life of the process; this widens only the
+     * frame of the invocation that actually made the acquisition, which
+     * is what the ordering mask should have been all along
+     * (Bundles.h::CausalEdgeFrame).
+     *
+     * BOTH directions, because a reference is an edge either way: the
+     * parent now reaches the child's type, and the child is reachable
+     * from the parent's. Neither is the callee's closure being
+     * inherited -- that is the thing this deliberately does not do.
+     */
+            ETCS::NoteCausalEdge(child_bit | parent->myTagMask());
         }
         return rid;
     }
@@ -2358,6 +2481,16 @@ inline ETCS::ScopeTag::ScopeTag(ETCS::Entity* entity, const char* label,
                                  const ETCS::TagMask& extra)
     : e(entity), extra_mask(extra)
 {
+    /*
+ * Recorded HERE, where the entity is unambiguously alive -- the caller is
+ * entering the call. Everything the destructor needs is captured now so that
+ * it never has to trust the pointer later. See ScopeTag's own comment.
+ */
+    if (entity)
+    {
+        rid = entity->getRID();
+        conjugate_key = entity->myConjugateKey();
+    }
     /*
  * "active_scope_Listen" -- no guard address anymore. The address made
  * every instance's flag unique, which meant the flag could only ever
@@ -2403,10 +2536,42 @@ inline ETCS::ScopeTag::ScopeTag(ETCS::Entity* entity, const char* label,
  * double-removeTag against a guard that was never really "this one" to
  * begin with.
  */
+/*
+ * Resolve an entity by conjugate key and RID, through the LOADER only.
+ *
+ * The loader's map is the authoritative one: each EventNode::getInstance() is a
+ * per-SO static holding only what that module created, while the loader absorbs
+ * every module's lists and watches them join and leave. Checking the local map
+ * first would answer correctly for a module's own entities and wrongly for
+ * anything composed.
+ *
+ * Null means gone -- a real answer, not an error.
+ */
+ETCS::EventNode* etcs_loader_event_node();   // defined in DynamicLoader.h
+inline Entity* etcs_resolve_by_key(const ETCS::Buffer& conjugate_key, RID rid)
+{
+    if (rid == 0 || conjugate_key.written == 0) return nullptr;
+    ETCS::EventNode* owner = etcs_loader_event_node();
+    if (!owner) return nullptr;
+    auto it = owner->ridMap.find(conjugate_key);
+    if (it == owner->ridMap.end()) return nullptr;
+    if (!it->second.invoke_contains(rid)) return nullptr;
+    return it->second.invoke_get(rid);
+}
+
 inline ETCS::ScopeTag::~ScopeTag()
 {
-    if (!e) return;
-    Scope::Removal rem = e->unregisterScope(scope_id);
+    if (!e) return;                      // moved-from: not ours to unwind
+    /*
+ * ASK FOR THE POINTER AGAIN. `e` is only the moved-from sentinel by now; the
+ * entity it named may have been reclaimed while this scope's body ran, which
+ * is the ordinary case for a frame edge that ended because its surface
+ * retired. Null here means there is nothing left to unregister and no tag
+ * left to remove.
+ */
+    ETCS::Entity* live = etcs_resolve_by_key(conjugate_key, rid);
+    if (!live) return;
+    Scope::Removal rem = live->unregisterScope(scope_id);
     /*
  * Unregister first, THEN removeTag -- load-bearing ordering. removeTag
  * fires a TagModifyEvent whose handler calls interruptLabel(label) for
@@ -2415,7 +2580,7 @@ inline ETCS::ScopeTag::~ScopeTag()
  * erasing the flag from flags_ rather than treating the removal as an
  * interrupt request and returning early with the flag still set.
  */
-    if (rem.found && rem.last_of_label) e->removeTag(tag, extra_mask);
+    if (rem.found && rem.last_of_label) live->removeTag(tag, extra_mask);
 }
  
 /*
@@ -2476,7 +2641,7 @@ inline HASH_TYPE GenerateEnvironmentSignature(const ETCS::Buffer& uniqueName)
  * arena-resident entities. A Root never has typed children, is never
  * dispatched through any tag, and is never arena-resident (it lives
  * wherever its own caller constructed it -- typically the stack, per
- * ShellREPL.h's own nav_root and CommandExecutor.h's detached_root/
+ * the navigator's own nav_root and CommandExecutor.h's detached_root/
  * run_root/local_root, but nothing about Root itself requires that).
  *
  * Root previously inherited Entity purely so it could satisfy
@@ -2492,6 +2657,17 @@ inline HASH_TYPE GenerateEnvironmentSignature(const ETCS::Buffer& uniqueName)
  * tagged to hold either an Entity* or a Root* -- Root has no reason to
  * masquerade as an Entity at all, and simply doesn't have local_arena_
  * (or tags/flags_/typed_children_) to leak in the first place.
+ *
+ * ROOT IS THE ENTRY POINT FOR THE ONTOLOGY; SHELL IS THE ENTRY POINT
+ * FOR LIFETIMES AND SIGNALS. A Root is where a module gets attached and
+ * where typed entities come from -- it answers "what exists". It holds
+ * no signal authority of its own and starts no control thread, so it
+ * cannot answer "what is running, and how do I stop it": that is a
+ * Shell, which is a Thread (ontology/Thread.h) and therefore the one
+ * kind of entity that can produce another control thread. A Root spawns
+ * a Shell; everything the Shell runs, and every job it detaches, hangs
+ * off the Shell rather than off the Root, which is what makes a
+ * session's history a subtree instead of a list.
  *
  * Tag is deliberately lowercase ("root") - the ONE exception to the
  * TitleCase convention every other entity tag follows in this codebase.
@@ -2565,58 +2741,29 @@ public:
  * The race the old condition was really guarding -- ~Root's vacate
  * firing a RequestUnloadEvent whose recheck thread then dlclose'd
  * under still-running workers -- is closed at its own level now, by
- * PendingUnloadRegistry's join barrier (DynamicLoader.h): a recheck
- * cannot be started after the barrier, and every one started before
- * it is joined. Guarding it a second time here, with a condition
- * that also drops registry bookkeeping, cost more than it bought.
+ * PendingUnloadRegistry's join barrier (DynamicLoader.h). Guarding it
+ * a second time here, with a condition that also drops registry
+ * bookkeeping, cost more than it bought.
  *
- * If a signal-driven shutdown is already in progress, skip the
- * normal graceful vacate/unload dance entirely -- there is no
- * safe way to synchronously wait for an asynchronous module
- * unload's own worker threads to finish while the PROCESS
- * itself is concurrently mid-teardown; the OS reclaims
- * everything regardless the instant this process actually
- * exits. Attempting the ordinary path here (ChangeModuleEvent's
- * own synchronous vacate, which can itself go on to fire a
- * RequestUnloadEvent) is exactly what raced dlclose() against
- * still-running worker threads and produced a real, reproduced
- * SIGSEGV. PendingUnloadRegistry (DynamicLoader.h) closes the
- * equivalent race for an ORDINARY exit path (main() actually
- * returning, wait_for_environment_drain unblocking normally),
- * but a signal arriving mid-navigation doesn't reliably route
- * through that return path in time for the join to matter --
- * this stops the race from ever starting in the first place,
- * for this specific case, rather than trying to win it after
- * the fact.
- *
- * ctx_ is still carried and still load-bearing -- every entity
- * this Root hosts reaches it as signal authority -- it is just
- * no longer what decides this branch. See the note above the
- * condition for why.
+ * ctx_ is still carried and still load-bearing -- every entity this
+ * Root hosts reaches it as signal authority -- it is just no longer
+ * what decides this branch.
  */
         if (!ETCS::EventNode::alive())
         {
             /*
- * This body returning early is NOT enough on its own --
- * module_ is a MEMBER, not something this body controls the
- * destruction of. C++ destroys members in reverse
- * declaration order regardless of what this body does, so
- * module_'s own ~Module() runs immediately after this
- * function returns either way, and ~Module() has its OWN,
- * completely independent path to the identical cascade (its
- * own "Root going out of scope -- relinquishing/
- * unregistering" branch, DynamicLoader.h, gated only on
- * `parent && hosting_entity.kind == LifetimeOwner::Kind::
- * Root`) -- a real, reproduced second instance of the same
- * SIGSEGV traced to exactly that: the check above alone
- * silenced ~Root()'s own attempt, but ~Module()'s fired
- * moments later regardless, via a code path this class
- * never touches directly. Nulling parent here makes that
- * branch's own condition false, so ~Module() safely skips
- * it -- without Module itself needing any SignalContext
- * awareness of its own. hosting_entity is deliberately left
- * alone: nothing else in ~Module() reads it once parent is
- * null, and leaving it intact costs nothing.
+ * RETURNING EARLY IS NOT ENOUGH. module_ is a MEMBER, destroyed in
+ * reverse declaration order regardless of what this body does, and
+ * ~Module() has its OWN independent path to the identical cascade
+ * (its "Root going out of scope" branch, DynamicLoader.h, gated only
+ * on `parent && hosting_entity.kind == Root`). A reproduced second
+ * instance of the same SIGSEGV came from exactly that: the check
+ * above silenced ~Root()'s attempt and ~Module()'s fired anyway.
+ *
+ * Nulling parent makes that branch's condition false, so ~Module()
+ * skips it without Module needing any SignalContext awareness.
+ * hosting_entity is left alone -- nothing reads it once parent is
+ * null.
  */
             module_.parent = nullptr;
             return;
@@ -2866,12 +3013,117 @@ inline void* etcs_true_type(Entity* e) { return e ? e->getTrueType() : nullptr; 
  * A type that does not claim the family returns null here and is skipped, which
  * is how this stays a call core can make unconditionally.
  */
-inline bool etcs_release_lifecycle(Entity* e)
+/*
+ * etcs_supertype_fanin — the inverse of etcs_supertype_fanout, written directly
+ * beneath it so the pair cannot drift again.
+ *
+ * It drifted once. Fanout inserts under the names getInterfaceFamilies()
+ * returns, read out of interface_pointers_. The only removal that existed
+ * (destroyImpl) walked getTags() instead -- a different map -- and built
+ * qualified "Module:Tag" keys from it, so the two never named the same key. A
+ * traced run of composited_scenes showed 78 insertions into the unqualified
+ * family lists and zero removals, with all 78 later resolves returning hits for
+ * entities already destructed. Those lists are what resolve_in_family checks
+ * FIRST, before asking the loader, which is why resolving by RID was never a
+ * liveness check.
+ *
+ * Both scopes in one call: the module's own map under the unqualified name, the
+ * loader's under the origin-affixed one. The per-TYPE entry goes too -- same
+ * kind of registration, made by ETCS_MAKE_INSTANCE rather than by fanout.
+ */
+inline void etcs_supertype_fanin(Entity* e)
+{
+    if (!e) return;
+    std::vector<ETCS::Buffer> families;
+    e->getInterfaceFamilies(families);
+
+    const RID         rid    = e->getRID();
+    const std::string module = e->getSourceModule().toString();
+    const ETCS::Buffer own_tag = e->getSourceTag();
+
+    // Everything this entity was published under, in the module's own spelling.
+    std::vector<ETCS::Buffer> names = families;
+    if (own_tag.written) names.push_back(own_tag);
+
+    auto& mine = ETCS::EventNode::getInstance().ridMap;
+    ETCS::EventNode* owner = etcs_loader_event_node();
+
+    for (const ETCS::Buffer& name : names)
+    {
+        auto local = mine.find(name);
+        if (local != mine.end()) local->second.invoke_remove(rid);
+
+        if (!owner) continue;
+        ETCS::Buffer qualified((module + ":" + name.toString()).c_str());
+        auto absorbed = owner->ridMap.find(qualified);
+        if (absorbed != owner->ridMap.end()) absorbed->second.invoke_remove(rid);
+    }
+}
+
+inline bool etcs_retire_entity(Entity* e)
 {
     if (!e) return false;
-    void* raw = e->getInterfacePointer(ETCS::Buffer("Lifecycle"));
-    if (!raw) return false;
-    return static_cast<ETCS::IWireLifecycle*>(raw)->Release();
+    // Gate first: no new hold is granted, so no walk that has not started ever
+    // will. destroyImpl did this around an explicit Delete and the arena's
+    // reclaim -- the other way every entity dies -- did not.
+    e->beginRetire();
+    // Then halt, before anything it is using is taken away. Cooperative, so this
+    // does not wait: the body stops at its next opportunity.
+    if (void* raw = e->getInterfacePointer(ETCS::Buffer("Threaded")))
+        static_cast<ETCS::IWireThread*>(raw)->Halt();
+    // Then wait for what was already inside. After the halt, deliberately: a
+    // body that has been asked to stop drains in one iteration.
+    if (!e->awaitQuiesced(2000))
+        ETCS_LOG("retireEntity", "RID:" << e->getRID() << " still held after 2000ms -- "
+                 "reclaiming anyway. A walk is holding it across an emit.");
+    // Release while the parent link is still live -- "unbind from what holds
+    // you" is on its own list of jobs.
+    bool released = false;
+    if (void* raw = e->getInterfacePointer(ETCS::Buffer("Lifecycle")))
+        released = static_cast<ETCS::IWireLifecycle*>(raw)->Release();
+    /*
+ * Then leave the parent's child list, for every entity. This used to happen in
+ * ~Entity(), which meant a child was still answerable through getTypedChild
+ * while its own destructor ran: a concurrent frame edge resolved it, called
+ * through it, and read a vtable coming apart. reclaimEntity is the moment that
+ * works -- before unlinkRecord, before ~T(), and ours to order.
+ *
+ * ~Entity() still makes the same call; removeTypedChild is a no-op once the RID
+ * is gone, so neither path has to know about the other.
+ */
+    e->detachFromParent();
+    /*
+ * A CHILD LEAVING IS A SUBTREE CHANGE, and nothing was saying so.
+ *
+ * tagModifyImpl already marks for a tag going on or off, on the argument that
+ * tags are the state surface and a transition on it makes every observer out
+ * of date. A node being removed from the tree is the same claim with a larger
+ * delta: what its parent would compose is no longer what it composed last
+ * time. Nothing else covered it -- reparentChildrenTo, detachFromParent and
+ * removeTypedChild are all pure bookkeeping, and none of the drawable leaf
+ * types drop their own "active" tag on the way out -- so a compositor's
+ * TakeObserved answered false and it re-blitted a raster still containing the
+ * deleted node until something unrelated (a moving scene, an FPS label) woke
+ * it for its own reasons.
+ *
+ * FROM THE PARENT, not from e: e is what changed, but e is also what is going
+ * away, so the nearest claimant at or above the PARENT is who needs telling.
+ * Origin stays e's RID -- MarkObserved excludes only the edge whose observer
+ * is the origin, and that edge belongs to e, which is leaving anyway. A
+ * self-observing parent is keyed on its OWN rid, so it hears this.
+ *
+ * AFTER detachFromParent, deliberately: an observer woken here and walking
+ * immediately must not still find e among the children.
+ *
+ * Guarded on isDestructed because this path also runs under arena teardown,
+ * where an ancestor may already have run ~Entity() -- the one context tag
+ * modification never reaches.
+ */
+    Entity::markStateChange(e->getParent(), e->getRID());
+    // And leave every registry it was published into, keyed the way it was
+    // admitted. This is what turns "the RID resolved" into "it is alive".
+    etcs_supertype_fanin(e);
+    return released;
 }
 
 inline void etcs_supertype_fanout(Entity* e)

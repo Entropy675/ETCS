@@ -192,7 +192,7 @@ view.Compose(@stage)
 main.CaptureMouse(1)
 
 detach scene3d_input.etcs window=main scene=world
-detach RenderProvider/scripts/render_frames.etcs view=view
+detach RenderProvider/scripts/render_frames.etcs view=view gpu=gpu
 
 # does nothing but final setup and run for the window + cleanup when Run exits
-detach scene3d_profile.etcs main=main
+detach scene3d_profile.etcs main=main gpu=gpu view=view

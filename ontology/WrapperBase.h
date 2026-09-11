@@ -2,14 +2,13 @@
 #define BASE_WRAPPER_H__
 #include "Wrapper.h"
 
-ETCS_SUPERTYPE_BASE(Wrapper)
+// The locality rule rides in a private empty base -- see ETCS::WrapperIsLocal
+// (Wrapper.h) for why it cannot be a static_assert in this body, and how that
+// went unnoticed until the family had its first concrete leaf. AFTER Wrapper_,
+// so Wrapper_ stays the first non-virtual base and the offset-0 pointer
+// identity MirrorBuffer depends on is untouched.
+ETCS_SUPERTYPE_BASE(Wrapper), private ETCS::WrapperIsLocal<Derived>
 {
-    // A Wrapper_-derived type must never be Remote: wrapping happens
-    // local to the wire it's about to cross, never across another hop.
-    static_assert(!ETCS::IsRemote<Derived>::value,
-        "Wrapper_-derived types must never be Remote -- wrapping happens "
-        "local to the wire it's about to cross, never across another hop.");
-
     ETCS_MAKE_INSTANCE(Wrapper)
     ETCS_DISPATCH_METHOD(       void, Wrap,      (ETCS::MBuffer&, io), (ETCS::SignalContext, ctx));
     ETCS_DISPATCH_METHOD(       void, Unwrap,    (ETCS::MBuffer&, io), (ETCS::SignalContext, ctx));

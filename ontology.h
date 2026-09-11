@@ -38,7 +38,20 @@
 #include "ontology/ClippableBase.h"
 #include "ontology/SurfaceBase.h"
 #include "ontology/PresentableBase.h"
+
+// The raster split: Raster is a grid of pixels with a size, and the two
+// families under it are where those pixels live -- Pixels in host memory,
+// Renderable in a device's. Mutually exclusive by the final-overrider rule
+// rather than by a written one, so a leaf that claimed both would not
+// compile.
+//
+// There is deliberately no RasterBase to include, and it is the only parent
+// in this ontology with no base of its own: a leaf claiming only Raster
+// would have a size, no bytes, no device, and no way to reach a screen --
+// not an incomplete type but an incoherent one. Raster.h says the rest,
+// including why the lineage sits in those two interfaces instead.
 #include "ontology/PixelsBase.h"
+#include "ontology/RenderableBase.h"
 
 // The Drawable lineage: Surface refined into a node that occupies space in
 // a parent and nests. DrawableBase composes SurfaceBase, the two leaf bases
@@ -50,6 +63,9 @@
 #include "ontology/DrawableBase.h"
 #include "ontology/Drawable2DBase.h"
 #include "ontology/Drawable3DBase.h"
+// Not a refinement of anything: a Device is the place other things' pixels can
+// be. Included before the camera, which asks for one by family name.
+#include "ontology/DeviceBase.h"
 #include "ontology/CameraBase.h"
 #include "ontology/GlyphsBase.h"
 
@@ -60,9 +76,26 @@
 // guaranteed to happen exactly once whichever way the entity dies. See
 // ontology/Lifecycle.h.
 #include "ontology/LifecycleBase.h"
+// Threaded claims IWireThread, the wire core/InterfaceWire.h declared and left
+// unclaimed. Beside Lifecycle because they are used together: retiring an
+// entity asks its bodies to stop before it tells the type to let go.
+#include "ontology/ThreadedBase.h"
+// Observable is the general observer/dirty structure the render tree already
+// had twice by hand. See ontology/Observable.h.
+#include "ontology/ObservableBase.h"
+// Thread refines Threaded: an entity that IS a control thread, owning signal
+// authority and a closure, rather than one that merely has a body to stop.
+// Nothing claims it yet -- it is the surface the CommandExecutor migration
+// lands on. See ontology/Thread.h.
+#include "ontology/ThreadBase.h"
 #include "ontology/EphemeralBase.h"
 #include "ontology/ParserBase.h"
 #include "ontology/WrapperBase.h"
+// Matrix refines Wrapper: one step, and a forward link, in a transform chain.
+// The chain is the owner's Wrapper children in attach order, which MirrorBuffer
+// already resolves and applies -- so a pipeline is built by attaching, not by
+// wiring. See ontology/Matrix.h.
+#include "ontology/MatrixBase.h"
 #include "ontology/GateBase.h"
 #include "ontology/SwitchableBase.h"
 #include "ontology/FilterBase.h"

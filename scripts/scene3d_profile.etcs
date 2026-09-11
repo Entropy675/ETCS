@@ -2,7 +2,8 @@
 #IMPORT ACE_ROOT/modules
 
 requires main [Window]
-
+requires gpu  [Instance]
+requires view [Surface]
 # this is the profile being ran for scene3d.etcs
 main.Run(1024, 768, 'ETCS 3D scene -- WASD')
 

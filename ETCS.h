@@ -12,15 +12,14 @@
 #include "core_defs.h"
 #include "ontology.h"
 
-// Always included in a loader build now, regardless of ETCS_REPL_SHELL --
-// ShellREPL.h provides both the interactive implementation (under its own
-// ETCS_REPL_SHELL guard) and the drain-mode entry points
-// (shell_startup/drive_main_loop_then_exit), so etcs.cc no longer needs
-// to know the flag exists at all. Still gated on ETCS_LOADER -- module
-// builds never touch this file.
-#ifdef ETCS_LOADER
-#include "ShellREPL.h"
-#endif
+// ShellREPL.h is gone. Its two halves went to the places that already owned
+// them: the navigator and the process entry points
+// (shell_startup/drive_main_loop_then_exit) to core/CommandExecutor.h, which
+// arrives transitively through core_defs.h above; the terminal to
+// modules/ShellProvider, which is an ordinary provider loaded at runtime.
+//
+// So a loader build needs no extra include here, and -DETCS_REPL_SHELL no
+// longer decides what compiles -- only what the loader DOES with it.
 // trust layer, can add more hashes later
 #include "core_hashes.h"
 #include "ontology_hashes.h"

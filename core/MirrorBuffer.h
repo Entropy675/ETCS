@@ -19,7 +19,9 @@
 #include "SharedPage.h"
 #include "LMAXSequentialSharedPage.h"
 
-// TODO/Warn: currently wrap logic is untested, I see a potential bug within the LMAX path... (which is the most common)
+// TODO/Warn: the LMAX wrap path is the least exercised of the three and the
+// most used. Re-read emitWrapped and the scratch-pool reuse rule before
+// trusting it under churn.
 
 namespace ETCS
 {
@@ -85,10 +87,8 @@ struct StrategyFor<CallerTag, CalleeTag,
 // ---------------------------------------------------------------------------
 // PageFor<Strategy> — maps a strategy to its page type.
 //
-//   StrategyLMAX   → LMAXSequentialSharedPage
-//                    Ring carries Buffer* pointers into the call stack frame.
-//                    No payload copy — lifetime guaranteed by call() blocking
-//                    on consumer completion before the frame unwinds.
+//   StrategyLMAX   → LMAXSequentialSharedPage   (zero-copy; see the LMAX path
+//                    on the MirrorBuffer class comment for why that is safe)
 //
 //   StrategyPipe   → SharedPage
 //                    Staging buffer for fd writes — decouples logical payload
@@ -463,8 +463,8 @@ public:
     //   stage failing to load sets unwrap_failed_ and aborts the chain —
     //   this IS the graceful capability-negotiation failure path.
     //
-    // Declared here, DEFINED in DynamicLoader.h — needs Entity complete
-    // AND LoadEvent's real operator()() body, neither available here.
+    // Out-of-line in DynamicLoader.h for the reason above, plus LoadEvent's
+    // real operator()() body.
     // -----------------------------------------------------------------------
     void resolveWrapChain(Entity* handler);
     // -----------------------------------------------------------------------
@@ -719,8 +719,8 @@ public:
     // LMAX:   nothing to do. The pair is one blocking call frame, so a
     //         consumer that returned has already ended its producer.
     //
-    // Idempotent. Leaves write_fd_ alone -- on a Pipe consumer that is the ack
-    // channel, not this stream.
+    // Idempotent, like closeWrite. Leaves write_fd_ alone -- on a Pipe
+    // consumer that is the ack channel, not this stream.
     // -----------------------------------------------------------------------
     void closeRead()
     {
@@ -1069,11 +1069,9 @@ public:
         // terminators the new owner is going to emit.
         o.closed_ = true;
     }
-    // Declared here (not = default), DEFINED in DynamicLoader.h — needs
-    // DestroyEvent, which needs EventNode.h complete, which is not
-    // reachable from this file (EventNode.h -> Bundles.h -> MirrorBuffer.h
-    // is the same circularity every other Entity-dependent piece in this
-    // struct already routes around). Tears down every entity THIS
+    // Not `= default`: out-of-line in DynamicLoader.h, same circularity as
+    // the wrap helpers above, here because it needs DestroyEvent.
+    // Tears down every entity THIS
     // instance bootstrapped via LoadEvent during unpack()'s unwrap branch
     // — never the wrap side, which never owns what it points at.
     ~MirrorBuffer();
@@ -1379,6 +1377,9 @@ private:
     }
 };
 // ---------------------------------------------------------------------------
+// The two produce-side guards. ProducerLiveGuard is defined first and
+// destructs last; StreamWriteGuard follows it, below.
+//
 // StreamWriteGuard — closes a producer's write end when its body returns by
 // ANY path: normal completion, an early `return`, or an exception.
 //
@@ -1400,8 +1401,8 @@ private:
 // destructor's closeWrite() is a no-op and the new owner's own teardown stays
 // authoritative. No explicit release() call needed, and nothing to forget.
 //
-// Producers that already call closeWrite() explicitly keep working unchanged
-// -- closeWrite() is idempotent on all three strategies.
+// Producers that already call closeWrite() explicitly keep working: it is
+// idempotent.
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 // ProducerLiveGuard — marks the produce BODY as gone when it returns by any

@@ -1,0 +1,126 @@
+#!/usr/bin/env etcs
+#IMPORT ACE_ROOT/modules
+
+# The same 3D scene as scene3d.etcs, projected THROUGH the device instead of
+# into host pixels.
+#
+#     ./bin/etcs scripts/scene3d_gpu.etcs
+#
+# and then, from the prompt while it runs:
+#
+#     Root> eye.SetDeviceProjection(0)     # hold it on the CPU deliberately
+#     Root> eye.SetDeviceProjection(1)     # and hand it back (the default)
+#     Root> RenderProvider                 # log file  -- just this module
+#
+# TWO LINES ARE THE WHOLE DIFFERENCE from scene3d.etcs, and neither is a mode:
+# they spawn a Device under the camera and point it at the Instance. There is no
+# third line turning anything on. A camera wants a device by default
+# (ontology/Camera.h), so attaching one IS the switch -- a camera that had the
+# capability and drew on the CPU anyway would just be confusing.
+#
+# WHY A CHILD AND NOT A FLAG. There is always a CPU. Host memory is the floor
+# every raster in this system already stands on, so it needs no declaration --
+# which makes a device strictly an ADDITION, and in this ontology an addition
+# is a child. The capability is then a fact about the entity graph: enumerable
+# by the same typed-child walk everything else uses, on the state surface like
+# every other origin-affixed tag, and marking the camera's observers when it
+# appears or goes. A boolean on the camera would have been a second copy of
+# that, settable to a value the graph disagrees with.
+#
+# It also means "which device" is the same mechanism as "whether": two Devices
+# under one camera is two devices available to it, with no new concept.
+#
+# AND THE FALLBACK IS FREE. Delete the Device child mid-run and the camera
+# quietly draws on the host again -- the effective mode is the preference AND a
+# device still being there, derived at read time rather than stored, so the two
+# can never disagree (ontology/Camera.h). Nothing to reset, because the host is
+# what a camera falls back to rather than something it has to be told to use.
+#
+# WHAT ACTUALLY CHANGES DOWNSTREAM. Nothing above the sink: the view, the
+# flatten, the near clip, the perspective divide, the fan and the depth test
+# are arithmetic about a scene and a lens, identical either way. What differs
+# is where a surviving run of pixels goes -- written as bytes into the camera's
+# buffer, or emitted as one DrawRect through the destination. On a
+# VulkanSurface those are device rects, so the frame is produced by the GPU and
+# never exists as host pixels at all. That is the same thing
+# PolygonDrawable2D has always done one dimension down.
+
+spawn RenderProvider::Instance gpu
+gpu.Create()
+
+spawn WindowProvider::Window main
+main.Create(1024, 768, 'ETCS 3D scene -- device projection')
+
+main.spawn(RenderProvider::Surface view)
+view.Create(@gpu)
+
+spawn RenderProvider::CompositeDrawable2D stage
+stage.Create(1024, 768)
+stage.SetPosition(0, 0)
+stage.SetBackground(0.04, 0.05, 0.08, 1.0)
+
+stage.spawn(RenderProvider::Camera3D eye)
+eye.Create(1024, 768)
+eye.SetPosition(0, 0)
+eye.SetOrder(1)
+eye.SetBackground(0.07, 0.09, 0.15, 1.0)
+eye.LookAt(0.0, 3.0, -14.0, 0.0, 0.5, 2.0)
+eye.SetLens(60.0, 0.1, 400.0)
+
+# ── the capability, which is the whole of it ─────────────────────────────
+#
+# Spawned under the camera rather than attached from the root, because `attach`
+# is a pure lookup and does not re-parent (doc/etcs_specification.md): a
+# relation gets INTO the tree by being created there. The Device names the
+# Instance by RID and answers for it, so there is one Vulkan device in this
+# process, not two -- the child is the capability, not the hardware.
+eye.spawn(RenderProvider::Device dev)
+dev.Create(@gpu)
+
+spawn RenderProvider::Scene3D world
+world.Create(1.0, 1.0, 1.0)
+world.SetVisible(0)
+world.SetPosition(0.0, 0.0, 0.0)
+world.SetSpeed(7.0)
+world.SetDamping(6.0)
+world.SetSensitivity(2.0)
+world.SetEmissivity(0.5)
+
+run RenderProvider/scripts/scene3d.etcs anchor=world
+
+eye.SetScene(@world)
+
+# ── 2D UI on the camera's frame ──────────────────────────────────────────
+#
+# Unchanged from the host version, and that is the point worth watching: these
+# are children of the camera and know nothing about how their parent's frame is
+# produced. In device mode the camera owns no picture for them to be drawn
+# into, so they compose onto the destination exactly as the camera's own spans
+# do -- same tree, same order, same coordinates.
+eye.spawn(RenderProvider::TextLabel hud)
+hud.Create(24)
+hud.SetText(%f fps -- device projection -- wasd move / mouse look / ctrl+tab)
+hud.SetPosition(16, 16)
+hud.SetColor(0.6, 1.0, 0.7, 1.0)
+hud.SetBackground(0.0, 0.0, 0.0, 0.45)
+hud.SetPadding(6)
+hud.SetOrder(11)
+hud.BindFps(@view)
+
+eye.spawn(RenderProvider::PolygonDrawable2D reticle)
+reticle.Create()
+reticle.AddPoint(506, 378)
+reticle.AddPoint(518, 378)
+reticle.AddPoint(518, 390)
+reticle.AddPoint(506, 390)
+reticle.SetFill(1.0, 1.0, 1.0, 0.55)
+reticle.SetOrder(10)
+
+view.Clear(0.02, 0.02, 0.03, 1.0)
+view.Compose(@stage)
+
+main.CaptureMouse(1)
+
+detach scene3d_input.etcs window=main scene=world
+detach RenderProvider/scripts/render_frames.etcs view=view gpu=gpu
+detach scene3d_profile.etcs main=main gpu=gpu view=view

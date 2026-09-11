@@ -4,6 +4,9 @@
 #include <ostream>
 #include <sstream>
 #include <iostream>
+#include <chrono>
+#include <cstdio>
+#include <ctime>
 
 /*
  * WHERE A LINE GOES IS A RUNTIME PROPERTY, not a compile-time one.
@@ -13,12 +16,27 @@
  * are using the shell, and those alternate minute to minute. It now sets only
  * the DEFAULT.
  *
- * ONE FLAG PER MODULE, by construction rather than by design: this header is
- * compiled into the loader and into every module, and an inline variable under
- * -fvisibility=hidden gives each DSO its own copy. That is the right grain --
- * getModuleLog() already writes to logs/<ModuleName>.log, so a module's
- * destination is a module's own property. `log file` in the shell sets every
- * one it can reach (CommandExecutor.h).
+ * ONE FLAG PER BINARY, and now BY DESIGN rather than by construction. This
+ * header is compiled into the loader and into every module, and each of them
+ * having its own copy is the whole grain the feature runs on -- getModuleLog()
+ * already writes to logs/<ModuleName>.log, so where a module's lines go is a
+ * module's own property, separately settable from the loader's.
+ *
+ * It used to rest on -fvisibility=hidden being passed, which is a BUILD FLAG
+ * and therefore not part of this header's meaning: an inline variable has vague
+ * linkage, so with default visibility the dynamic linker is entitled to collapse
+ * every DSO's copy onto whichever it resolves first, and one `log file` would
+ * silently move every module's lines at once again. ETCS_PER_BINARY below says
+ * it in the declaration instead, where it cannot be dropped by a build line.
+ *
+ * NOT `static`, which was the other way to spell it and is a DIFFERENT grain:
+ * internal linkage gives one copy per TRANSLATION UNIT, so a loader or module
+ * that ever grows a second .cc including this header would carry two flags and
+ * the shell would set one of them. Hidden visibility is per-binary exactly,
+ * whatever a binary is made of.
+ *
+ * `log file` in the shell sets the one you are standing in; `log all file`
+ * still sets every one it can reach (CommandExecutor.h).
  *
  * The default follows the shell: built WITH ETCS_REPL_SHELL there is a person
  * at that terminal reading it, so the lines go there and `log file` moves them
@@ -43,13 +61,72 @@
     #define ETCS_LOG_TO_FILE_DEFAULT false
 #endif
 
+// One copy per DSO, guaranteed here rather than by a build flag -- see above.
+// A Windows DLL never shares a data symbol with its host to begin with, so
+// there is nothing to say there.
+#if defined(_WIN32)
+    #define ETCS_PER_BINARY
+#else
+    #define ETCS_PER_BINARY __attribute__((visibility("hidden")))
+#endif
+
 namespace ETCS {
-    inline std::atomic<bool> log_enabled{true};
-    inline std::atomic<bool> log_to_file{ ETCS_LOG_TO_FILE_DEFAULT };
+    ETCS_PER_BINARY inline std::atomic<bool> log_enabled{true};
+    ETCS_PER_BINARY inline std::atomic<bool> log_to_file{ ETCS_LOG_TO_FILE_DEFAULT };
+
+    /*
+ * THE TIME A LINE LEFT, not the time anything decided to write one.
+ *
+ * Built here, at the point of emission, and nowhere earlier: a stamp taken
+ * when a message was composed and carried to the sink would date the intent
+ * rather than the record, and the gap between those is exactly the interval a
+ * log is usually being read to measure.
+ *
+ * A 16-byte struct by value, so a line costs no allocation. The seconds half
+ * is cached per thread and recomputed only when the second turns -- localtime_r
+ * is the expensive part and a busy log emits hundreds of lines inside one of
+ * them.
+ *
+ * Local wall clock, to the millisecond. Local rather than UTC because the
+ * thing being correlated with is usually something else on this machine, and
+ * milliseconds because frames are the shortest interval anyone has yet needed
+ * to see between two lines.
+ */
+    struct LogStamp { char text[16]; };
+
+    inline LogStamp log_stamp()
+    {
+        const auto now  = std::chrono::system_clock::now();
+        const auto secs = std::chrono::time_point_cast<std::chrono::seconds>(now);
+        const long ms   = static_cast<long>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - secs).count());
+
+        static thread_local std::time_t cached = 0;
+        static thread_local char hms[9] = "00:00:00";
+
+        const std::time_t t = std::chrono::system_clock::to_time_t(secs);
+        if (t != cached)
+        {
+            cached = t;
+            std::tm tmv{};
+#if defined(_WIN32)
+            localtime_s(&tmv, &t);
+#else
+            localtime_r(&t, &tmv);
+#endif
+            std::snprintf(hms, sizeof(hms), "%02d:%02d:%02d",
+                          tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+        }
+
+        LogStamp s{};
+        std::snprintf(s.text, sizeof(s.text), "%s.%03ld", hms, ms);
+        return s;
+    }
 
     // Set THIS DSO's destination. The loader reaches a module's copy through
-    // that module's own EventNode (EventNode::SetLogToFile), which is compiled
-    // into the module and so writes the module's variable, not the loader's.
+    // that module's own EventNode::set_log_to_file trampoline (EventNode.h),
+    // which is compiled into the module and so writes the module's variable,
+    // not the loader's.
     inline void set_log_to_file(bool on) { log_to_file.store(on, std::memory_order_relaxed); }
     inline bool get_log_to_file()        { return log_to_file.load(std::memory_order_relaxed); }
 
@@ -71,9 +148,6 @@ namespace ETCS {
         LogSinkGuard& operator=(const LogSinkGuard&) = delete;
     };
 }
-
-// Lives here because TBuffer is the only thing guaranteed included everywhere,
-// arena and threadpool included.
 
 #define GET_LOG_MACRO(_1, _2, NAME, ...) NAME
 
@@ -105,9 +179,21 @@ namespace ETCS {
 // window in which a splice can happen one call wide instead of a dozen, which
 // for a line-oriented log is the difference between never and constantly.
 // ---------------------------------------------------------------------------
-#define ETCS_LOG_LINE(type, msg, out) \
+//
+// `stamp` is a literal at every call site, so the branch folds away and an
+// unstamped line pays nothing. WHO PASSES TRUE is the whole of the policy: the
+// log FILE does, and nothing else. A terminal line is read in the moment it is
+// produced, with the frame it belongs to still on screen, so the clock beside
+// it is noise on the one output where noise was already the problem -- `log
+// file` exists because that terminal fills up. A file is read afterwards, with
+// none of that context left, and there the time IS the context. A captured
+// sink (LogSinkGuard) is a transcript handed back to a caller -- a session's
+// own output, a command's captured result -- and dating those would put wall
+// clock into strings that get compared and displayed.
+#define ETCS_LOG_LINE(type, msg, out, stamp) \
     do { \
         std::ostringstream etcs_log_ss_; \
+        if (stamp) etcs_log_ss_ << "[" << ETCS::log_stamp().text << "] "; \
         etcs_log_ss_ << "[" << getCurrentModulePath() << "::" << type << "] " << msg << "\n"; \
         (out) << etcs_log_ss_.str(); \
     } while (0)
@@ -125,10 +211,10 @@ namespace ETCS {
 // would not be one.
 #define ETCS_LOG_2(type, msg) \
     do { \
-        if (ETCS::log_sink) ETCS_LOG_LINE(type, msg, *ETCS::log_sink); \
+        if (ETCS::log_sink) ETCS_LOG_LINE(type, msg, *ETCS::log_sink, false); \
         else if (ETCS::log_to_file.load(std::memory_order_relaxed)) \
-                          { ETCS_LOG_LINE(type, msg, getModuleLog()); getModuleLog().flush(); } \
-        else              { ETCS_LOG_LINE(type, msg, std::cout); std::cout.flush(); } \
+                          { ETCS_LOG_LINE(type, msg, getModuleLog(), true); getModuleLog().flush(); } \
+        else              { ETCS_LOG_LINE(type, msg, std::cout, false); std::cout.flush(); } \
     } while (0)
 
 #define ETCS_LOG_1(msg) ETCS_LOG_2(this->myTag(), msg)
