@@ -119,12 +119,12 @@ inline const char* execute_status_name(ExecuteStatus s)
 struct ExecuteResult
 {
     ExecuteStatus status = ExecuteStatus::Ok;
-    std::string   message;
+    ::std::string   message;
 };
 
-struct ExecSource { std::string origin; size_t line_number; };
+struct ExecSource { ::std::string origin; size_t line_number; };
 
-inline void exec_log(const ExecSource& src, const std::string& msg)
+inline void exec_log(const ExecSource& src, const ::std::string& msg)
 {
     if (src.line_number > 0)
         { ETCS_LOG("CommandExecutor", "[" << src.origin << ":" << src.line_number << "] " << msg); }
@@ -133,11 +133,11 @@ inline void exec_log(const ExecSource& src, const std::string& msg)
 }
 
 // Follows the active ETCS_LOG sink when there is one, exactly as ETCS_LOG_2
-// does, rather than always taking std::cerr. Without this a redirected
+// does, rather than always taking ::std::cerr. Without this a redirected
 // session sees its successes and none of its failures.
-inline void exec_warn(const ExecSource& src, const std::string& msg)
+inline void exec_warn(const ExecSource& src, const ::std::string& msg)
 {
-    std::ostream& out = log_sink ? *log_sink : std::cerr;
+    ::std::ostream& out = log_sink ? *log_sink : ::std::cerr;
     if (src.line_number > 0)
         out << "[" << src.origin << ":" << src.line_number << "] " << msg << "\n";
     else
@@ -176,8 +176,8 @@ inline void exec_warn(const ExecSource& src, const std::string& msg)
 
 #ifdef ETCS_EXECUTOR_HOST
 
-inline const ETCS::RIDListHandle* get_handle(const std::string& module,
-                                             const std::string& tag)
+inline const ETCS::RIDListHandle* get_handle(const ::std::string& module,
+                                             const ::std::string& tag)
 {
     ETCS::Buffer key;
     key.writeString((module + ":" + tag).c_str());
@@ -192,7 +192,7 @@ inline const ETCS::RIDListHandle* get_handle(const std::string& module,
 // changeModule is the operation meant for this. Unconditional: changeModule
 // is a documented no-op for the module already attached. Roots only -- an
 // Entity's module is its type's origin, not a navigable slot.
-inline bool resolve_module(const std::string& module_name,
+inline bool resolve_module(const ::std::string& module_name,
                            const ExecSource& src, ETCS::LifetimeOwner entity)
 {
     try
@@ -202,38 +202,38 @@ inline bool resolve_module(const std::string& module_name,
 
         if (!ETCS::ResolveEvent{module_name.c_str(), entity}())
         {
-            exec_warn(src, std::string("Module '") + module_name + "' not available.");
+            exec_warn(src, ::std::string("Module '") + module_name + "' not available.");
             return false;
         }
     }
-    catch (const std::exception& ex)
+    catch (const ::std::exception& ex)
     {
-        exec_warn(src, std::string("Failed to load module '") + module_name + "': " + ex.what());
+        exec_warn(src, ::std::string("Failed to load module '") + module_name + "': " + ex.what());
         return false;
     }
     return true;
 }
 
-inline bool verify_tag(ETCS::LifetimeOwner entity, const std::string& module_name,
-                       const std::string& tag_name, const ExecSource& src)
+inline bool verify_tag(ETCS::LifetimeOwner entity, const ::std::string& module_name,
+                       const ::std::string& tag_name, const ExecSource& src)
 {
     const auto& tags = entity.module().getTags();
     for (const auto& t : tags)
         if (t.toString() == tag_name) return true;
-    exec_warn(src, std::string("Tag '") + tag_name + "' not found in module '"
+    exec_warn(src, ::std::string("Tag '") + tag_name + "' not found in module '"
               + module_name + "'.");
     return false;
 }
 
-inline ETCS::Entity* get_entity_by_rid(const std::string& module,
-                                       const std::string& tag,
+inline ETCS::Entity* get_entity_by_rid(const ::std::string& module,
+                                       const ::std::string& tag,
                                        ETCS::RID rid,
                                        const ExecSource& src)
 {
     const ETCS::RIDListHandle* handle = get_handle(module, tag);
     if (!handle)
     {
-        exec_warn(src, std::string("No ridlist for '") + module + "::" + tag + "'.");
+        exec_warn(src, ::std::string("No ridlist for '") + module + "::" + tag + "'.");
         return nullptr;
     }
     return handle->invoke_get(rid);
@@ -270,7 +270,7 @@ inline ETCS::Entity* resolve_bound_entity(const NameBinding& b)
 // spawn_entity — always creates. No name table consulted, no retarget.
 // PersistentNames' silent rebind-onto-a-matching-name is gone; a script that
 // wants the closure's entity says attach or ensure.
-inline ETCS::Entity* spawn_entity(const std::string& module, const std::string& tag,
+inline ETCS::Entity* spawn_entity(const ::std::string& module, const ::std::string& tag,
                                   ExecutionContext& ctx, const ExecSource& src)
 {
     if (!ctx.root_entity)
@@ -314,7 +314,7 @@ inline ETCS::Entity* spawn_entity(const std::string& module, const std::string& 
         if (m.parent != nullptr && m.parent->name != module)
         {
             if (!ctx.spawn_host)
-                ctx.spawn_host = std::make_shared<ETCS::Root>(
+                ctx.spawn_host = ::std::make_shared<ETCS::Root>(
                     ctx.sig ? *ctx.sig : ETCS::SignalContext{});
             ctx.spawn_host->changeModule(module);   // migrate in place
             host = ctx.spawn_host.get();
@@ -333,9 +333,9 @@ inline ETCS::Entity* spawn_entity(const std::string& module, const std::string& 
         evt.root = host;
         return evt();
     }
-    catch (const std::exception& ex)
+    catch (const ::std::exception& ex)
     {
-        exec_warn(src, std::string("spawn: ") + ex.what());
+        exec_warn(src, ::std::string("spawn: ") + ex.what());
         return nullptr;
     }
 }
@@ -351,7 +351,7 @@ inline ETCS::Entity* spawn_entity(const std::string& module, const std::string& 
 //
 // Called on THIS thread, never the ordering thread: the export blocks on an
 // AddTagEvent internally, which the ordering thread would have to service.
-inline ETCS::Entity* make_typed_child(const std::string& module, const std::string& tag,
+inline ETCS::Entity* make_typed_child(const ::std::string& module, const ::std::string& tag,
                                       ETCS::Entity* parent, const ExecSource& src)
 {
 #ifndef ETCS_LOADER
@@ -379,9 +379,9 @@ inline ETCS::Entity* make_typed_child(const std::string& module, const std::stri
     using MakeChildResolver = ETCS::MakeChildFunc (*)();
     ETCS::MakeChildFunc make_child = reinterpret_cast<MakeChildResolver>(addr)();
     try { return make_child(parent); }
-    catch (const std::exception& ex)
+    catch (const ::std::exception& ex)
     {
-        exec_warn(src, std::string("spawn/ensure child: ") + ex.what());
+        exec_warn(src, ::std::string("spawn/ensure child: ") + ex.what());
         return nullptr;
     }
 #endif  // ETCS_LOADER
@@ -399,7 +399,7 @@ struct ResolvedName
     NameBinding   binding;
 };
 
-inline std::optional<ResolvedName> resolve_receiver(const std::string& name,
+inline ::std::optional<ResolvedName> resolve_receiver(const ::std::string& name,
                                                     ExecutionContext& ctx,
                                                     const ExecSource& src)
 {
@@ -408,7 +408,7 @@ inline std::optional<ResolvedName> resolve_receiver(const std::string& name,
     {
         exec_warn(src, "'" + name + "' was never introduced in this script. A name "
                        "comes from requires, spawn, attach or ensure.");
-        return std::nullopt;
+        return ::std::nullopt;
     }
 
     ETCS::Entity* e = resolve_bound_entity(*b);
@@ -420,16 +420,16 @@ inline std::optional<ResolvedName> resolve_receiver(const std::string& name,
         if (ctx.owns(b->rid))
         {
             ctx.note_lost(b->rid);
-            exec_warn(src, "'" + name + "' (RID:" + std::to_string(b->rid)
+            exec_warn(src, "'" + name + "' (RID:" + ::std::to_string(b->rid)
                          + ") no longer resolves -- this script depends on it, so it "
                            "stops here.");
         }
         else
         {
-            exec_warn(src, "'" + name + "' (RID:" + std::to_string(b->rid)
+            exec_warn(src, "'" + name + "' (RID:" + ::std::to_string(b->rid)
                          + ") no longer resolves.");
         }
-        return std::nullopt;
+        return ::std::nullopt;
     }
 
     ResolvedName out;
@@ -457,25 +457,25 @@ inline std::optional<ResolvedName> resolve_receiver(const std::string& name,
 // which is the Vanished rule's business, not a stale-row problem -- and if a
 // name is both local and global they are different entities, so the local
 // dying says nothing about the global.
-inline std::optional<NameBinding> live_global(const std::string& name)
+inline ::std::optional<NameBinding> live_global(const ::std::string& name)
 {
     auto g = GlobalNames::getInstance().find(name);
-    if (!g) return std::nullopt;
+    if (!g) return ::std::nullopt;
     if (resolve_bound_entity(*g)) return g;
 
     GlobalNames::getInstance().forget(name);
     ETCS_LOG("CommandExecutor", "global '" << name << "' (RID:" << g->rid
              << ") no longer resolves -- forgetting it.");
-    return std::nullopt;
+    return ::std::nullopt;
 }
 
-inline std::optional<NameBinding> lookup_live(ExecutionContext& ctx,
-                                              const std::string& name)
+inline ::std::optional<NameBinding> lookup_live(ExecutionContext& ctx,
+                                              const ::std::string& name)
 {
     auto local = ctx.names.find(name);
     if (local != ctx.names.end())
         return resolve_bound_entity(local->second)
-             ? std::optional<NameBinding>(local->second) : std::nullopt;
+             ? ::std::optional<NameBinding>(local->second) : ::std::nullopt;
     return live_global(name);
 }
 
@@ -492,10 +492,10 @@ inline std::optional<NameBinding> lookup_live(ExecutionContext& ctx,
 // through verbatim, so the callee read a 0 RID and reported a missing
 // argument -- a comma silently changing what a call means, with the error
 // surfacing one layer away from the cause.
-inline std::string substitute_name_tokens(const std::string& payload,
+inline ::std::string substitute_name_tokens(const ::std::string& payload,
                                           ExecutionContext& ctx)
 {
-    std::string out;
+    ::std::string out;
     out.reserve(payload.size());
     bool in_single = false, in_double = false;
     size_t i = 0;
@@ -518,17 +518,17 @@ inline std::string substitute_name_tokens(const std::string& payload,
         size_t start = i + 1;
         size_t end   = start;
         while (end < payload.size()
-               && (std::isalnum(static_cast<unsigned char>(payload[end])) || payload[end] == '_'))
+               && (::std::isalnum(static_cast<unsigned char>(payload[end])) || payload[end] == '_'))
             ++end;
 
-        std::string name = payload.substr(start, end - start);
+        ::std::string name = payload.substr(start, end - start);
         ETCS::RID rid = name.empty() ? 0 : ctx.resolve_name(name);
         // Unresolved: emit the sigil and the name exactly as written and
         // carry on from the delimiter, which the loop copies like any other
         // byte. No npos case to special-case any more -- end is always a
         // real index or the payload length.
         if (rid == 0) out += payload.substr(i, end - i);
-        else          out += std::to_string(rid);
+        else          out += ::std::to_string(rid);
         i = end;
     }
     return out;
@@ -549,101 +549,101 @@ inline std::string substitute_name_tokens(const std::string& payload,
 // file's reference space is exactly "local directory + this one domain
 // folder", knowable from that file alone.
 // ---------------------------------------------------------------------------
-inline std::string peek_import_directive(const std::string& script_path)
+inline ::std::string peek_import_directive(const ::std::string& script_path)
 {
-    std::ifstream in(script_path);
+    ::std::ifstream in(script_path);
     if (!in.is_open()) return "";
-    std::string line;
-    if (!std::getline(in, line)) return "";   // line 1: shebang
-    if (!std::getline(in, line)) return "";
+    ::std::string line;
+    if (!::std::getline(in, line)) return "";   // line 1: shebang
+    if (!::std::getline(in, line)) return "";
     if (!line.empty() && line.back() == '\r') line.pop_back();
 
-    static const std::string kImportPrefix = "#IMPORT";
-    static const std::string kExportPrefix = "#EXPORT";
-    std::string prefix;
+    static const ::std::string kImportPrefix = "#IMPORT";
+    static const ::std::string kExportPrefix = "#EXPORT";
+    ::std::string prefix;
     if (line.compare(0, kImportPrefix.size(), kImportPrefix) == 0)      prefix = kImportPrefix;
     else if (line.compare(0, kExportPrefix.size(), kExportPrefix) == 0) prefix = kExportPrefix;
     else return "";
 
-    std::string rest = line.substr(prefix.size());
+    ::std::string rest = line.substr(prefix.size());
     size_t s = rest.find_first_not_of(" \t");
-    if (s == std::string::npos) return "";
+    if (s == ::std::string::npos) return "";
     size_t e = rest.find_last_not_of(" \t");
     return rest.substr(s, e - s + 1);
 }
 
 // Cached for the process's lifetime -- ACE_ROOT-relative directives would
 // otherwise spawn a subprocess on every single run/detach resolution.
-inline std::string get_ace_root()
+inline ::std::string get_ace_root()
 {
-    static std::string cached;
-    static std::once_flag once;
-    std::call_once(once, []()
+    static ::std::string cached;
+    static ::std::once_flag once;
+    ::std::call_once(once, []()
     {
         FILE* pipe = popen("ace root 2>/dev/null", "r");
         if (!pipe) return;
         char buf[4096];
-        std::string out;
+        ::std::string out;
         while (fgets(buf, sizeof(buf), pipe) != nullptr) out += buf;
         pclose(pipe);
         size_t end = out.find_last_not_of(" \t\r\n");
-        cached = (end == std::string::npos) ? "" : out.substr(0, end + 1);
+        cached = (end == ::std::string::npos) ? "" : out.substr(0, end + 1);
     });
     return cached;
 }
 
-inline std::string resolve_ace_root_placeholder(const std::string& raw_target)
+inline ::std::string resolve_ace_root_placeholder(const ::std::string& raw_target)
 {
-    static const std::string kPlaceholder = "ACE_ROOT";
+    static const ::std::string kPlaceholder = "ACE_ROOT";
     const bool is_ace_root_path =
         raw_target == kPlaceholder
         || raw_target.compare(0, kPlaceholder.size() + 1, kPlaceholder + "/") == 0;
     if (!is_ace_root_path) return raw_target;
 
-    std::string root = get_ace_root();
+    ::std::string root = get_ace_root();
     if (root.empty())
     {
-        std::cerr << "ACE_ROOT-relative import could not be resolved -- "
+        ::std::cerr << "ACE_ROOT-relative import could not be resolved -- "
                      "'ace root' is unavailable.\n";
         return "";
     }
-    std::string remainder = (raw_target.size() > kPlaceholder.size())
+    ::std::string remainder = (raw_target.size() > kPlaceholder.size())
         ? raw_target.substr(kPlaceholder.size() + 1)
         : "";
     if (!root.empty() && root.back() != '/') root += '/';
     return root + remainder;
 }
 
-inline std::string resolve_script_path(const std::string& origin,
-                                       const std::string& script_name)
+inline ::std::string resolve_script_path(const ::std::string& origin,
+                                       const ::std::string& script_name)
 {
     size_t slash = origin.find_last_of("/\\");
-    std::string script_dir = (slash != std::string::npos)
+    ::std::string script_dir = (slash != ::std::string::npos)
         ? origin.substr(0, slash + 1) : "./";
 
-    std::string local_candidate = script_dir + script_name;
-    { std::ifstream probe(local_candidate); if (probe.is_open()) return local_candidate; }
+    ::std::string local_candidate = script_dir + script_name;
+    { ::std::ifstream probe(local_candidate); if (probe.is_open()) return local_candidate; }
 
-    std::string raw_target = peek_import_directive(origin);
+    ::std::string raw_target = peek_import_directive(origin);
     if (raw_target.empty()) return local_candidate;
 
-    std::string import_target = resolve_ace_root_placeholder(raw_target);
+    ::std::string import_target = resolve_ace_root_placeholder(raw_target);
     if (import_target.empty()) return local_candidate;
 
-    std::string import_dir = (import_target.front() == '/')
+    ::std::string import_dir = (import_target.front() == '/')
         ? import_target : script_dir + import_target;
     if (!import_dir.empty() && import_dir.back() != '/') import_dir += '/';
     return import_dir + script_name;
 }
 
-inline std::string format_duration_ns(long long ns)
+inline ::std::string format_duration_ns(long long ns)
 {
-    std::ostringstream oss;
-    oss << std::fixed;
+    ::std::ostringstream oss;
+    oss << ::std::fixed;
     if (ns < 1'000)             { oss << ns << "ns"; }
-    else if (ns < 1'000'000)    { oss << std::setprecision(2) << (ns / 1'000.0) << "µs"; }
-    else if (ns < 1'000'000'000){ oss << std::setprecision(2) << (ns / 1'000'000.0) << "ms"; }
-    else                        { oss << std::setprecision(3) << (ns / 1e9) << "s"; }
+    else if (ns < 1'000'000)    { oss << ::std::setprecision(2) << (ns / 1'000.0) << "µs"; }
+    else if (ns < 1'000'000'000){ oss << ::std::setprecision(2) << (ns / 1'000'000.0) << "ms"; }
+    else                        { oss << ::std::setprecision(3) << (ns / 1e9) << "s"; }
     return oss.str();
 }
 
@@ -656,16 +656,16 @@ struct ScriptLine
     Command cmd;
 };
 
-inline bool read_script(std::istream& in, std::vector<ScriptLine>& out)
+inline bool read_script(::std::istream& in, ::std::vector<ScriptLine>& out)
 {
-    std::string line;
+    ::std::string line;
     size_t line_number = 0;
-    while (std::getline(in, line))
+    while (::std::getline(in, line))
     {
         ++line_number;
         if (!line.empty() && line.back() == '\r') line.pop_back();
         size_t s = line.find_first_not_of(" \t");
-        if (s == std::string::npos) continue;   // blank
+        if (s == ::std::string::npos) continue;   // blank
         if (line[s] == '#')         continue;   // comment / directive
         out.push_back(ScriptLine{line_number, parse_line(line)});
     }
@@ -710,30 +710,30 @@ inline bool read_script(std::istream& in, std::vector<ScriptLine>& out)
 // ===========================================================================
 struct PreflightName
 {
-    std::string module;
-    std::string tag;
+    ::std::string module;
+    ::std::string tag;
     bool        typed = false;   // false for a `requires` name: no type in the address slot
 };
 
-using PreflightScope = std::unordered_map<std::string, PreflightName>;
+using PreflightScope = ::std::unordered_map<::std::string, PreflightName>;
 
 struct PreflightReport
 {
-    std::vector<std::string> problems;   // refuse
-    std::vector<std::string> notes;      // annotate, but run
+    ::std::vector<::std::string> problems;   // refuse
+    ::std::vector<::std::string> notes;      // annotate, but run
     bool ok() const { return problems.empty(); }
 };
 
 namespace detail {
 
-inline std::string where(const std::string& path, size_t line)
+inline ::std::string where(const ::std::string& path, size_t line)
 {
-    return path + ":" + std::to_string(line);
+    return path + ":" + ::std::to_string(line);
 }
 
-inline std::string type_of(const PreflightName& n)
+inline ::std::string type_of(const PreflightName& n)
 {
-    return n.typed ? (n.module + "::" + n.tag) : std::string("(untyped)");
+    return n.typed ? (n.module + "::" + n.tag) : ::std::string("(untyped)");
 }
 
 // One script's own contribution, plus recursion into whatever it launches.
@@ -742,17 +742,17 @@ inline std::string type_of(const PreflightName& n)
 //             type the launching script knew for them
 //   globals   the ROOT script's own names. Visible to every script in the
 //             tree, at any depth, with no ancestor chain in between.
-inline void preflight_one(const std::string& path,
+inline void preflight_one(const ::std::string& path,
                           const PreflightScope& provided,
                           const PreflightScope& globals,
-                          std::vector<std::string> stack,
+                          ::std::vector<::std::string> stack,
                           PreflightReport& rep,
                           bool is_root)
 {
     for (const auto& seen : stack)
         if (seen == path)
         {
-            std::string chain;
+            ::std::string chain;
             for (const auto& s : stack) chain += s + " -> ";
             rep.problems.push_back("cycle: " + chain + path
                 + " -- with no branching there is no base case, so a cycle is "
@@ -761,13 +761,13 @@ inline void preflight_one(const std::string& path,
         }
     stack.push_back(path);
 
-    std::ifstream in(path);
+    ::std::ifstream in(path);
     if (!in.is_open())
     {
         rep.problems.push_back("cannot open '" + path + "'");
         return;
     }
-    std::vector<ScriptLine> lines;
+    ::std::vector<ScriptLine> lines;
     read_script(in, lines);
 
     // Names visible to this script. Locals shadow globals; there is nothing
@@ -785,9 +785,9 @@ inline void preflight_one(const std::string& path,
     // means. A name handed in on the launch line, or reached as a global, was
     // not introduced here -- a `requires` naming it is the script accepting
     // it, not declaring it a second time.
-    std::unordered_set<std::string> introduced_here;
+    ::std::unordered_set<::std::string> introduced_here;
 
-    auto visible = [&](const std::string& n) -> const PreflightName*
+    auto visible = [&](const ::std::string& n) -> const PreflightName*
     {
         auto it = local.find(n);
         if (it != local.end()) return &it->second;
@@ -801,7 +801,7 @@ inline void preflight_one(const std::string& path,
     //   still fires, since a leaf reusing the root's `web` is worth saying.
     // shadow_is_the_problem -- spawn, where any clash is already refused; the
     //   note would repeat it.
-    auto introduce = [&](const std::string& n, const PreflightName& pn, size_t line,
+    auto introduce = [&](const ::std::string& n, const PreflightName& pn, size_t line,
                          bool mismatch_reported = false,
                          bool shadow_is_the_problem = false)
     {
@@ -836,7 +836,7 @@ inline void preflight_one(const std::string& path,
     // line 2 may legitimately name something `requires`'d on line 40.
     for (const auto& sl : lines)
     {
-        if (const CmdRequires* r = std::get_if<CmdRequires>(&sl.cmd))
+        if (const CmdRequires* r = ::std::get_if<CmdRequires>(&sl.cmd))
         {
             const PreflightName* have = visible(r->name);
             if (!have)
@@ -850,21 +850,21 @@ inline void preflight_one(const std::string& path,
     // --- pass 2: everything else, in order --------------------------------
     for (const auto& sl : lines)
     {
-        if (const CmdError* e = std::get_if<CmdError>(&sl.cmd))
+        if (const CmdError* e = ::std::get_if<CmdError>(&sl.cmd))
         {
             rep.problems.push_back(where(path, sl.number) + ": " + e->message);
             continue;
         }
-        if (std::holds_alternative<CmdRequires>(sl.cmd)) continue;   // pass 1
+        if (::std::holds_alternative<CmdRequires>(sl.cmd)) continue;   // pass 1
 
-        auto need_receiver = [&](const std::string& n)
+        auto need_receiver = [&](const ::std::string& n)
         {
             if (!visible(n))
                 rep.problems.push_back(where(path, sl.number) + ": '" + n
                     + "' was never introduced in this script.");
         };
 
-        if (const CmdAcquire* a = std::get_if<CmdAcquire>(&sl.cmd))
+        if (const CmdAcquire* a = ::std::get_if<CmdAcquire>(&sl.cmd))
         {
             PreflightName pn{a->module, a->tag, true};
             if (a->verb == AcquireVerb::Spawn)
@@ -899,7 +899,7 @@ inline void preflight_one(const std::string& path,
             introduce(a->name, pn, sl.number, a->verb != AcquireVerb::Spawn,
                       a->verb == AcquireVerb::Spawn);
         }
-        else if (const CmdChildAcquire* ca = std::get_if<CmdChildAcquire>(&sl.cmd))
+        else if (const CmdChildAcquire* ca = ::std::get_if<CmdChildAcquire>(&sl.cmd))
         {
             need_receiver(ca->parent_name);
             if (ca->verb == AcquireVerb::Spawn)
@@ -917,30 +917,30 @@ inline void preflight_one(const std::string& path,
                       sl.number, ca->verb != AcquireVerb::Spawn,
                       ca->verb == AcquireVerb::Spawn);
         }
-        else if (const CmdAction* act = std::get_if<CmdAction>(&sl.cmd))
+        else if (const CmdAction* act = ::std::get_if<CmdAction>(&sl.cmd))
         {
             need_receiver(act->receiver);
             if (act->is_stream) need_receiver(act->consumer_receiver);
         }
-        else if (const CmdKill* k = std::get_if<CmdKill>(&sl.cmd))
+        else if (const CmdKill* k = ::std::get_if<CmdKill>(&sl.cmd))
         {
             need_receiver(k->receiver);
         }
-        else if (const CmdUnflag* u = std::get_if<CmdUnflag>(&sl.cmd))
+        else if (const CmdUnflag* u = ::std::get_if<CmdUnflag>(&sl.cmd))
         {
             need_receiver(u->receiver);
         }
-        else if (std::holds_alternative<CmdDetach>(sl.cmd)
-              || std::holds_alternative<CmdRun>(sl.cmd))
+        else if (::std::holds_alternative<CmdDetach>(sl.cmd)
+              || ::std::holds_alternative<CmdRun>(sl.cmd))
         {
-            const std::string& script =
-                std::holds_alternative<CmdDetach>(sl.cmd)
-                    ? std::get<CmdDetach>(sl.cmd).script
-                    : std::get<CmdRun>(sl.cmd).script;
+            const ::std::string& script =
+                ::std::holds_alternative<CmdDetach>(sl.cmd)
+                    ? ::std::get<CmdDetach>(sl.cmd).script
+                    : ::std::get<CmdRun>(sl.cmd).script;
             const auto& bindings =
-                std::holds_alternative<CmdDetach>(sl.cmd)
-                    ? std::get<CmdDetach>(sl.cmd).bindings
-                    : std::get<CmdRun>(sl.cmd).bindings;
+                ::std::holds_alternative<CmdDetach>(sl.cmd)
+                    ? ::std::get<CmdDetach>(sl.cmd).bindings
+                    : ::std::get<CmdRun>(sl.cmd).bindings;
 
             PreflightScope child_provided;
             for (const auto& [child_key, parent_key] : bindings)
@@ -956,7 +956,7 @@ inline void preflight_one(const std::string& path,
                 child_provided[child_key] = *have;
             }
 
-            std::string child_path = resolve_script_path(path, script);
+            ::std::string child_path = resolve_script_path(path, script);
             // The root's own names are the globals for the WHOLE tree, so
             // they are threaded down unchanged rather than accumulated as we
             // descend -- a script's parent's locals are deliberately not
@@ -973,7 +973,7 @@ inline void preflight_one(const std::string& path,
 
 // preflight_script_tree — the entry point. Call once, before executing the
 // root script; refuse to start if it does not pass.
-inline PreflightReport preflight_script_tree(const std::string& root_path,
+inline PreflightReport preflight_script_tree(const ::std::string& root_path,
                                              const PreflightScope& launch_bindings = {})
 {
     PreflightReport rep;
@@ -983,21 +983,21 @@ inline PreflightReport preflight_script_tree(const std::string& root_path,
     // resolve any leaf's `attach`/`requires` against them regardless of depth.
     PreflightScope globals = launch_bindings;
     {
-        std::ifstream in(root_path);
+        ::std::ifstream in(root_path);
         if (!in.is_open())
         {
             rep.problems.push_back("cannot open root script '" + root_path + "'");
             return rep;
         }
-        std::vector<ScriptLine> lines;
+        ::std::vector<ScriptLine> lines;
         read_script(in, lines);
         for (const auto& sl : lines)
         {
-            if (const CmdAcquire* a = std::get_if<CmdAcquire>(&sl.cmd))
+            if (const CmdAcquire* a = ::std::get_if<CmdAcquire>(&sl.cmd))
                 globals[a->name] = PreflightName{a->module, a->tag, true};
-            else if (const CmdChildAcquire* ca = std::get_if<CmdChildAcquire>(&sl.cmd))
+            else if (const CmdChildAcquire* ca = ::std::get_if<CmdChildAcquire>(&sl.cmd))
                 globals[ca->name] = PreflightName{ca->module, ca->tag, true};
-            else if (const CmdRequires* r = std::get_if<CmdRequires>(&sl.cmd))
+            else if (const CmdRequires* r = ::std::get_if<CmdRequires>(&sl.cmd))
                 if (!globals.count(r->name)) globals[r->name] = PreflightName{};
         }
     }
@@ -1006,7 +1006,7 @@ inline PreflightReport preflight_script_tree(const std::string& root_path,
     return rep;
 }
 
-inline void report_preflight(const PreflightReport& rep, const std::string& root_path)
+inline void report_preflight(const PreflightReport& rep, const ::std::string& root_path)
 {
     for (const auto& n : rep.notes)
         ETCS_LOG("CommandExecutor", "preflight note: " << n);
@@ -1017,7 +1017,7 @@ inline void report_preflight(const PreflightReport& rep, const std::string& root
                  << " and everything it launches resolve -- starting.");
         return;
     }
-    std::ostream& out = log_sink ? *log_sink : std::cerr;
+    ::std::ostream& out = log_sink ? *log_sink : ::std::cerr;
     out << "preflight: refusing to run '" << root_path << "' -- "
         << rep.problems.size() << " problem(s):\n";
     for (const auto& p : rep.problems) out << "  " << p << "\n";
@@ -1040,13 +1040,13 @@ inline void report_preflight(const PreflightReport& rep, const std::string& root
 struct DetachedExecutor
 {
     uint64_t        id = 0;
-    std::string     script;
+    ::std::string     script;
     SignalContext   local_sig;
     SignalFlag      local_interrupt{0};
     SignalFlag      local_terminate{0};
     SignalFlag      local_user1{0};
-    std::thread     thread;
-    std::atomic<bool> finished{false};
+    ::std::thread     thread;
+    ::std::atomic<bool> finished{false};
 
     DetachedExecutor()                                   = default;
     DetachedExecutor(const DetachedExecutor&)            = delete;
@@ -1055,15 +1055,15 @@ struct DetachedExecutor
 
 struct DetachedRegistry
 {
-    std::mutex                                     mutex_;
-    std::vector<std::unique_ptr<DetachedExecutor>> executors_;
-    std::atomic<uint64_t>                          next_id_{1};
+    ::std::mutex                                     mutex_;
+    ::std::vector<::std::unique_ptr<DetachedExecutor>> executors_;
+    ::std::atomic<uint64_t>                          next_id_{1};
 
-    DetachedExecutor* create(const std::string& script, SignalContext* parent_sig)
+    DetachedExecutor* create(const ::std::string& script, SignalContext* parent_sig)
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto exec = std::make_unique<DetachedExecutor>();
-        exec->id     = next_id_.fetch_add(1, std::memory_order_relaxed);
+        ::std::lock_guard<::std::mutex> lock(mutex_);
+        auto exec = ::std::make_unique<DetachedExecutor>();
+        exec->id     = next_id_.fetch_add(1, ::std::memory_order_relaxed);
         exec->script = script;
         exec->local_sig.tag       = ETCS::Buffer(("detach:" + script).c_str());
         exec->local_sig.interrupt = &exec->local_interrupt;
@@ -1107,50 +1107,50 @@ struct DetachedRegistry
             if (&e->local_sig == parent_sig) { exec->local_sig.setProvider(parent_sig); break; }
 
         DetachedExecutor* raw = exec.get();
-        executors_.push_back(std::move(exec));
+        executors_.push_back(::std::move(exec));
         return raw;
     }
 
-    void set_thread(DetachedExecutor* exec, std::thread t)
+    void set_thread(DetachedExecutor* exec, ::std::thread t)
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        exec->thread = std::move(t);
+        ::std::lock_guard<::std::mutex> lock(mutex_);
+        exec->thread = ::std::move(t);
     }
 
     bool terminate(uint64_t id)
     {
-        std::lock_guard<std::mutex> lock(mutex_);
+        ::std::lock_guard<::std::mutex> lock(mutex_);
         for (auto& e : executors_) if (e->id == id) { e->local_terminate = 1; return true; }
         return false;
     }
 
     bool interrupt(uint64_t id)
     {
-        std::lock_guard<std::mutex> lock(mutex_);
+        ::std::lock_guard<::std::mutex> lock(mutex_);
         for (auto& e : executors_) if (e->id == id) { e->local_interrupt = 1; return true; }
         return false;
     }
 
-    std::vector<std::pair<uint64_t, std::string>> list()
+    ::std::vector<::std::pair<uint64_t, ::std::string>> list()
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        std::vector<std::pair<uint64_t, std::string>> out;
+        ::std::lock_guard<::std::mutex> lock(mutex_);
+        ::std::vector<::std::pair<uint64_t, ::std::string>> out;
         for (auto& e : executors_) out.emplace_back(e->id, e->script);
         return out;
     }
 
     void join_all()
     {
-        std::lock_guard<std::mutex> lock(mutex_);
+        ::std::lock_guard<::std::mutex> lock(mutex_);
         for (auto& e : executors_) if (e->thread.joinable()) e->thread.join();
         executors_.clear();
     }
 
     bool all_finished()
     {
-        std::lock_guard<std::mutex> lock(mutex_);
+        ::std::lock_guard<::std::mutex> lock(mutex_);
         for (auto& e : executors_)
-            if (!e->finished.load(std::memory_order_acquire)) return false;
+            if (!e->finished.load(::std::memory_order_acquire)) return false;
         return true;
     }
 
@@ -1177,7 +1177,7 @@ struct RunSignalScope
     SignalFlag    local_user1{0};
     SignalContext local_sig;
 
-    RunSignalScope(const std::string& script, SignalContext* parent)
+    RunSignalScope(const ::std::string& script, SignalContext* parent)
     {
         local_sig.tag       = ETCS::Buffer(("run:" + script).c_str());
         local_sig.interrupt = &local_interrupt;
@@ -1191,8 +1191,8 @@ struct RunSignalScope
 
 // Forward declaration — run_script is defined below execute_command but
 // referenced inside the detach lambda.
-inline bool run_script(std::istream& in,
-                       const std::string& origin,
+inline bool run_script(::std::istream& in,
+                       const ::std::string& origin,
                        ExecutionContext& ctx,
                        ExecuteStatus* out_status = nullptr);
 
@@ -1213,10 +1213,10 @@ inline bool run_script(std::istream& in,
 // makes "root" as a name always mean "whichever Root is anchoring THIS
 // execution" rather than one entity threaded unchanged through every level.
 // ---------------------------------------------------------------------------
-inline bool resolve_run_bindings(const std::vector<std::pair<std::string,std::string>>& bindings,
+inline bool resolve_run_bindings(const ::std::vector<::std::pair<::std::string,::std::string>>& bindings,
                                  ExecutionContext& ctx,
                                  const ExecSource& src,
-                                 std::unordered_map<std::string, NameBinding>& out)
+                                 ::std::unordered_map<::std::string, NameBinding>& out)
 {
     if (!ctx.root_entity)
     {
@@ -1241,7 +1241,7 @@ inline bool resolve_run_bindings(const std::vector<std::pair<std::string,std::st
         if (!e)
         {
             exec_warn(src, "run/detach: '" + parent_key + "' (RID:"
-                         + std::to_string(nb.rid) + ") no longer resolves.");
+                         + ::std::to_string(nb.rid) + ") no longer resolves.");
             return false;
         }
         if (nb.tag.empty())
@@ -1274,22 +1274,22 @@ inline bool resolve_run_bindings(const std::vector<std::pair<std::string,std::st
 // All failures are reported together rather than one at a time: a caller
 // missing three bindings should learn that once.
 // ---------------------------------------------------------------------------
-inline bool check_requirements(const std::vector<ScriptLine>& lines,
+inline bool check_requirements(const ::std::vector<ScriptLine>& lines,
                                ExecutionContext& ctx,
-                               const std::string& origin)
+                               const ::std::string& origin)
 {
-    std::vector<std::string> unmet;
+    ::std::vector<::std::string> unmet;
 
     for (const auto& sl : lines)
     {
-        const CmdRequires* r = std::get_if<CmdRequires>(&sl.cmd);
+        const CmdRequires* r = ::std::get_if<CmdRequires>(&sl.cmd);
         if (!r) continue;
 
         ExecSource src{origin, sl.number};
         auto b = ETCS::lookup_live(ctx, r->name);
         if (!b)
         {
-            unmet.push_back("'" + r->name + "' (line " + std::to_string(sl.number)
+            unmet.push_back("'" + r->name + "' (line " + ::std::to_string(sl.number)
                 + ") was not passed in, and no root global provides it");
             continue;
         }
@@ -1298,24 +1298,24 @@ inline bool check_requirements(const std::vector<ScriptLine>& lines,
         ETCS::Entity* e = resolve_bound_entity(*b);
         if (!e) continue;
 
-        std::vector<std::string> missing;
+        ::std::vector<::std::string> missing;
         for (const auto& tag : r->tags)
             if (!e->hasTag(ETCS::Buffer(tag.c_str()))) missing.push_back(tag);
 
         if (!missing.empty())
         {
-            std::string list;
+            ::std::string list;
             for (size_t i = 0; i < missing.size(); ++i)
                 list += (i ? ", " : "") + missing[i];
 
-            std::vector<ETCS::Buffer> carried;
+            ::std::vector<ETCS::Buffer> carried;
             e->getTags(carried);
-            std::string has;
+            ::std::string has;
             for (size_t i = 0; i < carried.size(); ++i)
                 has += (i ? ", " : "") + carried[i].toString();
 
-            unmet.push_back("'" + r->name + "' (line " + std::to_string(sl.number)
-                + ") does not carry [" + list + "] -- RID:" + std::to_string(b->rid)
+            unmet.push_back("'" + r->name + "' (line " + ::std::to_string(sl.number)
+                + ") does not carry [" + list + "] -- RID:" + ::std::to_string(b->rid)
                 + " carries [" + has + "]");
             continue;
         }
@@ -1328,7 +1328,7 @@ inline bool check_requirements(const std::vector<ScriptLine>& lines,
 
     if (unmet.empty()) return true;
 
-    std::ostream& out = log_sink ? *log_sink : std::cerr;
+    ::std::ostream& out = log_sink ? *log_sink : ::std::cerr;
     out << "[" << origin << "] will not run -- " << unmet.size()
         << " unmet requirement(s):\n";
     for (const auto& u : unmet) out << "  " << u << "\n";
@@ -1345,14 +1345,14 @@ inline ExecuteResult execute_command(const Command& cmd,
 {
     (void)ctx;   // every arm touching it is #ifdef ETCS_EXECUTOR_HOST; a module build reads none
 
-    return std::visit([&](auto&& c) -> ExecuteResult
+    return ::std::visit([&](auto&& c) -> ExecuteResult
     {
-        using T = std::decay_t<decltype(c)>;
+        using T = ::std::decay_t<decltype(c)>;
 
-        if constexpr (std::is_same_v<T, CmdExit>)
+        if constexpr (::std::is_same_v<T, CmdExit>)
             return {ExecuteStatus::Exit, ""};
 
-        if constexpr (std::is_same_v<T, CmdError>)
+        if constexpr (::std::is_same_v<T, CmdError>)
         {
             ETCS::exec_warn(src, c.message);
             return {ExecuteStatus::Error, c.message};
@@ -1360,10 +1360,10 @@ inline ExecuteResult execute_command(const Command& cmd,
 
         // Checked as a whole file before line one runs (check_requirements).
         // Reaching one during execution means it has already been satisfied.
-        if constexpr (std::is_same_v<T, CmdRequires>)
+        if constexpr (::std::is_same_v<T, CmdRequires>)
             return {ExecuteStatus::Ok, ""};
 
-        if constexpr (std::is_same_v<T, CmdAcquire>)
+        if constexpr (::std::is_same_v<T, CmdAcquire>)
         {
 #ifdef ETCS_EXECUTOR_HOST
             if (ctx.introduced(c.name))
@@ -1381,10 +1381,10 @@ inline ExecuteResult execute_command(const Command& cmd,
                 if (auto clash = ETCS::lookup_live(ctx, c.name))
                 {
                     const bool local = ctx.introduced(c.name);
-                    std::string what = clash->tag.empty()
-                        ? std::string("RID:") + std::to_string(clash->rid)
+                    ::std::string what = clash->tag.empty()
+                        ? ::std::string("RID:") + ::std::to_string(clash->rid)
                         : clash->module + "::" + clash->tag
-                          + " RID:" + std::to_string(clash->rid);
+                          + " RID:" + ::std::to_string(clash->rid);
                     return {ExecuteStatus::Error,
                         "spawn '" + c.name + "': clobbering " + (local ? "local" : "global")
                         + " '" + c.name + "' (" + what + "). Did you mean attach/ensure instead?"};
@@ -1406,9 +1406,9 @@ inline ExecuteResult execute_command(const Command& cmd,
                 ETCS::Entity* e = ETCS::resolve_bound_entity(*existing);
                 if (e)
                 {
-                    const std::string have_mod = existing->module.empty()
+                    const ::std::string have_mod = existing->module.empty()
                         ? e->getSourceModule().toString() : existing->module;
-                    const std::string have_tag = existing->tag.empty()
+                    const ::std::string have_tag = existing->tag.empty()
                         ? e->getSourceTag().toString() : existing->tag;
 
                     if (have_mod != c.module || have_tag != c.tag)
@@ -1437,7 +1437,7 @@ inline ExecuteResult execute_command(const Command& cmd,
             return {ExecuteStatus::Ok, ""};
         }
 
-        if constexpr (std::is_same_v<T, CmdChildAcquire>)
+        if constexpr (::std::is_same_v<T, CmdChildAcquire>)
         {
 #ifdef ETCS_EXECUTOR_HOST
             // Same rule as top-level spawn -- a child spawn introduces a name
@@ -1450,7 +1450,7 @@ inline ExecuteResult execute_command(const Command& cmd,
                     return {ExecuteStatus::Error,
                         c.parent_name + ".spawn '" + c.name + "': clobbering "
                         + (local ? "local" : "global") + " '" + c.name + "' (RID:"
-                        + std::to_string(clash->rid) + "). Did you mean "
+                        + ::std::to_string(clash->rid) + "). Did you mean "
                         + c.parent_name + ".attach/.ensure instead?"};
                 }
             }
@@ -1473,7 +1473,7 @@ inline ExecuteResult execute_command(const Command& cmd,
                     ETCS::Entity* prior = ETCS::resolve_bound_entity(*existing);
                     if (prior && prior->getParent() == parent->entity)
                     {
-                        const std::string have_tag = prior->getSourceTag().toString();
+                        const ::std::string have_tag = prior->getSourceTag().toString();
                         if (have_tag != c.tag)
                             return {ExecuteStatus::Unmet,
                                 "'" + c.name + "' is a " + have_tag + " child, not a "
@@ -1506,7 +1506,7 @@ inline ExecuteResult execute_command(const Command& cmd,
             return {ExecuteStatus::Ok, ""};
         }
 
-        if constexpr (std::is_same_v<T, CmdUnflag>)
+        if constexpr (::std::is_same_v<T, CmdUnflag>)
         {
 #ifdef ETCS_EXECUTOR_HOST
             auto r = ETCS::resolve_receiver(c.receiver, ctx, src);
@@ -1518,9 +1518,9 @@ inline ExecuteResult execute_command(const Command& cmd,
             // names an active_scope_* label this reaches in and interrupts
             // that stream call's own SignalContext, not merely bookkeeping.
             try { r->entity->removeTag(ETCS::Buffer(c.flag.c_str())); }
-            catch (const std::exception& ex)
+            catch (const ::std::exception& ex)
             {
-                ETCS::exec_warn(src, std::string("unflag: ") + ex.what());
+                ETCS::exec_warn(src, ::std::string("unflag: ") + ex.what());
                 return {ExecuteStatus::Error, ex.what()};
             }
             ETCS_LOG("CommandExecutor", "unflag: removed '" << c.flag << "' from "
@@ -1529,7 +1529,7 @@ inline ExecuteResult execute_command(const Command& cmd,
             return {ExecuteStatus::Ok, ""};
         }
 
-        if constexpr (std::is_same_v<T, CmdKill>)
+        if constexpr (::std::is_same_v<T, CmdKill>)
         {
 #ifdef ETCS_EXECUTOR_HOST
             auto r = ETCS::resolve_receiver(c.receiver, ctx, src);
@@ -1547,7 +1547,7 @@ inline ExecuteResult execute_command(const Command& cmd,
                 if (!r->entity->interruptScopeAt(c.label, c.index))
                 {
                     ETCS::exec_warn(src, "kill: no live '" + c.label + "' at index "
-                                      + std::to_string(c.index) + ".");
+                                      + ::std::to_string(c.index) + ".");
                     return {ExecuteStatus::Ok, ""};
                 }
                 ETCS_LOG("CommandExecutor", "kill: interrupt requested for "
@@ -1569,7 +1569,7 @@ inline ExecuteResult execute_command(const Command& cmd,
             return {ExecuteStatus::Ok, ""};
         }
 
-        if constexpr (std::is_same_v<T, CmdAction>)
+        if constexpr (::std::is_same_v<T, CmdAction>)
         {
 #ifdef ETCS_EXECUTOR_HOST
             auto r = ETCS::resolve_receiver(c.receiver, ctx, src);
@@ -1610,7 +1610,7 @@ inline ExecuteResult execute_command(const Command& cmd,
                 prod_buf.write((r->binding.tag + "." + c.action).c_str());
                 cons_buf.write((cons->binding.tag + "." + c.consumer_action).c_str());
 
-                std::string payload = ETCS::substitute_name_tokens(c.payload, ctx);
+                ::std::string payload = ETCS::substitute_name_tokens(c.payload, ctx);
                 if (!payload.empty()) config.write(payload.c_str());
 
                 ETCS_LOG("CommandExecutor", c.receiver << "." << c.action
@@ -1618,9 +1618,9 @@ inline ExecuteResult execute_command(const Command& cmd,
                          << (payload.empty() ? "" : " [" + payload + "]"));
 
                 try { cons->entity->call(r->entity, prod_buf, cons_buf, config, *ctx.sig); }
-                catch (const std::exception& ex)
+                catch (const ::std::exception& ex)
                 {
-                    ETCS::exec_warn(src, std::string("stream error: ") + ex.what());
+                    ETCS::exec_warn(src, ::std::string("stream error: ") + ex.what());
                     return {ExecuteStatus::Error, ex.what()};
                 }
                 catch (...)
@@ -1641,7 +1641,7 @@ inline ExecuteResult execute_command(const Command& cmd,
                 // @name becomes a RID here, so a work function taking a <rid>
                 // argument (every filter/route registration) can be written by
                 // name rather than by a number copied out of a log.
-                std::string payload = ETCS::substitute_name_tokens(c.payload, ctx);
+                ::std::string payload = ETCS::substitute_name_tokens(c.payload, ctx);
 
                 ETCS::Buffer payload_buf;
                 if (!payload.empty()) payload_buf.write(payload.c_str());
@@ -1653,7 +1653,7 @@ inline ExecuteResult execute_command(const Command& cmd,
                 r->entity->call(act_buf, payload_buf, *ctx.sig);
                 ETCS_LOG("CommandExecutor", "[workFunc]: " << payload_buf);
             }
-            catch (const std::exception& ex)
+            catch (const ::std::exception& ex)
             {
                 ETCS::exec_warn(src, "action '" + c.action + "' on " + c.receiver
                                   + " (" + r->binding.module + "::" + r->binding.tag
@@ -1669,14 +1669,14 @@ inline ExecuteResult execute_command(const Command& cmd,
             return {ExecuteStatus::Ok, ""};
         }
 
-        if constexpr (std::is_same_v<T, CmdDetach>)
+        if constexpr (::std::is_same_v<T, CmdDetach>)
         {
 #ifdef ETCS_EXECUTOR_HOST
-            std::unordered_map<std::string, NameBinding> child_names;
+            ::std::unordered_map<::std::string, NameBinding> child_names;
             if (!ETCS::resolve_run_bindings(c.bindings, ctx, src, child_names))
                 return {ExecuteStatus::Error, "detach: binding resolution failed."};
  
-            std::string script_path = ETCS::resolve_script_path(src.origin, c.script);
+            ::std::string script_path = ETCS::resolve_script_path(src.origin, c.script);
             /*
  * IF THIS SCRIPT IS RUNNING UNDER A THREAD, THE JOB IS ITS CHILD.
  *
@@ -1741,15 +1741,15 @@ inline ExecuteResult execute_command(const Command& cmd,
             // shared root and the others got nothing. Each detached thread
             // now constructs its OWN fresh Root, and binds "root" to THAT
             // Root's RID.
-            std::thread child_thread([script_path, child_names, exec,
+            ::std::thread child_thread([script_path, child_names, exec,
                                       child_entity, child_sig]() mutable
             {
-                std::ifstream in(script_path);
+                ::std::ifstream in(script_path);
                 if (!in.is_open())
                 {
-                    std::cerr << "[CommandExecutor] detach: could not open '"
+                    ::std::cerr << "[CommandExecutor] detach: could not open '"
                               << script_path << "'\n";
-                    exec->finished.store(true, std::memory_order_release);
+                    exec->finished.store(true, ::std::memory_order_release);
                     return;
                 }
                 // The child Thread entity is this job's root when there is
@@ -1783,23 +1783,23 @@ inline ExecuteResult execute_command(const Command& cmd,
                     if (ETCS::resolve_bound_entity(b)) child_ctx.own(b.rid);
  
                 run_script(in, script_path, child_ctx);
-                exec->finished.store(true, std::memory_order_release);
+                exec->finished.store(true, ::std::memory_order_release);
             });
  
-            DetachedRegistry::getInstance().set_thread(exec, std::move(child_thread));
+            DetachedRegistry::getInstance().set_thread(exec, ::std::move(child_thread));
 #endif
             return {ExecuteStatus::Ok, ""};
         }
  
-        if constexpr (std::is_same_v<T, CmdRun>)
+        if constexpr (::std::is_same_v<T, CmdRun>)
         {
 #ifdef ETCS_EXECUTOR_HOST
-            std::unordered_map<std::string, NameBinding> child_names;
+            ::std::unordered_map<::std::string, NameBinding> child_names;
             if (!ETCS::resolve_run_bindings(c.bindings, ctx, src, child_names))
                 return {ExecuteStatus::Error, "run: binding resolution failed."};
  
-            std::string script_path = ETCS::resolve_script_path(src.origin, c.script);
-            std::ifstream in(script_path);
+            ::std::string script_path = ETCS::resolve_script_path(src.origin, c.script);
+            ::std::ifstream in(script_path);
             if (!in.is_open())
             {
                 ETCS::exec_warn(src, "run: could not open '" + script_path + "'");
@@ -1824,12 +1824,12 @@ inline ExecuteResult execute_command(const Command& cmd,
                 if (ETCS::resolve_bound_entity(b)) child_ctx.own(b.rid);
  
             ETCS_LOG("CommandExecutor", "run: " << script_path << " (blocking)");
-            auto t0 = std::chrono::steady_clock::now();
+            auto t0 = ::std::chrono::steady_clock::now();
             ExecuteStatus child_status = ExecuteStatus::Ok;
             bool ok = run_script(in, script_path, child_ctx, &child_status);
-            auto t1 = std::chrono::steady_clock::now();
-            std::string elapsed = ETCS::format_duration_ns(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+            auto t1 = ::std::chrono::steady_clock::now();
+            ::std::string elapsed = ETCS::format_duration_ns(
+                ::std::chrono::duration_cast<::std::chrono::nanoseconds>(t1 - t0).count());
 
             /*
  * THE CLOSURE IS THE ROOT'S, so what this run made joins the caller's record.
@@ -1896,7 +1896,7 @@ inline ExecuteResult execute_command(const Command& cmd,
             }
             else
             {
-                std::cerr << "  [run] " << c.script << " crashed after " << elapsed << "\n";
+                ::std::cerr << "  [run] " << c.script << " crashed after " << elapsed << "\n";
                 return {ExecuteStatus::Fatal, "run: child script hit a fatal error."};
             }
 #endif
@@ -1965,9 +1965,9 @@ inline size_t dissolve_closure(ExecutionContext& ctx, const ExecSource& src)
             e->getOwningArena().deleteEntity(e, true);
             ++gone;
         }
-        catch (const std::exception& ex)
+        catch (const ::std::exception& ex)
         {
-            exec_warn(src, std::string("dissolve: RID ") + std::to_string(rid)
+            exec_warn(src, ::std::string("dissolve: RID ") + ::std::to_string(rid)
                          + " refused deletion -- " + ex.what());
         }
     }
@@ -1979,30 +1979,30 @@ inline size_t dissolve_closure(ExecutionContext& ctx, const ExecSource& src)
 // ===========================================================================
 // run_script
 // ===========================================================================
-inline bool run_script(std::istream& in,
-                       const std::string& origin,
+inline bool run_script(::std::istream& in,
+                       const ::std::string& origin,
                        ExecutionContext& ctx,
                        ExecuteStatus* out_status)
 {
     if (out_status) *out_status = ExecuteStatus::Ok;
  
-    std::vector<ScriptLine> lines;
+    ::std::vector<ScriptLine> lines;
     read_script(in, lines);
  
     // Parse errors stop the file before any of it runs. Reported together --
     // a file with four typos should show four, not the first one four times.
     {
-        std::vector<const ScriptLine*> bad;
+        ::std::vector<const ScriptLine*> bad;
         for (const auto& sl : lines)
-            if (std::holds_alternative<CmdError>(sl.cmd)) bad.push_back(&sl);
+            if (::std::holds_alternative<CmdError>(sl.cmd)) bad.push_back(&sl);
         if (!bad.empty())
         {
-            std::ostream& out = log_sink ? *log_sink : std::cerr;
+            ::std::ostream& out = log_sink ? *log_sink : ::std::cerr;
             out << "[" << origin << "] will not run -- " << bad.size()
                 << " line(s) did not parse:\n";
             for (const auto* sl : bad)
                 out << "  line " << sl->number << ": "
-                    << std::get<CmdError>(sl->cmd).message << "\n";
+                    << ::std::get<CmdError>(sl->cmd).message << "\n";
             if (out_status) *out_status = ExecuteStatus::Error;
             return false;
         }
@@ -2037,7 +2037,7 @@ inline bool run_script(std::istream& in,
         {
             if (result.status != ExecuteStatus::Exit)
             {
-                exec_warn(src, std::string("stopping: ")
+                exec_warn(src, ::std::string("stopping: ")
                     + execute_status_name(result.status)
                     + (result.message.empty() ? "" : " -- " + result.message));
             }
@@ -2122,8 +2122,8 @@ inline bool run_script(std::istream& in,
             {
                 closure_ended = true;
                 ETCS_LOG("CommandExecutor", "closure " << why
-                         << (dissolved ? " (RID:" + std::to_string(dissolved) + " no longer resolves)"
-                                       : std::string())
+                         << (dissolved ? " (RID:" + ::std::to_string(dissolved) + " no longer resolves)"
+                                       : ::std::string())
                          << " -- " << (detached ? "winding up detached members before"
                                                 : "stopping")
                          << " the rest of " << origin << ".");
@@ -2137,17 +2137,17 @@ inline bool run_script(std::istream& in,
                         exec_warn(src, "closure has no interrupt authority on its active chain -- "
                                        "its detached members cannot be told to stop.");
 
-                    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                    const auto deadline = ::std::chrono::steady_clock::now() + ::std::chrono::seconds(5);
                     while (!DetachedRegistry::getInstance().all_finished())
                     {
-                        if (std::chrono::steady_clock::now() > deadline)
+                        if (::std::chrono::steady_clock::now() > deadline)
                         {
                             exec_warn(src, "closure drain timed out after 5s -- a detached member is "
                                            "not observing its interrupt. Continuing, but anything this "
                                            "script deletes below may still be referenced by it.");
                             break;
                         }
-                        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                        ::std::this_thread::sleep_for(::std::chrono::milliseconds(2));
                     }
                     DetachedRegistry::getInstance().join_all();
                 }
@@ -2211,7 +2211,7 @@ inline bool run_script(std::istream& in,
 // INVOCATION, not of a file: a script reached via detach/run has already been
 // checked as part of its root's tree, and re-checking it at every hop would
 // re-read the same files once per edge for no new information.
-inline bool run_root_script(const std::string& path,
+inline bool run_root_script(const ::std::string& path,
                             ExecutionContext& ctx,
                             ExecuteStatus* out_status = nullptr)
 {
@@ -2227,10 +2227,10 @@ inline bool run_root_script(const std::string& path,
         return false;
     }
  
-    std::ifstream in(path);
+    ::std::ifstream in(path);
     if (!in.is_open())
     {
-        std::cerr << "run_root_script: could not open '" << path << "'\n";
+        ::std::cerr << "run_root_script: could not open '" << path << "'\n";
         if (out_status) *out_status = ExecuteStatus::Error;
         return false;
     }
@@ -2271,7 +2271,7 @@ inline void run_control_session(int fd, SignalContext& session_ctx)
     if (!g_session_navigator)
     {
         const char* msg = "No navigator in this build -- closing.\n";
-        ::send(fd, msg, std::strlen(msg), 0);
+        ::send(fd, msg, ::std::strlen(msg), 0);
         ::close(fd);
         return;
     }
@@ -2279,7 +2279,7 @@ inline void run_control_session(int fd, SignalContext& session_ctx)
     ::close(fd);
 }
  
-inline void run_control_listener(const std::string& path, SignalContext& sig)
+inline void run_control_listener(const ::std::string& path, SignalContext& sig)
 {
     // A socket file left by a previous run would make bind() fail with
     // EADDRINUSE even though nothing holds it.
@@ -2288,8 +2288,8 @@ inline void run_control_listener(const std::string& path, SignalContext& sig)
     int lfd = ::socket(AF_UNIX, SOCK_STREAM, 0);
     if (lfd < 0)
     {
-        std::cerr << "[CommandExecutor] control listener: socket() failed: "
-                  << std::strerror(errno) << "\n";
+        ::std::cerr << "[CommandExecutor] control listener: socket() failed: "
+                  << ::std::strerror(errno) << "\n";
         return;
     }
  
@@ -2297,25 +2297,25 @@ inline void run_control_listener(const std::string& path, SignalContext& sig)
     addr.sun_family = AF_UNIX;
     if (path.size() >= sizeof(addr.sun_path))
     {
-        std::cerr << "[CommandExecutor] control listener: path too long ("
+        ::std::cerr << "[CommandExecutor] control listener: path too long ("
                   << path.size() << " >= " << sizeof(addr.sun_path) << ")\n";
         ::close(lfd);
         return;
     }
-    std::strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
+    ::std::strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
  
     if (::bind(lfd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0)
     {
-        std::cerr << "[CommandExecutor] control listener: bind('" << path
-                  << "') failed: " << std::strerror(errno) << "\n";
+        ::std::cerr << "[CommandExecutor] control listener: bind('" << path
+                  << "') failed: " << ::std::strerror(errno) << "\n";
         ::close(lfd);
         return;
     }
     // Owner only. Set after bind, since the socket file does not exist before it.
     if (::chmod(path.c_str(), S_IRUSR | S_IWUSR) < 0)
     {
-        std::cerr << "[CommandExecutor] control listener: chmod 0600 on '" << path
-                  << "' failed: " << std::strerror(errno)
+        ::std::cerr << "[CommandExecutor] control listener: chmod 0600 on '" << path
+                  << "' failed: " << ::std::strerror(errno)
                   << " -- refusing to listen on a socket whose permissions are "
                      "unknown.\n";
         ::close(lfd);
@@ -2324,8 +2324,8 @@ inline void run_control_listener(const std::string& path, SignalContext& sig)
     }
     if (::listen(lfd, 8) < 0)
     {
-        std::cerr << "[CommandExecutor] control listener: listen() failed: "
-                  << std::strerror(errno) << "\n";
+        ::std::cerr << "[CommandExecutor] control listener: listen() failed: "
+                  << ::std::strerror(errno) << "\n";
         ::close(lfd);
         ::unlink(path.c_str());
         return;
@@ -2344,22 +2344,22 @@ inline void run_control_listener(const std::string& path, SignalContext& sig)
         if (cfd < 0)
         {
             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue;
-            std::cerr << "[CommandExecutor] control listener: accept() failed: "
-                      << std::strerror(errno) << "\n";
+            ::std::cerr << "[CommandExecutor] control listener: accept() failed: "
+                      << ::std::strerror(errno) << "\n";
             break;
         }
  
-        const std::string label = "socket:" + path + "#" + std::to_string(++session_no);
+        const ::std::string label = "socket:" + path + "#" + ::std::to_string(++session_no);
         DetachedExecutor* exec = DetachedRegistry::getInstance().create(label, &sig);
         ETCS_LOG("CommandExecutor", "control listener: session opened ["
                  << exec->id << "] " << label);
  
-        std::thread session_thread([cfd, exec]()
+        ::std::thread session_thread([cfd, exec]()
         {
             run_control_session(cfd, exec->local_sig);
-            exec->finished.store(true, std::memory_order_release);
+            exec->finished.store(true, ::std::memory_order_release);
         });
-        DetachedRegistry::getInstance().set_thread(exec, std::move(session_thread));
+        DetachedRegistry::getInstance().set_thread(exec, ::std::move(session_thread));
     }
  
     ETCS_LOG("CommandExecutor", "control listener: closing '" << path << "'.");
@@ -2385,7 +2385,7 @@ inline void wait_for_environment_drain(SignalContext& sig)
                 "wait_for_environment_drain: signal received -- unblocking.");
             return;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        ::std::this_thread::sleep_for(::std::chrono::milliseconds(50));
     }
  
     ETCS_LOG("CommandExecutor",
@@ -2490,15 +2490,15 @@ inline bool& color_enabled()
 
 // prompt in, line out. Returns false when the source is finished (peer
 // closed, signal raised, stdin gone) -- every loop treats that as "leave".
-using ReplLineSource = std::function<bool(const std::string& prompt, std::string& out)>;
+using ReplLineSource = ::std::function<bool(const ::std::string& prompt, ::std::string& out)>;
 
 // Output helpers. ETCS_LOG already follows ETCS::log_sink; these are for the
 // handful of places that wrote to cout/cerr directly, which under a session
 // would have gone to the SERVER's console rather than to whoever typed the
 // command. thread_local sink, so a local terminal is unaffected and two
 // concurrent sessions never cross-talk.
-inline std::ostream& repl_out() { return ETCS::log_sink ? *ETCS::log_sink : std::cout; }
-inline std::ostream& repl_err() { return ETCS::log_sink ? *ETCS::log_sink : std::cerr; }
+inline ::std::ostream& repl_out() { return ETCS::log_sink ? *ETCS::log_sink : ::std::cout; }
+inline ::std::ostream& repl_err() { return ETCS::log_sink ? *ETCS::log_sink : ::std::cerr; }
 
 /*
  * A REPLY IS NOT A LOG LINE, and until the destination became switchable
@@ -2519,23 +2519,23 @@ inline std::ostream& repl_err() { return ETCS::log_sink ? *ETCS::log_sink : std:
 // Never stamped: this is a prompt, not a record -- see ETCS_LOG_LINE (Log.h).
 #define ETCS_SHELL(type, msg) ETCS_LOG_LINE(type, msg, repl_out(), false)
 
-inline bool repl_is_module(const std::filesystem::directory_entry& entry)
+inline bool repl_is_module(const ::std::filesystem::directory_entry& entry)
 {
     auto ext = entry.path().extension().string();
     return (ext == ".so" || ext == ".dll" || ext == ".dylib");
 }
 
-inline bool repl_iequals_prefix(const std::string& full, const std::string& partial)
+inline bool repl_iequals_prefix(const ::std::string& full, const ::std::string& partial)
 {
     if (partial.size() > full.size()) return false;
-    return std::equal(partial.begin(), partial.end(), full.begin(),
+    return ::std::equal(partial.begin(), partial.end(), full.begin(),
                       [](char a, char b) {
-                          return std::tolower((unsigned char)a)
-                              == std::tolower((unsigned char)b);
+                          return ::std::tolower((unsigned char)a)
+                              == ::std::tolower((unsigned char)b);
                       });
 }
 
-namespace fs = std::filesystem;
+namespace fs = ::std::filesystem;
 
 /*
  * PROCESS SIGNAL MACHINERY, WHICH IS NOT TERMINAL MACHINERY.
@@ -2549,20 +2549,20 @@ namespace fs = std::filesystem;
  * action loop called both.
  *
  * They exist to name an ordering once. These are ETCS::SignalFlag
- * (std::atomic), so `g_sig_int = 0` compiles as a seq_cst store and
+ * (::std::atomic), so `g_sig_int = 0` compiles as a seq_cst store and
  * `if (g_sig_int)` as a seq_cst load -- correct but stronger than needed, and
  * silently so.
  */
 inline void repl_clear_signal_flags()
 {
-    g_sig_int .store(0, std::memory_order_release);
-    g_sig_term.store(0, std::memory_order_release);
-    g_sig_usr1.store(0, std::memory_order_release);
+    g_sig_int .store(0, ::std::memory_order_release);
+    g_sig_term.store(0, ::std::memory_order_release);
+    g_sig_usr1.store(0, ::std::memory_order_release);
 }
 
 inline bool repl_sigint_raised()
 {
-    return g_sig_int.load(std::memory_order_acquire) != 0;
+    return g_sig_int.load(::std::memory_order_acquire) != 0;
 }
 
 /*
@@ -2644,8 +2644,8 @@ inline constexpr char SHELL_LINE_DONE = '-';
  * the caller owns it.
  */
 inline ETCS::Entity* ensure_session_shell(ETCS::Root& host, ETCS::SignalContext& sig,
-                                          const std::string& provider = "ShellProvider",
-                                          const std::string& tag      = "Shell")
+                                          const ::std::string& provider = "ShellProvider",
+                                          const ::std::string& tag      = "Shell")
 {
     ETCS::ExecutionContext env(&host, &sig);
     env.is_root = false;                  // its names are not a script's globals
@@ -2657,7 +2657,7 @@ inline ETCS::Entity* ensure_session_shell(ETCS::Root& host, ETCS::SignalContext&
         shell->call("Shell.Create", "", sig);
         return shell;
     }
-    catch (const std::exception&) { return nullptr; }
+    catch (const ::std::exception&) { return nullptr; }
 }
 #endif // ETCS_LOADER
 
@@ -2673,7 +2673,7 @@ inline ETCS::Entity* ensure_session_shell(ETCS::Root& host, ETCS::SignalContext&
  */
 inline ReplLineSource repl_shell_line_source(ETCS::Entity* shell, ETCS::SignalContext& sig)
 {
-    return [shell, &sig](const std::string& prompt, std::string& out) -> bool
+    return [shell, &sig](const ::std::string& prompt, ::std::string& out) -> bool
     {
         if (!shell) return false;
         if (sig.isInterrupted() || sig.isTerminated()) return false;
@@ -2682,9 +2682,9 @@ inline ReplLineSource repl_shell_line_source(ETCS::Entity* shell, ETCS::SignalCo
         data.writeString(prompt.c_str());
         shell->call(ETCS::Buffer("Shell.ReadLine"), data, sig);
 
-        const std::string reply = data.toString();
+        const ::std::string reply = data.toString();
         if (reply.empty() || reply[0] != ETCS::SHELL_LINE_OK) return false;
-        out.assign(reply, 1, std::string::npos);
+        out.assign(reply, 1, ::std::string::npos);
         return !(sig.isInterrupted() || sig.isTerminated());
     };
 }
@@ -2711,10 +2711,10 @@ inline ReplLineSource repl_shell_line_source(ETCS::Entity* shell, ETCS::SignalCo
 // Liveness is verified here rather than trusted -- nothing prunes an entry
 // when its entity dies, so a name whose target is gone is skipped instead of
 // shown as reachable.
-inline std::vector<std::pair<std::string, ETCS::NameBinding>>
-repl_live_globals_for_module(const std::string& mod_name)
+inline ::std::vector<::std::pair<::std::string, ETCS::NameBinding>>
+repl_live_globals_for_module(const ::std::string& mod_name)
 {
-    std::vector<std::pair<std::string, ETCS::NameBinding>> out;
+    ::std::vector<::std::pair<::std::string, ETCS::NameBinding>> out;
     auto& ridMap = ETCS::EventNode::getInstance().ridMap;
     for (auto& [name, b] : ETCS::GlobalNames::getInstance().snapshot())
     {
@@ -2727,7 +2727,7 @@ repl_live_globals_for_module(const std::string& mod_name)
         else
             ETCS::GlobalNames::getInstance().forget(name);   // dead: retract it
     }
-    std::sort(out.begin(), out.end(),
+    ::std::sort(out.begin(), out.end(),
               [](const auto& a, const auto& c) { return a.first < c.first; });
     return out;
 }
@@ -2743,8 +2743,8 @@ repl_live_globals_for_module(const std::string& mod_name)
 // The selected entity is bound under a fixed name so the Command values below
 // have a receiver to carry -- every command now names one, and the navigator
 // is not exempt just because a menu makes the target obvious.
-inline ETCS::ExecutionContext repl_nav_context(const std::string& mod_name,
-                                               const std::string& tag_name,
+inline ETCS::ExecutionContext repl_nav_context(const ::std::string& mod_name,
+                                               const ::std::string& tag_name,
                                                ETCS::RID rid,
                                                ETCS::Root& nav_root,
                                                ETCS::SignalContext& sig)
@@ -2757,7 +2757,7 @@ inline ETCS::ExecutionContext repl_nav_context(const std::string& mod_name,
     return ctx;
 }
 
-inline void repl_shell_print_dir(std::vector<std::string>& mods)
+inline void repl_shell_print_dir(::std::vector<::std::string>& mods)
 {
     mods.clear();
     ETCS_SHELL("Navigator", "\n" << COLOR_DIR << "[ " << fs::current_path().string()
@@ -2798,10 +2798,10 @@ inline void repl_shell_print_dir(std::vector<std::string>& mods)
 //
 // Appends onto the same all_mods vector repl_shell_print_dir filled, so
 // numeric selection keeps working unchanged.
-inline void repl_shell_print_live_modules(std::vector<std::string>& all_mods)
+inline void repl_shell_print_live_modules(::std::vector<::std::string>& all_mods)
 {
-    std::unordered_set<std::string> already(all_mods.begin(), all_mods.end());
-    std::vector<std::string> live_only;
+    ::std::unordered_set<::std::string> already(all_mods.begin(), all_mods.end());
+    ::std::vector<::std::string> live_only;
 
     auto& registry = ETCS::EventNode::getInstance().stream.module_registry;
     for (const auto& [name, mod_ptr] : registry)
@@ -2810,7 +2810,7 @@ inline void repl_shell_print_live_modules(std::vector<std::string>& all_mods)
         if (already.count(name)) continue;
         live_only.push_back(name);
     }
-    std::sort(live_only.begin(), live_only.end());
+    ::std::sort(live_only.begin(), live_only.end());
     if (live_only.empty()) return;
 
     ETCS_SHELL("Navigator", COLOR_LIB
@@ -2820,7 +2820,7 @@ inline void repl_shell_print_live_modules(std::vector<std::string>& all_mods)
         ETCS_SHELL("Navigator", COLOR_LIB << "  [" << all_mods.size() + i << "] "
                  << live_only[i] << COLOR_RESET);
     }
-    for (auto& m : live_only) all_mods.push_back(std::move(m));
+    for (auto& m : live_only) all_mods.push_back(::std::move(m));
 }
 
 // ── Action loop ─────────────────────────────────────────────────────────────
@@ -2858,27 +2858,27 @@ inline void repl_shell_print_live_modules(std::vector<std::string>& all_mods)
  *
  * Returns true if the line WAS a log command, so each loop can `continue`.
  */
-inline bool repl_handle_log(const std::string& line, const std::string& here)
+inline bool repl_handle_log(const ::std::string& line, const ::std::string& here)
 {
     if (line != "log" && line.rfind("log ", 0) != 0) return false;
 
-    std::string rest = (line.size() > 4) ? line.substr(4) : "";
+    ::std::string rest = (line.size() > 4) ? line.substr(4) : "";
     {
         size_t b0 = rest.find_first_not_of(" \t");
         size_t b1 = rest.find_last_not_of(" \t");
-        rest = (b0 == std::string::npos) ? "" : rest.substr(b0, b1 - b0 + 1);
+        rest = (b0 == ::std::string::npos) ? "" : rest.substr(b0, b1 - b0 + 1);
     }
 
     // "<target> <where>" or just one word. A lone "file"/"term" targets `here`.
-    std::string target, where;
+    ::std::string target, where;
     {
         size_t sp = rest.find_first_of(" \t");
-        if (sp == std::string::npos) where = rest;
+        if (sp == ::std::string::npos) where = rest;
         else { target = rest.substr(0, sp);
                size_t b0 = rest.find_first_not_of(" \t", sp);
-               where = (b0 == std::string::npos) ? "" : rest.substr(b0); }
+               where = (b0 == ::std::string::npos) ? "" : rest.substr(b0); }
     }
-    auto is_dest = [](const std::string& s)
+    auto is_dest = [](const ::std::string& s)
         { return s == "file" || s == "term" || s == "terminal"; };
     // "log RenderProvider" with no destination is a status query, not a typo.
     if (target.empty() && !where.empty() && !is_dest(where) && where != "status" && where != "all")
@@ -2895,7 +2895,7 @@ inline bool repl_handle_log(const std::string& line, const std::string& here)
                            << "' is not a loaded module" << COLOR_RESET << "\n";
             else
                 ETCS_SHELL("Navigator", COLOR_DIR << "log " << target << ": "
-                         << (f ? "logs/" + target + ".log" : std::string("terminal"))
+                         << (f ? "logs/" + target + ".log" : ::std::string("terminal"))
                          << COLOR_RESET);
             return true;
         }
@@ -2906,20 +2906,20 @@ inline bool repl_handle_log(const std::string& line, const std::string& here)
         // The COLOR_* macros are ternaries rather than string literals (they
         // ask isatty), so they cannot be juxtaposed into one -- this is built
         // once instead of pasted at each row.
-        const std::string mark = std::string(COLOR_RID) + "   (you are here)" + COLOR_RESET;
-        const std::string none;
+        const ::std::string mark = ::std::string(COLOR_RID) + "   (you are here)" + COLOR_RESET;
+        const ::std::string none;
 
         ETCS_SHELL("Navigator", COLOR_DIR << "log destinations:" << COLOR_RESET);
         ETCS_SHELL("Navigator", COLOR_LIB << "  loader" << COLOR_RESET << "  -> "
                  << (ETCS::log_destination_is_file() ? "logs/<loader>.log"
-                                                     : std::string("terminal"))
+                                                     : ::std::string("terminal"))
                  << (here.empty() ? mark : none));
-        for (const std::string& s : ETCS::module_log_scopes())
+        for (const ::std::string& s : ETCS::module_log_scopes())
         {
             bool found = false;
             const bool f = ETCS::module_log_destination_is_file(s, found);
             ETCS_SHELL("Navigator", COLOR_LIB << "  " << s << COLOR_RESET << "  -> "
-                     << (f ? "logs/" + s + ".log" : std::string("terminal"))
+                     << (f ? "logs/" + s + ".log" : ::std::string("terminal"))
                      << (s == here ? mark : none));
         }
         ETCS_SHELL("Navigator", COLOR_DIR
@@ -2946,7 +2946,7 @@ inline bool repl_handle_log(const std::string& line, const std::string& here)
     }
 
     // No target named: the one you are standing in.
-    const std::string scope = target.empty() ? here : target;
+    const ::std::string scope = target.empty() ? here : target;
 
     if (scope.empty())
     {
@@ -2967,7 +2967,7 @@ inline bool repl_handle_log(const std::string& line, const std::string& here)
         return true;
     }
     ETCS_SHELL("Navigator", COLOR_LIB << "log " << scope << " -> "
-             << (to_file ? "logs/" + scope + ".log" : std::string("this terminal"))
+             << (to_file ? "logs/" + scope + ".log" : ::std::string("this terminal"))
              << COLOR_RESET);
     return true;
 }
@@ -2979,8 +2979,8 @@ inline void repl_shell_action_loop(ETCS::Entity* e, ETCS::Root& nav_root,
 
     // Derived from the entity, never passed in -- getSourceModule/Tag are
     // already the authoritative identity (setModuleSource at attach time).
-    const std::string mod_name = e->getSourceModule().toString();
-    const std::string tag_name = e->getSourceTag().toString();
+    const ::std::string mod_name = e->getSourceModule().toString();
+    const ::std::string tag_name = e->getSourceTag().toString();
 
     // e->module_.catalog(), not nav_root's: every live entity carries its own
     // attached module_ token from construction.
@@ -2994,7 +2994,7 @@ inline void repl_shell_action_loop(ETCS::Entity* e, ETCS::Root& nav_root,
     }
     const ETCS::ModuleBundle& bundle = cat_it->second;
 
-    std::vector<std::pair<ETCS::Buffer, ETCS::WorkBundle>> action_list;
+    ::std::vector<::std::pair<ETCS::Buffer, ETCS::WorkBundle>> action_list;
     for (const auto& pair : bundle.actions)
         action_list.emplace_back(pair.first, pair.second);
 
@@ -3013,7 +3013,7 @@ inline void repl_shell_action_loop(ETCS::Entity* e, ETCS::Root& nav_root,
         return it->second.invoke_get(target_rid);
     };
 
-    auto resolve_other = [](const std::string& m, const std::string& t,
+    auto resolve_other = [](const ::std::string& m, const ::std::string& t,
                             ETCS::RID rid) -> ETCS::Entity*
     {
         ETCS::Buffer key;
@@ -3038,7 +3038,7 @@ inline void repl_shell_action_loop(ETCS::Entity* e, ETCS::Root& nav_root,
 
         // Identity, not pointer -- `parent` goes stale across the read below
         // exactly like `e` does, and the `up` branch dereferences it after.
-        std::string  parent_mod, parent_tag;
+        ::std::string  parent_mod, parent_tag;
         ETCS::RID    parent_rid = 0;
         if (ETCS::Entity* parent = e->getParent())
         {
@@ -3050,7 +3050,7 @@ inline void repl_shell_action_loop(ETCS::Entity* e, ETCS::Root& nav_root,
                 << " [RID:" << COLOR_RID << parent_rid << COLOR_RESET << "]");
         }
 
-        std::vector<std::pair<ETCS::Buffer, ETCS::RID>> children;
+        ::std::vector<::std::pair<ETCS::Buffer, ETCS::RID>> children;
         e->getTypedChildren(children);
         if (!children.empty())
         {
@@ -3080,7 +3080,7 @@ inline void repl_shell_action_loop(ETCS::Entity* e, ETCS::Root& nav_root,
         // navigator and scripts cannot drift in behavior. Neither is script
         // syntax -- a script writes `<name>.kill(Listen)`, because a script
         // has a name for its entity and this menu has a selection.
-        std::vector<ETCS::Scope::View> scopes;
+        ::std::vector<ETCS::Scope::View> scopes;
         e->collectScopes(scopes);
         if (!scopes.empty())
         {
@@ -3095,7 +3095,7 @@ inline void repl_shell_action_loop(ETCS::Entity* e, ETCS::Root& nav_root,
                 "  [s<n>] Interrupt by position   [kill <label> [index]] Interrupt directly");
         }
 
-        std::string a_in;
+        ::std::string a_in;
         if (!in(tag_name + " Act> ", a_in)) break;
         if (a_in == "back")                   { break; }
         if (a_in == "exit" || a_in == "quit") { return; }
@@ -3138,10 +3138,10 @@ inline void repl_shell_action_loop(ETCS::Entity* e, ETCS::Root& nav_root,
             continue;
         }
 
-        if (a_in.size() > 1 && a_in[0] == 'c' && std::isdigit((unsigned char)a_in[1]))
+        if (a_in.size() > 1 && a_in[0] == 'c' && ::std::isdigit((unsigned char)a_in[1]))
         {
             try {
-                size_t idx = std::stoul(a_in.substr(1));
+                size_t idx = ::std::stoul(a_in.substr(1));
                 if (idx < children.size())
                 {
                     // getTypedChild is a RID lookup -- re-resolved already.
@@ -3185,10 +3185,10 @@ inline void repl_shell_action_loop(ETCS::Entity* e, ETCS::Root& nav_root,
         // be spelled s0 -- exactly why back/up/kill are safe too. No
         // disambiguation check here on purpose; adding one would imply the
         // runtime permits something it actually forbids.
-        if (a_in.size() > 1 && a_in[0] == 's' && std::isdigit((unsigned char)a_in[1]))
+        if (a_in.size() > 1 && a_in[0] == 's' && ::std::isdigit((unsigned char)a_in[1]))
         {
             try {
-                size_t idx = std::stoul(a_in.substr(1));
+                size_t idx = ::std::stoul(a_in.substr(1));
                 if (idx < scopes.size())
                 {
                     ETCS::ExecutionContext kctx =
@@ -3221,9 +3221,9 @@ inline void repl_shell_action_loop(ETCS::Entity* e, ETCS::Root& nav_root,
         if (a_in.rfind("kill", 0) == 0
             && (a_in.size() == 4 || a_in[4] == ' ' || a_in[4] == '\t'))
         {
-            std::string rest = (a_in.size() > 4) ? a_in.substr(5) : "";
+            ::std::string rest = (a_in.size() > 4) ? a_in.substr(5) : "";
             size_t rb = rest.find_first_not_of(" \t");
-            rest = (rb == std::string::npos) ? "" : rest.substr(rb);
+            rest = (rb == ::std::string::npos) ? "" : rest.substr(rb);
             if (rest.empty())
             {
                 repl_err() << COLOR_WARN
@@ -3234,18 +3234,18 @@ inline void repl_shell_action_loop(ETCS::Entity* e, ETCS::Root& nav_root,
             ETCS::CmdKill kcmd;
             kcmd.receiver = "self";
             size_t sp2 = rest.find_first_of(" \t");
-            kcmd.label = (sp2 == std::string::npos) ? rest : rest.substr(0, sp2);
-            if (sp2 != std::string::npos)
+            kcmd.label = (sp2 == ::std::string::npos) ? rest : rest.substr(0, sp2);
+            if (sp2 != ::std::string::npos)
             {
-                std::string idx_str = rest.substr(sp2 + 1);
+                ::std::string idx_str = rest.substr(sp2 + 1);
                 size_t ib = idx_str.find_first_not_of(" \t");
-                idx_str = (ib == std::string::npos) ? "" : idx_str.substr(ib);
+                idx_str = (ib == ::std::string::npos) ? "" : idx_str.substr(ib);
                 if (!idx_str.empty())
                 {
                     try {
                         size_t end;
-                        kcmd.index = static_cast<size_t>(std::stoull(idx_str, &end));
-                        if (end != idx_str.size()) throw std::invalid_argument("trailing");
+                        kcmd.index = static_cast<size_t>(::std::stoull(idx_str, &end));
+                        if (end != idx_str.size()) throw ::std::invalid_argument("trailing");
                         kcmd.has_index = true;
                     } catch (...) {
                         repl_err() << COLOR_WARN << "kill: invalid index '" << idx_str
@@ -3269,18 +3269,18 @@ inline void repl_shell_action_loop(ETCS::Entity* e, ETCS::Root& nav_root,
         // brackets exist in the script grammar to remove an ambiguity about
         // where a payload starts; here there is no selector to confuse it
         // with, because the selection is the menu.
-        std::string action_str = a_in;
-        std::string payload_str;
+        ::std::string action_str = a_in;
+        ::std::string payload_str;
         size_t sp = a_in.find(' ');
-        if (sp != std::string::npos)
+        if (sp != ::std::string::npos)
         {
             action_str  = a_in.substr(0, sp);
             payload_str = a_in.substr(sp + 1);
         }
-        if (!action_str.empty() && std::isdigit((unsigned char)action_str[0]))
+        if (!action_str.empty() && ::std::isdigit((unsigned char)action_str[0]))
         {
             try {
-                size_t idx = std::stoul(action_str);
+                size_t idx = ::std::stoul(action_str);
                 if (idx < action_list.size())
                     action_str = action_list[idx].first.toString();
             } catch (...) {}
@@ -3305,7 +3305,7 @@ inline void repl_shell_action_loop(ETCS::Entity* e, ETCS::Root& nav_root,
         if (repl_owns_console && repl_sigint_raised())
         {
             ETCS_SHELL("Navigator", COLOR_WARN << "\n[SIGNAL] Action interrupted." << COLOR_RESET);
-            g_sig_int.store(0, std::memory_order_release);
+            g_sig_int.store(0, ::std::memory_order_release);
         }
         e = resolve_self();
         if (!e)
@@ -3319,7 +3319,7 @@ inline void repl_shell_action_loop(ETCS::Entity* e, ETCS::Root& nav_root,
 }
 
 // ── Instance loop ───────────────────────────────────────────────────────────
-inline void repl_shell_instance_loop(const std::string& mod_name, const std::string& tag_name,
+inline void repl_shell_instance_loop(const ::std::string& mod_name, const ::std::string& tag_name,
                                      ETCS::Root& nav_root, ETCS::SignalContext& sig,
                                      ReplLineSource& in)
 {
@@ -3340,7 +3340,7 @@ inline void repl_shell_instance_loop(const std::string& mod_name, const std::str
             return;
         }
 
-        std::vector<ETCS::RID> live_rids;
+        ::std::vector<ETCS::RID> live_rids;
         handle->invoke_collect_rids(live_rids);
 
         ETCS_SHELL("Navigator", "\n--- Live instances of " << COLOR_LIB << tag_name
@@ -3358,7 +3358,7 @@ inline void repl_shell_instance_loop(const std::string& mod_name, const std::str
             auto named_here = repl_live_globals_for_module(mod_name);
             for (size_t i = 0; i < live_rids.size(); ++i)
             {
-                std::string alias;
+                ::std::string alias;
                 for (auto& [name, b] : named_here)
                     if (b.tag == tag_name && b.rid == live_rids[i])
                         { alias = " (" + name + ")"; break; }
@@ -3370,7 +3370,7 @@ inline void repl_shell_instance_loop(const std::string& mod_name, const std::str
             "  [n] Select   [spawn <name>] Create and name   [log file|term] This module"
             "   [back] Return");
 
-        std::string i_in;
+        ::std::string i_in;
         if (!in(tag_name + " Inst> ", i_in)) break;
         if (i_in == "back")                   { break; }
         if (i_in == "exit" || i_in == "quit") { return; }
@@ -3391,10 +3391,10 @@ inline void repl_shell_instance_loop(const std::string& mod_name, const std::str
         // them by attach/ensure/requires with no binding threaded down.
         if (i_in == "spawn" || i_in.rfind("spawn ", 0) == 0)
         {
-            std::string sname = (i_in.size() > 5) ? i_in.substr(6) : "";
+            ::std::string sname = (i_in.size() > 5) ? i_in.substr(6) : "";
             size_t nb = sname.find_first_not_of(" \t");
             size_t ne = sname.find_last_not_of(" \t");
-            sname = (nb == std::string::npos) ? "" : sname.substr(nb, ne - nb + 1);
+            sname = (nb == ::std::string::npos) ? "" : sname.substr(nb, ne - nb + 1);
 
             if (sname.empty())
             {
@@ -3409,7 +3409,7 @@ inline void repl_shell_instance_loop(const std::string& mod_name, const std::str
             // every navigator dispatch binds the selection under it.
             bool valid = (sname != "root" && sname != "self");
             for (char c : sname)
-                if (!std::isalnum((unsigned char)c) && c != '_') { valid = false; break; }
+                if (!::std::isalnum((unsigned char)c) && c != '_') { valid = false; break; }
             if (!valid)
             {
                 repl_err() << COLOR_WARN << "spawn: '" << sname
@@ -3451,10 +3451,10 @@ inline void repl_shell_instance_loop(const std::string& mod_name, const std::str
             continue;
         }
 
-        if (!i_in.empty() && std::isdigit((unsigned char)i_in[0]))
+        if (!i_in.empty() && ::std::isdigit((unsigned char)i_in[0]))
         {
             try {
-                size_t idx = std::stoul(i_in);
+                size_t idx = ::std::stoul(i_in);
                 if (idx < live_rids.size())
                 {
                     ETCS::Entity* e = handle->invoke_get(live_rids[idx]);
@@ -3477,11 +3477,11 @@ inline void repl_shell_instance_loop(const std::string& mod_name, const std::str
 
 // ── Tag loop ────────────────────────────────────────────────────────────────
 // nav_root's module_ is already bound by repl_shell_loop_with before this runs.
-inline void repl_shell_tag_loop(const std::string& mod_name, ETCS::Root& nav_root,
+inline void repl_shell_tag_loop(const ::std::string& mod_name, ETCS::Root& nav_root,
                                 ETCS::SignalContext& sig, ReplLineSource& in)
 {
     bool detach_module = false;
-    const std::vector<ETCS::Buffer>& tags = nav_root.module_.getTags();
+    const ::std::vector<ETCS::Buffer>& tags = nav_root.module_.getTags();
 
     while (true)
     {
@@ -3521,7 +3521,7 @@ inline void repl_shell_tag_loop(const std::string& mod_name, ETCS::Root& nav_roo
         ETCS_SHELL("Navigator",
             "  [back] Return   [detach] Detach   [log file|term] This module   [exit] Quit");
 
-        std::string t_in;
+        ::std::string t_in;
         if (!in(mod_name + " Tag> ", t_in)) break;
         if (t_in.empty()) continue;
 
@@ -3533,11 +3533,11 @@ inline void repl_shell_tag_loop(const std::string& mod_name, ETCS::Root& nav_roo
         if (t_in == "detach") { detach_module = true; break; }
         if (t_in == "exit" || t_in == "quit") { return; }
 
-        std::string tag_name = t_in;
+        ::std::string tag_name = t_in;
         try {
-            if (!t_in.empty() && std::isdigit((unsigned char)t_in[0]))
+            if (!t_in.empty() && ::std::isdigit((unsigned char)t_in[0]))
             {
-                size_t idx = std::stoul(t_in);
+                size_t idx = ::std::stoul(t_in);
                 if (idx < tags.size()) tag_name = tags[idx].toString();
             }
         } catch (...) {}
@@ -3576,12 +3576,12 @@ inline void repl_shell_loop_with(ETCS::SignalContext& sig, ReplLineSource& in)
 {
     while (!(sig.isInterrupted() || sig.isTerminated()))
     {
-        std::vector<std::string> available_mods;
+        ::std::vector<::std::string> available_mods;
         repl_shell_print_dir(available_mods);
         repl_shell_print_live_modules(available_mods);
         ETCS_SHELL("Navigator", "--------------------------------------------------------");
 
-        std::string mod_input;
+        ::std::string mod_input;
         if (!in("Root> ", mod_input)) break;
         if (mod_input == "exit" || mod_input == "quit") break;
         if (mod_input.empty()) continue;
@@ -3589,7 +3589,7 @@ inline void repl_shell_loop_with(ETCS::SignalContext& sig, ReplLineSource& in)
         if (mod_input.substr(0, 3) == "cd ")
         {
             try { fs::current_path(mod_input.substr(3)); }
-            catch (const std::exception& e)
+            catch (const ::std::exception& e)
                 { repl_err() << COLOR_WARN << "CD Error: " << e.what() << COLOR_RESET << "\n"; }
             continue;
         }
@@ -3616,15 +3616,15 @@ inline void repl_shell_loop_with(ETCS::SignalContext& sig, ReplLineSource& in)
 
         if (mod_input.rfind("signal ", 0) == 0)
         {
-            std::string rest = mod_input.substr(7);
+            ::std::string rest = mod_input.substr(7);
             size_t sp = rest.find_first_of(" \t");
-            std::string id_str = (sp == std::string::npos) ? rest : rest.substr(0, sp);
-            std::string mode   = (sp == std::string::npos) ? "" : rest.substr(sp + 1);
+            ::std::string id_str = (sp == ::std::string::npos) ? rest : rest.substr(0, sp);
+            ::std::string mode   = (sp == ::std::string::npos) ? "" : rest.substr(sp + 1);
             uint64_t id = 0;
             bool ok = true;
             try {
                 size_t end;
-                id = std::stoull(id_str, &end);
+                id = ::std::stoull(id_str, &end);
                 if (end != id_str.size()) ok = false;
             } catch (...) { ok = false; }
             if (!ok)
@@ -3658,10 +3658,10 @@ inline void repl_shell_loop_with(ETCS::SignalContext& sig, ReplLineSource& in)
         // console it was not holding.
         if (mod_input.rfind("attach ", 0) == 0)
         {
-            std::string apath = mod_input.substr(7);
+            ::std::string apath = mod_input.substr(7);
             size_t as = apath.find_first_not_of(" \t");
             size_t ae = apath.find_last_not_of(" \t");
-            if (as == std::string::npos)
+            if (as == ::std::string::npos)
             {
                 repl_err() << COLOR_WARN << "attach: expected a socket path"
                            << COLOR_RESET << "\n";
@@ -3677,20 +3677,20 @@ inline void repl_shell_loop_with(ETCS::SignalContext& sig, ReplLineSource& in)
                                      apath.substr(as, ae - as + 1).c_str(), sig);
             // Clear so a Ctrl+C aimed at the remote session doesn't also exit
             // this shell -- same reason the script path clears it.
-            g_sig_int.store(0, std::memory_order_release);
+            g_sig_int.store(0, ::std::memory_order_release);
             continue;
         }
 
         // Separate the module/script target from any injection arguments.
-        std::istringstream iss(mod_input);
-        std::string target_str;
+        ::std::istringstream iss(mod_input);
+        ::std::string target_str;
         iss >> target_str;
 
-        std::string mod_name = target_str;
+        ::std::string mod_name = target_str;
         try {
-            if (!target_str.empty() && std::isdigit((unsigned char)target_str[0]))
+            if (!target_str.empty() && ::std::isdigit((unsigned char)target_str[0]))
             {
-                size_t idx = std::stoul(target_str);
+                size_t idx = ::std::stoul(target_str);
                 if (idx < available_mods.size()) mod_name = available_mods[idx];
             }
         } catch (...) {}
@@ -3711,25 +3711,25 @@ inline void repl_shell_loop_with(ETCS::SignalContext& sig, ReplLineSource& in)
             script_ctx.root_entity = &script_root;
             script_ctx.is_root     = true;   // its names become the globals
 
-            std::string arg;
+            ::std::string arg;
             bool args_valid = true;
             while (iss >> arg)
             {
                 if (sig.isInterrupted() || sig.isTerminated()) break;
                 auto eq = arg.find('=');
-                if (eq == std::string::npos || eq == 0 || eq == arg.size() - 1)
+                if (eq == ::std::string::npos || eq == 0 || eq == arg.size() - 1)
                 {
                     repl_err() << COLOR_WARN << "Navigator: invalid injection argument '"
                                << arg << "' -- expected name=globalname or name=RID" << COLOR_RESET << "\n";
                     args_valid = false;
                     break;
                 }
-                std::string name    = arg.substr(0, eq);
-                std::string rid_str = arg.substr(eq + 1);
+                ::std::string name    = arg.substr(0, eq);
+                ::std::string rid_str = arg.substr(eq + 1);
 
                 bool valid_name = !name.empty() && name != "root";
                 for (char c : name)
-                    if (!std::isalnum((unsigned char)c) && c != '_') { valid_name = false; break; }
+                    if (!::std::isalnum((unsigned char)c) && c != '_') { valid_name = false; break; }
                 if (!valid_name)
                 {
                     repl_err() << COLOR_WARN << "Navigator: invalid name '" << name
@@ -3753,8 +3753,8 @@ inline void repl_shell_loop_with(ETCS::SignalContext& sig, ReplLineSource& in)
                 {
                     try {
                         size_t end;
-                        unsigned long long rid_v = std::stoull(rid_str, &end);
-                        if (end != rid_str.size()) throw std::invalid_argument("trailing");
+                        unsigned long long rid_v = ::std::stoull(rid_str, &end);
+                        if (end != rid_str.size()) throw ::std::invalid_argument("trailing");
                         nb.rid = static_cast<ETCS::RID>(rid_v);
                     } catch (...) {
                         repl_err() << COLOR_WARN << "Navigator: '" << rid_str
@@ -3793,7 +3793,7 @@ inline void repl_shell_loop_with(ETCS::SignalContext& sig, ReplLineSource& in)
             ETCS::run_root_script(mod_name, script_ctx);
 
             // Clear so a Ctrl+C aimed at the script doesn't also exit the REPL.
-            g_sig_int.store(0, std::memory_order_release);
+            g_sig_int.store(0, ::std::memory_order_release);
             continue;
         }
 
@@ -3808,7 +3808,7 @@ inline void repl_shell_loop_with(ETCS::SignalContext& sig, ReplLineSource& in)
             repl_shell_tag_loop(mod_name, nav_root, sig, in);
             // nav_root pops here.
         }
-        catch (const std::exception& ex)
+        catch (const ::std::exception& ex)
         {
             repl_err() << COLOR_WARN << "Error: " << ex.what() << COLOR_RESET << "\n";
         }
@@ -3841,13 +3841,13 @@ inline void repl_shell_loop_with(ETCS::SignalContext& sig, ReplLineSource& in)
 // ---------------------------------------------------------------------------
 inline void repl_session_navigator(int fd, ETCS::SignalContext& sig)
 {
-    std::ostringstream sink_buf;
-    std::string accum;
+    ::std::ostringstream sink_buf;
+    ::std::string accum;
 
     // MSG_NOSIGNAL as well as the process-wide SIG_IGN in shell_startup: belt
     // and braces, and it keeps the guarantee local to the call rather than
     // dependent on startup order.
-    auto send_all = [fd](const std::string& s) -> bool
+    auto send_all = [fd](const ::std::string& s) -> bool
     {
         size_t off = 0;
         while (off < s.size())
@@ -3859,11 +3859,11 @@ inline void repl_session_navigator(int fd, ETCS::SignalContext& sig)
         return true;
     };
 
-    ReplLineSource in = [&](const std::string& prompt, std::string& out) -> bool
+    ReplLineSource in = [&](const ::std::string& prompt, ::std::string& out) -> bool
     {
         // Flush whatever the last render produced, then the prompt.
-        std::string pending = sink_buf.str();
-        sink_buf.str(std::string());
+        ::std::string pending = sink_buf.str();
+        sink_buf.str(::std::string());
         sink_buf.clear();
         if (!pending.empty() && !send_all(pending)) return false;
         if (!prompt.empty() && !send_all(prompt))   return false;
@@ -3873,7 +3873,7 @@ inline void repl_session_navigator(int fd, ETCS::SignalContext& sig)
         while (true)
         {
             size_t nl = accum.find('\n');
-            if (nl != std::string::npos)
+            if (nl != ::std::string::npos)
             {
                 out = accum.substr(0, nl);
                 accum.erase(0, nl + 1);
@@ -3900,7 +3900,7 @@ inline void repl_session_navigator(int fd, ETCS::SignalContext& sig)
 
     // Whatever the last screen produced has no prompt following it to trigger
     // a flush, so it goes out here.
-    std::string tail = sink_buf.str();
+    ::std::string tail = sink_buf.str();
     if (!tail.empty()) send_all(tail);
 }
 #endif // __linux__
@@ -3963,7 +3963,7 @@ inline void shell_startup()
  * own running workers.
  */
 inline int drive_main_loop_then_exit(ETCS::SignalContext& ctx, int code,
-                                     const std::string& control_socket = "")
+                                     const ::std::string& control_socket = "")
 {
     // The session's Shell, spawned in EVERY mode and held until this returns.
     // Interactive asks it for a console; drain and --listen simply keep it, so

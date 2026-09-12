@@ -5,6 +5,12 @@
 #ifdef ETCS_DLL_EXPORTS
     #ifdef _WIN32 // Windows-specific export/import
         #define ETCS_API __declspec(dllexport)
+    #elif defined(__EMSCRIPTEN__)
+        // Side/main module: keep the symbol in the wasm export table so JS
+        // (and dylink) can call it. EMSCRIPTEN_KEEPALIVE is the keep-loaded
+        // marker; visibility default is required for dylink to see it.
+        #include <emscripten/emscripten.h>
+        #define ETCS_API EMSCRIPTEN_KEEPALIVE __attribute__((visibility("default")))
     #else // Linux/macOS (GCC/Clang) - visibility default often handles it
         #define ETCS_API __attribute__((visibility("default")))
     #endif
@@ -12,10 +18,28 @@
     // When NOT building the DLL, we are using it, so we IMPORT symbols.
     #ifdef _WIN32
         #define ETCS_API __declspec(dllimport)
+    #elif defined(__EMSCRIPTEN__)
+        // Import side: still need the symbol visible for cross-module calls;
+        // keep-alive is on the defining side (ETCS_DLL_EXPORTS).
+        #define ETCS_API __attribute__((visibility("default")))
     #else
         #define ETCS_API
     #endif
 #endif
+
+// Under emscripten SIDE_MODULE, C++ static-init runs while the main module is
+// still inside loadDynamicLibrary. EventNode/ThreadPool/MemoryArena symbols
+// resolve to the *loader* (GOT imports), not a private per-DSO copy the way a
+// native .so does. Touching them from a module static lambda is therefore a
+// reach into the loader mid-load — hang / re-entry. Defer those registrations;
+// the loader's post-dlopen calls (RegisterEventNode / Name()) perform the real
+// work once both sides are live.
+#if defined(__EMSCRIPTEN__) && !defined(ETCS_LOADER)
+#  define ETCS_MODULE_STATIC_REACH_LOADER 0
+#else
+#  define ETCS_MODULE_STATIC_REACH_LOADER 1
+#endif
+
 // flags for make with -DETCS_PRODUCTION_BUILD module side (see ETCS.h for loader side)
 #ifdef ETCS_PRODUCTION_BUILD
     #define ETCS_LOG_TO_FILE
@@ -90,7 +114,7 @@
 #define MAX_LMAX_BUFFER_SIZE   (ETCS_SLOT_SIZE - ETCS_BUFFER_METADATA_SIZE - ETCS_SEQUENTIAL_FRAME_SIZE)
 // you get 16 bytes, fit a ptr & action type
 #define DEFAULT_THREAD_POOL_THREADS  4
-// can maybe be std::thread::hardware_concurrency()
+// can maybe be ::std::thread::hardware_concurrency()
 // default hash size/type
 #define HASH_TYPE uint64_t
 #define BASE_SOURCE_STRING "ETCS_Kernel_v1.0"
@@ -120,7 +144,7 @@
     #include <sys/stat.h> // For stat
     using library_handle_t = void*;
     #define DL_EXTENSION ".so"
-    #define RENAME_CMD(old_name, new_name) std::rename(old_name.c_str(), new_name.c_str())
+    #define RENAME_CMD(old_name, new_name) ::std::rename(old_name.c_str(), new_name.c_str())
     #define GET_CWD() getcwd(nullptr, 0)
 #endif
 #include "Buffer.h"
@@ -273,7 +297,7 @@ public: \
      * SAME MODULE ONLY, self-guarded -- TAG_MASK is assigned by this module's \
      * own ETCS_TAG_DECLARE, so a foreign type reads empty and contributes \
      * nothing (see addTagTrampoline). Two modules' tag bits must never meet. */ \
-    inline static std::atomic<uint64_t> TAG_CLOSURE_W[ETCS::TAG_WORDS]{}; \
+    inline static ::std::atomic<uint64_t> TAG_CLOSURE_W[ETCS::TAG_WORDS]{}; \
     /* Atomic words plus a generation: a reader on any pool worker can be \
      * mid-read while the loader's ordering thread records a first \
      * acquisition. The atomics make each word coherent (and keep TSan quiet); \
@@ -281,7 +305,7 @@ public: \
      * sampled either side, falling back to all(), so tearing fails SHUT \
      * instead of dropping a bit. All writes are on that one thread, so there \
      * is no writer-writer case; fetch_or covers it regardless. */ \
-    inline static std::atomic<uint32_t> TAG_CLOSURE_GEN{0}; \
+    inline static ::std::atomic<uint32_t> TAG_CLOSURE_GEN{0}; \
     void* getTrueType() override { return static_cast<void*>(this); } \
     const char* myTag() override { return TAG; } \
     const ETCS::TagMask& myTagMask() const override { return TAG_MASK; } \
@@ -290,11 +314,11 @@ public: \
      * reference would be a data race. */ \
     static ETCS::TagMask readTagClosure() \
     { \
-        const uint32_t g0 = TAG_CLOSURE_GEN.load(std::memory_order_acquire); \
+        const uint32_t g0 = TAG_CLOSURE_GEN.load(::std::memory_order_acquire); \
         ETCS::TagMask m; \
         for (size_t i = 0; i < ETCS::TAG_WORDS; ++i) \
-            m.w[i] = TAG_CLOSURE_W[i].load(std::memory_order_relaxed); \
-        if (TAG_CLOSURE_GEN.load(std::memory_order_acquire) != g0) \
+            m.w[i] = TAG_CLOSURE_W[i].load(::std::memory_order_relaxed); \
+        if (TAG_CLOSURE_GEN.load(::std::memory_order_acquire) != g0) \
             return ETCS::TagMask::all(); \
         return TAG_MASK | m; \
     } \
@@ -303,8 +327,8 @@ public: \
     { \
         if (!other.any()) return; \
         for (size_t i = 0; i < ETCS::TAG_WORDS; ++i) \
-            if (other.w[i]) TAG_CLOSURE_W[i].fetch_or(other.w[i], std::memory_order_relaxed); \
-        TAG_CLOSURE_GEN.fetch_add(1, std::memory_order_release); \
+            if (other.w[i]) TAG_CLOSURE_W[i].fetch_or(other.w[i], ::std::memory_order_relaxed); \
+        TAG_CLOSURE_GEN.fetch_add(1, ::std::memory_order_release); \
     } \
     uint64_t getRID() const override { return m_rid; } \
 // for the locals ctx and root, auto registering ctx to globals.
@@ -420,6 +444,7 @@ public: \
         return list; \
     } \
     inline bool _etcs_supertype_registered_##Name = []() { \
+        if (!ETCS_MODULE_STATIC_REACH_LOADER) return true; \
         ETCS::ThreadPool::getInstance(); \
         /* Direct ridMap write, not RegisterRIDRegistry -- that method    \
          * only exists on module-scope EventNode (its own #ifndef         \
@@ -607,7 +632,7 @@ public: \
          * as leaving. */ \
         ETCS::SharedPage* _live_token = stream.producerEnter(); \
         try { \
-        self->getThreadPool().enqueue(ETCS::Priority::Medium, ctx, [self, stream = std::move(stream), config, _pair_mod, _live_token, _auto_scope = std::move(_auto_scope)]() mutable { \
+        self->getThreadPool().enqueue(ETCS::Priority::Medium, ctx, [self, stream = ::std::move(stream), config, _pair_mod, _live_token, _auto_scope = ::std::move(_auto_scope)]() mutable { \
             ETCS::ProducerLiveGuard _auto_live(_live_token); \
             ETCS::PairScope _pair_scope(_pair_mod); \
             ETCS_CAUSAL_SCOPE(Type, Name); \
@@ -653,7 +678,7 @@ public: \
          * move below; PairScope copies. */ \
         ETCS::PairScope _pair_scope(stream.pairModuleMask()); \
         ETCS_CAUSAL_SCOPE(Type, Name); \
-        _implConsume_##Type##_##Name(*self, std::move(stream), config, _auto_scope.ctx()); \
+        _implConsume_##Type##_##Name(*self, ::std::move(stream), config, _auto_scope.ctx()); \
     } \
  \
     void _implConsume_##Type##_##Name(Type& self, ETCS::MirrorBuffer stream, ETCS::Buffer data, ETCS::SignalContext ctx)
@@ -677,8 +702,8 @@ public: \
  * settled answer or the fallback, never a half-written one.
  */
 #define ETCS_CAUSAL_EDGE_STORE(Type, Name) \
-    static std::atomic<uint64_t> _edge_w_##Type##_##Name[ETCS::TAG_WORDS]{}; \
-    static std::atomic<bool>     _edge_set_##Type##_##Name{false};
+    static ::std::atomic<uint64_t> _edge_w_##Type##_##Name[ETCS::TAG_WORDS]{}; \
+    static ::std::atomic<bool>     _edge_set_##Type##_##Name{false};
 
 #define ETCS_CAUSAL_SCOPE(Type, Name) \
     ETCS::CausalScope _causal_edge_scope( \
@@ -705,7 +730,7 @@ namespace ETCS
 {
     // etcs_count_tags / etcs_tag_index — constexpr tokenization of a
     // module's own Tags string, splitting on the same whitespace class
-    // std::stringstream's own operator>> uses (see
+    // ::std::stringstream's own operator>> uses (see
     // ETCS_MODULE_EXPORT_MAIN's own static-init loop, which feeds
     // RegisterTagBitIndex). Same string, same tokenizer, same order --
     // so the compile-time bit position and the static-init one agree by
@@ -837,9 +862,10 @@ namespace ETCS
      * DecodeTagClosureMask still needs the reverse mapping to name which \
      * types were actually colliding when diagnosing a stall. */ \
     static const bool Name##_tag_bit_index_registered_ = []() { \
-        std::vector<std::string> ordered_tags; \
-        std::stringstream ss(Tags); \
-        std::string tok; \
+        if (!ETCS_MODULE_STATIC_REACH_LOADER) return true; \
+        ::std::vector<::std::string> ordered_tags; \
+        ::std::stringstream ss(Tags); \
+        ::std::string tok; \
         while (ss >> tok) ordered_tags.push_back(tok); \
         ETCS::EventNode::getInstance().RegisterTagBitIndex(ordered_tags); \
         return true; \
@@ -864,6 +890,7 @@ namespace ETCS
      * than just eventually-true, since this runs mid-static-init instead \
      * of at the loader's first runtime call into Name(). */ \
     static const bool Name##_loader_manifest_checked_ = []() { \
+        if (!ETCS_MODULE_STATIC_REACH_LOADER) return true; \
         void* getterAddr = ETCS::etcs_find_loader_manifest_getter(); \
         if (!getterAddr) return true; \
         using LoaderManifestGetter = void* (*)(); \
@@ -871,9 +898,9 @@ namespace ETCS
         if (!loaderManifestPtr) return true; \
         auto* loaderManifest = static_cast<ETCS::Manifest*>(loaderManifestPtr); \
         if (ETCS::compareManifests(ETCS::Entity::getManifest(), loaderManifest, #Name)) { \
-            std::cerr << "FATAL: module '" #Name "' and the loader disagree on " \
+            ::std::cerr << "FATAL: module '" #Name "' and the loader disagree on " \
                          "CORE:/HEADER:/ONTOLOGY: hashes -- built for different epochs. " \
-                         "Refusing to run." << std::endl; \
+                         "Refusing to run." << ::std::endl; \
             /* TODO(recovery): re-fetch whichever of {this module, the \
              * loader} is older from anticurrententropy.com and retry once \
              * before aborting. A SECURITY boundary as much as a \
@@ -885,7 +912,7 @@ namespace ETCS
              * goes straight to abort() rather than trusting an \
              * unverifiable replacement, or running as one that already \
              * disagrees with the loader. */ \
-            std::abort(); \
+            ::std::abort(); \
         } \
         return true; \
     }(); \
@@ -1020,7 +1047,7 @@ namespace ETCS
             ETCS_LOG("ETCS_TAG_DECLARE", "FATAL: " #Name "'s concrete type already " \
                      "carries a TAG_MASK (answering to '" << Name::CONTRACT_TAG \
                      << "'). Two contract tags alias one concrete type."); \
-            std::abort(); \
+            ::std::abort(); \
         } \
         Name::CONTRACT_TAG = #Name; \
         Name::TAG_MASK     = ETCS::TagMask::bit(_tag_bit_##Name); \
@@ -1031,6 +1058,7 @@ namespace ETCS
         return list;\
     }\
     static bool _ridlist_##Name##_registered = []() {\
+        if (!ETCS_MODULE_STATIC_REACH_LOADER) return true; \
         ETCS::ThreadPool::getInstance(); \
         ETCS::EventNode::getInstance().RegisterRIDRegistry(\
             #Name, \

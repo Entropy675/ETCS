@@ -31,7 +31,7 @@ ETCS_SUPERTYPE_BASE(Deletable)
     // Both mean the same to a caller: you did not delete this.
     bool Delete() override final
     {
-        if (m_deleted.exchange(true, std::memory_order_acq_rel)) return false;
+        if (m_deleted.exchange(true, ::std::memory_order_acq_rel)) return false;
         // Release first, if this type has one: Delete is Release plus a destroy
         // request, so both death paths run one ReleaseConcrete exactly once.
         //
@@ -45,10 +45,10 @@ ETCS_SUPERTYPE_BASE(Deletable)
 
     // Has the request path run? Release reads it; so may a work function that
     // would otherwise act on something already destroyed.
-    bool Deleted() const { return m_deleted.load(std::memory_order_acquire); }
+    bool Deleted() const { return m_deleted.load(::std::memory_order_acquire); }
 
 private:
-    std::atomic<bool> m_deleted{false};
+    ::std::atomic<bool> m_deleted{false};
 };
 
 #endif

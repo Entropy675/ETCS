@@ -76,7 +76,7 @@ public:
  */
     template <typename Leaf>
     static size_t Search(const char* qualified_type, const Leaf& exemplar,
-                         std::vector<ETCS::RID>& out)
+                         ::std::vector<ETCS::RID>& out)
     {
         return ETCS::search_in_family<Leaf>(qualified_type, exemplar, out);
     }
@@ -93,7 +93,7 @@ public:
  * asking is opened up.
  */
     static size_t Search(const char* qualified_type, ETCS::RID exemplar,
-                         std::vector<ETCS::RID>& out)
+                         ::std::vector<ETCS::RID>& out)
     {
         return ETCS::search_in_family(qualified_type, exemplar, out);
     }

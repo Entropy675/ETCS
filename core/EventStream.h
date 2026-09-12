@@ -158,15 +158,15 @@ struct WorkResult
 // Thrown by EventStream::start() specifically when ordering_thread_ is
 // still joinable at the moment a fresh start() is attempted -- see that
 // method's own comment. A distinct type (rather than a plain
-// std::runtime_error) so RegisterDynamicLoader (ETCS_API.h) can catch this
+// ::std::runtime_error) so RegisterDynamicLoader (ETCS_API.h) can catch this
 // SPECIFICALLY and distinguish "OS-level zombie DLL, reloaded too fast"
 // from any other failure (e.g. a genuine allocation/OOM failure inside
 // allocateTunedRing) -- the two conditions warrant different crash
-// messages, and conflating them behind a single std::exception catch
+// messages, and conflating them behind a single ::std::exception catch
 // would lose that distinction.
-struct EventStreamZombieException : std::runtime_error
+struct EventStreamZombieException : ::std::runtime_error
 {
-    using std::runtime_error::runtime_error;
+    using ::std::runtime_error::runtime_error;
 };
 template<typename Derived, typename State, typename InEvent>
 struct EventStream
@@ -205,9 +205,9 @@ protected:
  * Written only by the ordering thread; atomic for readers, relaxed because
  * nothing is ordered against it.
  */
-    std::atomic<uint64_t>     blocked_admissions_{ 0 };
-    std::thread               ordering_thread_;
-    std::atomic<bool>         stop_{ false };
+    ::std::atomic<uint64_t>     blocked_admissions_{ 0 };
+    ::std::thread               ordering_thread_;
+    ::std::atomic<bool>         stop_{ false };
     // Set true the instant shutdown begins (start of stop()/~EventStream()),
     // BEFORE stop_ is even set and well before the ordering thread is
     // joined. Distinct from stop_: stop_ tells the ordering LOOP to exit;
@@ -219,7 +219,7 @@ protected:
     // fails fast and the loader just moves on, instead of blocking forever
     // waiting for a thread that's already gone (or about to be) to service
     // it -- which is exactly the hang this flag exists to prevent.
-    std::atomic<bool>         is_cleaning_up_{ false };
+    ::std::atomic<bool>         is_cleaning_up_{ false };
     // Default all(): fail-shut, and it makes the restructure a no-op for any
     // stream that does not override -- every slot blocks on every earlier one,
     // which is what a single ordering thread already did. A Derived declaring
@@ -259,7 +259,7 @@ protected:
             const LBuffer* buf = completion_ring_->acquireRead(cmp_seq_);
             if (!buf) break;
             WorkResult* wr = nullptr;
-            std::memcpy(&wr, buf->buf, sizeof(WorkResult*));
+            ::std::memcpy(&wr, buf->buf, sizeof(WorkResult*));
             completion_ring_->markConsumed(cmp_seq_);
             ++cmp_seq_;
             if (!wr) continue;
@@ -271,7 +271,7 @@ protected:
     void ordering_loop()
     {
         int retry = 0;
-        while (!stop_.load(std::memory_order_acquire))
+        while (!stop_.load(::std::memory_order_acquire))
         {
             drain_completions();
             while (tail_seq_ < in_seq_ &&
@@ -329,7 +329,7 @@ protected:
             }
             retry = 0;
             InEvent evt;
-            std::memcpy(&evt, buf->buf, sizeof(InEvent));
+            ::std::memcpy(&evt, buf->buf, sizeof(InEvent));
             input_ring_->markConsumed(in_seq_);
             // Mask FIRST, from the event alone -- the handler has not run and
             // must not have to. Every loader kind answers this way (see
@@ -345,27 +345,27 @@ protected:
             if (!reorder_.blocked(in_seq_))
                 launch_slot(in_seq_);
             else
-                blocked_admissions_.fetch_add(1, std::memory_order_relaxed);
+                blocked_admissions_.fetch_add(1, ::std::memory_order_relaxed);
             service();
             ++in_seq_;
         }
         ETCS_LOG("EventStream", "Ordering thread exiting. in_seq="
             << in_seq_ << " cmp_seq=" << cmp_seq_ << " blocked_admissions="
-            << blocked_admissions_.load(std::memory_order_relaxed));
+            << blocked_admissions_.load(::std::memory_order_relaxed));
     }
 public:
     // See blocked_admissions_. Ratio against in_seq_ is the useful reading:
     // what fraction of arrivals this stream's masks refused to let start.
     uint64_t blockedAdmissions() const
-    { return blocked_admissions_.load(std::memory_order_relaxed); }
+    { return blocked_admissions_.load(::std::memory_order_relaxed); }
     EventStream()  = default;
     ~EventStream()
     {
-        is_cleaning_up_.store(true, std::memory_order_release);
+        is_cleaning_up_.store(true, ::std::memory_order_release);
         ETCS_LOG("EventStream", "dtor called, joining ordering thread...");
         if (ordering_thread_.joinable())
         {
-            stop_.store(true, std::memory_order_release);
+            stop_.store(true, ::std::memory_order_release);
             ordering_thread_.join();
         }
         ETCS_LOG("EventStream", "dtor called, ordering thread joined.");
@@ -411,15 +411,15 @@ public:
         input_ring_      = allocateTunedRing(arena, 0, producer_count);
         completion_ring_ = allocateTunedRing(arena, 1, producer_count);
         output_ring_     = allocateTunedRing(arena, 2, 1);
-        stop_.store(false, std::memory_order_relaxed);
-        is_cleaning_up_.store(false, std::memory_order_relaxed);
-        ordering_thread_ = std::thread([this]() { ordering_loop(); });
+        stop_.store(false, ::std::memory_order_relaxed);
+        is_cleaning_up_.store(false, ::std::memory_order_relaxed);
+        ordering_thread_ = ::std::thread([this]() { ordering_loop(); });
         ETCS_LOG("EventStream", "Ordering thread started.");
     }
     void stop()
     {
-        is_cleaning_up_.store(true, std::memory_order_release);
-        stop_.store(true, std::memory_order_release);
+        is_cleaning_up_.store(true, ::std::memory_order_release);
+        stop_.store(true, ::std::memory_order_release);
         if (ordering_thread_.joinable())
             ordering_thread_.join();
         ETCS_LOG("EventStream", "Ordering thread stopped.");
@@ -431,10 +431,10 @@ public:
     // blindly waiting on a completion flag that may never flip.
     bool enqueue(const InEvent& evt)
     {
-        if (is_cleaning_up_.load(std::memory_order_acquire))
+        if (is_cleaning_up_.load(::std::memory_order_acquire))
             return false;
         LBuffer payload;
-        std::memcpy(payload.buf, &evt, sizeof(InEvent));
+        ::std::memcpy(payload.buf, &evt, sizeof(InEvent));
         payload.written = sizeof(InEvent);
         int retry = 0;
         while (input_ring_->write(0, payload) == UINT64_MAX)
@@ -446,7 +446,7 @@ public:
     void post_completion(WorkResult* result)
     {
         LBuffer payload;
-        std::memcpy(payload.buf, &result, sizeof(WorkResult*));
+        ::std::memcpy(payload.buf, &result, sizeof(WorkResult*));
         payload.written = sizeof(WorkResult*);
         int retry = 0;
         while (completion_ring_->write(0, payload) == UINT64_MAX)

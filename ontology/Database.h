@@ -11,7 +11,7 @@ protected:
     ETCS::Buffer dbPath;
     ETCS::Buffer schemaGenerator;
     bool connected = false;
-    std::atomic<bool> in_transaction = false;
+    ::std::atomic<bool> in_transaction = false;
     
 public:
     Database_() {} ;

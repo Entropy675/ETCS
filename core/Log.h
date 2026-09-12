@@ -71,8 +71,8 @@
 #endif
 
 namespace ETCS {
-    ETCS_PER_BINARY inline std::atomic<bool> log_enabled{true};
-    ETCS_PER_BINARY inline std::atomic<bool> log_to_file{ ETCS_LOG_TO_FILE_DEFAULT };
+    ETCS_PER_BINARY inline ::std::atomic<bool> log_enabled{true};
+    ETCS_PER_BINARY inline ::std::atomic<bool> log_to_file{ ETCS_LOG_TO_FILE_DEFAULT };
 
     /*
  * THE TIME A LINE LEFT, not the time anything decided to write one.
@@ -96,30 +96,30 @@ namespace ETCS {
 
     inline LogStamp log_stamp()
     {
-        const auto now  = std::chrono::system_clock::now();
-        const auto secs = std::chrono::time_point_cast<std::chrono::seconds>(now);
+        const auto now  = ::std::chrono::system_clock::now();
+        const auto secs = ::std::chrono::time_point_cast<::std::chrono::seconds>(now);
         const long ms   = static_cast<long>(
-            std::chrono::duration_cast<std::chrono::milliseconds>(now - secs).count());
+            ::std::chrono::duration_cast<::std::chrono::milliseconds>(now - secs).count());
 
-        static thread_local std::time_t cached = 0;
+        static thread_local ::std::time_t cached = 0;
         static thread_local char hms[9] = "00:00:00";
 
-        const std::time_t t = std::chrono::system_clock::to_time_t(secs);
+        const ::std::time_t t = ::std::chrono::system_clock::to_time_t(secs);
         if (t != cached)
         {
             cached = t;
-            std::tm tmv{};
+            ::std::tm tmv{};
 #if defined(_WIN32)
             localtime_s(&tmv, &t);
 #else
             localtime_r(&t, &tmv);
 #endif
-            std::snprintf(hms, sizeof(hms), "%02d:%02d:%02d",
+            ::std::snprintf(hms, sizeof(hms), "%02d:%02d:%02d",
                           tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
         }
 
         LogStamp s{};
-        std::snprintf(s.text, sizeof(s.text), "%s.%03ld", hms, ms);
+        ::std::snprintf(s.text, sizeof(s.text), "%s.%03ld", hms, ms);
         return s;
     }
 
@@ -127,8 +127,8 @@ namespace ETCS {
     // that module's own EventNode::set_log_to_file trampoline (EventNode.h),
     // which is compiled into the module and so writes the module's variable,
     // not the loader's.
-    inline void set_log_to_file(bool on) { log_to_file.store(on, std::memory_order_relaxed); }
-    inline bool get_log_to_file()        { return log_to_file.load(std::memory_order_relaxed); }
+    inline void set_log_to_file(bool on) { log_to_file.store(on, ::std::memory_order_relaxed); }
+    inline bool get_log_to_file()        { return log_to_file.load(::std::memory_order_relaxed); }
 
     // Thread-local ETCS_LOG redirect. Set via LogSinkGuard only -- direct
     // assignment skips the restore that nested guards rely on.
@@ -137,12 +137,12 @@ namespace ETCS {
     // that hops to a ThreadPool worker (a stream produce trampoline) logs to
     // whatever's ambient there, usually null. Threading a sink through every
     // async capture is a much larger change.
-    inline thread_local std::ostream* log_sink = nullptr;
+    inline thread_local ::std::ostream* log_sink = nullptr;
 
     struct LogSinkGuard
     {
-        std::ostream* previous;
-        explicit LogSinkGuard(std::ostream* sink) : previous(log_sink) { log_sink = sink; }
+        ::std::ostream* previous;
+        explicit LogSinkGuard(::std::ostream* sink) : previous(log_sink) { log_sink = sink; }
         ~LogSinkGuard() { log_sink = previous; }
         LogSinkGuard(const LogSinkGuard&)            = delete;
         LogSinkGuard& operator=(const LogSinkGuard&) = delete;
@@ -192,7 +192,7 @@ namespace ETCS {
 // clock into strings that get compared and displayed.
 #define ETCS_LOG_LINE(type, msg, out, stamp) \
     do { \
-        std::ostringstream etcs_log_ss_; \
+        ::std::ostringstream etcs_log_ss_; \
         if (stamp) etcs_log_ss_ << "[" << ETCS::log_stamp().text << "] "; \
         etcs_log_ss_ << "[" << getCurrentModulePath() << "::" << type << "] " << msg << "\n"; \
         (out) << etcs_log_ss_.str(); \
@@ -212,9 +212,9 @@ namespace ETCS {
 #define ETCS_LOG_2(type, msg) \
     do { \
         if (ETCS::log_sink) ETCS_LOG_LINE(type, msg, *ETCS::log_sink, false); \
-        else if (ETCS::log_to_file.load(std::memory_order_relaxed)) \
+        else if (ETCS::log_to_file.load(::std::memory_order_relaxed)) \
                           { ETCS_LOG_LINE(type, msg, getModuleLog(), true); getModuleLog().flush(); } \
-        else              { ETCS_LOG_LINE(type, msg, std::cout, false); std::cout.flush(); } \
+        else              { ETCS_LOG_LINE(type, msg, ::std::cout, false); ::std::cout.flush(); } \
     } while (0)
 
 #define ETCS_LOG_1(msg) ETCS_LOG_2(this->myTag(), msg)

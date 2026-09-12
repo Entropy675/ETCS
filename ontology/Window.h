@@ -78,7 +78,7 @@ public:
     // the window is known live (RenderProvider::Surface). Anything that calls
     // the platform with it on a running window goes through the backend's own
     // in-flight guard instead -- see m_window below.
-    void* GetHandle() { return m_window.load(std::memory_order_acquire); }
+    void* GetHandle() { return m_window.load(::std::memory_order_acquire); }
     bool IsActive() const { return this->hasTag("active"); }
 
     // Non-dispatched (like GetHandle()) on purpose -- see the struct's own
@@ -106,7 +106,7 @@ protected:
      * The claim settles WHO destroys. WHEN is the backend's, because only it
      * knows which of its calls are in flight -- see GLFWWindow::PlatformUse.
      */
-    std::atomic<void*>  m_window{ nullptr };
+    ::std::atomic<void*>  m_window{ nullptr };
     NativeSurfaceHandle m_nativeSurface{};
 };
 
