@@ -94,7 +94,7 @@ struct TagMask
     friend TagMask operator|(TagMask a, const TagMask& b) { a |= b; return a; }
     explicit operator bool() const { return any(); }
 };
-static_assert(std::is_trivially_copyable_v<TagMask>,
+static_assert(::std::is_trivially_copyable_v<TagMask>,
               "TagMask rides inside GapSlot across DSO boundaries");
 } // namespace ETCS
 #include <atomic>
@@ -110,17 +110,20 @@ struct Module;   // ModuleBundle holds a Module*, LifetimeOwner::module()
                  // returns Module&, both ahead of Module's definition below.
 struct WorkBundle;
 struct ModuleBundle;
-#ifdef __GNUC__
+// cxxabi demangle is host-only: under emscripten, including <cxxabi.h>
+// conflicts with libc++'s exception_ptr declaration of
+// __cxa_init_primary_exception (void* vs __cxa_exception* return types).
+#if defined(__GNUC__) && !defined(__EMSCRIPTEN__)
 #include <cxxabi.h>
-inline std::string demangle(const char* name) {
+inline ::std::string demangle(const char* name) {
     int status = -1;
     char* demangled = abi::__cxa_demangle(name, NULL, NULL, &status);
-    std::string result = (status == 0) ? demangled : name;
+    ::std::string result = (status == 0) ? demangled : name;
     free(demangled);
     return result;
 }
 #else
-inline std::string demangle(const char* name) { return name; }
+inline ::std::string demangle(const char* name) { return name; }
 #endif
 template<typename K, typename V>
 struct FlatMap {
@@ -136,21 +139,21 @@ struct FlatMap {
     size_t count(const K& key) const { 
         return (this->find(key) != this->end()) ? 1 : 0; 
     }
-    // Inserts a default value if absent, mimicking std::map.
+    // Inserts a default value if absent, mimicking ::std::map.
     V& operator[](const K& key) {
         Pair* it = find(key);
         if (it != end()) return it->second;
     
         if (!arena) {
-            std::cerr << "\n[ETCS FATAL ERROR]: FlatMap Arena Violation\n"
+            ::std::cerr << "\n[ETCS FATAL ERROR]: FlatMap Arena Violation\n"
                       << "-------------------------------------------\n"
                       << "Map Type: FlatMap<" << demangle(typeid(K).name()) 
                       << ", " << demangle(typeid(V).name()) << ">\n"
                       << "Status:   Attempted insertion but 'arena' pointer is NULL.\n"
                       << "Context:  This usually happens during global static registration.\n"
                       << "Fix:      Call FlatMap::setArena(&arena) before this access.\n"
-                      << "-------------------------------------------\n" << std::endl;
-            throw std::logic_error("ETCS::FlatMap - Null MemoryArena during insertion.");
+                      << "-------------------------------------------\n" << ::std::endl;
+            throw ::std::logic_error("ETCS::FlatMap - Null MemoryArena during insertion.");
         }
         insert(arena, key, V{});
         return find(key)->second; 
@@ -186,7 +189,7 @@ struct FlatMap {
         arena = arena_ptr;
         Pair* new_data = (Pair*)arena->allocateRaw(new_capacity * sizeof(Pair), alignof(Pair));
         if (data && size > 0) {
-            std::memcpy((void*)new_data, (const void*)data, size * sizeof(Pair));
+            ::std::memcpy((void*)new_data, (const void*)data, size * sizeof(Pair));
         }
         data = new_data;
         capacity = new_capacity;
@@ -198,7 +201,7 @@ struct FlatMap {
         }
         uint32_t i = size;
         while (i > 0 && key < data[i-1].first) {
-            std::memmove((void*)&data[i], (const void*)&data[i-1], sizeof(Pair));
+            ::std::memmove((void*)&data[i], (const void*)&data[i-1], sizeof(Pair));
             i--;
         }
         
@@ -212,9 +215,9 @@ using Manifest = FlatMap<ETCS::Buffer, ETCS::Buffer>; // dependent headers -> ha
 // A HEADER:/ONTOLOGY: entry disagreed -- loader and module built for
 // different epochs. Never an ordinary load failure (missing .so, missing
 // export): attachModule (DynamicLoader.h) handles this one distinctly.
-struct ManifestMismatchException : std::runtime_error
+struct ManifestMismatchException : ::std::runtime_error
 {
-    using std::runtime_error::runtime_error;
+    using ::std::runtime_error::runtime_error;
 };
 
 // Logs `theirs` against `ours` row by row and returns true iff a
@@ -225,16 +228,16 @@ struct ManifestMismatchException : std::runtime_error
 // handshake (DynamicLoader.h) call this independently against the other
 // side's manifest, so a bad build can't slip through by only one side
 // checking.
-inline bool compareManifests(Manifest& ours, Manifest* theirs, const std::string& label)
+inline bool compareManifests(Manifest& ours, Manifest* theirs, const ::std::string& label)
 {
     bool mismatch_found = false;
     ETCS_LOG("ManifestCheck", "--- Manifest comparison: " << label << " ---");
-    ETCS_LOG("ManifestCheck", std::left << std::setw(40) << "Key"
-        << std::setw(12) << "Ours(8)" << std::setw(12) << "Theirs(8)" << "Status");
+    ETCS_LOG("ManifestCheck", ::std::left << ::std::setw(40) << "Key"
+        << ::std::setw(12) << "Ours(8)" << ::std::setw(12) << "Theirs(8)" << "Status");
     for (auto const& [key_c, their_hash_c] : *theirs)
     {
-        std::string key(key_c);
-        std::string their_hash(their_hash_c);
+        ::std::string key(key_c);
+        ::std::string their_hash(their_hash_c);
         /*
      * CORE COUNTS AS A CONTRACT, and leaving it out was the hole.
      *
@@ -256,25 +259,25 @@ inline bool compareManifests(Manifest& ours, Manifest* theirs, const std::string
      */
         bool is_contract = (key.rfind("ONTOLOGY:", 0) == 0 || key.rfind("HEADER:", 0) == 0
                          || key.rfind("CORE:", 0) == 0);
-        std::stringstream row;
-        row << std::left << std::setw(40) << key;
+        ::std::stringstream row;
+        row << ::std::left << ::std::setw(40) << key;
         if (ours.count(key_c))
         {
-            std::string o_short = std::string(ours[key_c]).substr(0, 8);
-            std::string t_short = their_hash.substr(0, 8);
-            row << std::setw(12) << o_short << std::setw(12) << t_short;
+            ::std::string o_short = ::std::string(ours[key_c]).substr(0, 8);
+            ::std::string t_short = their_hash.substr(0, 8);
+            row << ::std::setw(12) << o_short << ::std::setw(12) << t_short;
             if      (o_short == t_short) row << "[ OK ]";
             else if (is_contract)      { row << "[ FAIL ]"; mismatch_found = true; }
             else                         row << "[ DIFF ]";
         }
         else
-            row << std::setw(12) << "N/A" << std::setw(12) << their_hash.substr(0, 8) << "[INFO]";
+            row << ::std::setw(12) << "N/A" << ::std::setw(12) << their_hash.substr(0, 8) << "[INFO]";
         ETCS_LOG("ManifestCheck", row.str());
     }
     if (mismatch_found)
         for (auto const& [key_c, their_hash_c] : *theirs)
         {
-            std::string key(key_c);
+            ::std::string key(key_c);
         bool is_contract = (key.rfind("ONTOLOGY:", 0) == 0 || key.rfind("HEADER:", 0) == 0
                          || key.rfind("CORE:", 0) == 0);
             if (is_contract && ours.count(key_c) && ours[key_c] != their_hash_c)
@@ -346,17 +349,17 @@ struct Scope
         // that runs after the trampoline frame has returned.
         SignalContext parent_snapshot;
         SignalContext ctx;   // ctx.up == &parent_snapshot
-        std::string label;   // bare, no prefix and no address -- "Listen"
+        ::std::string label;   // bare, no prefix and no address -- "Listen"
         uint64_t    id = 0;  // see the struct comment: identity, not position
     };
     // unique_ptr elements, not Entry by value. Two independent requirements
     // force it: ctx.interrupt points at &entry.flag and ctx.up at
     // &entry.parent_snapshot, both handed to a body that may run for a
     // server's lifetime, so vector growth must not move them; and SignalFlag
-    // (std::atomic) is neither copyable nor movable, so a by-value vector
+    // (::std::atomic) is neither copyable nor movable, so a by-value vector
     // could not reallocate at all. Indirection buys insertion order and O(1)
     // indexed access that the previous unordered_map could not provide.
-    std::vector<std::unique_ptr<Entry>> entries;
+    ::std::vector<::std::unique_ptr<Entry>> entries;
     uint64_t next_id_ = 1;
     struct Registration
     {
@@ -368,20 +371,20 @@ struct Scope
     {
         bool        found         = false;
         bool        last_of_label = false;    // caller should removeTag the flag
-        std::string label;
+        ::std::string label;
     };
     // `label` is the bare action name ("Listen"), never a prefixed or
     // address-bearing string. first_of_label tells ScopeTag whether to raise
     // the shared flag -- computed here, under the caller's lock, rather than
     // by a separate check-then-act on ScopeTag's side that two concurrent
     // registrations could interleave.
-    Registration registerContext(const std::string& label, const SignalContext& incoming)
+    Registration registerContext(const ::std::string& label, const SignalContext& incoming)
     {
         Registration r;
         r.first_of_label = true;
         for (const auto& e : entries)
             if (e->label == label) { r.first_of_label = false; break; }
-        auto entry = std::make_unique<Entry>();
+        auto entry = ::std::make_unique<Entry>();
         entry->label           = label;
         entry->id              = next_id_++;
         entry->parent_snapshot = incoming;
@@ -390,7 +393,7 @@ struct Scope
         entry->ctx.interrupt   = &entry->flag;
         r.ctx = entry->ctx;
         r.id  = entry->id;
-        entries.push_back(std::move(entry));
+        entries.push_back(::std::move(entry));
         return r;
     }
     // By id, never by position -- see the struct comment. found == false is
@@ -418,25 +421,25 @@ struct Scope
     // the shared "active_scope_<label>" flag now means. Returns how many were
     // signalled, so tagModifyImpl knows whether this key was a scope at all or
     // should fall through to ordinary flag removal.
-    size_t interruptLabel(const std::string& label)
+    size_t interruptLabel(const ::std::string& label)
     {
         size_t n = 0;
         for (auto& e : entries)
-            if (e->label == label) { e->flag.store(1, std::memory_order_release); ++n; }
+            if (e->label == label) { e->flag.store(1, ::std::memory_order_release); ++n; }
         return n;
     }
     // The FINE verb -- one specific call, addressed by its position among the
     // live entries sharing `label`, in creation order. Both verbs only ever
     // REQUEST; removal from this registry happens in ~ScopeTag, when the call
     // actually returns.
-    bool interruptAt(const std::string& label, size_t index)
+    bool interruptAt(const ::std::string& label, size_t index)
     {
         size_t seen = 0;
         for (auto& e : entries)
         {
             if (e->label != label) continue;
             if (seen++ != index)   continue;
-            e->flag.store(1, std::memory_order_release);
+            e->flag.store(1, ::std::memory_order_release);
             return true;
         }
         return false;
@@ -447,7 +450,7 @@ struct Scope
     void interruptAll()
     {
         for (auto& e : entries)
-            e->flag.store(1, std::memory_order_release);
+            e->flag.store(1, ::std::memory_order_release);
     }
     // Read-only enumeration for the shell. index is computed here, on read,
     // exactly as interruptAt resolves it -- so what a user sees and what a
@@ -456,16 +459,16 @@ struct Scope
     // volatility, not a discrepancy in the addressing).
     struct View
     {
-        std::string label;
+        ::std::string label;
         size_t      index       = 0;
         bool        interrupted = false; // already asked to stop, hasn't returned yet
     };
-    void collect(std::vector<View>& out) const
+    void collect(::std::vector<View>& out) const
     {
-        std::unordered_map<std::string, size_t> counters;
+        ::std::unordered_map<::std::string, size_t> counters;
         for (const auto& e : entries)
             out.push_back(View{e->label, counters[e->label]++,
-                               e->flag.load(std::memory_order_acquire) != 0});
+                               e->flag.load(::std::memory_order_acquire) != 0});
     }
     bool empty() const { return entries.empty(); }
 };
@@ -569,8 +572,8 @@ struct CausalEdgeFrame
     // Where to fold `accumulated` on the way out -- the per-(Type, Action)
     // statics the DEFINE_WORK_FUNC macros declare. Null for a frame with
     // nowhere to record (a nested helper that is not itself a work function).
-    std::atomic<uint64_t>* store_w   = nullptr;
-    std::atomic<bool>*     store_set = nullptr;
+    ::std::atomic<uint64_t>* store_w   = nullptr;
+    ::std::atomic<bool>*     store_set = nullptr;
 };
 
 inline CausalEdgeFrame*& ActiveCausalEdgeRef()
@@ -594,15 +597,15 @@ struct CausalScope
     CausalEdgeFrame  frame;
     CausalEdgeFrame* saved;
 
-    CausalScope(std::atomic<uint64_t>* store_w, std::atomic<bool>* store_set)
+    CausalScope(::std::atomic<uint64_t>* store_w, ::std::atomic<bool>* store_set)
         : saved(ActiveCausalEdgeRef())
     {
         frame.store_w   = store_w;
         frame.store_set = store_set;
-        if (store_set && store_set->load(std::memory_order_acquire))
+        if (store_set && store_set->load(::std::memory_order_acquire))
         {
             for (size_t i = 0; i < ETCS::TAG_WORDS; ++i)
-                frame.settled.w[i] = store_w[i].load(std::memory_order_relaxed);
+                frame.settled.w[i] = store_w[i].load(::std::memory_order_relaxed);
             frame.has_settled = true;
         }
         // EMPTY, not inherited -- see "EDGES, NOT CLOSURE" above.
@@ -620,17 +623,17 @@ struct CausalScope
             for (size_t i = 0; i < ETCS::TAG_WORDS; ++i)
                 if (frame.accumulated.w[i])
                     frame.store_w[i].fetch_or(frame.accumulated.w[i],
-                                              std::memory_order_relaxed);
+                                              ::std::memory_order_relaxed);
             if (frame.store_set)
-                frame.store_set->store(true, std::memory_order_release);
+                frame.store_set->store(true, ::std::memory_order_release);
         }
-        else if (frame.store_set && !frame.store_set->load(std::memory_order_acquire))
+        else if (frame.store_set && !frame.store_set->load(::std::memory_order_acquire))
         {
             // Ran and touched nothing. That IS the answer for this function and
             // it is the most valuable one -- a work function with no edges
             // orders against nothing but its own type. Marked settled so the
             // second invocation stops falling back to the type-wide closure.
-            frame.store_set->store(true, std::memory_order_release);
+            frame.store_set->store(true, ::std::memory_order_release);
         }
         // Restore WITHOUT folding into the parent: the parent's edge to this
         // callee is recorded at the acquisition site, not by inheriting here.
@@ -745,7 +748,7 @@ struct WorkBundle
     const bool isStream = false;
     
     WorkBundle(ETCS::Buffer m = "", ETCS::Buffer w = "", const void* f = nullptr, HASH_TYPE h = 0, bool stream = false)
-        : module_tag(std::move(m)), work_tag(std::move(w)), workFunc(f), hash(h), isStream(stream) {}
+        : module_tag(::std::move(m)), work_tag(::std::move(w)), workFunc(f), hash(h), isStream(stream) {}
     
     /*
  * By RID, not by pointer, which follows from what this struct is: bookkeeping
@@ -829,7 +832,7 @@ struct LifetimeOwner
         ETCS::Root*   as_root;
     };
     LifetimeOwner()                : as_entity(nullptr) {}
-    LifetimeOwner(std::nullptr_t)  : as_entity(nullptr) {}
+    LifetimeOwner(::std::nullptr_t)  : as_entity(nullptr) {}
     // Both check for null explicitly rather than unconditionally setting kind.
     // operator bool() and every `if (survivor)`/`if (entity)` branch rely
     // ENTIRELY on kind, never on the pointer -- so Kind::Entity with a null
@@ -862,7 +865,7 @@ struct LifetimeOwner
 // Entity::getManifest(), none of which exist yet in this include chain.
 struct Module
 {
-    std::string      name           = "";
+    ::std::string      name           = "";
 private:
     /*
  * PRIVATE so it cannot be closed from outside. Every dlclose/FreeLibrary
@@ -902,8 +905,8 @@ public:
  * only when no EventNode exists to purge from.
  */
     void unmapLibrary(EventNode* node);
-    std::string      filename       = "";
-    std::vector<ETCS::Buffer> tags;
+    ::std::string      filename       = "";
+    ::std::vector<ETCS::Buffer> tags;
     bool validBinary = false;
     // Every tag this module exports -> its fully-discovered ModuleBundle.
     //
@@ -912,7 +915,7 @@ public:
     // is what keeps every live entity's TagEntry::bundle valid across
     // hand-offs: those point INTO this map's entries, and its address never
     // changes while the module is loaded.
-    std::unordered_map<std::string, ModuleBundle>* type_catalog = nullptr;
+    ::std::unordered_map<::std::string, ModuleBundle>* type_catalog = nullptr;
     // This module's per-DSO MemoryArena::getInstance(), resolved once via the
     // Name##_GetArena export and cached here.
     MemoryArena* module_arena = nullptr;
@@ -951,7 +954,7 @@ public:
     // The only constructor for an Entity-hosted token. Every entity's module_
     // is constructed this way in Entity's own ctor initializer list, giving
     // every entity a valid (if vacant) token from the moment it exists.
-    Module(const std::string& modName, Entity& owner)
+    Module(const ::std::string& modName, Entity& owner)
         : name(modName)
         , library_handle(nullptr)
         , filename(getBinDir() + name + DL_EXTENSION)
@@ -959,7 +962,7 @@ public:
     {}
     // Root-hosted counterpart. Root no longer derives from Entity, so ordinary
     // overload resolution on *this picks between the two.
-    Module(const std::string& modName, Root& owner)
+    Module(const ::std::string& modName, Root& owner)
         : name(modName)
         , library_handle(nullptr)
         , filename(getBinDir() + name + DL_EXTENSION)
@@ -968,7 +971,7 @@ public:
     // For the ONE permanent global instance per module name (loader-arena
     // allocated). It never lives inside any entity's or Root's module_ member,
     // so hosting_entity stays Kind::None.
-    explicit Module(const std::string& modName)
+    explicit Module(const ::std::string& modName)
         : name(modName)
         , library_handle(nullptr)
         , filename(getBinDir() + name + DL_EXTENSION)
@@ -989,12 +992,12 @@ public:
     void promoteOrVacate(LifetimeOwner survivor);
     // Gives an already-constructed, still-vacant module_ its real identity.
     // Used once, by attachModule's bootstrap case.
-    void setIdentity(const std::string& modName)
+    void setIdentity(const ::std::string& modName)
     {
         name     = modName;
         filename = getBinDir() + name + DL_EXTENSION;
     }
-    const std::vector<ETCS::Buffer>& getTags()
+    const ::std::vector<ETCS::Buffer>& getTags()
     {
         if (parent) return parent->getTags();   // forwarding proxy
         if (tags.size() == 0)
@@ -1007,15 +1010,15 @@ public:
     // Use this rather than touching type_catalog directly on any Module that
     // might be a proxy. Anchor-only paths (catalogTypes, loadImpl) touch the
     // member directly since they only run on real anchors.
-    std::unordered_map<std::string, ModuleBundle>& catalog()
+    ::std::unordered_map<::std::string, ModuleBundle>& catalog()
     {
         return parent ? parent->catalog() : *type_catalog;
     }
-    const std::string& getFilename() const
+    const ::std::string& getFilename() const
     {
         return filename;
     }
-    void* getTagFunction(const std::string& tag)
+    void* getTagFunction(const ::std::string& tag)
     {
 #ifdef ETCS_LOADER
         if (!library_handle) return nullptr;
@@ -1033,7 +1036,7 @@ public:
     {
 #ifdef ETCS_LOADER
         if (!library_handle || !validBinary) return;
-        std::string cleanupSymbol = name + "_Cleanup";
+        ::std::string cleanupSymbol = name + "_Cleanup";
         void* cleanupHandle = getTagFunction(cleanupSymbol);
         reinterpret_cast<ThreadpoolCleanFunc>(cleanupHandle)();
 #endif
@@ -1053,32 +1056,32 @@ public:
                     << "' -- cannot allocate persistent type_catalog.");
                 return;
             }
-            type_catalog = module_arena->allocate<std::unordered_map<std::string, ModuleBundle>>();
+            type_catalog = module_arena->allocate<::std::unordered_map<::std::string, ModuleBundle>>();
         }
         for (const auto& tag : getTags())
         {
-            std::string tag_str = tag.toString();
+            ::std::string tag_str = tag.toString();
             if (type_catalog->find(tag_str) == type_catalog->end())
                 type_catalog->emplace(tag_str, getTagAddress(tag_str));
         }
 #endif
     }
-    Manifest* discoverTags(std::vector<ETCS::Buffer>& vec)
+    Manifest* discoverTags(::std::vector<ETCS::Buffer>& vec)
     {
 #ifdef ETCS_LOADER
         void* moduleFuncAddr = getTagFunction(name);
         if (!moduleFuncAddr)
-            throw std::runtime_error(
+            throw ::std::runtime_error(
                 "Failed to find module discovery function '" + name + "' in " + getFilename());
         ModuleFunc moduleFunc = reinterpret_cast<ModuleFunc>(moduleFuncAddr);
         ETCS::BBuffer buff;
         Manifest* hashes = moduleFunc(buff);
         if (!hashes)
-            throw std::runtime_error("Discover tags on " + name + " failed to provide a valid Manifest.");
+            throw ::std::runtime_error("Discover tags on " + name + " failed to provide a valid Manifest.");
         if (validateManifest(hashes))
             throw ManifestMismatchException("manifest mismatch loading " + name);
-        std::stringstream ss(buff.toString());
-        std::string tag_string;
+        ::std::stringstream ss(buff.toString());
+        ::std::string tag_string;
         ETCS_LOG("DynamicLoader:Module", "Discovering tags provided by " << name);
         while (ss >> tag_string)
         {
@@ -1094,27 +1097,27 @@ public:
     // Manifest tokens are UNQUALIFIED; the exported SYMBOLS are
     // Type-qualified (ETCS_MODULE_EXPORT_WORK explains why). The
     // qualification is reconstructed here, where `tag` is already in scope.
-    Manifest* discoverActions(std::string tag, ETCS::FlatMap<ETCS::Buffer, WorkBundle>& actions)
+    Manifest* discoverActions(::std::string tag, ETCS::FlatMap<ETCS::Buffer, WorkBundle>& actions)
     {
 #ifdef ETCS_LOADER
         using WorkFuncResolver   = WorkFunc (*)();
         using StreamFuncResolver = StreamFunc (*)();
-        std::string workFuncSymbol = tag + "_List";
+        ::std::string workFuncSymbol = tag + "_List";
         void* workAddr = getTagFunction(workFuncSymbol);
         if (!workAddr)
-            throw std::runtime_error("Failed to find '" + workFuncSymbol + "' in " + name);
+            throw ::std::runtime_error("Failed to find '" + workFuncSymbol + "' in " + name);
         ModuleFunc moduleFunc = reinterpret_cast<ModuleFunc>(workAddr);
         ETCS::BBuffer buff;
         Manifest* actionsHashes = moduleFunc(buff);
         if (!actionsHashes)
-            throw std::runtime_error(
+            throw ::std::runtime_error(
                 "Discover actions on " + name + "." + tag + " failed to provide a valid Manifest.");
-        std::stringstream ss(buff.toString());
-        std::string workToken;
+        ::std::stringstream ss(buff.toString());
+        ::std::string workToken;
         ETCS_LOG("DynamicLoader:Module", "Got actions: ");
         while (ss >> workToken)
         {
-            std::string baseName;
+            ::std::string baseName;
             bool isStream;
             if (workToken.size() > 5 &&
                 workToken.compare(workToken.size() - 5, 5, "_Work") == 0)
@@ -1134,8 +1137,8 @@ public:
                     "Malformed action token (expected '<Action>_Work' or '_Stream'): " << workToken);
                 continue;
             }
-            std::string foundAction      = tag + "_" + baseName + (isStream ? "_Stream" : "_Work");
-            std::string foundActionsHash = tag + "_" + baseName + "_GetHash";
+            ::std::string foundAction      = tag + "_" + baseName + (isStream ? "_Stream" : "_Work");
+            ::std::string foundActionsHash = tag + "_" + baseName + "_GetHash";
             void* foundWorkAddr = getTagFunction(foundAction);
             void* foundHashAddr = getTagFunction(foundActionsHash);
             if (!foundWorkAddr) {
@@ -1157,9 +1160,9 @@ public:
                 {ETCS::Buffer(tag), ETCS::Buffer(baseName), actualWork, actualWorkHash, isStream});
             ETCS_LOG("DynamicLoader:Module", baseName << " [Stream:" << isStream << "]"
                 << " WorkAddr: " << foundWorkAddr
-                << " Hash: " << std::hex << std::showbase << actualWorkHash << std::dec);
+                << " Hash: " << ::std::hex << ::std::showbase << actualWorkHash << ::std::dec);
         }
-        std::cout << " --- " << "\n";
+        ::std::cout << " --- " << "\n";
         return actionsHashes;
 #endif
         (void) tag; (void) actions;
@@ -1171,10 +1174,10 @@ public:
     // RootSignalContext().
     bool registerLoader(EventNode& st);
     // Defined in DynamicLoader.h -- same reasons as registerLoader.
-    ETCS::ModuleBundle getTagAddress(const std::string& tag);
+    ETCS::ModuleBundle getTagAddress(const ::std::string& tag);
 private:
-    static const std::string& getBinDir() {
-        static const std::string dir = []() -> std::string {
+    static const ::std::string& getBinDir() {
+        static const ::std::string dir = []() -> ::std::string {
 #if defined(_WIN32) || defined(_WIN64)
             char path[MAX_PATH];
             DWORD len = GetModuleFileNameA(NULL, path, MAX_PATH);
@@ -1183,7 +1186,7 @@ private:
             if (!lastSep) lastSep = strrchr(path, '/');
             if (lastSep) *(lastSep + 1) = '\0';
             else return ".\\";
-            return std::string(path);
+            return ::std::string(path);
 #else
             char path[PATH_MAX];
             ssize_t len = readlink("/proc/self/exe", path, sizeof(path) - 1);
@@ -1192,7 +1195,7 @@ private:
             char* lastSlash = strrchr(path, '/');
             if (lastSlash) *(lastSlash + 1) = '\0';
             else return "./";
-            return std::string(path);
+            return ::std::string(path);
 #endif
         }();
         return dir;

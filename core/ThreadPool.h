@@ -14,7 +14,7 @@
 #include <iostream>
 #include <string>
 
-#ifdef __linux__
+#if defined(__linux__) && !defined(__EMSCRIPTEN__)
 #include <liburing.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -22,6 +22,8 @@
 #elif defined(_WIN32)
 #include <winsock2.h>
 #include <windows.h>
+#elif defined(__EMSCRIPTEN__)
+#include <unistd.h>
 #endif
 
 #include "Buffer.h"
@@ -55,7 +57,7 @@ struct IOCompletion
     void*       buffer;
     size_t      buffer_len;
     ETCS::SignalContext ctx;
-    std::function<void(IOCompletion)> callback;
+    ::std::function<void(IOCompletion)> callback;
 };
 
 struct IOSubmission
@@ -70,10 +72,10 @@ struct IOSubmission
     size_t      buffer_len = 0;
     int         priority;
     ETCS::SignalContext ctx;
-    std::function<void(IOCompletion)> callback;
+    ::std::function<void(IOCompletion)> callback;
 
     uint64_t    timeout_ns = 0;
-#ifdef __linux__
+#if defined(__linux__) && !defined(__EMSCRIPTEN__)
     __kernel_timespec ts = {};
 #endif
 };
@@ -106,7 +108,7 @@ public:
         // survived every entity-teardown fix.
         //
         // Destructor first, THEN release: releaseToFreeList memsets the
-        // block, and the SignalContext/std::function members must have
+        // block, and the SignalContext/::std::function members must have
         // destructed before their storage is overwritten.
         auto& arena = ETCS::MemoryArena::getInstance();
         p->~IOSubmission();
@@ -119,26 +121,26 @@ public:
 class ThreadPool
 {
 private:
-    std::atomic<bool> is_drained_{false};
+    ::std::atomic<bool> is_drained_{false};
 
     struct TaskMetadata
     {
         ETCS::SignalContext ctx;
-        std::chrono::steady_clock::time_point signal_detected_at;
+        ::std::chrono::steady_clock::time_point signal_detected_at;
         bool is_terminating = false;
         bool dump_requested = false;
         bool cancel_requested = false;
-        std::thread::native_handle_type native_handle;
+        ::std::thread::native_handle_type native_handle;
     };
 
     void watchdog_loop()
     {
         while (!watchdog_stop_)
         {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            ::std::this_thread::sleep_for(::std::chrono::milliseconds(100));
 
-            std::unique_lock<std::mutex> lock(active_tasks_mutex_);
-            auto now = std::chrono::steady_clock::now();
+            ::std::unique_lock<::std::mutex> lock(active_tasks_mutex_);
+            auto now = ::std::chrono::steady_clock::now();
 
             for (auto it = active_tasks_.begin(); it != active_tasks_.end(); )
             {
@@ -156,13 +158,13 @@ private:
                     continue;
                 }
 
-                auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+                auto duration = ::std::chrono::duration_cast<::std::chrono::milliseconds>(
                     now - meta.signal_detected_at);
                 long long ms = duration.count();
 
                 if (ms > 400 && ms <= 500 && meta.ctx.user1 && !meta.dump_requested)
                 {
-                    meta.ctx.user1->store(1, std::memory_order_release);
+                    meta.ctx.user1->store(1, ::std::memory_order_release);
                     meta.dump_requested = true;
                     ETCS_LOG("ThreadPool:WATCHDOG", "Task '" << meta.ctx.tag << "' is hanging. Requested state dump (User1).");
                 }
@@ -170,7 +172,7 @@ private:
                 if (ms > 500 && !meta.cancel_requested)
                 {
                     {
-                        std::lock_guard<std::mutex> err_lock(error_mutex_);
+                        ::std::lock_guard<::std::mutex> err_lock(error_mutex_);
                         last_error_tag = meta.ctx.tag.toString();
                         has_error = true;
                     }
@@ -178,7 +180,7 @@ private:
                     ETCS_LOG("ThreadPool:WATCHDOG", "CRITICAL: Task '" << meta.ctx.tag
                               << "' ignored signals for 500ms. Parent: " << meta.ctx.parent
                               << ". Requesting cancellation of thread " << it->first << " (one-shot).");
-    #ifdef __linux__
+    #if defined(__linux__) && !defined(__EMSCRIPTEN__)
                     pthread_cancel(meta.native_handle);
     #elif defined(_WIN32)
                     TerminateThread(meta.native_handle, 0);
@@ -191,7 +193,7 @@ private:
         }
     }
 
-#ifdef __linux__
+#if defined(__linux__) && !defined(__EMSCRIPTEN__)
     static constexpr unsigned RING_ENTRIES = 256;
     struct io_uring ring_;
 
@@ -223,7 +225,7 @@ private:
             // Cancel completions have no meaningful callback — just release the sub
             if (sub->op == IOOp::Cancel)
             {
-                std::lock_guard<std::mutex> lock(submit_mutex_);
+                ::std::lock_guard<::std::mutex> lock(submit_mutex_);
                 sub_pool_.release(sub);
                 continue;
             }
@@ -239,15 +241,15 @@ private:
             int  pri = sub->priority;
             auto ctx = sub->ctx;
             {
-                std::lock_guard<std::mutex> lock(submit_mutex_);
+                ::std::lock_guard<::std::mutex> lock(submit_mutex_);
                 sub_pool_.release(sub);
             }
 
             if (!cb) continue;
             // enqueue throws once stop_ is set; uncaught it unwinds the loop
-            // into std::terminate during shutdown.
+            // into ::std::terminate during shutdown.
             try { enqueue(pri, ctx, [cb, completion]() mutable { cb(completion); }); }
-            catch (const std::exception& e)
+            catch (const ::std::exception& e)
             { ETCS_LOG("ThreadPool:IO", "completion dropped: " << e.what()); }
         }
     }
@@ -285,15 +287,23 @@ private:
             int  pri = sub->priority;
             auto ctx = sub->ctx;
             {
-                std::lock_guard<std::mutex> lock(submit_mutex_);
+                ::std::lock_guard<::std::mutex> lock(submit_mutex_);
                 sub_pool_.release(sub);
             }
 
             if (!cb) continue;
             try { enqueue(pri, ctx, [cb, completion]() mutable { cb(completion); }); }
-            catch (const std::exception& e)
+            catch (const ::std::exception& e)
             { ETCS_LOG("ThreadPool:IO", "completion dropped: " << e.what()); }
         }
+    }
+#elif defined(__EMSCRIPTEN__)
+    // No kernel async IO (io_uring / IOCP). Completion thread is a park
+    // loop so start/stop lifecycle still works; submit() is a no-op refuse.
+    void io_completion_loop()
+    {
+        while (!io_stop_)
+            ::std::this_thread::sleep_for(::std::chrono::milliseconds(100));
     }
 #endif
 
@@ -301,11 +311,11 @@ private:
     {
         int priority;
         ETCS::SignalContext ctx;
-        std::function<void()> func;
+        ::std::function<void()> func;
 
         Task() : priority(0), ctx({}), func(nullptr) {}
-        Task(int p, ETCS::SignalContext c, std::function<void()> f)
-            : priority(p), ctx(c), func(std::move(f)) {}
+        Task(int p, ETCS::SignalContext c, ::std::function<void()> f)
+            : priority(p), ctx(c), func(::std::move(f)) {}
     };
 
     struct CompareTask
@@ -316,29 +326,29 @@ private:
         }
     };
 
-    std::vector<std::thread> workers_;
-    std::priority_queue<Task, std::vector<Task>, CompareTask> task_queue_;
+    ::std::vector<::std::thread> workers_;
+    ::std::priority_queue<Task, ::std::vector<Task>, CompareTask> task_queue_;
 
-    std::mutex              queue_mutex_;
-    std::mutex              active_tasks_mutex_;
-    std::mutex              error_mutex_;
-    std::condition_variable condition_;
+    ::std::mutex              queue_mutex_;
+    ::std::mutex              active_tasks_mutex_;
+    ::std::mutex              error_mutex_;
+    ::std::condition_variable condition_;
 
-    std::atomic<bool> stop_;
-    std::atomic<bool> watchdog_stop_;
-    std::atomic<bool> io_stop_;
-    std::atomic<bool> io_cleaned_up_{false};
+    ::std::atomic<bool> stop_;
+    ::std::atomic<bool> watchdog_stop_;
+    ::std::atomic<bool> io_stop_;
+    ::std::atomic<bool> io_cleaned_up_{false};
 
-    std::unordered_map<std::thread::id, TaskMetadata> active_tasks_;
-    std::thread watchdog_thread_;
-    std::thread io_thread_;
+    ::std::unordered_map<::std::thread::id, TaskMetadata> active_tasks_;
+    ::std::thread watchdog_thread_;
+    ::std::thread io_thread_;
 
-    std::atomic<bool> has_error{false};
-    std::string       last_error_tag{"none"};
+    ::std::atomic<bool> has_error{false};
+    ::std::string       last_error_tag{"none"};
 
     // io_uring_get_sqe bumps the SQ tail non-atomically and liburing gives no
     // thread-safety without SQPOLL. Every pool worker calls submit().
-    std::mutex       submit_mutex_;
+    ::std::mutex       submit_mutex_;
     IOSubmissionPool sub_pool_;
 
     void cleanup_io()
@@ -346,7 +356,7 @@ private:
         bool expected = false;
         if (!io_cleaned_up_.compare_exchange_strong(expected, true))
             return;
-#ifdef __linux__
+#if defined(__linux__) && !defined(__EMSCRIPTEN__)
         io_uring_queue_exit(&ring_);
 #elif defined(_WIN32)
         if (iocp_ != INVALID_HANDLE_VALUE)
@@ -394,13 +404,13 @@ public:
         // designed to be first-constructed at any point, by any caller.
         ETCS::MemoryArena::getInstance();
 
-#ifdef __linux__
+#if defined(__linux__) && !defined(__EMSCRIPTEN__)
         if (io_uring_queue_init(RING_ENTRIES, &ring_, 0) < 0)
-            throw std::runtime_error("[IO] Failed to init io_uring");
+            throw ::std::runtime_error("[IO] Failed to init io_uring");
 #elif defined(_WIN32)
         iocp_ = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 1);
         if (!iocp_ || iocp_ == INVALID_HANDLE_VALUE)
-            throw std::runtime_error("[IO] Failed to create IOCP");
+            throw ::std::runtime_error("[IO] Failed to create IOCP");
 #endif
 
         ETCS_LOG("ThreadPool", "Initializing with hardware threads: " << threads);
@@ -413,28 +423,28 @@ public:
                 {
                     Task task;
                     {
-                        std::unique_lock<std::mutex> lock(queue_mutex_);
+                        ::std::unique_lock<::std::mutex> lock(queue_mutex_);
                         condition_.wait(lock, [this] { return stop_ || !task_queue_.empty(); });
                         if (stop_ && task_queue_.empty()) return;
-                        task = std::move(task_queue_.top());
+                        task = ::std::move(task_queue_.top());
                         task_queue_.pop();
                     }
 
                     {
-                        std::lock_guard<std::mutex> lock(active_tasks_mutex_);
+                        ::std::lock_guard<::std::mutex> lock(active_tasks_mutex_);
                         TaskMetadata meta;
                         meta.ctx                = task.ctx;
-                        meta.signal_detected_at  = std::chrono::steady_clock::now();
+                        meta.signal_detected_at  = ::std::chrono::steady_clock::now();
 #ifdef _WIN32
                         meta.native_handle = GetCurrentThread();
 #else
                         meta.native_handle = pthread_self();
 #endif
-                        active_tasks_[std::this_thread::get_id()] = std::move(meta);
+                        active_tasks_[::std::this_thread::get_id()] = ::std::move(meta);
                     }
                     
                     try { task.func(); }
-                    catch (const std::exception& e)
+                    catch (const ::std::exception& e)
                     {
                         ETCS_LOG("ThreadPool", "Worker caught exception in '"
                                  << task.ctx.tag << "': " << e.what());
@@ -442,16 +452,16 @@ public:
                     catch (...) {}
 
                     {
-                        std::lock_guard<std::mutex> lock(active_tasks_mutex_);
-                        active_tasks_.erase(std::this_thread::get_id());
+                        ::std::lock_guard<::std::mutex> lock(active_tasks_mutex_);
+                        active_tasks_.erase(::std::this_thread::get_id());
                     }
                 }
             });
         }
 
-        watchdog_thread_ = std::thread(&ThreadPool::watchdog_loop, this);
-        io_thread_       = std::thread(&ThreadPool::io_completion_loop, this);
-        s_alive.store(true, std::memory_order_release);
+        watchdog_thread_ = ::std::thread(&ThreadPool::watchdog_loop, this);
+        io_thread_       = ::std::thread(&ThreadPool::io_completion_loop, this);
+        s_alive.store(true, ::std::memory_order_release);
     }
 
     // Liveness, readable AFTER this object has been destroyed. Same hazard
@@ -465,12 +475,12 @@ public:
     // That trick works because both singletons are ours; it cannot reach the
     // loader's statics, which register with __cxa_atexit before this module
     // was ever dlopen'd and are therefore torn down after it.
-    inline static std::atomic<bool> s_alive{false};
-    static bool alive() { return s_alive.load(std::memory_order_acquire); }
+    inline static ::std::atomic<bool> s_alive{false};
+    static bool alive() { return s_alive.load(::std::memory_order_acquire); }
 
     ~ThreadPool()
     {
-        s_alive.store(false, std::memory_order_release);
+        s_alive.store(false, ::std::memory_order_release);
         ETCS_LOG("ThreadPool", "dtor called, trigger_shutdown_drain...");
         trigger_shutdown_drain();
     }
@@ -482,11 +492,11 @@ public:
 
     bool submit(IOSubmission&& sub)
     {
-#ifdef __linux__
-        std::lock_guard<std::mutex> lock(submit_mutex_);
+#if defined(__linux__) && !defined(__EMSCRIPTEN__)
+        ::std::lock_guard<::std::mutex> lock(submit_mutex_);
 
         IOSubmission* heap_sub = sub_pool_.acquire();
-        *heap_sub = std::move(sub);
+        *heap_sub = ::std::move(sub);
 
         struct io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
         if (!sqe)
@@ -542,9 +552,9 @@ public:
         io_uring_submit(&ring_);
 
 #elif defined(_WIN32)
-        std::lock_guard<std::mutex> lock(submit_mutex_);
+        ::std::lock_guard<::std::mutex> lock(submit_mutex_);
         IOSubmission* heap_sub = sub_pool_.acquire();
-        *heap_sub = std::move(sub);
+        *heap_sub = ::std::move(sub);
         heap_sub->overlapped = {};
 
         switch (heap_sub->op)
@@ -573,6 +583,11 @@ public:
             case IOOp::Cancel:
                 break;
         }
+#else
+        // Web / other: no kernel async IO backend. Refuse so callers retry
+        // or use a synchronous path rather than believing a submission stuck.
+        (void)sub;
+        return false;
 #endif
         return true;
     }
@@ -586,34 +601,34 @@ public:
 
     template<class F, class... Args>
     auto enqueue(ETCS::Priority priority, ETCS::SignalContext ctx, F&& f, Args&&... args)
-        -> std::future<std::invoke_result_t<F, Args...>>
+        -> ::std::future<::std::invoke_result_t<F, Args...>>
     {
-        return enqueue(static_cast<int>(priority), std::move(ctx),
-                       std::forward<F>(f), std::forward<Args>(args)...);
+        return enqueue(static_cast<int>(priority), ::std::move(ctx),
+                       ::std::forward<F>(f), ::std::forward<Args>(args)...);
     }
 
     template<class F, class... Args>
     auto enqueue(int priority, ETCS::SignalContext ctx, F&& f, Args&&... args)
-        -> std::future<std::invoke_result_t<F, Args...>>
+        -> ::std::future<::std::invoke_result_t<F, Args...>>
     {
-        using return_type = std::invoke_result_t<F, Args...>;
+        using return_type = ::std::invoke_result_t<F, Args...>;
 
-        auto packaged = std::make_shared<std::packaged_task<return_type()>>(
+        auto packaged = ::std::make_shared<::std::packaged_task<return_type()>>(
             [
-                f_func = std::forward<F>(f),
-                f_args = std::make_tuple(std::forward<Args>(args)...)
+                f_func = ::std::forward<F>(f),
+                f_args = ::std::make_tuple(::std::forward<Args>(args)...)
             ]() mutable -> return_type
             {
-                return std::apply(std::move(f_func), std::move(f_args));
+                return ::std::apply(::std::move(f_func), ::std::move(f_args));
             }
         );
 
-        std::future<return_type> res = packaged->get_future();
+        ::std::future<return_type> res = packaged->get_future();
         {
-            std::unique_lock<std::mutex> lock(queue_mutex_);
-            if (stop_.load(std::memory_order_relaxed))
-                throw std::runtime_error("ThreadPool stopped");
-            task_queue_.emplace(priority, std::move(ctx), [packaged]() { (*packaged)(); });
+            ::std::unique_lock<::std::mutex> lock(queue_mutex_);
+            if (stop_.load(::std::memory_order_relaxed))
+                throw ::std::runtime_error("ThreadPool stopped");
+            task_queue_.emplace(priority, ::std::move(ctx), [packaged]() { (*packaged)(); });
         }
         condition_.notify_one();
         return res;
@@ -637,13 +652,13 @@ public:
         if (watchdog_thread_.joinable()) watchdog_thread_.join();
 
         {
-            std::unique_lock<std::mutex> lock(queue_mutex_);
+            ::std::unique_lock<::std::mutex> lock(queue_mutex_);
             stop_ = true;
         }
         condition_.notify_all();
 
         ETCS_LOG("ThreadPool", "cushion wait for threads...");
-        std::this_thread::sleep_for(std::chrono::milliseconds(101)); // intentional delay so this doesn't go too fast... 
+        ::std::this_thread::sleep_for(::std::chrono::milliseconds(101)); // intentional delay so this doesn't go too fast... 
         // this sleep also allows any unload event in transit to resolve in worst case within 100ms
         ETCS_LOG("ThreadPool", "done cushion waiting for threads...");
 
@@ -654,8 +669,8 @@ public:
  * Any path that reaches exit() from inside a pool worker runs the static
  * destructors on that worker, which reaches here, which joins the worker
  * itself. pthread_join on self returns EDEADLK, libstdc++ turns that into a
- * std::system_error, and an exception leaving a destructor during exit is
- * std::terminate -- an abort, with the real cause four frames of unwinder
+ * ::std::system_error, and an exception leaving a destructor during exit is
+ * ::std::terminate -- an abort, with the real cause four frames of unwinder
  * below anything recognisable.
  *
  * Reached in practice through Xlib: its default error handler calls exit()
@@ -671,8 +686,8 @@ public:
  * is the one case where the shutdown is being run BY the thing it is
  * shutting down.
  */
-        const std::thread::id self_id = std::this_thread::get_id();
-        for (std::thread& worker : workers_)
+        const ::std::thread::id self_id = ::std::this_thread::get_id();
+        for (::std::thread& worker : workers_)
         {
             if (!worker.joinable()) continue;
             if (worker.get_id() == self_id)
@@ -687,11 +702,11 @@ public:
         }
     }
     
-    bool isDrained() const { return is_drained_.load(std::memory_order_acquire); }
+    bool isDrained() const { return is_drained_.load(::std::memory_order_acquire); }
 
-    bool getLastError(std::string& out_tag)
+    bool getLastError(::std::string& out_tag)
     {
-        std::lock_guard<std::mutex> lock(error_mutex_);
+        ::std::lock_guard<::std::mutex> lock(error_mutex_);
         if (!has_error) return false;
         out_tag = last_error_tag;
         has_error = false;
