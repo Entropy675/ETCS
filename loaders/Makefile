@@ -12,6 +12,7 @@
 UNAME_S := $(shell uname -s)
 NPROC   := $(shell nproc)
 CXX := g++
+CC  := gcc
 BIN_DIR := ../bin
 
 # Debug info: make DEBUG=1, off by default. A sanitizer build forces
@@ -55,7 +56,19 @@ CXXFLAGS := -std=c++17 \
             $(DEBUGFLAGS) \
             $(SANITIZE)
 
-ifeq ($(UNAME_S),Linux)
+# Web FIRST: under emscripten uname still reports Linux.
+ifdef EMSCRIPTEN
+    # Loader = MAIN module. Side modules (-sSIDE_MODULE) load at runtime;
+    # MAIN_MODULE=2 keeps flexible dynamic linking. -pthread /
+    # -fwasm-exceptions MUST match every side module or the browser
+    # refuses instantiation. -fvisibility=default so @@ETCS_ABI
+    # trampolines are visible to dylink.
+    CXX := em++
+    CC  := emcc
+    CXXFLAGS += -pthread -fwasm-exceptions -fvisibility=default
+    LDFLAGS := -sMAIN_MODULE=2 -pthread -fwasm-exceptions \
+               -sALLOW_MEMORY_GROWTH=1 -sERROR_ON_UNDEFINED_SYMBOLS=0
+else ifeq ($(UNAME_S),Linux)
     LDFLAGS := -ldl -Wl,--no-as-needed -pthread -luring -Wl,--as-needed -fuse-ld=gold -Wl,--threads -Wl,--thread-count,$(NPROC) -rdynamic -Wl,--version-script=exports.map
 else ifeq ($(UNAME_S),Windows_NT)
     LDFLAGS := -lws2_32
@@ -108,7 +121,7 @@ copy_loaders:
 	@mkdir -p $(BIN_DIR)
 	@echo "--- Moving Loaders to $(BIN_DIR)/ ---"
 	@found=0; \
-	for f in Run_*Loader etcs; do \
+	for f in Run_*Loader etcs Run_*Loader.js Run_*Loader.wasm etcs.js etcs.wasm; do \
 	    if [ -f "$$f" ]; then \
 	        mv -f "$$f" $(BIN_DIR)/; \
 	        echo " [✓] Moved: $$f -> $(BIN_DIR)/"; \
@@ -118,5 +131,5 @@ copy_loaders:
 	if [ $$found -eq 0 ]; then echo " [!] No binaries found to move"; fi
 
 clean:
-	rm -f Run_*Loader etcs *.o
-	@for f in Run_*Loader etcs; do rm -f $(BIN_DIR)/$$f; done
+	rm -f Run_*Loader etcs *.o Run_*Loader.js Run_*Loader.wasm etcs.js etcs.wasm
+	@for f in Run_*Loader etcs Run_*Loader.js Run_*Loader.wasm etcs.js etcs.wasm; do rm -f $(BIN_DIR)/$$f; done

@@ -115,14 +115,18 @@ struct alignas(8) TBuffer  // C-style TBuffer struct, cross DLL info transfer
     TBuffer& operator=(const TBuffer& other) = default;
     TBuffer& operator=(TBuffer&&) noexcept = default;
     
-    operator const char*() const {
+    operator const char*() const 
+    {
+        // byte mode doesn't keep these in sync
+        assert((written < bufsize && std::strlen(buf) == written)
+               && "TBuffer: string view taken on raw/packed content");
         return buf;
     }
     
     operator bool() const {
-        return buf[0] != '\0';
+        return written != 0;
     }
-    
+
     void reset() 
     {
         written = 0;
@@ -152,13 +156,17 @@ struct alignas(8) TBuffer  // C-style TBuffer struct, cross DLL info transfer
     const char* c_str() const { return buf; }
 
     bool operator<(const TBuffer& other) const 
-    {   // Lexicographical comparison for map ordering
-        return std::strcmp(this->buf, other.buf) < 0;
+    {
+        const size_t common = written < other.written ? written : other.written;
+        const int cmp = (common == 0) ? 0 : std::memcmp(buf, other.buf, common);
+        if (cmp != 0) return cmp < 0;
+        return written < other.written;
     }
 
-    bool operator==(const TBuffer& other) const 
+    bool operator==(const TBuffer& other) const
     {
-        return std::strcmp(this->buf, other.buf) == 0;
+        return written == other.written
+            && (written == 0 || std::memcmp(buf, other.buf, written) == 0);
     }
     
     bool operator!=(const TBuffer& other) const
@@ -177,6 +185,14 @@ struct alignas(8) TBuffer  // C-style TBuffer struct, cross DLL info transfer
         }
         std::memcpy(buf + written, data, len);
         written += len;
+        // Maintain the string-side invariant (buf[written] == '\0'
+        // whenever there is room) so c_str()/operator const char*/
+        // ostream<< read the CURRENT extent instead of stale bytes from
+        // whatever was written before. Capacity semantics unchanged: a
+        // raw fill may still use all N bytes, in which case there is no
+        // terminator -- exactly like the string writers at their own
+        // limit.
+        if (written < bufsize) buf[written] = '\0';
         return true;
     }
 
@@ -315,8 +331,22 @@ inline TBuffer<N>& operator>>(TBuffer<N>& b, T& val)
 
 template<size_t N, size_t M>
 inline TBuffer<N>& operator>>(TBuffer<N>& src, TBuffer<M>& dest)
-{   // Logic to move/copy all remaining data from src to dest
-    dest.write(src.buf);
+{   // Move the REMAINING bytes (from read_offset) into dest, as bytes.
+    // The old body copied from the START of src -- re-delivering tokens
+    // already extracted -- and routed through write(), which is
+    // strlen-bounded, so any embedded NUL truncated the copy at byte
+    // zero. This now does what the comment always said.
+    //
+    // One flagged behavior change: src is CONSUMED (read_offset advanced
+    // to written), matching every other >> extractor and the "move" in
+    // the comment. The old code left src untouched -- if any call site
+    // relied on tee-into-dest-then-keep-extracting-from-src, it will
+    // surface here immediately rather than silently. No trailing space
+    // is appended: this is a byte move, and extraction from dest is
+    // delimiter-skipping and bounded by written either way.
+    if (src.read_offset < src.written)
+        dest.writeRaw(src.buf + src.read_offset, src.written - src.read_offset);
+    src.read_offset = src.written;
     return src;
 }
 
@@ -460,8 +490,12 @@ inline TBuffer<N>& operator<<(TBuffer<N>& buf, const bool& val) {
 template<size_t N, size_t M>
 inline TBuffer<N>& operator<<(TBuffer<N>& b, const TBuffer<M>& val) 
 {
-    // Simply use the existing write method to append the raw contents
-    b.write(val.c_str());
+    // Append the WRITTEN prefix as bytes: the old c_str() route was
+    // strlen-bounded and silently dropped everything past an embedded
+    // NUL. The trailing space stays -- every token-forming << appends
+    // its own delimiter, so dropping it would merge this buffer's first
+    // token into the previous one's tail.
+    b.writeRaw(val.buf, val.written);
     
     // Maintain your delimiter consistency
     if (b.written < N - 1) {
@@ -470,7 +504,6 @@ inline TBuffer<N>& operator<<(TBuffer<N>& b, const TBuffer<M>& val)
     }
     return b;
 }
-
 template<size_t N>
 inline std::ostream& operator<<(std::ostream& os, const TBuffer<N>& TBuffer) 
 {
