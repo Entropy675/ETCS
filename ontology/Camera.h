@@ -173,7 +173,7 @@ public:
  */
     Device_* DeviceSource()
     {
-        std::vector<std::pair<ETCS::Buffer, ETCS::RID>> kids;
+        ::std::vector<::std::pair<ETCS::Buffer, ETCS::RID>> kids;
         this->getTypedChildren(kids);
         for (const auto& entry : kids)
         {

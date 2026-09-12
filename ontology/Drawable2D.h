@@ -232,7 +232,7 @@ public:
         void* as_drawable = getInterfacePointer(ETCS::Buffer("Drawable"));
         if (!as_drawable) return Pick2D{ this, local };  // no lineage: nothing nested
 
-        std::vector<Drawable_*> ordered;
+        ::std::vector<Drawable_*> ordered;
         static_cast<Drawable_*>(as_drawable)->collectDrawableChildren(ordered);
         for (size_t i = ordered.size(); i-- > 0; )
         {

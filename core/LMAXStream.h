@@ -30,7 +30,7 @@ namespace ETCS
 // underlying page). A single thread must then be responsible consumption.
 // ---------------------------------------------------------------------------
 
-template <typename Callback = std::function<void(const LBuffer&)>>
+template <typename Callback = ::std::function<void(const LBuffer&)>>
 struct LMAXStream
 {
     // ------------------------------------------------------------------
@@ -102,7 +102,7 @@ struct LMAXStream
     uint64_t consumeAll(Callback&& cb)
     {
         uint64_t count = 0;
-        while (consume(std::forward<Callback>(cb)))
+        while (consume(::std::forward<Callback>(cb)))
             ++count;
         return count;
     }
@@ -115,7 +115,7 @@ struct LMAXStream
         int retry = 0;
         while (expected_seq_ < target)
         {
-            if (consume(std::forward<Callback>(cb)))
+            if (consume(::std::forward<Callback>(cb)))
             {
                 retry = 0;
                 continue;
@@ -127,15 +127,15 @@ struct LMAXStream
     // Spin indefinitely, calling cb for every frame that arrives.
     // Returns only when stop_flag becomes true AND the ring is drained
     // up to total_expected frames.
-    void consumeLoop(std::atomic<bool>& stop_flag,
-                     std::atomic<uint64_t>& total_expected,
+    void consumeLoop(::std::atomic<bool>& stop_flag,
+                     ::std::atomic<uint64_t>& total_expected,
                      Callback&& cb)
     {
         int retry = 0;
-        while (stop_flag.load(std::memory_order_acquire) == false ||
-               expected_seq_ < total_expected.load(std::memory_order_relaxed))
+        while (stop_flag.load(::std::memory_order_acquire) == false ||
+               expected_seq_ < total_expected.load(::std::memory_order_relaxed))
         {
-            if (consume(std::forward<Callback>(cb)))
+            if (consume(::std::forward<Callback>(cb)))
             {
                 retry = 0;
                 continue;

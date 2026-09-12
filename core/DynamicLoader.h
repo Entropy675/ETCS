@@ -44,9 +44,9 @@ namespace ETCS {
  * and this map is how it finds them: filled at registerLoader, emptied at
  * unload, keyed by the module's own scope name.
  */
-    inline std::unordered_map<std::string, EventNode*>& module_log_nodes()
+    inline ::std::unordered_map<::std::string, EventNode*>& module_log_nodes()
     {
-        static std::unordered_map<std::string, EventNode*> nodes;
+        static ::std::unordered_map<::std::string, EventNode*> nodes;
         return nodes;
     }
 
@@ -72,7 +72,7 @@ namespace ETCS {
  * nothing: "RenderProvider is not loaded" and "RenderProvider now logs to a
  * file" are different answers and the shell prints them differently.
  */
-    inline bool set_module_log_destination(const std::string& scope, bool to_file)
+    inline bool set_module_log_destination(const ::std::string& scope, bool to_file)
     {
         auto it = module_log_nodes().find(scope);
         if (it == module_log_nodes().end() || !it->second || !it->second->set_log_to_file)
@@ -83,7 +83,7 @@ namespace ETCS {
 
     // Same shape for the read. `found` distinguishes "not loaded" from "on the
     // terminal", which a bare bool cannot.
-    inline bool module_log_destination_is_file(const std::string& scope, bool& found)
+    inline bool module_log_destination_is_file(const ::std::string& scope, bool& found)
     {
         auto it = module_log_nodes().find(scope);
         found = (it != module_log_nodes().end() && it->second && it->second->get_log_to_file);
@@ -99,13 +99,13 @@ namespace ETCS {
 
     // Every registered scope, for `log status` -- which now has to enumerate
     // rather than generalise, for the reason just above.
-    inline std::vector<std::string> module_log_scopes()
+    inline ::std::vector<::std::string> module_log_scopes()
     {
-        std::vector<std::string> out;
+        ::std::vector<::std::string> out;
         out.reserve(module_log_nodes().size());
         for (auto& [name, node] : module_log_nodes())
             if (node && node->get_log_to_file) out.push_back(name);
-        std::sort(out.begin(), out.end());
+        ::std::sort(out.begin(), out.end());
         return out;
     }
 }
@@ -115,7 +115,7 @@ using namespace ETCS;
 /*
  * -- PendingUnloadRegistry ------------------------------------------------------
  * Tracks every RequestUnloadEvent-spawned delay-then-recheck thread
- * joinably, rather than the raw std::thread(...).detach() this used to
+ * joinably, rather than the raw ::std::thread(...).detach() this used to
  * be (see the Kind::RequestUnload case below). A detached thread has NO
  * handle anywhere at all, meaning nothing -- including, critically, the
  * process's own normal exit path -- could ever wait for it to finish.
@@ -140,8 +140,8 @@ using namespace ETCS;
  */
 struct PendingUnloadRegistry
 {
-    std::mutex               mutex_;
-    std::vector<std::thread> threads_;
+    ::std::mutex               mutex_;
+    ::std::vector<::std::thread> threads_;
     /*
  * Set by join_all(): the join barrier has been crossed and no further
  * recheck may be started. Without this the registry has a second hole
@@ -160,7 +160,7 @@ struct PendingUnloadRegistry
  * join_all(), prints, returns -- and THEN static destruction vacates
  * the module's lifetime_owner, firing one last RequestUnloadEvent.
  * The thread that fired for it was tracked into a registry nobody
- * would ever join again, so ~vector<std::thread> destroyed a joinable
+ * would ever join again, so ~vector<::std::thread> destroyed a joinable
  * thread and the process aborted with "terminate called without an
  * active exception" AFTER a completely successful run. Loaders were
  * papering over it by calling join_all() at exactly the right moment,
@@ -172,21 +172,21 @@ struct PendingUnloadRegistry
  * it owns. The construction happens INSIDE the lock so the decision and
  * the spawn cannot straddle a concurrent join_all().
  */
-    bool spawn(std::function<void()> body)
+    bool spawn(::std::function<void()> body)
     {
-        std::lock_guard<std::mutex> lock(mutex_);
+        ::std::lock_guard<::std::mutex> lock(mutex_);
         if (closed_) return false;
-        threads_.emplace_back(std::move(body));
+        threads_.emplace_back(::std::move(body));
         return true;
     }
-    void track(std::thread t)
+    void track(::std::thread t)
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        threads_.push_back(std::move(t));
+        ::std::lock_guard<::std::mutex> lock(mutex_);
+        threads_.push_back(::std::move(t));
     }
     void join_all()
     {
-        std::lock_guard<std::mutex> lock(mutex_);
+        ::std::lock_guard<::std::mutex> lock(mutex_);
         for (auto& t : threads_)
             if (t.joinable()) t.join();
         threads_.clear();
@@ -200,7 +200,7 @@ struct PendingUnloadRegistry
  */
     ~PendingUnloadRegistry()
     {
-        std::lock_guard<std::mutex> lock(mutex_);
+        ::std::lock_guard<::std::mutex> lock(mutex_);
         for (auto& t : threads_)
             if (t.joinable()) t.join();
         threads_.clear();
@@ -282,7 +282,7 @@ bool ETCS::Module::registerLoader(EventNode& st)
             // Absorb module ridMap entries directly via st
             for (const auto& [originalKey, handle] : node->ridMap)
             {
-                std::stringstream ss;
+                ::std::stringstream ss;
                 ss << node->scope << ":" << originalKey;
                 ETCS::Buffer combinedKey;
                 ss >> combinedKey;
@@ -310,7 +310,7 @@ bool ETCS::Module::registerLoader(EventNode& st)
  * RootSignalContext()/WIRE_SIGNAL_CONTEXT. Optional export: a module
  * built without RegisterRootSignalContext simply keeps a local,
  * never-wired root - inert (no local, no parent authority) rather
- * than fighting the loader over std::signal() registration.
+ * than fighting the loader over ::std::signal() registration.
  */
     using RegisterSignalsFunc = void (*)(ETCS::SignalContext*);
     void* sigFuncPtr = getTagFunction("RegisterRootSignalContext");
@@ -333,15 +333,15 @@ bool ETCS::Module::registerLoader(EventNode& st)
     (void)st;
     return false;
 }
-ETCS::ModuleBundle ETCS::Module::getTagAddress(const std::string& tag)
+ETCS::ModuleBundle ETCS::Module::getTagAddress(const ::std::string& tag)
 {
 #ifdef ETCS_LOADER
-    std::string hashFuncSymbol = tag + "_GetHash";
-    std::string makeFuncSymbol = tag + "_Make";
+    ::std::string hashFuncSymbol = tag + "_GetHash";
+    ::std::string makeFuncSymbol = tag + "_Make";
     void* hashAddr = getTagFunction(hashFuncSymbol);
     void* makeAddr = getTagFunction(makeFuncSymbol);
-    if (!makeAddr) throw std::runtime_error("Failed to find '" + makeFuncSymbol + "' in " + name);
-    if (!hashAddr) throw std::runtime_error("Failed to find '" + hashFuncSymbol + "' in " + name);
+    if (!makeAddr) throw ::std::runtime_error("Failed to find '" + makeFuncSymbol + "' in " + name);
+    if (!hashAddr) throw ::std::runtime_error("Failed to find '" + hashFuncSymbol + "' in " + name);
     ETCS_LOG("DynamicLoader:ModuleBundle", "Raw "     << makeAddr << " from " << tag << "!");
     ETCS_LOG("DynamicLoader:ModuleBundle", "RawHash " << hashAddr << " from " << tag << "!");
     using MakeFuncResolver = MakeFunc (*)();
@@ -529,19 +529,19 @@ void ETCS::Module::unmapLibrary(ETCS::EventNode* node)
  *    global_signal_handler's store and paired with SignalContext::raised's
  *    acquire.
  */
-    interrupt.store(1, std::memory_order_release);
-    terminate.store(1, std::memory_order_release);
+    interrupt.store(1, ::std::memory_order_release);
+    terminate.store(1, ::std::memory_order_release);
 
     // 2. registerLoader absorbs a module's ridMap under "<module>:<tag>"
     //    keys, each handle wrapping a RIDList in the MODULE's image.
     //    Per-entity removal empties those lists without unlinking the rows.
     if (node)
     {
-        const std::string prefix = name + ":";
+        const ::std::string prefix = name + ":";
         size_t purged = 0;
         for (auto it = node->ridMap.begin(); it != node->ridMap.end(); )
         {
-            const std::string key = it->first.toString();
+            const ::std::string key = it->first.toString();
             if (key.compare(0, prefix.size(), prefix) == 0) { it = node->ridMap.erase(it); ++purged; }
             else ++it;
         }
@@ -632,7 +632,7 @@ void ETCS::MirrorBuffer::buildWrapManifest(ETCS::Entity* owner)
 {
     wrap_manifest_len_ = 0;
     if (!owner) return;
-    std::vector<std::pair<ETCS::Buffer, RID>> children;
+    ::std::vector<::std::pair<ETCS::Buffer, RID>> children;
     owner->getTypedChildren(children);
     for (auto& [tag, rid] : children)
     {
@@ -695,7 +695,7 @@ void ETCS::MirrorBuffer::resolveWrapChain(ETCS::Entity* handler)
  * consulted for resolution on this side.
  */
         if (!handler) return;
-        std::vector<std::pair<ETCS::Buffer, RID>> children;
+        ::std::vector<::std::pair<ETCS::Buffer, RID>> children;
         handler->getTypedChildren(children);
         for (auto& [tag, rid] : children)
         {
@@ -738,7 +738,7 @@ void ETCS::MirrorBuffer::resolveWrapChain(ETCS::Entity* handler)
     for (size_t i = 0; i < wrap_manifest_len_; ++i)
     {
         if (wrap_chain_len_ >= MAX_WRAP_STAGES) break;
-        std::string key = wrap_manifest_[i].module.toString() + ":"
+        ::std::string key = wrap_manifest_[i].module.toString() + ":"
                          + wrap_manifest_[i].tag.toString();
         ETCS::LoadEvent evt(key.c_str());
         evt.root = ETCS::LifetimeOwner(&boot_root);
@@ -783,7 +783,7 @@ ETCS::MirrorBuffer::~MirrorBuffer()
     {
         Entity* e = ephemeral_entities_[i];
         if (!e) continue;
-        std::string key = e->getSourceModule().toString() + ":"
+        ::std::string key = e->getSourceModule().toString() + ":"
                          + e->getSourceTag().toString();
         ETCS::DestroyEvent{key.c_str(), e, true}();
     }
@@ -845,7 +845,7 @@ ETCS::Entity* ETCS::ModuleBundle::operator()()
     result->getContext().setProvider(&catalog_bundle.ctx);
     ETCS_LOG("DynamicLoader:ModuleBundle",
         "Instance " << result->myTag() << " [HID: " << result->getID() << ", RID: " << result->getRID() << "] Tags:");
-    std::vector<ETCS::Buffer> tags;
+    ::std::vector<ETCS::Buffer> tags;
     result->getTags(tags);
     for (ETCS::Buffer i : tags)
         ETCS_LOG("DynamicLoader:ModuleBundle", "    - " << i);
@@ -1159,7 +1159,7 @@ ETCS::DispatchResult ETCS::EventNode::LoaderStream::on_event(
  * ResolveEvent's own construction (ResolveEvent{mod_name...}),
  * unlike Load/Destroy's "module:tag" form. No parsing needed.
  */
-            std::string module_name = evt.conjugate_key.toString();
+            ::std::string module_name = evt.conjugate_key.toString();
             bool ok = evt.resolve_target
                    && resolveImpl(module_name, evt.resolve_target);
             sendAckIfNeeded(evt);
@@ -1168,7 +1168,7 @@ ETCS::DispatchResult ETCS::EventNode::LoaderStream::on_event(
         }
         case DLInEvent::Kind::Destroy:
         {
-            std::string key_str = evt.conjugate_key.toString();
+            ::std::string key_str = evt.conjugate_key.toString();
             bool removed = destroyImpl(key_str, evt.rid, evt.destroy_children);
             sendAckIfNeeded(evt);
             evt.release_value = removed ? 1 : 0;
@@ -1185,7 +1185,7 @@ ETCS::DispatchResult ETCS::EventNode::LoaderStream::on_event(
  * on_emit. The caller's acquire-load of it publishes this write
  * along with everything else the handler did.
  */
-            evt.rid_out->store(r, std::memory_order_relaxed);
+            evt.rid_out->store(r, ::std::memory_order_relaxed);
             return {ETCS::DispatchKind::Inline, &evt};
         }
         case DLInEvent::Kind::EntityUnload:
@@ -1310,7 +1310,7 @@ ETCS::DispatchResult ETCS::EventNode::LoaderStream::on_event(
                 // PendingUnloadRegistry::spawn's own comment.
                 const bool recheck_started = PendingUnloadRegistry::getInstance().spawn([target]()
                 {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    ::std::this_thread::sleep_for(::std::chrono::milliseconds(100));
                     /*
  * Stack-allocated, unlike the old heap-allocated
  * recheck_evt -- safe now specifically because this
@@ -1320,7 +1320,7 @@ ETCS::DispatchResult ETCS::EventNode::LoaderStream::on_event(
  * codebase (TagModifyEvent, ChangeModuleEvent, etc.)
  * already relies on.
  */
-                    std::atomic<bool> done{false};
+                    ::std::atomic<bool> done{false};
                     DLInEvent recheck_evt{};
                     recheck_evt.kind                   = DLInEvent::Kind::RequestUnload;
                     recheck_evt.request_unload_target  = target;
@@ -1334,7 +1334,7 @@ ETCS::DispatchResult ETCS::EventNode::LoaderStream::on_event(
  * out regardless.
  */
                     if (getLoader().stream.enqueue(DLInEventPtr{&recheck_evt}))
-                        while (!done.load(std::memory_order_acquire));
+                        while (!done.load(::std::memory_order_acquire));
                 });
                 if (!recheck_started)
                     ETCS_LOG("DynamicLoader:Module", "Module '" << target
@@ -1400,7 +1400,7 @@ ETCS::DispatchResult ETCS::EventNode::LoaderStream::on_event(
  * naming collision loudly rather than picking one arbitrarily.
  */
 void ETCS::EventNode::LoaderStream::registerTypeOwnership(
-    const std::string& module_name, Module* mod)
+    const ::std::string& module_name, Module* mod)
 {
     for (const auto& [tag_str, bundle] : mod->catalog())
     {
@@ -1458,8 +1458,8 @@ void ETCS::EventNode::LoaderStream::registerTypeOwnership(
  * parameter would otherwise create for the return type too.
  */
 bool ETCS::EventNode::LoaderStream::attachModule(
-    const std::string& module_name, ETCS::LifetimeOwner entity,
-    const std::string& spawn_tag)
+    const ::std::string& module_name, ETCS::LifetimeOwner entity,
+    const ::std::string& spawn_tag)
 {
     /*
  * Step 1. ONE MODULE PER ENTITY, FOR ITS WHOLE LIFETIME -- an enforced
@@ -1499,13 +1499,13 @@ bool ETCS::EventNode::LoaderStream::attachModule(
         /*
  * CAUGHT HERE BECAUSE NO CALLER CAN CATCH IT. Everything in this
  * bootstrap -- dlopen, registerLoader/discoverTags,
- * catalogTypes/discoverActions -- throws std::runtime_error for
+ * catalogTypes/discoverActions -- throws ::std::runtime_error for
  * ordinary reasons: a typo'd module name, a missing export.
  *
  * This runs on the loader's ONE ordering thread, which services
  * attachModule for the rest of the process. An escaping exception
  * unwinds to the top of THAT thread, finds no handler, and calls
- * std::terminate -- killing every future Load/Resolve/Destroy/
+ * ::std::terminate -- killing every future Load/Resolve/Destroy/
  * AddTag/ChangeModule. A caller's try/catch around its blocking
  * evt() cannot help: it enqueues and spins on an atomic, and the
  * throw is on a different thread. That is exactly what crashed the
@@ -1524,12 +1524,12 @@ bool ETCS::EventNode::LoaderStream::attachModule(
 #ifdef _WIN32
             handle = LoadLibraryA(global_mod->getFilename().c_str());
             if (!handle)
-                throw std::runtime_error("Failed to load DLL (error "
-                    + std::to_string(GetLastError()) + ") for " + module_name);
+                throw ::std::runtime_error("Failed to load DLL (error "
+                    + ::std::to_string(GetLastError()) + ") for " + module_name);
 #else
             handle = dlopen(global_mod->getFilename().c_str(), RTLD_LAZY | RTLD_LOCAL);
             if (!handle)
-                throw std::runtime_error(std::string("Failed to load SO: ") + dlerror());
+                throw ::std::runtime_error(::std::string("Failed to load SO: ") + dlerror());
 #endif
             global_mod->adoptLibrary(handle);
             if (!global_mod->registerLoader(*owner)) return false;
@@ -1599,12 +1599,12 @@ bool ETCS::EventNode::LoaderStream::attachModule(
  * shutdown rather than fetching-and-trusting something unverifiable, or
  * silently continuing on a build that already can't be trusted.
  */
-            std::cerr << "FATAL: '" << module_name << "' -- " << mex.what()
+            ::std::cerr << "FATAL: '" << module_name << "' -- " << mex.what()
                       << " -- loader and module were not built for the same "
-                         "epoch. Shutting down." << std::endl;
-            std::abort();
+                         "epoch. Shutting down." << ::std::endl;
+            ::std::abort();
         }
-        catch (const std::exception& ex)
+        catch (const ::std::exception& ex)
         {
             /*
  * global_mod itself is simply abandoned here: it was never
@@ -1804,11 +1804,11 @@ bool ETCS::EventNode::LoaderStream::attachModule(
  * actively using it.
  */
 void ETCS::EventNode::LoaderStream::changeModuleImpl(
-    ETCS::Root* root, const std::string& target_module)
+    ETCS::Root* root, const ::std::string& target_module)
 {
     if (root->module_.parent != nullptr)
     {
-        const std::string current_module = root->module_.parent->name;
+        const ::std::string current_module = root->module_.parent->name;
  
         if (current_module == target_module)
             return; // already there
@@ -1920,7 +1920,7 @@ void ETCS::EventNode::LoaderStream::requestUnloadImpl(ETCS::Module* target)
         return;
     }
  
-    const std::string module_name = target->name;
+    const ::std::string module_name = target->name;
     ETCS_LOG("DynamicLoader", "Module '" << module_name
         << "' RequestUnload recheck: still vacant after the delay -- "
            "unloading now.");
@@ -1992,7 +1992,7 @@ void ETCS::EventNode::LoaderStream::sendAckIfNeeded(DLInEvent& evt)
  * gated on spawn_tag being non-empty, so passing "" here correctly
  * attaches the module without instantiating any specific type from it.
  */
-bool ETCS::EventNode::LoaderStream::resolveImpl(const std::string& module_name, ETCS::LifetimeOwner entity)
+bool ETCS::EventNode::LoaderStream::resolveImpl(const ::std::string& module_name, ETCS::LifetimeOwner entity)
 {
     return attachModule(module_name, entity, "");
 }
@@ -2019,7 +2019,7 @@ bool ETCS::EventNode::LoaderStream::resolveImpl(const std::string& module_name, 
  * either way.
  */
 ETCS::Entity* ETCS::EventNode::LoaderStream::loadImpl(
-    const std::string& conjugate_key, ETCS::LifetimeOwner bootstrap_root)
+    const ::std::string& conjugate_key, ETCS::LifetimeOwner bootstrap_root)
 {
     auto [module_name, tag_type] = parseConjugateOriginKey(conjugate_key);
  
@@ -2124,7 +2124,7 @@ ETCS::Entity* ETCS::EventNode::LoaderStream::loadImpl(
  * however much later that happened to be (sometimes not until process
  * exit). deleteEntity is what actually runs it now.
  */
-bool ETCS::EventNode::LoaderStream::destroyImpl(const std::string& conjugate_key, ETCS::RID rid,
+bool ETCS::EventNode::LoaderStream::destroyImpl(const ::std::string& conjugate_key, ETCS::RID rid,
                                                  bool delete_children)
 {
     ETCS::Buffer key(conjugate_key);
@@ -2263,12 +2263,12 @@ ETCS::RID ETCS::EventNode::LoaderStream::addTagImpl(
     ETCS::Entity* parent, ETCS::Entity* child,
     const ETCS::Buffer& tag, ETCS::AddTagEvent::Trampoline trampoline)
 {
-    std::string child_type_tag = tag.toString();
+    ::std::string child_type_tag = tag.toString();
  
     auto owner_it = type_owner_index.find(child_type_tag);
     if (owner_it != type_owner_index.end())
     {
-        const std::string& mod_name = owner_it->second;
+        const ::std::string& mod_name = owner_it->second;
         auto reg_it = module_registry.find(mod_name);
         Module* mod = (reg_it != module_registry.end()) ? reg_it->second : nullptr;
  
@@ -2344,7 +2344,7 @@ ETCS::RID ETCS::EventNode::LoaderStream::addTagImpl(
 }
  
 bool ETCS::EventNode::LoaderStream::isTypedActionStream(
-    const std::string& origin, const std::string& conjugate_key)
+    const ::std::string& origin, const ::std::string& conjugate_key)
 {
     auto [type, action] = ETCS::Entity::parseConjugateActionKey(conjugate_key);
     auto it = module_registry.find(origin);
@@ -2542,7 +2542,7 @@ extern "C" ETCS_API ETCS::EventNode* RegisterDynamicLoader(void* ptr)
         dynamicLoader.node = static_cast<ETCS::EventNode*>(ptr);
         ETCS_LOG("DynamicLoader", "Passed EventNode! " << ptr);
         /*
- * No signal wiring here. Re-registering std::signal() per module used to
+ * No signal wiring here. Re-registering ::std::signal() per module used to
  * silently steal OS signal disposition from the loader (process-global,
  * last dlopen wins). The loader instead hands this module its real root
  * SignalContext* via RegisterRootSignalContext() below, called from
@@ -2559,13 +2559,13 @@ extern "C" ETCS_API ETCS::EventNode* RegisterDynamicLoader(void* ptr)
     }
     catch (const ETCS::EventStreamZombieException&)
     {
-        std::cerr << "Reloaded DLL " << ETCS_MODULE_NAME
+        ::std::cerr << "Reloaded DLL " << ETCS_MODULE_NAME
                    << " too many times within a very short period: "
                       "OS generated zombie DLL (zombie thread in EventStream "
-                      "detected)" << std::endl;
-        std::abort();
+                      "detected)" << ::std::endl;
+        ::std::abort();
     }
-    catch (const std::exception&)
+    catch (const ::std::exception&)
     {
         /*
  * Any other exception here - allocation failures inside
@@ -2576,14 +2576,14 @@ extern "C" ETCS_API ETCS::EventNode* RegisterDynamicLoader(void* ptr)
  * since this branch genuinely doesn't know which allocation
  * failed or why.
  */
-        std::cerr << "DLL cannot be loaded: Out of memory" << std::endl;
-        std::abort();
+        ::std::cerr << "DLL cannot be loaded: Out of memory" << ::std::endl;
+        ::std::abort();
     }
     catch (...)
     {
-        std::cerr << "DLL cannot be loaded: unknown fatal error during "
-                      "RegisterDynamicLoader." << std::endl;
-        std::abort();
+        ::std::cerr << "DLL cannot be loaded: unknown fatal error during "
+                      "RegisterDynamicLoader." << ::std::endl;
+        ::std::abort();
     }
 }
  
@@ -2623,7 +2623,7 @@ bool ETCS::drainEntityScopes(ETCS::Entity* target, const char* who)
     int retries = 0;
     while (ETCS::ScopeTag::anyActive(target))
     {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        ::std::this_thread::sleep_for(::std::chrono::milliseconds(10));
         if (++retries > 500) // 5s
         {
             ETCS_LOG(who, "ERROR: RID:" << target->getRID()
@@ -2679,7 +2679,7 @@ inline ETCS::Entity* ETCS::LoadEvent::operator()()
         return nullptr;
     }
     ETCS::Entity* e;
-    while (!(e = result.load(std::memory_order_acquire)));
+    while (!(e = result.load(::std::memory_order_acquire)));
     return e == reinterpret_cast<ETCS::Entity*>(UINTPTR_MAX) ? nullptr : e;
 }
  
@@ -2699,7 +2699,7 @@ inline bool ETCS::ResolveEvent::operator()()
     if (!getLoader().stream.enqueue(DLInEventPtr{&evt}))
         return false;
     int8_t r;
-    while ((r = ok.load(std::memory_order_acquire)) < 0);
+    while ((r = ok.load(::std::memory_order_acquire)) < 0);
     return r != 0;
 }
  
@@ -2726,7 +2726,7 @@ inline bool ETCS::DestroyEvent::operator()()
     if (!getLoader().stream.enqueue(DLInEventPtr{&evt}))
         return false;
     int8_t r;
-    while ((r = result.load(std::memory_order_acquire)) < 0);
+    while ((r = result.load(::std::memory_order_acquire)) < 0);
     return r != 0;
 }
  
@@ -2757,8 +2757,8 @@ inline ETCS::RID ETCS::AddTagEvent::operator()()
 #endif
     if (!getLoader().stream.enqueue(DLInEventPtr{&evt}))
         return 0;
-    while (!ready.load(std::memory_order_acquire));
-    return result.load(std::memory_order_relaxed);
+    while (!ready.load(::std::memory_order_acquire));
+    return result.load(::std::memory_order_relaxed);
 }
  
 /*
@@ -2816,7 +2816,7 @@ inline void ETCS::EntityUnloadEvent::operator()()
 #endif
     if (!getLoader().stream.enqueue(DLInEventPtr{&evt}))
         return;
-    while (!done.load(std::memory_order_acquire));
+    while (!done.load(::std::memory_order_acquire));
 }
  
 /*
@@ -2825,7 +2825,7 @@ inline void ETCS::EntityUnloadEvent::operator()()
  * (survivor search via root_registry, promoteOrVacate, the reattach)
  * lives in changeModuleImpl above, on the loader's own ordering thread.
  */
-inline void ETCS::Root::changeModule(const std::string& targetModule)
+inline void ETCS::Root::changeModule(const ::std::string& targetModule)
 {
     ETCS::ChangeModuleEvent evt(targetModule, this);
     evt();
@@ -2853,7 +2853,7 @@ inline void ETCS::ChangeModuleEvent::operator()()
 #endif
     if (!getLoader().stream.enqueue(DLInEventPtr{&evt}))
         return;
-    while (!done.load(std::memory_order_acquire));
+    while (!done.load(::std::memory_order_acquire));
 }
  
 /*
@@ -2907,8 +2907,8 @@ inline bool ETCS::TagModifyEvent::operator()()
  */
     if (!ETCS::EventNode::getInstance().stream.enqueue(DLInEventPtr{&evt}))
         return false;
-    while (!done.load(std::memory_order_acquire));
-    return changed.load(std::memory_order_acquire);
+    while (!done.load(::std::memory_order_acquire));
+    return changed.load(::std::memory_order_acquire);
 }
  
 /*
@@ -2939,7 +2939,7 @@ inline void ETCS::PairMaskEvent::operator()()
 #endif
     if (!getLoader().stream.enqueue(DLInEventPtr{&evt}))
         return;
-    while (!done.load(std::memory_order_acquire));
+    while (!done.load(::std::memory_order_acquire));
 }
  
 #ifndef ETCS_LOADER
@@ -2963,7 +2963,7 @@ inline ETCS::Entity* ETCS::CreateEvent::operator()()
     if (!getLoader().stream.enqueue(DLInEventPtr{&evt}))
         return nullptr;
     ETCS::Entity* e;
-    while (!(e = result.load(std::memory_order_acquire)));
+    while (!(e = result.load(::std::memory_order_acquire)));
     return e == reinterpret_cast<ETCS::Entity*>(UINTPTR_MAX) ? nullptr : e;
 }
 #endif

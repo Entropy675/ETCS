@@ -131,7 +131,7 @@ inline void etcs_mark_observed(ETCS::Entity* from)
 inline void etcs_mark_observed_below(ETCS::Entity* from)
 {
     if (!from) return;
-    std::vector<std::pair<ETCS::Buffer, ETCS::RID>> kids;
+    ::std::vector<::std::pair<ETCS::Buffer, ETCS::RID>> kids;
     from->getTypedChildren(kids);
     for (const auto& entry : kids)
     {

@@ -94,7 +94,7 @@ ETCS_SUPERTYPE_BASE(Thread), public ThreadedBase<Derived>
     bool Bind(const ETCS::Buffer& name, const char* data, size_t len)
     {
         if (!data || len >= ETCS::Buffer::bufsize) return false;
-        std::lock_guard<std::mutex> lock(m_closureMutex);
+        ::std::lock_guard<::std::mutex> lock(m_closureMutex);
         for (auto& e : m_closure)
             if (e.name == name) { e.data = ETCS::Buffer(data); return true; }
         m_closure.push_back(Binding{name, ETCS::Buffer(data)});
@@ -103,7 +103,7 @@ ETCS_SUPERTYPE_BASE(Thread), public ThreadedBase<Derived>
 
     bool Lookup(const ETCS::Buffer& name, ETCS::Buffer& out) const
     {
-        std::lock_guard<std::mutex> lock(m_closureMutex);
+        ::std::lock_guard<::std::mutex> lock(m_closureMutex);
         for (const auto& e : m_closure)
             if (e.name == name) { out = e.data; return true; }
         return false;
@@ -114,21 +114,21 @@ ETCS_SUPERTYPE_BASE(Thread), public ThreadedBase<Derived>
     // only the leaf knows how it makes one.
     void InheritClosureTo(ThreadBase<Derived>& child) const
     {
-        std::lock_guard<std::mutex> lock(m_closureMutex);
-        std::lock_guard<std::mutex> clock(child.m_closureMutex);
+        ::std::lock_guard<::std::mutex> lock(m_closureMutex);
+        ::std::lock_guard<::std::mutex> clock(child.m_closureMutex);
         child.m_closure = m_closure;
     }
 
     size_t ClosureSize() const
     {
-        std::lock_guard<std::mutex> lock(m_closureMutex);
+        ::std::lock_guard<::std::mutex> lock(m_closureMutex);
         return m_closure.size();
     }
 
 private:
     struct Binding { ETCS::Buffer name; ETCS::Buffer data; };
-    mutable std::mutex   m_closureMutex;
-    std::vector<Binding> m_closure;
+    mutable ::std::mutex   m_closureMutex;
+    ::std::vector<Binding> m_closure;
 
     /*
  * THE FLAGS DO NOT LIVE IN THIS ENTITY, and that is the whole point.
@@ -154,20 +154,20 @@ private:
  * wholesale at teardown -- the cost of a bounded leak against a class of bug
  * that reads as an unrelated subtree stopping for no reason.
  */
-    ETCS::SignalFlag* ensureFlag(std::atomic<ETCS::SignalFlag*>& slot)
+    ETCS::SignalFlag* ensureFlag(::std::atomic<ETCS::SignalFlag*>& slot)
     {
-        if (ETCS::SignalFlag* f = slot.load(std::memory_order_acquire)) return f;
+        if (ETCS::SignalFlag* f = slot.load(::std::memory_order_acquire)) return f;
         ETCS::SignalFlag* fresh =
             ETCS::MemoryArena::getInstance().allocate<ETCS::SignalFlag>(0);
         ETCS::SignalFlag* expected = nullptr;
-        if (slot.compare_exchange_strong(expected, fresh, std::memory_order_acq_rel))
+        if (slot.compare_exchange_strong(expected, fresh, ::std::memory_order_acq_rel))
             return fresh;
         return expected;   // lost the race; ours is arena-owned and simply unused
     }
 
-    std::atomic<ETCS::SignalFlag*> m_interrupt{nullptr};
-    std::atomic<ETCS::SignalFlag*> m_terminate{nullptr};
-    std::atomic<ETCS::SignalFlag*> m_user1{nullptr};
+    ::std::atomic<ETCS::SignalFlag*> m_interrupt{nullptr};
+    ::std::atomic<ETCS::SignalFlag*> m_terminate{nullptr};
+    ::std::atomic<ETCS::SignalFlag*> m_user1{nullptr};
 };
 
 #endif

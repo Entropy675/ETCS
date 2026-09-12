@@ -251,11 +251,11 @@ struct OrderVector
     {
         Matrix4 m = Matrix4::Identity();
 
-        const float len = std::sqrt(sx * sx + sy * sy + sz * sz);
+        const float len = ::std::sqrt(sx * sx + sy * sy + sz * sz);
         if (len > 0.0f && theta != 0.0f)
         {
             const float ax = sx / len, ay = sy / len, az = sz / len;
-            const float c = std::cos(theta), s = std::sin(theta), t = 1.0f - c;
+            const float c = ::std::cos(theta), s = ::std::sin(theta), t = 1.0f - c;
             m.at(0,0) = t*ax*ax + c;    m.at(0,1) = t*ax*ay - s*az; m.at(0,2) = t*ax*az + s*ay;
             m.at(1,0) = t*ax*ay + s*az; m.at(1,1) = t*ay*ay + c;    m.at(1,2) = t*ay*az - s*ax;
             m.at(2,0) = t*ax*az - s*ay; m.at(2,1) = t*ay*az + s*ax; m.at(2,2) = t*az*az + c;
@@ -265,7 +265,7 @@ struct OrderVector
         return m;
     }
 
-    float KineticFraction() const { return std::sqrt(ox * ox + oy * oy + oz * oz); }
+    float KineticFraction() const { return ::std::sqrt(ox * ox + oy * oy + oz * oz); }
     float KineticEnergy()   const { return KineticFraction() * energy; }
     float Heat()            const { return energy - KineticEnergy(); }
 
@@ -295,7 +295,7 @@ struct OrderVector
         if (!(ke > 0.0f)) return;
         float dx, dy, dz;
         Direction(dx, dy, dz);
-        const float v = std::sqrt(2.0f * ke / mass);
+        const float v = ::std::sqrt(2.0f * ke / mass);
         vx = dx * v; vy = dy * v; vz = dz * v;
     }
 
@@ -314,7 +314,7 @@ struct OrderVector
     void Impulse(float dx, float dy, float dz, float joules)
     {
         if (!(joules > 0.0f)) return;
-        const float m = std::sqrt(dx * dx + dy * dy + dz * dz);
+        const float m = ::std::sqrt(dx * dx + dy * dy + dz * dz);
         if (!(m > 0.0f)) return;
 
         float kx = ox * energy, ky = oy * energy, kz = oz * energy;
@@ -372,7 +372,7 @@ struct OrderVector
         if (!(dt > 0.0f) || !(emissivity > 0.0f)) return 0.0f;
         const float h = Heat();
         if (!(h > 0.0f)) return 0.0f;
-        return h * (1.0f - std::exp(-emissivity * dt));
+        return h * (1.0f - ::std::exp(-emissivity * dt));
     }
 
     /*
@@ -513,7 +513,7 @@ struct OrderVector
     // in the form every reader below assumes.
     void Orient(float ax, float ay, float az, float angle)
     {
-        const float m = std::sqrt(ax * ax + ay * ay + az * az);
+        const float m = ::std::sqrt(ax * ax + ay * ay + az * az);
         if (!(m > 0.0f)) { sx = sy = sz = 0.0f; theta = 0.0f; return; }
         sx = ax / m; sy = ay / m; sz = az / m;
         theta = angle;
@@ -537,10 +537,10 @@ struct OrderVector
         float qw, qx, qy, qz;
         toQuat(qw, qx, qy, qz);
 
-        const float m = std::sqrt(ax * ax + ay * ay + az * az);
+        const float m = ::std::sqrt(ax * ax + ay * ay + az * az);
         if (!(m > 0.0f) || angle == 0.0f) return;
-        const float h = angle * 0.5f, sh = std::sin(h);
-        const float dw = std::cos(h), dx = (ax / m) * sh, dy = (ay / m) * sh, dz = (az / m) * sh;
+        const float h = angle * 0.5f, sh = ::std::sin(h);
+        const float dw = ::std::cos(h), dx = (ax / m) * sh, dy = (ay / m) * sh, dz = (az / m) * sh;
 
         const float rw = dw * qw - dx * qx - dy * qy - dz * qz;
         const float rx = dw * qx + dx * qw + dy * qz - dz * qy;
@@ -555,7 +555,7 @@ struct OrderVector
     void RotateVector(float& vx, float& vy, float& vz) const
     {
         if (!Oriented() || theta == 0.0f) return;
-        const float c = std::cos(theta), s2 = std::sin(theta);
+        const float c = ::std::cos(theta), s2 = ::std::sin(theta);
         const float dot = sx * vx + sy * vy + sz * vz;
         const float cx = sy * vz - sz * vy;
         const float cy = sz * vx - sx * vz;
@@ -659,7 +659,7 @@ struct OrderVector
             const float dx = members[i].x - x;
             const float dy = members[i].y - y;
             const float dz = members[i].z - z;
-            const float reach = std::sqrt(dx * dx + dy * dy + dz * dz) + members[i].radius;
+            const float reach = ::std::sqrt(dx * dx + dy * dy + dz * dz) + members[i].radius;
             if (reach > radius) radius = reach;
         }
     }
@@ -697,7 +697,7 @@ struct OrderVector
     float GapTo(const OrderVector& other) const
     {
         const float dx = other.x - x, dy = other.y - y, dz = other.z - z;
-        return std::sqrt(dx * dx + dy * dy + dz * dz) - radius - other.radius;
+        return ::std::sqrt(dx * dx + dy * dy + dz * dz) - radius - other.radius;
     }
     bool MayInteractWith(const OrderVector& other) const { return GapTo(other) <= 0.0f; }
 
@@ -718,8 +718,8 @@ struct OrderVector
     static uint64_t derive_uncertainty(const OrderVector& e)
     {
         uint32_t qb, ib;
-        std::memcpy(&qb, &e.energy,   sizeof(qb));
-        std::memcpy(&ib, &e.interval, sizeof(ib));
+        ::std::memcpy(&qb, &e.energy,   sizeof(qb));
+        ::std::memcpy(&ib, &e.interval, sizeof(ib));
         uint64_t h = e.rid ^ (static_cast<uint64_t>(qb) << 32) ^ ib;
         h ^= h >> 30; h *= 0xbf58476d1ce4e5b9ull;
         h ^= h >> 27; h *= 0x94d049bb133111ebull;
@@ -731,18 +731,18 @@ private:
     void toQuat(float& w, float& x, float& y, float& z) const
     {
         if (!Oriented() || theta == 0.0f) { w = 1.0f; x = y = z = 0.0f; return; }
-        const float h = theta * 0.5f, sh = std::sin(h);
-        w = std::cos(h); x = sx * sh; y = sy * sh; z = sz * sh;
+        const float h = theta * 0.5f, sh = ::std::sin(h);
+        w = ::std::cos(h); x = sx * sh; y = sy * sh; z = sz * sh;
     }
     void fromQuat(float w, float x, float y, float z)
     {
-        const float n = std::sqrt(w * w + x * x + y * y + z * z);
+        const float n = ::std::sqrt(w * w + x * x + y * y + z * z);
         if (!(n > 0.0f)) { sx = sy = sz = 0.0f; theta = 0.0f; return; }
         w /= n; x /= n; y /= n; z /= n;
         if (w >  1.0f) w =  1.0f;
         if (w < -1.0f) w = -1.0f;
-        const float half = std::acos(w);
-        const float s2   = std::sqrt(1.0f - w * w);
+        const float half = ::std::acos(w);
+        const float s2   = ::std::sqrt(1.0f - w * w);
         if (!(s2 > 1e-7f)) { sx = sy = sz = 0.0f; theta = 0.0f; return; }  // identity
         sx = x / s2; sy = y / s2; sz = z / s2;
         theta = half * 2.0f;

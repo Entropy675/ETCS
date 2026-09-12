@@ -48,7 +48,7 @@ enum class EntityLocale : uint8_t
 // ---------------------------------------------------------------------------
 // Remote — trivial base struct.
 // Any tag type whose entity lives on a remote VM inherits from this.
-// StrategyFor detects it via std::is_base_of — no macro changes required.
+// StrategyFor detects it via ::std::is_base_of — no macro changes required.
 //
 // Usage:
 //   struct MyRemoteTag : ETCS::Remote { static constexpr const char* TAG = "MyRemote"; };
@@ -58,7 +58,7 @@ struct Remote {};
 // IsRemote<T> — true_type iff T publicly inherits Remote.
 // ---------------------------------------------------------------------------
 template<typename T>
-using IsRemote = std::is_base_of<Remote, T>;
+using IsRemote = ::std::is_base_of<Remote, T>;
 // ---------------------------------------------------------------------------
 // StrategyFor<CallerTag, CalleeTag> — compile-time transport selection.
 //
@@ -75,14 +75,14 @@ struct StrategyFor { using type = StrategyPipe; };
 // Same tag type, not remote → LMAX (in-process, pointer exchange)
 template<typename CallerTag, typename CalleeTag>
 struct StrategyFor<CallerTag, CalleeTag,
-    std::enable_if_t<
-        std::is_same<CallerTag, CalleeTag>::value &&
+    ::std::enable_if_t<
+        ::std::is_same<CallerTag, CalleeTag>::value &&
         !IsRemote<CalleeTag>::value>>
 { using type = StrategyLMAX; };
 // Callee inherits Remote → Socket (beats same-type match)
 template<typename CallerTag, typename CalleeTag>
 struct StrategyFor<CallerTag, CalleeTag,
-    std::enable_if_t<IsRemote<CalleeTag>::value>>
+    ::std::enable_if_t<IsRemote<CalleeTag>::value>>
 { using type = StrategySocket; };
 // ---------------------------------------------------------------------------
 // PageFor<Strategy> — maps a strategy to its page type.
@@ -374,7 +374,7 @@ private:
         {
             const LBuffer* buf = lmax_page_->acquireRead(next_read_seq_);
             if (buf) return buf;
-            if (lmax_page_->tombstoned.load(std::memory_order_acquire))
+            if (lmax_page_->tombstoned.load(::std::memory_order_acquire))
                 return nullptr; // EOF -- producer closed and nothing left to drain
             if (ctx.isInterrupted() || ctx.isTerminated()) return nullptr;
             LMAXSequentialSharedPage::progressiveYield(retries);
@@ -512,7 +512,7 @@ public:
                 // acquire, not relaxed: the tombstone is a happens-before
                 // edge (everything the consumer did before closing must be
                 // visible), and the old relaxed load could not carry that.
-                if (lmax_page_->tombstoned.load(std::memory_order_acquire))
+                if (lmax_page_->tombstoned.load(::std::memory_order_acquire))
                     return false;
                 if (wrap_chain_len_ == 0)
                 {
@@ -522,7 +522,7 @@ public:
                     // contract, exactly as it always has been.
                     LBuffer ptr_slot;
                     const Buffer* ptr = &slot;
-                    std::memcpy(ptr_slot.buf, &ptr, sizeof(Buffer*));
+                    ::std::memcpy(ptr_slot.buf, &ptr, sizeof(Buffer*));
                     ptr_slot.written = sizeof(Buffer*);
                     int retries = 0;
                     while (lmax_page_->write(writer_rid_, ptr_slot) == UINT64_MAX)
@@ -591,7 +591,7 @@ public:
                 {
                     // Fast path — unchanged.
                     const Buffer* ptr = nullptr;
-                    std::memcpy(&ptr, lbuf->buf, sizeof(Buffer*));
+                    ::std::memcpy(&ptr, lbuf->buf, sizeof(Buffer*));
                     slot = *ptr;
                     lmax_page_->markConsumed(next_read_seq_);
                     ++next_read_seq_;
@@ -604,7 +604,7 @@ public:
                 // already follows, so the pool slot is free to be reused
                 // by a later write the instant this call returns.
                 const MBuffer* ptr = nullptr;
-                std::memcpy(&ptr, lbuf->buf, sizeof(MBuffer*));
+                ::std::memcpy(&ptr, lbuf->buf, sizeof(MBuffer*));
                 MBuffer frame = *ptr;
                 lmax_page_->markConsumed(next_read_seq_);
                 ++next_read_seq_;
@@ -613,7 +613,7 @@ public:
                     wrap_chain_[i]->Unwrap(frame, bound_ctx_);
                 if (frame.written > Buffer::bufsize)
                 {
-                    std::cerr << "[MirrorBuffer] readRaw: unwrapped LMAX payload ("
+                    ::std::cerr << "[MirrorBuffer] readRaw: unwrapped LMAX payload ("
                               << frame.written << "B) exceeds Buffer capacity ("
                               << Buffer::bufsize << "B) -- cannot deliver to caller.\n";
                     return false;
@@ -634,7 +634,7 @@ public:
                     wrap_chain_[i]->Unwrap(frame, bound_ctx_);
                 if (frame.written > Buffer::bufsize)
                 {
-                    std::cerr << "[MirrorBuffer] readRaw: unwrapped payload ("
+                    ::std::cerr << "[MirrorBuffer] readRaw: unwrapped payload ("
                               << frame.written << "B) exceeds Buffer capacity ("
                               << Buffer::bufsize << "B) -- cannot deliver to caller.\n";
                     return false;
@@ -760,17 +760,17 @@ public:
     // returned. What is being counted is the BODY, not the ownership.
     SharedPage* producerEnter()
     {
-        if (shared_page_) shared_page_->producers_live.fetch_add(1, std::memory_order_acq_rel);
+        if (shared_page_) shared_page_->producers_live.fetch_add(1, ::std::memory_order_acq_rel);
         return shared_page_;
     }
     static void producerLeave(SharedPage* token)
     {
-        if (token) token->producers_live.fetch_sub(1, std::memory_order_acq_rel);
+        if (token) token->producers_live.fetch_sub(1, ::std::memory_order_acq_rel);
     }
     bool producerBusy() const
     {
         return shared_page_
-            && shared_page_->producers_live.load(std::memory_order_acquire) > 0;
+            && shared_page_->producers_live.load(::std::memory_order_acquire) > 0;
     }
     // Non-advancing liveness check.
     bool hasData()
@@ -779,7 +779,7 @@ public:
         {
             case ActiveStrategy::LMAX:
                 return lmax_page_ != nullptr
-                    && !lmax_page_->tombstoned.load(std::memory_order_acquire)
+                    && !lmax_page_->tombstoned.load(::std::memory_order_acquire)
                     && lmax_page_->acquireRead(next_read_seq_) != nullptr;
             case ActiveStrategy::Pipe:
             case ActiveStrategy::Socket:
@@ -805,7 +805,7 @@ public:
         {
             case ActiveStrategy::LMAX:
                 return lmax_page_ != nullptr
-                    && !lmax_page_->tombstoned.load(std::memory_order_acquire);
+                    && !lmax_page_->tombstoned.load(::std::memory_order_acquire);
             case ActiveStrategy::Pipe:
             case ActiveStrategy::Socket:
                 return read_fd_ != -1 || write_fd_ != -1;
@@ -846,7 +846,7 @@ public:
     //   int      wrap_count  — wrap_manifest_len_
     //   [string module, string tag] * wrap_count — the capability manifest,
     //                          quoted/token-delimited via the existing
-    //                          std::string operator<</>>, so ordinary
+    //                          ::std::string operator<</>>, so ordinary
     //                          space-delimited extraction on the far side
     //                          just works, same as every other field above it.
     //   Buffer   config      — action parameter payload, ALWAYS LAST — see
@@ -1117,7 +1117,7 @@ private:
                 scratch = staged;
                 LBuffer ptr_slot;
                 const MBuffer* ptr = &scratch;
-                std::memcpy(ptr_slot.buf, &ptr, sizeof(MBuffer*));
+                ::std::memcpy(ptr_slot.buf, &ptr, sizeof(MBuffer*));
                 ptr_slot.written = sizeof(MBuffer*);
                 int retries = 0;
                 while (lmax_page_->write(writer_rid_, ptr_slot) == UINT64_MAX)
@@ -1160,12 +1160,12 @@ private:
             // producer, which is why one return serves.
             if (debug_)
                 ETCS_LOG("MirrorBuffer", "[PRODUCER] cannot stage -- "
-                         << (shared_page_->tombstoned.load(std::memory_order_acquire)
+                         << (shared_page_->tombstoned.load(::std::memory_order_acquire)
                              ? "the pair was torn down under this write." : "staging page full."));
             return false;
         }
-        std::memcpy(dest, &len, sizeof(size_t));
-        if (len > 0) std::memcpy(dest + sizeof(size_t), payload.buf, len);
+        ::std::memcpy(dest, &len, sizeof(size_t));
+        if (len > 0) ::std::memcpy(dest + sizeof(size_t), payload.buf, len);
         return flushStaged(bound_ctx_);
     }
     // Drain shared_page_ to write_fd_ in chunks until empty or signal fires.
@@ -1173,10 +1173,10 @@ private:
     {
         if (write_fd_ == -1)
         {
-            std::cerr << "[" << sideStr() << "] flushStaged: write_fd is -1\n";
+            ::std::cerr << "[" << sideStr() << "] flushStaged: write_fd is -1\n";
             return false;
         }
-        long long   total = shared_page_->written.load(std::memory_order_acquire);
+        long long   total = shared_page_->written.load(::std::memory_order_acquire);
         if (total == 0) return true;
         const char* src  = shared_page_->buffer;
         long long   sent = 0;
@@ -1189,8 +1189,8 @@ private:
                 if (ctx.isInterrupted() || ctx.isTerminated()) return false;
                 continue;
             }
-            std::cerr << "[" << sideStr() << "] flushStaged write error: "
-                      << std::strerror(errno) << "\n";
+            ::std::cerr << "[" << sideStr() << "] flushStaged write error: "
+                      << ::std::strerror(errno) << "\n";
             return false;
         }
         shared_page_->reset();
@@ -1213,7 +1213,7 @@ private:
     {
         if (in_.read_offset + sizeof(size_t) > in_.written) return false;
         size_t len = 0;
-        std::memcpy(&len, in_.buf + in_.read_offset, sizeof(size_t));
+        ::std::memcpy(&len, in_.buf + in_.read_offset, sizeof(size_t));
         in_.read_offset += sizeof(size_t);
         if (in_.read_offset + len > in_.written)
         {
@@ -1222,7 +1222,7 @@ private:
         }
         if (len > N)
         {
-            std::cerr << "[MirrorBuffer] tryExtractInto: wire frame (" << len
+            ::std::cerr << "[MirrorBuffer] tryExtractInto: wire frame (" << len
                       << "B) exceeds output capacity (" << N << "B).\n";
             in_.read_offset += len; // still consume it -- stream stays in sync
             out.reset();
@@ -1231,7 +1231,7 @@ private:
         out.reset();
         if (len > 0)
         {
-            std::memcpy(out.buf, in_.buf + in_.read_offset, len);
+            ::std::memcpy(out.buf, in_.buf + in_.read_offset, len);
             out.written = len;
         }
         in_.read_offset += len;
@@ -1247,7 +1247,7 @@ private:
         if (tryExtractInto(out)) return true;
         if (read_fd_ == -1)
         {
-            std::cerr << "[" << sideStr() << "] fillAndCopyInto: read_fd is -1\n";
+            ::std::cerr << "[" << sideStr() << "] fillAndCopyInto: read_fd is -1\n";
             return false;
         }
         while (true)
@@ -1256,7 +1256,7 @@ private:
             if (in_.read_offset > 0 && in_.written > in_.read_offset)
             {
                 size_t remaining = in_.written - in_.read_offset;
-                std::memmove(in_.buf, in_.buf + in_.read_offset, remaining);
+                ::std::memmove(in_.buf, in_.buf + in_.read_offset, remaining);
                 in_.written = remaining;
                 in_.read_offset = 0;
             }
@@ -1287,13 +1287,13 @@ private:
                 if (ctx.isInterrupted() || ctx.isTerminated()) return false;
                 continue;
             }
-            std::cerr << "[" << sideStr() << "] fillAndCopyInto read error: "
-                      << std::strerror(errno) << "\n";
+            ::std::cerr << "[" << sideStr() << "] fillAndCopyInto read error: "
+                      << ::std::strerror(errno) << "\n";
             return false;
         }
     }
     // packWrapManifest / unpackWrapManifest — the wire form of
-    // wrap_manifest_. Token-delimited via the existing std::string
+    // wrap_manifest_. Token-delimited via the existing ::std::string
     // operator<</>> (quoted, space-terminated), so this slots in ahead of
     // config's own raw, unconditional write()/restAsString() pair without
     // disturbing that field's own delimiter-free contract.
@@ -1313,7 +1313,7 @@ private:
         wrap_manifest_len_ = 0;
         for (int i = 0; i < count; ++i)
         {
-            std::string mod, tag;
+            ::std::string mod, tag;
             transport >> mod >> tag;
             if (wrap_manifest_len_ < MAX_WRAP_STAGES)
             {
@@ -1323,7 +1323,7 @@ private:
             }
             else
             {
-                std::cerr << "[MirrorBuffer] unpackWrapManifest: manifest entry "
+                ::std::cerr << "[MirrorBuffer] unpackWrapManifest: manifest entry "
                           << i << " dropped -- MAX_WRAP_STAGES (" << MAX_WRAP_STAGES
                           << ") exceeded.\n";
             }
@@ -1342,8 +1342,8 @@ private:
                 if (ctx.isInterrupted() || ctx.isTerminated()) return false;
                 continue;
             }
-            std::cerr << "[" << sideStr() << "] flush error: "
-                      << std::strerror(errno) << "\n";
+            ::std::cerr << "[" << sideStr() << "] flush error: "
+                      << ::std::strerror(errno) << "\n";
             return false;
         }
     }
@@ -1370,8 +1370,8 @@ private:
                 if (ctx.isInterrupted() || ctx.isTerminated()) return false;
                 continue;
             }
-            std::cerr << "[" << sideStr() << "] fill error: "
-                      << std::strerror(errno) << "\n";
+            ::std::cerr << "[" << sideStr() << "] fill error: "
+                      << ::std::strerror(errno) << "\n";
             return false;
         }
     }
@@ -1507,7 +1507,7 @@ inline void MirrorBuffer::makePair<StrategyPipe, SharedPage>(
     assert(page && "[MirrorBuffer] Pipe makePair: null staging page");
     int fds_data[2], fds_ack[2];
     if (pipe(fds_data) < 0 || pipe(fds_ack) < 0)
-        throw std::runtime_error("[MirrorBuffer] Pipe makePair: pipe() failed");
+        throw ::std::runtime_error("[MirrorBuffer] Pipe makePair: pipe() failed");
  
     producer.active_      = MirrorBuffer::ActiveStrategy::Pipe;
     producer.shared_page_ = page;
@@ -1616,9 +1616,9 @@ inline void MirrorBuffer::teardownPair<StrategyLMAX, LMAXSequentialSharedPage>(
     // entity and not the job that launched it -- precisely the granularity
     // `kill <label> <index>` exists to express.
     if (producer.bound_ctx_.interrupt)
-        producer.bound_ctx_.interrupt->store(1, std::memory_order_release);
+        producer.bound_ctx_.interrupt->store(1, ::std::memory_order_release);
     if (consumer.bound_ctx_.interrupt)
-        consumer.bound_ctx_.interrupt->store(1, std::memory_order_release);
+        consumer.bound_ctx_.interrupt->store(1, ::std::memory_order_release);
     if (producer.debug_ || consumer.debug_)
         ETCS_LOG("MirrorBuffer", "LMAX teardown."
                  << " slots=" << (page ? page->slot_count_ : 0));

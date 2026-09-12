@@ -90,7 +90,7 @@ public:
      * THE EDGE IS THE SAME EITHER WAY; only the delivery differs, and the
      * follower picks it (see ResizeDelivery).
      *
-     * This used to hand the source a std::function and the source used to run
+     * This used to hand the source a ::std::function and the source used to run
      * it. What was wrong with that was never the pushing -- it was that the
      * push CARRIED THE SIZE. Carrying it meant a listener list to hold, an
      * ordering to define over that list, a coalescer at the far end because a
@@ -115,7 +115,7 @@ public:
 
         if (how == ResizeDelivery::Pushed)
         {
-            std::lock_guard<std::mutex> lock(source->m_pushMutex);
+            ::std::lock_guard<::std::mutex> lock(source->m_pushMutex);
             for (ETCS::RID r : source->m_pushFollowers) if (r == getRID()) return;
             source->m_pushFollowers.push_back(getRID());
         }
@@ -172,9 +172,9 @@ public:
      */
     bool settleResize()
     {
-        std::vector<ETCS::RID> wake;
+        ::std::vector<ETCS::RID> wake;
         {
-            std::lock_guard<std::mutex> lock(m_pushMutex);
+            ::std::lock_guard<::std::mutex> lock(m_pushMutex);
             if (m_settle < 0) return false;       // idle
             if (--m_settle > 0) return false;     // still moving
             m_settle = -1;
@@ -203,7 +203,7 @@ protected:
     {
         m_size = newSize;
         etcs_mark_observed(this);
-        std::lock_guard<std::mutex> lock(m_pushMutex);
+        ::std::lock_guard<::std::mutex> lock(m_pushMutex);
         if (!m_pushFollowers.empty()) m_settle = RESIZE_SETTLE_FRAMES;
     }
 
@@ -215,8 +215,8 @@ private:
     // Followers that asked to be woken rather than to ask. Resizable's own
     // policy, deliberately not on the Observable edge: the edge says a change
     // happened, this says who wants to be told about it without asking.
-    mutable std::mutex     m_pushMutex;
-    std::vector<ETCS::RID> m_pushFollowers;
+    mutable ::std::mutex     m_pushMutex;
+    ::std::vector<ETCS::RID> m_pushFollowers;
     int                    m_settle = -1;   // pump passes left; -1 = idle
 };
 

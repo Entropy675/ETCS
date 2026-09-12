@@ -35,7 +35,7 @@ struct DLInEvent
                                                    // for `rid` below).
     ETCS::RID                   rid         = 0;       // Destroy only — instance to remove
     bool                        destroy_children = false; // Destroy only — see DestroyEvent's own comment
-    std::atomic<ETCS::Entity*>* entity_out  = nullptr; // Load
+    ::std::atomic<ETCS::Entity*>* entity_out  = nullptr; // Load
     // Load only — carries LoadEvent::prebuilt. When set, the handler calls
     // attachModule instead of resolving and calling Make(); conjugate_key
     // still carries "module:tag" and is parsed the same way.
@@ -61,8 +61,8 @@ struct DLInEvent
     // The answer rides home in release_value and is published by on_emit, the
     // same read-then-publish split AddTag uses for rid_out.
     bool              (*tagmodify_impl)(ETCS::Entity*, const ETCS::Buffer&, bool) = nullptr;
-    std::atomic<bool>* tagmodify_done = nullptr;
-    std::atomic<bool>* tagmodify_changed = nullptr;
+    ::std::atomic<bool>* tagmodify_done = nullptr;
+    ::std::atomic<bool>* tagmodify_changed = nullptr;
     // TagModify only — the emitting entity's own TYPE bit, stamped at the
     // call site from that type's static TAG_MASK (WIRE_TYPE_IDENTITY,
     // ETCS_API.h) rather than looked up by string in whichever EventNode
@@ -80,7 +80,7 @@ struct DLInEvent
     // here it needs no ack.
     ETCS::Buffer       pairmask_tag_b;
     ETCS::TagMask*     pairmask_out  = nullptr;
-    std::atomic<bool>* pairmask_done = nullptr;
+    ::std::atomic<bool>* pairmask_done = nullptr;
     // MODULE-SCOPE bits the ORIGIN wants added, on top of the origin module's
     // own bit. Today that is exactly one thing: the module pair of a stream
     // call whose body this event was fired from inside
@@ -108,8 +108,8 @@ struct DLInEvent
     // module-context resolution (a real Entity in the general case) both
     // route through the identical ResolveEvent/DLInEvent path.
     ETCS::LifetimeOwner         resolve_target;
-    std::atomic<int8_t>*        resolve_ok  = nullptr; // Resolve: -1 pending/0 fail/1 ok
-    std::atomic<int8_t>*        tri_out     = nullptr; // Destroy: -1 pending, 0 false, 1 true
+    ::std::atomic<int8_t>*        resolve_ok  = nullptr; // Resolve: -1 pending/0 fail/1 ok
+    ::std::atomic<int8_t>*        tri_out     = nullptr; // Destroy: -1 pending, 0 false, 1 true
     // AddTag only — see AddTagEvent below and Entity::addTag<T>() /
     // Entity::addTagTrampoline<T>() in Entity.h. `addtag_trampoline` is
     // captured at the addTag<T> call site, where T is still known, and
@@ -118,8 +118,8 @@ struct DLInEvent
     ETCS::Entity*     addtag_parent      = nullptr;
     ETCS::Entity*     addtag_child       = nullptr;
     RID (*addtag_trampoline)(ETCS::Entity*, ETCS::Entity*, const ETCS::Buffer&) = nullptr;
-    std::atomic<RID>*  rid_out           = nullptr; // AddTag result (the assigned RID)
-    std::atomic<bool>* ready_out         = nullptr; // AddTag completion flag — RID 0 isn't
+    ::std::atomic<RID>*  rid_out           = nullptr; // AddTag result (the assigned RID)
+    ::std::atomic<bool>* ready_out         = nullptr; // AddTag completion flag — RID 0 isn't
                                                        // structurally impossible the way a
                                                        // null Entity* is, so unlike LoadEvent's
                                                        // sentinel trick this needs an explicit
@@ -137,7 +137,7 @@ struct DLInEvent
     // reaches this path at all (see EntityUnloadEvent's own comment).
     ETCS::Entity*      unload_target = nullptr;
     bool               unload_delete_children = false; // see EntityUnloadEvent's own comment
-    std::atomic<bool>* unload_done   = nullptr;
+    ::std::atomic<bool>* unload_done   = nullptr;
     // reply_to — set ONLY by a module-side caller's own operator()()
     // (LoadEvent/ResolveEvent/DestroyEvent/AddTagEvent/EntityUnloadEvent),
     // pointing at &EventNode::getInstance() as seen from THAT module's own
@@ -168,7 +168,7 @@ struct DLInEvent
     // fully finished (requestUnloadImpl returned, dlclose included), so it
     // can be joined. Null on the first fire: its only job is to spawn the
     // recheck, and nothing waits on that.
-    std::atomic<bool>* request_unload_done = nullptr;
+    ::std::atomic<bool>* request_unload_done = nullptr;
     // (ack_done removed.) The Ack carries no result slot at all now: nothing
     // waits on it. sendAckIfNeeded enqueues a heap-allocated Ack and returns
     // immediately, and ModuleProxy::on_event deletes it -- see sendAckIfNeeded's
@@ -191,7 +191,7 @@ struct DLInEvent
     // invariant), so there is no second kind this field ever needs to
     // represent.
     ETCS::Root*        changemodule_root = nullptr;
-    std::atomic<bool>* changemodule_done = nullptr;
+    ::std::atomic<bool>* changemodule_done = nullptr;
 };
 struct DLInEventPtr
 {
@@ -214,7 +214,7 @@ struct Event
 // operator() bodies defined in DynamicLoader.h after getLoader() is visible.
 struct LoadEvent : Event
 {
-    std::atomic<ETCS::Entity*> result{nullptr};
+    ::std::atomic<ETCS::Entity*> result{nullptr};
     // Non-null means "ALREADY constructed -- just attach a Module reference",
     // built on the calling thread before this event fired (spawn<T>,
     // spawn<T>(arena)). Same principle addTagTrampoline<T> uses: construct
@@ -243,7 +243,7 @@ struct LoadEvent : Event
 struct ResolveEvent : Event
 {
     ETCS::LifetimeOwner target;        // entity or Root whose OWN module_ slot gets populated
-    std::atomic<int8_t> ok{-1};        // -1 pending, 0 fail, 1 success
+    ::std::atomic<int8_t> ok{-1};        // -1 pending, 0 fail, 1 success
     ResolveEvent(const char* key, ETCS::LifetimeOwner out) : Event(key), target(out) {}
     ResolveEvent(const ETCS::Buffer& key, ETCS::LifetimeOwner out) : Event(key), target(out) {}
     bool operator()();
@@ -275,7 +275,7 @@ struct DestroyEvent : Event
 {
     ETCS::RID            rid;
     bool                 delete_children;
-    std::atomic<int8_t>  result{-1}; // -1 = pending, 0 = false, 1 = true
+    ::std::atomic<int8_t>  result{-1}; // -1 = pending, 0 = false, 1 = true
     // Optional. Non-null enables the caller-thread scope drain in
     // operator()(); null keeps the old behaviour byte-for-byte. Every real
     // call site is a self-destroy that already holds the pointer -- but
@@ -306,8 +306,8 @@ struct AddTagEvent : Event
     ETCS::Entity* parent;
     ETCS::Entity* child;
     Trampoline    trampoline;
-    std::atomic<RID>  result{0};
-    std::atomic<bool> ready {false};
+    ::std::atomic<RID>  result{0};
+    ::std::atomic<bool> ready {false};
     AddTagEvent(ETCS::Entity* p, ETCS::Entity* c, const ETCS::Buffer& tag_key, Trampoline tramp)
         : Event(tag_key), parent(p), child(c), trampoline(tramp) {}
     RID operator()();
@@ -348,8 +348,8 @@ struct TagModifyEvent : Event
     bool              is_remove;
     Impl              impl;
     ETCS::TagMask     extra_mask;
-    std::atomic<bool> done{false};
-    std::atomic<bool> changed{false};
+    ::std::atomic<bool> done{false};
+    ::std::atomic<bool> changed{false};
     // The fail-shut substitution an empty mask needs — a type with no tag
     // block, so nothing ever assigned its TAG_MASK — is made in operator()(),
     // where the mask is now acquired. Kept out of TAG_MASK's own default,
@@ -390,7 +390,7 @@ struct PairMaskEvent : Event
 {
     ETCS::Buffer      tag_b;
     ETCS::TagMask     result{};
-    std::atomic<bool> done{false};
+    ::std::atomic<bool> done{false};
     PairMaskEvent(const ETCS::Buffer& tag_a, const ETCS::Buffer& b)
         : Event(tag_a), tag_b(b) {}
     void operator()();
@@ -424,7 +424,7 @@ struct EntityUnloadEvent : Event
 {
     ETCS::Entity*     target;
     bool              delete_children;
-    std::atomic<bool> done{false};
+    ::std::atomic<bool> done{false};
     explicit EntityUnloadEvent(ETCS::Entity* t, bool del_children = true)
         : Event(""), target(t), delete_children(del_children) {}
     void operator()();
@@ -444,8 +444,8 @@ struct EntityUnloadEvent : Event
 struct ChangeModuleEvent : Event
 {
     ETCS::Root*       root;
-    std::atomic<bool> done{false};
-    ChangeModuleEvent(const std::string& target_module, ETCS::Root* r)
+    ::std::atomic<bool> done{false};
+    ChangeModuleEvent(const ::std::string& target_module, ETCS::Root* r)
         : Event(target_module.c_str()), root(r) {}
     void operator()();
 };
@@ -463,7 +463,7 @@ struct ChangeModuleEvent : Event
 struct RequestUnloadEvent : Event
 {
     ETCS::Module* target;
-    explicit RequestUnloadEvent(const std::string& module_name, ETCS::Module* mod)
+    explicit RequestUnloadEvent(const ::std::string& module_name, ETCS::Module* mod)
         : Event(module_name.c_str()), target(mod) {}
     void operator()();
 };
@@ -479,7 +479,7 @@ struct RequestUnloadEvent : Event
 // Kind::Ack directly.
 struct AckEvent : Event
 {
-    explicit AckEvent(const std::string& module_name) : Event(module_name.c_str()) {}
+    explicit AckEvent(const ::std::string& module_name) : Event(module_name.c_str()) {}
 };
 // drainEntityScopes -- signal every in-flight scope registered against
 // target, then wait for them to actually return. Declared here, DEFINED in
@@ -501,7 +501,7 @@ bool drainEntityScopes(ETCS::Entity* target, const char* who);
 // ModuleProxy into the loader's LoaderStream.
 struct CreateEvent : Event
 {
-    std::atomic<ETCS::Entity*> result{nullptr};
+    ::std::atomic<ETCS::Entity*> result{nullptr};
     using Event::Event;
     ETCS::Entity* operator()();
 };
@@ -514,14 +514,14 @@ class EventNode
 {
 public:
     template<typename K, typename V>
-    using ArenaMap = std::unordered_map<
+    using ArenaMap = ::std::unordered_map<
         K, V,
-        std::hash<K>,
-        std::equal_to<K>,
-        ArenaAllocator<std::pair<const K, V>>
+        ::std::hash<K>,
+        ::std::equal_to<K>,
+        ArenaAllocator<::std::pair<const K, V>>
     >;
     // Deliberately NOT an ArenaMap, unlike the name might suggest at a
-    // glance — plain std::unordered_map, default (heap) allocator. There's
+    // glance — plain ::std::unordered_map, default (heap) allocator. There's
     // exactly one of these per module, constructed and destructed as a
     // single static-lifetime unit alongside EventNode itself; arena-
     // backing it bought nothing but a real hazard: EventNode::~EventNode()
@@ -557,7 +557,7 @@ public:
     void (*set_log_to_file)(bool) = nullptr;
     bool (*get_log_to_file)()     = nullptr;
 
-    std::unordered_map<ETCS::Buffer, RIDListHandle> ridMap;
+    ::std::unordered_map<ETCS::Buffer, RIDListHandle> ridMap;
     // -----------------------------------------------------------------------
     // Tag bit index — maps each of THIS module's own contract tags (the
     // exact same, ordered, space-separated Tags string ETCS_MODULE_EXPORT_MAIN
@@ -584,8 +584,8 @@ public:
     // code (see ETCS_MODULE_EXPORT_MAIN) — meaning it lands on THIS
     // module's own per-DSO EventNode singleton naturally, the same way
     // every other per-module static already does.
-    std::unordered_map<std::string, uint8_t> tag_bit_index;
-    std::vector<std::string>                 bit_tag_names; // reverse — index is the bit position
+    ::std::unordered_map<::std::string, uint8_t> tag_bit_index;
+    ::std::vector<::std::string>                 bit_tag_names; // reverse — index is the bit position
     // Overflow is FATAL, not truncating. A tag past the budget used to get
     // no entry here at all, so GetTagBit returned an empty mask, so
     // acquire() set no blocked_by_ bits for it -- meaning two operations
@@ -597,7 +597,7 @@ public:
     // The real guard is the static_assert on the Tags string in
     // ETCS_MODULE_EXPORT_MAIN, which fails the BUILD. This is the backstop
     // for anything reaching here another way.
-    void RegisterTagBitIndex(const std::vector<std::string>& ordered_tags)
+    void RegisterTagBitIndex(const ::std::vector<::std::string>& ordered_tags)
     {
         if (ordered_tags.size() > TAG_BITS)
         {
@@ -605,7 +605,7 @@ public:
                      "FATAL: " << ordered_tags.size() << " contract tags declared, TAG_BITS is "
                      << TAG_BITS << ". Tags past the budget would silently stop serializing "
                      "against themselves.");
-            std::abort();
+            ::std::abort();
         }
         for (size_t i = 0; i < ordered_tags.size(); ++i)
         {
@@ -620,7 +620,7 @@ public:
     // It is no longer reachable by overflow (see RegisterTagBitIndex), and
     // no longer reachable by an empty loader-side index either, since
     // dispatch no longer calls this at all.
-    TagMask GetTagBit(const std::string& tag_name) const
+    TagMask GetTagBit(const ::std::string& tag_name) const
     {
         auto it = tag_bit_index.find(tag_name);
         return it != tag_bit_index.end() ? TagMask::bit(it->second) : TagMask{};
@@ -628,9 +628,9 @@ public:
     // Decodes a tag_closure_mask back into the type names it represents —
     // for diagnosing a collision after the fact ("which two types were
     // actually colliding"), not for anything on the hot dispatch path.
-    std::vector<std::string> DecodeTagClosureMask(const TagMask& mask) const
+    ::std::vector<::std::string> DecodeTagClosureMask(const TagMask& mask) const
     {
-        std::vector<std::string> result;
+        ::std::vector<::std::string> result;
         for (size_t i = 0; i < bit_tag_names.size(); ++i)
             if (mask.test(i))
                 result.push_back(bit_tag_names[i]);
@@ -682,8 +682,8 @@ public:
         // attachModule) publishes here on a vacant bootstrap exactly like
         // any other attachModule call does; there is no separate,
         // unpublished "browse" path anymore.
-        ArenaMap<std::string, Module*> module_registry{
-            ArenaAllocator<std::pair<const std::string, Module*>>(
+        ArenaMap<::std::string, Module*> module_registry{
+            ArenaAllocator<::std::pair<const ::std::string, Module*>>(
                 &MemoryArena::getInstance())};
         // module name -> that module's own per-DSO MemoryArena::getInstance()
         // (see Name##_GetArena, ETCS_API.h). Deliberately PERMANENT and
@@ -697,8 +697,8 @@ public:
         // different entity wins a later election. Resolved once, on
         // first contact with a module (whether via a real spawn or a
         // mere browse), and never cleared.
-        ArenaMap<std::string, MemoryArena*> module_arena_registry{
-            ArenaAllocator<std::pair<const std::string, MemoryArena*>>(
+        ArenaMap<::std::string, MemoryArena*> module_arena_registry{
+            ArenaAllocator<::std::pair<const ::std::string, MemoryArena*>>(
                 &MemoryArena::getInstance())};
         // module name -> that module's PERSISTENT type_catalog pointer.
         // Populated once, the first time any Module::catalogTypes() ever
@@ -707,8 +707,8 @@ public:
         // pointer-stability guarantee on Entity::TagEntry::bundle actually
         // hold across a hand-off: the NEW anchor Module struct gets this
         // SAME pointer assigned directly, never a freshly-allocated map.
-        ArenaMap<std::string, std::unordered_map<std::string, ModuleBundle>*> type_catalog_registry{
-            ArenaAllocator<std::pair<const std::string, std::unordered_map<std::string, ModuleBundle>*>>(
+        ArenaMap<::std::string, ::std::unordered_map<::std::string, ModuleBundle>*> type_catalog_registry{
+            ArenaAllocator<::std::pair<const ::std::string, ::std::unordered_map<::std::string, ModuleBundle>*>>(
                 &MemoryArena::getInstance())};
         // ── Module-order bit index ──────────────────────────────────────
         // The loader-scope counterpart to EventNode's own tag_bit_index
@@ -728,11 +728,11 @@ public:
         // serialize things that should be independent, but two operations
         // on one type failing to share a bit would fail to serialize
         // things that must not be.
-        ArenaMap<std::string, uint8_t> module_bit_index{
-            ArenaAllocator<std::pair<const std::string, uint8_t>>(
+        ArenaMap<::std::string, uint8_t> module_bit_index{
+            ArenaAllocator<::std::pair<const ::std::string, uint8_t>>(
                 &MemoryArena::getInstance())};
-        std::vector<std::string> bit_module_names;
-        TagMask GetModuleBit(const std::string& module_name)
+        ::std::vector<::std::string> bit_module_names;
+        TagMask GetModuleBit(const ::std::string& module_name)
         {
             auto it = module_bit_index.find(module_name);
             if (it != module_bit_index.end())
@@ -793,14 +793,14 @@ public:
         // resolve/spawn path (ResolveEvent, CmdSetModule, etc.) is
         // invisible here and can't currently be found as a hand-off
         // candidate.
-        ArenaMap<std::string, std::vector<Root*>> root_registry{
-            ArenaAllocator<std::pair<const std::string, std::vector<Root*>>>(
+        ArenaMap<::std::string, ::std::vector<Root*>> root_registry{
+            ArenaAllocator<::std::pair<const ::std::string, ::std::vector<Root*>>>(
                 &MemoryArena::getInstance())};
-        void registerRoot(const std::string& module_name, Root* root)
+        void registerRoot(const ::std::string& module_name, Root* root)
         {
             root_registry[module_name].push_back(root);
         }
-        void unregisterRoot(const std::string& module_name, Root* root)
+        void unregisterRoot(const ::std::string& module_name, Root* root)
         {
             auto it = root_registry.find(module_name);
             if (it == root_registry.end()) return;
@@ -813,7 +813,7 @@ public:
         // findRootCandidate — the Root-registry counterpart to
         // MemoryArena::findNextCandidateScope. Returns any OTHER live
         // Root already attached to module_name, or nullptr if none.
-        Root* findRootCandidate(const std::string& module_name, Root* exclude)
+        Root* findRootCandidate(const ::std::string& module_name, Root* exclude)
         {
             auto it = root_registry.find(module_name);
             if (it == root_registry.end()) return nullptr;
@@ -851,17 +851,17 @@ public:
                 case DLInEvent::Kind::Load:
                     if (e->entity_out)
                         e->entity_out->store(reinterpret_cast<ETCS::Entity*>(e->release_value),
-                                             std::memory_order_release);
+                                             ::std::memory_order_release);
                     break;
                 case DLInEvent::Kind::Resolve:
                     if (e->resolve_ok)
                         e->resolve_ok->store(static_cast<int8_t>(e->release_value),
-                                             std::memory_order_release);
+                                             ::std::memory_order_release);
                     break;
                 case DLInEvent::Kind::Destroy:
                     if (e->tri_out)
                         e->tri_out->store(static_cast<int8_t>(e->release_value),
-                                          std::memory_order_release);
+                                          ::std::memory_order_release);
                     break;
                 case DLInEvent::Kind::AddTag:
                     // ready_out, not rid_out: AddTagEvent spins on the flag,
@@ -869,31 +869,31 @@ public:
                     // rid_out was written relaxed by the handler and is
                     // published by this store.
                     if (e->ready_out)
-                        e->ready_out->store(true, std::memory_order_release);
+                        e->ready_out->store(true, ::std::memory_order_release);
                     break;
                 case DLInEvent::Kind::EntityUnload:
-                    if (e->unload_done)  e->unload_done->store(true, std::memory_order_release);
+                    if (e->unload_done)  e->unload_done->store(true, ::std::memory_order_release);
                     break;
                 case DLInEvent::Kind::TagModify:
                     // Answer before flag: the caller spins on the flag, so the
                     // store that releases it must be the last touch here.
                     if (e->tagmodify_changed)
                         e->tagmodify_changed->store(e->release_value != 0,
-                                                    std::memory_order_relaxed);
-                    if (e->tagmodify_done) e->tagmodify_done->store(true, std::memory_order_release);
+                                                    ::std::memory_order_relaxed);
+                    if (e->tagmodify_done) e->tagmodify_done->store(true, ::std::memory_order_release);
                     break;
                 case DLInEvent::Kind::ChangeModule:
-                    if (e->changemodule_done) e->changemodule_done->store(true, std::memory_order_release);
+                    if (e->changemodule_done) e->changemodule_done->store(true, ::std::memory_order_release);
                     break;
                 case DLInEvent::Kind::RequestUnload:
                     // Only the recheck fire has a waiter; the initial one is
                     // heap-allocated, deleted by its handler, and passes no
                     // completion.
                     if (e->request_unload_done)
-                        e->request_unload_done->store(true, std::memory_order_release);
+                        e->request_unload_done->store(true, ::std::memory_order_release);
                     break;
                 case DLInEvent::Kind::PairMask:
-                    if (e->pairmask_done) e->pairmask_done->store(true, std::memory_order_release);
+                    if (e->pairmask_done) e->pairmask_done->store(true, ::std::memory_order_release);
                     break;
                 case DLInEvent::Kind::Ack:
                     break;
@@ -901,7 +901,7 @@ public:
         }
         // Impl methods — only called from on_event (single-threaded consumer).
         // Access owner->ridMap directly; no getInstance() calls inside consumer.
-        ETCS::Entity* loadImpl   (const std::string& conjugate_key,
+        ETCS::Entity* loadImpl   (const ::std::string& conjugate_key,
                                    ETCS::LifetimeOwner bootstrap_root);
         // Attaches (or re-attaches) a module to an entity's or Root's own
         // .module_ slot with no spawn_tag — proxy onto the live anchor if
@@ -913,8 +913,8 @@ public:
         // since a loaded .so must always correspond to exactly one
         // canonical registry entry the instant it's loaded, regardless
         // of who's currently holding the entity/Root that hosts it.
-        bool          resolveImpl(const std::string& module_name, ETCS::LifetimeOwner entity);
-        bool          destroyImpl(const std::string& conjugate_key, ETCS::RID rid,
+        bool          resolveImpl(const ::std::string& module_name, ETCS::LifetimeOwner entity);
+        bool          destroyImpl(const ::std::string& conjugate_key, ETCS::RID rid,
                                    bool delete_children = true);
         // Runs the type-erased addTag<T> trampoline on this (the ordering)
         // thread. See AddTagEvent above and Entity::addTagTrampoline<T>()
@@ -939,9 +939,9 @@ public:
         // reference -- every caller either already holds the reference it
         // passed in, or only ever checked the old return value for
         // null/non-null. Ordering-thread only.
-        bool          attachModule(const std::string& module_name,
+        bool          attachModule(const ::std::string& module_name,
                                     ETCS::LifetimeOwner entity,
-                                    const std::string& spawn_tag);
+                                    const ::std::string& spawn_tag);
         // THE Kind::RequestUnload delayed-recheck handler -- called after
         // the delay (see DLInEvent::request_unload_recheck).
         // Re-verifies lifetime_owner is still nullptr before
@@ -950,15 +950,15 @@ public:
         void          requestUnloadImpl(ETCS::Module* target);
         // THE Kind::ChangeModule handler — see its own definition
         // comment, DynamicLoader.h. Ordering-thread only.
-        void          changeModuleImpl(ETCS::Root* root, const std::string& target_module);
-        bool          isTypedActionStream(const std::string& origin,
-                                          const std::string& conjugate_key);
+        void          changeModuleImpl(ETCS::Root* root, const ::std::string& target_module);
+        bool          isTypedActionStream(const ::std::string& origin,
+                                          const ::std::string& conjugate_key);
     private:
-        std::pair<std::string, std::string> parseConjugateOriginKey(const std::string& key)
+        ::std::pair<::std::string, ::std::string> parseConjugateOriginKey(const ::std::string& key)
         {
             size_t p = key.find(":");
-            if (p == std::string::npos || p == 0 || p == key.length() - 1)
-                throw std::runtime_error(
+            if (p == ::std::string::npos || p == 0 || p == key.length() - 1)
+                throw ::std::runtime_error(
                     "Invalid component key format. Expected 'module_name:tag_type'. Received: " + key);
             return {key.substr(0, p), key.substr(p + 1)};
         }
@@ -969,12 +969,12 @@ public:
         // module without assuming it shares its parent's module — the
         // type IS the key into this, exactly as it should be, regardless
         // of which entity happened to addTag<T> it or from where.
-        std::unordered_map<std::string, std::string> type_owner_index;
+        ::std::unordered_map<::std::string, ::std::string> type_owner_index;
         // Registers every tag in mod->type_catalog as owned by module_name.
         // Logs — does NOT silently overwrite — if a tag name is already
         // claimed by a DIFFERENT module, surfacing a genuine naming
         // collision loudly rather than picking one arbitrarily.
-        void registerTypeOwnership(const std::string& module_name, Module* mod);
+        void registerTypeOwnership(const ::std::string& module_name, Module* mod);
         // Called from each of Load/Resolve/Destroy/AddTag/EntityUnload's
         // own case in on_event, right before they return -- see
         // DLInEvent::reply_to for the reasoning. A no-op if evt.reply_to is
@@ -1002,9 +1002,9 @@ public:
             if (!e) return;
             // Answer before flag -- see LoaderStream::on_emit's own note.
             if (e->tagmodify_changed)
-                e->tagmodify_changed->store(e->release_value != 0, std::memory_order_relaxed);
+                e->tagmodify_changed->store(e->release_value != 0, ::std::memory_order_relaxed);
             if (e->tagmodify_done)
-                e->tagmodify_done->store(true, std::memory_order_release);
+                e->tagmodify_done->store(true, ::std::memory_order_release);
         }
         // Module scope. TagModify is handled locally and its mask is genuine
         // TAG bits, stamped from the emitting type's own closure -- meaningful
@@ -1043,8 +1043,8 @@ public:
     // a destroyed unordered_map: reproduced under ASan as a 104-byte
     // heap-use-after-free in _Hashtable::clear(), writing into a bucket array
     // already freed by __run_exit_handlers.
-    inline static std::atomic<bool> s_alive{false};
-    static bool alive() { return s_alive.load(std::memory_order_acquire); }
+    inline static ::std::atomic<bool> s_alive{false};
+    static bool alive() { return s_alive.load(::std::memory_order_acquire); }
 
     EventNode()
     {
@@ -1055,9 +1055,9 @@ public:
         get_log_to_file = &ETCS::get_log_to_file;
         stream.owner = this; // wire back-pointer now that EventNode is complete --
                               // both LoaderStream and ModuleProxy have this member.
-        s_alive.store(true, std::memory_order_release);
+        s_alive.store(true, ::std::memory_order_release);
     }
-    ~EventNode() { s_alive.store(false, std::memory_order_release); }
+    ~EventNode() { s_alive.store(false, ::std::memory_order_release); }
     static EventNode& getInstance()
     {
 #ifdef DEBUG_STATIC_GET_INSTANCE_ORDER
