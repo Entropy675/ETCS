@@ -26,6 +26,20 @@
         #define ETCS_API
     #endif
 #endif
+
+// Under emscripten SIDE_MODULE, C++ static-init runs while the main module is
+// still inside loadDynamicLibrary. EventNode/ThreadPool/MemoryArena symbols
+// resolve to the *loader* (GOT imports), not a private per-DSO copy the way a
+// native .so does. Touching them from a module static lambda is therefore a
+// reach into the loader mid-load — hang / re-entry. Defer those registrations;
+// the loader's post-dlopen calls (RegisterEventNode / Name()) perform the real
+// work once both sides are live.
+#if defined(__EMSCRIPTEN__) && !defined(ETCS_LOADER)
+#  define ETCS_MODULE_STATIC_REACH_LOADER 0
+#else
+#  define ETCS_MODULE_STATIC_REACH_LOADER 1
+#endif
+
 // flags for make with -DETCS_PRODUCTION_BUILD module side (see ETCS.h for loader side)
 #ifdef ETCS_PRODUCTION_BUILD
     #define ETCS_LOG_TO_FILE
@@ -430,6 +444,7 @@ public: \
         return list; \
     } \
     inline bool _etcs_supertype_registered_##Name = []() { \
+        if (!ETCS_MODULE_STATIC_REACH_LOADER) return true; \
         ETCS::ThreadPool::getInstance(); \
         /* Direct ridMap write, not RegisterRIDRegistry -- that method    \
          * only exists on module-scope EventNode (its own #ifndef         \
@@ -847,6 +862,7 @@ namespace ETCS
      * DecodeTagClosureMask still needs the reverse mapping to name which \
      * types were actually colliding when diagnosing a stall. */ \
     static const bool Name##_tag_bit_index_registered_ = []() { \
+        if (!ETCS_MODULE_STATIC_REACH_LOADER) return true; \
         ::std::vector<::std::string> ordered_tags; \
         ::std::stringstream ss(Tags); \
         ::std::string tok; \
@@ -874,6 +890,7 @@ namespace ETCS
      * than just eventually-true, since this runs mid-static-init instead \
      * of at the loader's first runtime call into Name(). */ \
     static const bool Name##_loader_manifest_checked_ = []() { \
+        if (!ETCS_MODULE_STATIC_REACH_LOADER) return true; \
         void* getterAddr = ETCS::etcs_find_loader_manifest_getter(); \
         if (!getterAddr) return true; \
         using LoaderManifestGetter = void* (*)(); \
@@ -1041,6 +1058,7 @@ namespace ETCS
         return list;\
     }\
     static bool _ridlist_##Name##_registered = []() {\
+        if (!ETCS_MODULE_STATIC_REACH_LOADER) return true; \
         ETCS::ThreadPool::getInstance(); \
         ETCS::EventNode::getInstance().RegisterRIDRegistry(\
             #Name, \
