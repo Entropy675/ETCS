@@ -1178,7 +1178,11 @@ public:
 private:
     static const ::std::string& getBinDir() {
         static const ::std::string dir = []() -> ::std::string {
-#if defined(_WIN32) || defined(_WIN64)
+#if defined(__EMSCRIPTEN__)
+            // Browser: no /proc/self/exe. Side modules are same-origin
+            // relative paths resolved by Module.locateFile / emscripten dlopen.
+            return "./";
+#elif defined(_WIN32) || defined(_WIN64)
             char path[MAX_PATH];
             DWORD len = GetModuleFileNameA(NULL, path, MAX_PATH);
             if (len == 0) return ".\\";

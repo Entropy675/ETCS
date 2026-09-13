@@ -106,7 +106,7 @@
 // up to 336 bytes together -- a sixth of the old budget, in a field that also
 // holds config. Cheaper than making config's headroom depend on tag count.
 #define MAX_MIRROR_TRANSPORT_SIZE       4096
-#define ETCS_NETWORK_MAX_HEADER_SIZE    8*8192
+#define ETCS_NETWORK_MAX_HEADER_SIZE    8*8192*8*4
 #define ETCS_SLOT_SIZE                  64
 #define ETCS_SEQUENTIAL_FRAME_SIZE      32
 #define ETCS_BUFFER_METADATA_SIZE       16
@@ -138,6 +138,17 @@
     #define DL_EXTENSION ".dll"
     #define RENAME_CMD(old_name, new_name) MoveFileExA(old_name.c_str(), new_name.c_str(), MOVEFILE_REPLACE_EXISTING)
     #define GET_CWD() _getcwd(nullptr, 0)
+#elif defined(__EMSCRIPTEN__)
+    // Compile-time only when the translation unit is built by em++.
+    // Native g++/clang never define __EMSCRIPTEN__, so DL_EXTENSION stays
+    // ".so" and existing Linux module loading is unchanged.
+    #include <dlfcn.h>
+    #include <unistd.h>
+    #include <sys/stat.h>
+    using library_handle_t = void*;
+    #define DL_EXTENSION ".wasm"
+    #define RENAME_CMD(old_name, new_name) ::std::rename(old_name.c_str(), new_name.c_str())
+    #define GET_CWD() getcwd(nullptr, 0)
 #else
     #include <dlfcn.h>
     #include <unistd.h> // For getcwd
