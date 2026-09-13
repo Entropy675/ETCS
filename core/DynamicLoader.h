@@ -302,7 +302,8 @@ bool ETCS::Module::registerLoader(EventNode& st)
                 ss >> combinedKey;
                 st.ridMap[combinedKey] = handle;
                 ETCS_LOG("EventNode:" << st.scope,
-                    "Absorbed module " << node->scope << " RIDList: " << originalKey);
+                    "Absorbed module scope='" << (node->scope ? node->scope : "(null)")
+                    << "' key='" << originalKey << "' -> '" << combinedKey << "'");
             }
         }
         else
@@ -2475,26 +2476,36 @@ inline ::std::vector<ETCS::EventNode*>& emscripten_deferred_module_nodes()
 
 inline void etcs_boot_runtime_threads()
 {
+    ETCS_LOG("ETCS", "[trace] etcs_boot: enter");
     g_etcs_runtime_threads_started.store(true, ::std::memory_order_release);
     ETCS::MemoryArena::getInstance();
     dynamicLoader.node = &ETCS::EventNode::getInstance();
 
     // Ordering threads BEFORE ThreadPool workers
     auto& loader_node = ETCS::EventNode::getInstance();
+    ETCS_LOG("ETCS", "[trace] etcs_boot: arming loader ordering thread scope="
+             << loader_node.scope);
     loader_node.stream.arm_emscripten_ordering_thread();
     ETCS_LOG("ETCS", "emscripten: loader ordering thread armed");
 
     for (ETCS::EventNode* mod_node : emscripten_deferred_module_nodes())
     {
         if (!mod_node) continue;
+        ETCS_LOG("ETCS", "[trace] etcs_boot: arming module ordering thread scope="
+                 << (mod_node->scope ? mod_node->scope : "(null)")
+                 << " node=" << (void*)mod_node
+                 << " loader_node=" << (void*)&loader_node
+                 << (mod_node == &loader_node ? " SAME_AS_LOADER" : " distinct"));
         mod_node->stream.arm_emscripten_ordering_thread();
         ETCS_LOG("ETCS", "emscripten: module ordering thread armed scope="
                  << mod_node->scope);
     }
     emscripten_deferred_module_nodes().clear();
 
+    ETCS_LOG("ETCS", "[trace] etcs_boot: arming ThreadPool workers");
     ETCS::ThreadPool::getInstance().arm_emscripten_workers();
     ETCS_LOG("ETCS", "emscripten: ThreadPool workers armed");
+    ETCS_LOG("ETCS", "[trace] etcs_boot: leave");
 }
 #endif
 

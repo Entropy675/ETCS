@@ -2651,17 +2651,27 @@ inline ETCS::Entity* ensure_session_shell(ETCS::Root& host, ETCS::SignalContext&
                                           const ::std::string& provider = "ShellProvider",
                                           const ::std::string& tag      = "Shell")
 {
+    ETCS_LOG("ETCS", "[trace] ensure_session_shell enter provider=" << provider
+             << " tag=" << tag);
     ETCS::ExecutionContext env(&host, &sig);
     env.is_root = false;                  // its names are not a script's globals
     const ExecSource src{"(session shell)", 0};
     try
     {
+        ETCS_LOG("ETCS", "[trace] ensure_session_shell before spawn_entity");
         ETCS::Entity* shell = ETCS::spawn_entity(provider, tag, env, src);
+        ETCS_LOG("ETCS", "[trace] ensure_session_shell after spawn_entity shell="
+                 << (void*)shell);
         if (!shell) return nullptr;
+        ETCS_LOG("ETCS", "[trace] ensure_session_shell before Shell.Create");
         shell->call("Shell.Create", "", sig);
+        ETCS_LOG("ETCS", "[trace] ensure_session_shell after Shell.Create");
         return shell;
     }
-    catch (const ::std::exception&) { return nullptr; }
+    catch (const ::std::exception& ex) {
+        ETCS_LOG("ETCS", "[trace] ensure_session_shell exception: " << ex.what());
+        return nullptr;
+    }
 }
 
 #if defined(__EMSCRIPTEN__)
@@ -4073,23 +4083,32 @@ inline void shell_startup()
 inline int drive_main_loop_then_exit(ETCS::SignalContext& ctx, int code,
                                      const ::std::string& control_socket = "")
 {
+    ETCS_LOG("ETCS", "[trace] drive_main_loop_then_exit enter");
     // The session's Shell, spawned in EVERY mode and held until this returns.
     // Interactive asks it for a console; drain and --listen simply keep it, so
     // the runtime has its lifetime anchor whether or not anyone is typing.
     ETCS::Root    shell_host(ctx);
+    ETCS_LOG("ETCS", "[trace] drive_main before ensure_session_shell");
     ETCS::Entity* shell = ETCS::ensure_session_shell(shell_host, ctx);
+    ETCS_LOG("ETCS", "[trace] drive_main after ensure_session_shell shell="
+             << (void*)shell);
 
 #ifdef ETCS_REPL_SHELL
     (void)control_socket;
     if (shell)
     {
         ETCS::Buffer none;
+        ETCS_LOG("ETCS", "[trace] before Shell.OpenConsole");
         shell->call(ETCS::Buffer("Shell.OpenConsole"), none, ctx);
+        ETCS_LOG("ETCS", "[trace] after Shell.OpenConsole");
         repl_owns_console = true;
         repl_console_shell = shell;
 
+        ETCS_LOG("ETCS", "[trace] before repl_shell_line_source");
         ReplLineSource in = repl_shell_line_source(shell, ctx);
+        ETCS_LOG("ETCS", "[trace] before repl_shell_loop_with");
         repl_shell_loop_with(ctx, in);
+        ETCS_LOG("ETCS", "[trace] after repl_shell_loop_with");
 
         repl_console_shell = nullptr;
         repl_owns_console = false;

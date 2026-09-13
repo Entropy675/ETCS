@@ -17,6 +17,9 @@
 // `etcs` must pass -DETCS_REPL_SHELL. A target without it is the
 // daemon/environment binary.
 #undef ETCS_PRODUCTION_BUILD
+#if defined(__EMSCRIPTEN__)
+#include <emscripten.h>
+#endif
 #include "../ETCS.h"
 #include <fstream>
 #include <iostream>
@@ -28,6 +31,25 @@
 // ANSI codes when stdout is a terminal, empty strings when it is a pipe or a
 // file, in either binary. No fallback needed here.
 
+
+#if defined(__EMSCRIPTEN__)
+// Force a line to the page terminal even when main is spinning (no stop-script needed).
+inline void etcs_web_trace(const char* msg)
+{
+    EM_ASM({
+        var s = UTF8ToString($0);
+        if (typeof Module !== 'undefined' && Module.print)
+            Module.print(s + (s.endsWith('\n') ? '' : '\n'));
+        else
+            console.log(s);
+    }, msg);
+    ::std::fflush(stdout);
+    ::std::fflush(stderr);
+}
+#else
+inline void etcs_web_trace(const char*) {}
+#endif
+
 int main(int argc, char* argv[])
 {
     shell_startup();
@@ -35,9 +57,13 @@ int main(int argc, char* argv[])
 #if defined(__EMSCRIPTEN__)
     // 1) Bind modules on THIS thread via attachModule (no ChangeModuleEvent).
     //    Ordering thread is still deferred — no concurrent LoaderStream consumer.
+    etcs_web_trace("[trace] before preload_web_modules");
     ETCS::preload_web_modules(ctx);
+    etcs_web_trace("[trace] after preload_web_modules");
     // 2) Then arm ThreadPool workers + loader ordering thread for the rest of the run.
+    etcs_web_trace("[trace] before etcs_boot_runtime_threads");
     etcs_boot_runtime_threads();
+    etcs_web_trace("[trace] after etcs_boot_runtime_threads");
 #endif
     // drive_main_loop_then_exit (CommandExecutor.h) is what every path through
     // main() funnels through so that, once whichever top-level loop
@@ -57,6 +83,7 @@ int main(int argc, char* argv[])
         // wait_for_environment_drain returns immediately (see its own comment,
         // CommandExecutor.h, on why an empty registry is correct-and-trivial,
         // not an error) -- this is a legitimate, if uninteresting, no-op.
+        etcs_web_trace("[trace] before drive_main_loop_then_exit");
         return drive_main_loop_then_exit(ctx, 0);
     }
     // ── Script file mode ──────────────────────────────────────────────────────
