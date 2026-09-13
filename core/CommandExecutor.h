@@ -1,5 +1,9 @@
 #ifndef COMMAND_EXECUTOR_H__
 #define COMMAND_EXECUTOR_H__
+#if defined(__EMSCRIPTEN__) && defined(ETCS_LOADER)
+#include <dirent.h>
+#include <memory>
+#endif
 // CommandExecutor.h - execution and its browse surface, no terminal I/O
 // Consumes Command values produced by parse_line() and fires ETCS events.
 //
@@ -2659,6 +2663,110 @@ inline ETCS::Entity* ensure_session_shell(ETCS::Root& host, ETCS::SignalContext&
     }
     catch (const ::std::exception&) { return nullptr; }
 }
+
+#if defined(__EMSCRIPTEN__)
+/*
+ * Web/emscripten: eager module load + Root lifetime anchors.
+ *
+ * Native ETCS loads modules on first spawn (attachModule at need). Under
+ * MAIN_MODULE + pthreads that is too late: workers are already running and
+ * side-module dlopen/static-init races wasmMemory. Preload every discoverable
+ * *.wasm (DL_EXTENSION) on the MAIN thread before the REPL/drain loops, and
+ * keep one Root per successful attach so lifetime_owner stays claimed for the
+ * process lifetime (same token model as a long-lived script host Root).
+ *
+ * Discovery:
+ *   1) Scan the binary/dir path ("./ " under emscripten) for *DL_EXTENSION.
+ *   2) Merge a small candidate list so browser fetches still work when the
+ *      VFS has no directory listing (HTTP-served side modules via dlopen).
+ * Skip the MAIN artifact name "etcs" and anything with "worker" in the name.
+ */
+inline ::std::vector<::std::unique_ptr<ETCS::Root>>& web_module_lifetime_roots()
+{
+    static ::std::vector<::std::unique_ptr<ETCS::Root>> roots;
+    return roots;
+}
+
+inline ::std::vector<::std::string> discover_web_module_names()
+{
+    ::std::vector<::std::string> names;
+    auto add = [&](const ::std::string& n) {
+        if (n.empty() || n == "etcs") return;
+        if (n.find("worker") != ::std::string::npos) return;
+        for (const auto& e : names)
+            if (e == n) return;
+        names.push_back(n);
+    };
+
+    const ::std::string ext = DL_EXTENSION; // ".wasm" under emscripten
+#if defined(_WIN32)
+    // not used on this path
+#else
+    DIR* dir = ::opendir(".");
+    if (dir)
+    {
+        while (dirent* ent = ::readdir(dir))
+        {
+            if (!ent->d_name) continue;
+            ::std::string f = ent->d_name;
+            if (f.size() <= ext.size()) continue;
+            if (f.compare(f.size() - ext.size(), ext.size(), ext) != 0) continue;
+            add(f.substr(0, f.size() - ext.size()));
+        }
+        ::closedir(dir);
+    }
+#endif
+    // Always try known Commons providers (dlopen will fetch by locateFile even
+    // when the VFS scan was empty). Failed attaches are ignored below.
+    static const char* kCandidates[] = {
+        "ShellProvider",
+        "WindowProvider",
+        "NetworkProvider",
+        "RenderProvider",
+        "LayoutProvider",
+        "DatabaseProvider",
+        "ChessProvider",
+    };
+    for (const char* c : kCandidates)
+        add(c);
+    return names;
+}
+
+inline void preload_web_modules(ETCS::SignalContext& ctx)
+{
+    auto& roots = web_module_lifetime_roots();
+    const auto names = discover_web_module_names();
+    for (const auto& name : names)
+    {
+        auto root = ::std::make_unique<ETCS::Root>(ctx);
+        try
+        {
+            root->changeModule(name);
+            // changeModule/attachModule log failures and leave parent null
+            if (root->module_.parent)
+            {
+                ETCS_LOG("ETCS", "web preload: held Root for " << name
+                         << " (lifetime_owner="
+                         << (root->module_.is_lifetime_owner ? "yes" : "no")
+                         << ")");
+                roots.push_back(::std::move(root));
+            }
+            else
+            {
+                ETCS_LOG("ETCS", "web preload: skip " << name
+                         << " (attach did not bind)");
+            }
+        }
+        catch (const ::std::exception& ex)
+        {
+            ETCS_LOG("ETCS", "web preload: " << name << " failed: " << ex.what());
+        }
+    }
+    ETCS_LOG("ETCS", "web preload: " << roots.size()
+             << " module Root(s) held for process lifetime");
+}
+#endif // __EMSCRIPTEN__ (loader web preload)
+
 #endif // ETCS_LOADER
 
 } // namespace ETCS
