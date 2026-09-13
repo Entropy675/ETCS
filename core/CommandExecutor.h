@@ -2720,18 +2720,19 @@ inline ::std::vector<::std::string> discover_web_module_names()
     // when the VFS scan was empty). Failed attaches are ignored below.
     static const char* kCandidates[] = {
         "ShellProvider",
-        "WindowProvider",
-        "NetworkProvider",
+        "WindowProvider"
+        /*"NetworkProvider",
         "RenderProvider",
         "LayoutProvider",
         "DatabaseProvider",
-        "ChessProvider",
+        "ChessProvider",*/
     };
     for (const char* c : kCandidates)
         add(c);
     return names;
 }
 
+/* Module bind: ETCS::etcs_web_root_attach_module (DynamicLoader.h) — main-thread attachModule. */
 inline void preload_web_modules(ETCS::SignalContext& ctx)
 {
     auto& roots = web_module_lifetime_roots();
@@ -2741,9 +2742,8 @@ inline void preload_web_modules(ETCS::SignalContext& ctx)
         auto root = ::std::make_unique<ETCS::Root>(ctx);
         try
         {
-            root->changeModule(name);
-            // changeModule/attachModule log failures and leave parent null
-            if (root->module_.parent)
+            const bool ok = ETCS::etcs_web_root_attach_module(*root, name);
+            if (ok && root->module_.parent)
             {
                 ETCS_LOG("ETCS", "web preload: held Root for " << name
                          << " (lifetime_owner="

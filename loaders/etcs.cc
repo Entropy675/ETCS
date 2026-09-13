@@ -33,9 +33,11 @@ int main(int argc, char* argv[])
     shell_startup();
     WIRE_CONTEXT();
 #if defined(__EMSCRIPTEN__)
-    // MAIN thread, before REPL/drain/ThreadPool-heavy work: discover and
-    // dlopen every side module, keep a Root per load so lifetime tokens stick.
+    // 1) Bind modules on THIS thread via attachModule (no ChangeModuleEvent).
+    //    Ordering thread is still deferred — no concurrent LoaderStream consumer.
     ETCS::preload_web_modules(ctx);
+    // 2) Then arm ThreadPool workers + loader ordering thread for the rest of the run.
+    etcs_boot_runtime_threads();
 #endif
     // drive_main_loop_then_exit (CommandExecutor.h) is what every path through
     // main() funnels through so that, once whichever top-level loop

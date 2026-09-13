@@ -34,6 +34,17 @@ namespace ETCS {
  */
     static EventNode& getLoader() { return *dynamicLoader.node; }
 
+#if defined(__EMSCRIPTEN__) && defined(ETCS_LOADER)
+    // Defined below after LoaderStream::attachModule is complete.
+    bool etcs_web_root_attach_module(Root& root, const ::std::string& module_name);
+    // Module EventNodes deferred during preload; drained in etcs_boot_runtime_threads.
+    inline ::std::vector<EventNode*>& emscripten_deferred_module_nodes()
+    {
+        static ::std::vector<EventNode*> nodes;
+        return nodes;
+    }
+#endif
+
     /*
  * EVERY LOADED MODULE'S OWN LOG DESTINATION, in one place the shell can reach.
  *
@@ -272,6 +283,9 @@ bool ETCS::Module::registerLoader(EventNode& st)
             // scope so a reload replaces rather than accumulates, and erased on
             // unload so the shell never calls through a dlclose'd trampoline.
             ETCS::module_log_nodes()[node->scope] = node;
+#if defined(__EMSCRIPTEN__) && defined(ETCS_LOADER)
+            ETCS::emscripten_deferred_module_nodes().push_back(node);
+#endif
             // Brought into step with the loader the moment it can be. Anything
             // the module logged BEFORE this -- its ThreadPool coming up, its
             // manifest comparison -- followed the module's own compile-time
@@ -2452,6 +2466,38 @@ ETCS::DispatchResult ETCS::EventNode::ModuleProxy::on_event(
 // -- Initialization ------------------------------------------------------------
  
 #ifdef ETCS_LOADER
+#if defined(__EMSCRIPTEN__)
+inline ::std::vector<ETCS::EventNode*>& emscripten_deferred_module_nodes()
+{
+    static ::std::vector<ETCS::EventNode*> nodes;
+    return nodes;
+}
+
+inline void etcs_boot_runtime_threads()
+{
+    g_etcs_runtime_threads_started.store(true, ::std::memory_order_release);
+    ETCS::MemoryArena::getInstance();
+    dynamicLoader.node = &ETCS::EventNode::getInstance();
+
+    // Ordering threads BEFORE ThreadPool workers
+    auto& loader_node = ETCS::EventNode::getInstance();
+    loader_node.stream.arm_emscripten_ordering_thread();
+    ETCS_LOG("ETCS", "emscripten: loader ordering thread armed");
+
+    for (ETCS::EventNode* mod_node : emscripten_deferred_module_nodes())
+    {
+        if (!mod_node) continue;
+        mod_node->stream.arm_emscripten_ordering_thread();
+        ETCS_LOG("ETCS", "emscripten: module ordering thread armed scope="
+                 << mod_node->scope);
+    }
+    emscripten_deferred_module_nodes().clear();
+
+    ETCS::ThreadPool::getInstance().arm_emscripten_workers();
+    ETCS_LOG("ETCS", "emscripten: ThreadPool workers armed");
+}
+#endif
+
 inline const bool _core_init = []() {
     WIRE_ROOT_SIGNAL_CONTEXT();
     /*
@@ -2459,10 +2505,17 @@ inline const bool _core_init = []() {
  * active_bundles, and active_modules. Replaces the old shared_mutex.
  */
     ETCS::MemoryArena::getInstance();
+    dynamicLoader.node = &ETCS::EventNode::getInstance();
+#if defined(__EMSCRIPTEN__)
+    // May construct pool / call start(); both defer std::thread until boot.
+    (void)ETCS::ThreadPool::getInstance();
+    ETCS::EventNode::getInstance().stream.start(
+        ETCS::MemoryArena::getInstance(), 1);
+#else
     ETCS::ThreadPool::getInstance();
     ETCS::EventNode::getInstance().stream.start(
         ETCS::MemoryArena::getInstance(), 1);
-    dynamicLoader.node = &ETCS::EventNode::getInstance();
+#endif
     return true;
 }();
 
@@ -2830,6 +2883,14 @@ inline void ETCS::Root::changeModule(const ::std::string& targetModule)
     ETCS::ChangeModuleEvent evt(targetModule, this);
     evt();
 }
+
+#if defined(__EMSCRIPTEN__) && defined(ETCS_LOADER)
+inline bool ETCS::etcs_web_root_attach_module(ETCS::Root& root, const ::std::string& module_name)
+{
+    return ETCS::getLoader().stream.attachModule(module_name, &root, "");
+}
+#endif
+
  
 /*
  * ChangeModuleEvent::operator()() - blocking, same spin pattern as every

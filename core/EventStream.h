@@ -207,6 +207,9 @@ protected:
  */
     ::std::atomic<uint64_t>     blocked_admissions_{ 0 };
     ::std::thread               ordering_thread_;
+    bool                        pending_start_ = false;
+    MemoryArena*                pending_arena_ = nullptr;
+    int                         pending_producer_count_ = 1;
     ::std::atomic<bool>         stop_{ false };
     // Set true the instant shutdown begins (start of stop()/~EventStream()),
     // BEFORE stop_ is even set and well before the ordering thread is
@@ -413,9 +416,30 @@ public:
         output_ring_     = allocateTunedRing(arena, 2, 1);
         stop_.store(false, ::std::memory_order_relaxed);
         is_cleaning_up_.store(false, ::std::memory_order_relaxed);
+#if defined(__EMSCRIPTEN__)
+        if (!g_etcs_runtime_threads_started.load(::std::memory_order_acquire))
+        {
+            pending_start_ = true;
+            pending_arena_ = &arena;
+            pending_producer_count_ = producer_count;
+            ETCS_LOG("EventStream", "emscripten: deferring ordering thread until runtime armed");
+            return;
+        }
+#endif
         ordering_thread_ = ::std::thread([this]() { ordering_loop(); });
         ETCS_LOG("EventStream", "Ordering thread started.");
     }
+
+    void arm_emscripten_ordering_thread()
+    {
+#if defined(__EMSCRIPTEN__)
+        if (!pending_start_ || ordering_thread_.joinable()) return;
+        pending_start_ = false;
+        if (pending_arena_)
+            start(*pending_arena_, pending_producer_count_);
+#endif
+    }
+
     void stop()
     {
         is_cleaning_up_.store(true, ::std::memory_order_release);

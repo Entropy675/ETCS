@@ -327,6 +327,8 @@ private:
     };
 
     ::std::vector<::std::thread> workers_;
+    bool workers_started_ = false;
+    size_t deferred_thread_count_ = 0;
     ::std::priority_queue<Task, ::std::vector<Task>, CompareTask> task_queue_;
 
     ::std::mutex              queue_mutex_;
@@ -413,6 +415,23 @@ public:
             throw ::std::runtime_error("[IO] Failed to create IOCP");
 #endif
 
+#if defined(__EMSCRIPTEN__)
+        deferred_thread_count_ = threads;
+        if (!g_etcs_runtime_threads_started.load(::std::memory_order_acquire))
+        {
+            ETCS_LOG("ThreadPool", "emscripten: deferring " << threads
+                     << " workers until etcs_boot_runtime_threads()");
+            s_alive.store(true, ::std::memory_order_release);
+            return;
+        }
+#endif
+        start_workers(threads);
+    }
+
+    void start_workers(size_t threads)
+    {
+        if (workers_started_) return;
+        workers_started_ = true;
         ETCS_LOG("ThreadPool", "Initializing with hardware threads: " << threads);
         workers_.reserve(threads);
         for (size_t i = 0; i < threads; ++i)
@@ -462,6 +481,14 @@ public:
         watchdog_thread_ = ::std::thread(&ThreadPool::watchdog_loop, this);
         io_thread_       = ::std::thread(&ThreadPool::io_completion_loop, this);
         s_alive.store(true, ::std::memory_order_release);
+    }
+
+    void arm_emscripten_workers()
+    {
+#if defined(__EMSCRIPTEN__)
+        if (deferred_thread_count_ > 0 && !workers_started_)
+            start_workers(deferred_thread_count_);
+#endif
     }
 
     // Liveness, readable AFTER this object has been destroyed. Same hazard

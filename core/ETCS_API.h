@@ -129,6 +129,14 @@
 #include <sstream>
 #include <vector>
 // ====================================================================
+// Emscripten: no std::thread until main arms the runtime (etcs_boot_runtime_threads).
+// ThreadPool / EventStream consult this before creating Web Workers.
+// ====================================================================
+#if defined(__EMSCRIPTEN__)
+inline ::std::atomic<bool> g_etcs_runtime_threads_started{false};
+#endif
+
+// ====================================================================
 // PLATFORM-SPECIFIC HEADER INCLUDES
 // ====================================================================
 #ifdef _WIN32
