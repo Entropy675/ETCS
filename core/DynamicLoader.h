@@ -316,11 +316,17 @@ bool ETCS::Module::registerLoader(EventNode& st)
             }
         }
 #if defined(__EMSCRIPTEN__)
-        else if (!node || node == &st || node == &getLoader())
+        else if (node == &st || node == &getLoader())
         {
             ETCS_LOG("DynamicLoader:Module",
-                "emscripten: single-hop register -- no module EventNode for '"
-                << name << "' (tags via dlsym only)");
+                "emscripten: shared EventNode with loader for '" << name
+                << "' -- RIDLists live on the single map (no absorb copy)");
+        }
+        else if (!node)
+        {
+            ETCS_LOG("DynamicLoader:Module",
+                "emscripten: RegisterDynamicLoader returned null for '" << name << "'");
+            return false;
         }
 #endif
         else
@@ -358,6 +364,28 @@ bool ETCS::Module::registerLoader(EventNode& st)
             "Module missing 'RegisterRootSignalContext' export -- "
             "module will not receive live global signal authority.");
     }
+#if defined(__EMSCRIPTEN__)
+    /*
+     * Static init skipped RIDList publish (ETCS_MODULE_STATIC_REACH_LOADER=0).
+     * Without this, _make_T inserts into a private static list that never
+     * appears in EventNode::ridMap -- WorkBundle resolve always fails.
+     */
+    for (const auto& tag : tags)
+    {
+        const ::std::string sym = tag.toString() + "_RegisterRidList";
+        using RegFn = void (*)();
+        void* p = getTagFunction(sym);
+        if (!p)
+        {
+            ETCS_LOG("DynamicLoader:Module",
+                "emscripten: missing " << sym << " -- RID resolve will fail for this tag");
+            continue;
+        }
+        reinterpret_cast<RegFn>(p)();
+        ETCS_LOG("DynamicLoader:Module",
+            "emscripten: registered RIDList for tag '" << tag << "'");
+    }
+#endif
     ETCS_LOG("DynamicLoader:Module", "tags! " << tags.size());
     validBinary = true;
     return validBinary;
@@ -2641,14 +2669,16 @@ extern "C" ETCS_API ETCS::EventNode* RegisterDynamicLoader(void* ptr)
         ETCS_LOG("DynamicLoader", "Passed ThreadPool! ");
 #if defined(__EMSCRIPTEN__)
         /*
-         * Single-hop web runtime: MAIN owns the only EventNode / LoaderStream.
-         * Side modules share that symbol under dylink; a second stream.start()
-         * and a module node that aliases the loader create self-proxy waits.
-         * Wire getLoader() only; return null so registerLoader skips absorb of self.
+         * Single-hop: do NOT stream.start() (MAIN owns LoaderStream / sync poll).
+         * Still return THIS DSO's EventNode so registerLoader can absorb RIDList
+         * handles. Returning null skipped absorb and left spawn RIDs invisible
+         * to etcs_resolve_by_key on the loader map (Create/ReadLine "no longer
+         * resolves"). If dylink aliases this node to the loader, registerLoader
+         * detects identity and skips absorb.
          */
         ETCS_LOG("DynamicLoader",
-            "emscripten: collapsed hop -- no module EventNode stream.start");
-        return nullptr;
+            "emscripten: collapsed hop -- no module stream.start; return node for RID absorb");
+        return &ETCS::EventNode::getInstance();
 #else
         ETCS::EventNode::getInstance().stream.start(
             ETCS::MemoryArena::getInstance(), 1);

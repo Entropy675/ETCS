@@ -1085,6 +1085,10 @@ namespace ETCS
         );\
         return true;\
     }(); \
+    extern "C" ETCS_API void Name##_RegisterRidList() { \
+        ETCS::EventNode::getInstance().RegisterRIDRegistry( \
+            #Name, _ridlist_##Name().handle(#Name)); \
+    } \
     ETCS::Entity* _make_child_##Name(ETCS::Entity* parent) \
     { \
         if (!parent) return nullptr; \
