@@ -276,24 +276,16 @@ bool ETCS::Module::registerLoader(EventNode& st)
         ETCS_LOG("DynamicLoader:Module", "Found registry function @" << funcPtr << ", passing local loader...");
         // Pass the loader's EventNode (not DynamicLoader) to the module
         ETCS::EventNode* node = reg(static_cast<void*>(&getLoader()));
-        if (node)
+        if (node && node != &st && node != &getLoader())
         {
-            // Remembered so `log file` / `log term` can reach this module's own
-            // destination flag -- see ETCS::set_log_destination below. Keyed by
-            // scope so a reload replaces rather than accumulates, and erased on
-            // unload so the shell never calls through a dlclose'd trampoline.
+            // Native distinct module EventNode
             ETCS::module_log_nodes()[node->scope] = node;
 #if defined(__EMSCRIPTEN__) && defined(ETCS_LOADER)
             ETCS::emscripten_deferred_module_nodes().push_back(node);
 #endif
-            // Brought into step with the loader the moment it can be. Anything
-            // the module logged BEFORE this -- its ThreadPool coming up, its
-            // manifest comparison -- followed the module's own compile-time
-            // default, because there was no module yet for the loader to tell.
-            // That chatter is startup-only and lands on the terminal; from
-            // here on the module goes where the loader goes.
             node->set_log_to_file(ETCS::get_log_to_file());
-            // Absorb module ridMap entries directly via st
+            // Absorb module ridMap entries directly via st (unchanged keying here;
+            // type-key absorb is a separate patch).
             for (const auto& [originalKey, handle] : node->ridMap)
             {
                 ::std::stringstream ss;
@@ -302,10 +294,17 @@ bool ETCS::Module::registerLoader(EventNode& st)
                 ss >> combinedKey;
                 st.ridMap[combinedKey] = handle;
                 ETCS_LOG("EventNode:" << st.scope,
-                    "Absorbed module scope='" << (node->scope ? node->scope : "(null)")
-                    << "' key='" << originalKey << "' -> '" << combinedKey << "'");
+                    "Absorbed module " << node->scope << " RIDList: " << originalKey);
             }
         }
+#if defined(__EMSCRIPTEN__)
+        else if (!node || node == &st || node == &getLoader())
+        {
+            ETCS_LOG("DynamicLoader:Module",
+                "emscripten: single-hop register -- no module EventNode for '"
+                << name << "' (tags via dlsym only)");
+        }
+#endif
         else
         {
             ETCS_LOG("DynamicLoader:Module", "Module returned a null EventNode!");
@@ -2616,10 +2615,22 @@ extern "C" ETCS_API ETCS::EventNode* RegisterDynamicLoader(void* ptr)
         ETCS_LOG("DynamicLoader", "Passed MemoryArena! ");
         ETCS::ThreadPool::getInstance();
         ETCS_LOG("DynamicLoader", "Passed ThreadPool! ");
+#if defined(__EMSCRIPTEN__)
+        /*
+         * Single-hop web runtime: MAIN owns the only EventNode / LoaderStream.
+         * Side modules share that symbol under dylink; a second stream.start()
+         * and a module node that aliases the loader create self-proxy waits.
+         * Wire getLoader() only; return null so registerLoader skips absorb of self.
+         */
+        ETCS_LOG("DynamicLoader",
+            "emscripten: collapsed hop -- no module EventNode stream.start");
+        return nullptr;
+#else
         ETCS::EventNode::getInstance().stream.start(
             ETCS::MemoryArena::getInstance(), 1);
         ETCS_LOG("DynamicLoader", "Passed EventNode stream start! ");
         return &ETCS::EventNode::getInstance();
+#endif
     }
     catch (const ETCS::EventStreamZombieException&)
     {
@@ -2721,11 +2732,11 @@ inline ETCS::Entity* ETCS::LoadEvent::operator()()
     evt.entity_out = &result;
     evt.prebuilt_entity = prebuilt;
     evt.bootstrap_root = root;
-#ifndef ETCS_LOADER
+#if !defined(ETCS_LOADER) && !defined(__EMSCRIPTEN__)
     /*
  * Module-side caller: reply_to lets the loader ack back onto THIS
- * module's own stream after it finishes -- see reply_to's own
- * comment (EventNode.h) for the full ordering-guarantee reasoning.
+ * module's own stream after it finishes.
+ * Emscripten: single EventNode; leave reply_to null (no self-proxy wait).
  */
     evt.reply_to = &ETCS::EventNode::getInstance();
     evt.origin_extra_mask = ETCS::ActivePairModuleMask();
@@ -2756,7 +2767,7 @@ inline bool ETCS::ResolveEvent::operator()()
     evt.conjugate_key  = conjugate_key;
     evt.resolve_target = target;
     evt.resolve_ok     = &ok;
-#ifndef ETCS_LOADER
+#if !defined(ETCS_LOADER) && !defined(__EMSCRIPTEN__)
     evt.reply_to = &ETCS::EventNode::getInstance();
     evt.origin_extra_mask = ETCS::ActivePairModuleMask();
 #endif
@@ -2783,7 +2794,7 @@ inline bool ETCS::DestroyEvent::operator()()
     evt.rid = rid;
     evt.destroy_children = delete_children;
     evt.tri_out = &result;
-#ifndef ETCS_LOADER
+#if !defined(ETCS_LOADER) && !defined(__EMSCRIPTEN__)
     evt.reply_to = &ETCS::EventNode::getInstance();
     evt.origin_extra_mask = ETCS::ActivePairModuleMask();
 #endif
@@ -2815,7 +2826,7 @@ inline ETCS::RID ETCS::AddTagEvent::operator()()
     evt.addtag_trampoline = trampoline;
     evt.rid_out           = &result;
     evt.ready_out         = &ready;
-#ifndef ETCS_LOADER
+#if !defined(ETCS_LOADER) && !defined(__EMSCRIPTEN__)
     evt.reply_to = &ETCS::EventNode::getInstance();
     evt.origin_extra_mask = ETCS::ActivePairModuleMask();
 #endif
@@ -2874,7 +2885,7 @@ inline void ETCS::EntityUnloadEvent::operator()()
     evt.unload_target           = target;
     evt.unload_delete_children  = delete_children;
     evt.unload_done             = &done;
-#ifndef ETCS_LOADER
+#if !defined(ETCS_LOADER) && !defined(__EMSCRIPTEN__)
     evt.reply_to = &ETCS::EventNode::getInstance();
     evt.origin_extra_mask = ETCS::ActivePairModuleMask();
 #endif
@@ -2919,7 +2930,7 @@ inline void ETCS::ChangeModuleEvent::operator()()
     evt.conjugate_key      = conjugate_key;
     evt.changemodule_root  = root;
     evt.changemodule_done  = &done;
-#ifndef ETCS_LOADER
+#if !defined(ETCS_LOADER) && !defined(__EMSCRIPTEN__)
     evt.reply_to = &ETCS::EventNode::getInstance();
     evt.origin_extra_mask = ETCS::ActivePairModuleMask();
 #endif
@@ -3005,7 +3016,7 @@ inline void ETCS::PairMaskEvent::operator()()
     evt.pairmask_tag_b = tag_b;
     evt.pairmask_out   = &result;
     evt.pairmask_done  = &done;
-#ifndef ETCS_LOADER
+#if !defined(ETCS_LOADER) && !defined(__EMSCRIPTEN__)
     evt.reply_to = &ETCS::EventNode::getInstance();
     evt.origin_extra_mask = ETCS::ActivePairModuleMask();
 #endif
