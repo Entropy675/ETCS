@@ -206,6 +206,66 @@ inline size_t etcs_flush_deferred_rid_registrars()
 #include <cstdint>
 #include <cstring>
 #include <atomic>   // WIRE_TYPE_IDENTITY's TAG_CLOSURE generation counter
+#include <thread>
+#include <chrono>
+#if defined(__EMSCRIPTEN__)
+// Unconditionally, not only under ETCS_DLL_EXPORTS: etcs_cooperative_pause_ms
+// below needs emscripten_sleep and emscripten_is_main_browser_thread in every
+// translation unit that waits, loader and module alike.
+#include <emscripten/emscripten.h>
+#include <emscripten/threading.h>
+#endif
+
+/*
+ * A WAIT THAT GIVES THE BROWSER ITS TURN.
+ *
+ * Same switch and same shape as EventStream's sync ordering: under emscripten
+ * there is no second thread to do the waiting on, so a wait has to RETURN TO THE
+ * EVENT LOOP instead of holding it. emscripten_sleep is ASYNCIFY's yield -- the
+ * stack is unwound, the browser runs, and the call resumes where it left off.
+ *
+ * WHY sleep_for AND yield ARE BOTH WRONG THERE, and not merely wasteful:
+ *
+ *   std::this_thread::yield() on the browser's main thread is an INFINITE HANG
+ *   whenever the condition it spins on can only change from a DOM callback --
+ *   which is every GLFW event, since glfw's emscripten backend delivers through
+ *   the event loop this loop is refusing to return to. A spin waiting for a
+ *   window to become active can therefore never see it become active.
+ *
+ *   std::this_thread::sleep_for blocks the same thread for real, so a 1ms poll
+ *   loop starves the page at a thousand stalls a second.
+ *
+ * On every other platform this is exactly the sleep it replaces, so a producer
+ * written for a pool worker keeps its own behaviour and gains a browser one.
+ */
+inline void etcs_cooperative_pause_ms(unsigned ms)
+{
+#if defined(__EMSCRIPTEN__)
+    /*
+     * ASYNCIFY ONLY ON THE MAIN THREAD, and this distinction is the whole of it.
+     *
+     * emscripten_sleep unwinds and rewinds the stack -- it is how the ONE thread
+     * that owns the event loop gives the browser a turn without ending its own
+     * call. On a pthread there is no event loop to give a turn to and nothing to
+     * unwind for: the Worker can block outright, which is what a Worker is for,
+     * and asyncify-unwinding there is both pointless and a known way to land on
+     * "unreachable on doRewind" (CommandExecutor.h says the same about
+     * Shell.ReadLine through WorkBundle).
+     *
+     * Which matters here specifically because this function is called from BOTH:
+     * the pump's producers run on a detached thread, while Window.Run's idle wait
+     * can be on the main one. Picking by where you actually are is the only
+     * version that is right in both.
+     */
+    if (emscripten_is_main_browser_thread())
+        emscripten_sleep(ms);
+    else
+        ::std::this_thread::sleep_for(::std::chrono::milliseconds(ms));
+#else
+    ::std::this_thread::sleep_for(::std::chrono::milliseconds(ms));
+#endif
+}
+
 #include <string>
 #include <cstddef>
 #include <unordered_map>
@@ -219,6 +279,7 @@ inline size_t etcs_flush_deferred_rid_registrars()
 #if defined(__EMSCRIPTEN__)
 inline ::std::atomic<bool> g_etcs_runtime_threads_started{false};
 #endif
+
 
 // ====================================================================
 // PLATFORM-SPECIFIC HEADER INCLUDES

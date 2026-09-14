@@ -2530,9 +2530,31 @@ inline void etcs_boot_runtime_threads()
     }
     emscripten_deferred_module_nodes().clear();
 
+    /*
+ * NOW THE WORKERS, AND THIS IS THE POINT OF THE DEFERRAL RATHER THAN A
+ * RELAXATION OF IT.
+ *
+ * What is unsafe in the browser is spawning a thread BEFORE the modules are
+ * loaded -- a Worker started while the main module is still inside
+ * loadDynamicLibrary finds wasmMemory undefined, which is what
+ * ETCS_MODULE_STATIC_REACH_LOADER and this whole deferred boot exist to avoid.
+ * By the time this function runs, preload_web_modules has finished every dlopen
+ * (loaders/etcs.cc calls them in that order, deliberately), so the condition the
+ * deferral was protecting against no longer holds and there is nothing left to
+ * wait for.
+ *
+ * LEAVING THEM DEFERRED FOREVER WAS NOT A SAFE DEFAULT, it was a silent one. A
+ * stream edge -- `producer() -> consumer()` -- enqueues onto this pool
+ * (ETCS_MODULE_EXPORT_STREAM, ETCS_API.h), so with no workers the producer is
+ * queued and never runs: the edge is stated, nothing refuses it, and no event
+ * ever arrives. A window's input pump IS such an edge
+ * (window_events.etcs: ProduceEvents -> ConsumeEvents), so on the web it was
+ * accepted and dead. Arming here is what makes a detached pump actually pump.
+ */
     ETCS_LOG("ETCS", "[trace] etcs_boot: arming ThreadPool workers");
-    // Keep workers deferred: browser pthread path still hits wasmMemory undefined.
-    ETCS_LOG("ETCS", "emscripten: ThreadPool workers left deferred (sync event path)");
+    ETCS::ThreadPool::getInstance().arm_emscripten_workers();
+    ETCS_LOG("ETCS", "emscripten: ThreadPool workers armed (modules are all loaded, "
+             "so a Worker can no longer start inside a dlopen)");
     ETCS_LOG("ETCS", "[trace] etcs_boot: leave");
 }
 #endif
