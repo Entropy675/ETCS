@@ -2631,10 +2631,36 @@ inline ETCS::RIDListHandle* etcs_ridmap_named(ETCS::EventNode* owner,
             return (it != owner->ridMap.end()) ? &it->second : nullptr;
         }
         auto mirror = owner->ridMirror.find(bare);
-        if (mirror == owner->ridMirror.end()) return nullptr;
-        for (auto& row : mirror->second)
-            if (row.module.toString() == wanted) return &row.handle;
-        return nullptr;
+        if (mirror != owner->ridMirror.end())
+        {
+            for (auto& row : mirror->second)
+                if (row.module.toString() == wanted) return &row.handle;
+            // The name IS mirrored, just not by that module. A different
+            // provider's list is not an answer to a question that named one.
+            return nullptr;
+        }
+        /*
+ * NO MIRROR BUCKET AT ALL MEANS THERE IS ONLY ONE IMAGE, so this image is that
+ * module -- and the own map is the answer whatever the qualifier says.
+ *
+ * THIS IS THE COLLAPSED BUILD, and getting it wrong is what a single address
+ * space does to an assumption built on several. A mirror row is how a SEPARATE
+ * image announces a list; under emscripten (and the kernel path later) the
+ * module's EventNode IS the loader's, registerLoader detects the identity and
+ * skips the absorb, so every module's list sits in ridMap and ridMirror is
+ * empty. Asking for "WindowProvider:Window" then looked for a mirror row tagged
+ * WindowProvider, found no mirror whatsoever, and refused -- with the list
+ * sitting in the very map it had just declined to read. Every QUALIFIED lookup
+ * in the browser failed that way, which is a whole class of them: a shell
+ * re-resolving the entity it is standing on, a global name being checked for
+ * liveness, a bound entity being reached by conjugate key.
+ *
+ * In a multi-image build this fires only when nothing mirrored the name, where
+ * the own map is the sole candidate anyway -- so the rule is not a special case
+ * for one platform, it is the general statement the mirror was always making.
+ */
+        auto it = owner->ridMap.find(bare);
+        return (it != owner->ridMap.end()) ? &it->second : nullptr;
     }
 
     /*
@@ -3569,8 +3595,20 @@ inline Base* resolve_in_family(const char* family, RID rid)
     ::std::string found_owner;
     int           matches = 0;
 
-    if (owner != &ETCS::EventNode::getInstance()
-        && (!qualified || wanted_module == (owner->scope ? owner->scope : "")))
+    auto mirror = owner->ridMirror.find(bare);
+
+    /*
+ * The asked-of image's own list is a candidate when the caller named THIS
+ * image, named nothing, or named a module in a build where no separate image
+ * mirrored this name at all -- the collapsed case, where one map holds every
+ * module's lists (see etcs_ridmap_named for the full reasoning).
+ */
+    const bool own_is_candidate =
+        !qualified
+        || wanted_module == (owner->scope ? owner->scope : "")
+        || mirror == owner->ridMirror.end();
+
+    if (owner != &ETCS::EventNode::getInstance() && own_is_candidate)
     {
         auto it = owner->ridMap.find(bare);
         if (it != owner->ridMap.end())
@@ -3578,7 +3616,6 @@ inline Base* resolve_in_family(const char* family, RID rid)
             { found = p; found_owner = owner->scope ? owner->scope : "(loader)"; ++matches; }
     }
 
-    auto mirror = owner->ridMirror.find(bare);
     if (mirror != owner->ridMirror.end())
         for (auto& row : mirror->second)
         {
@@ -3654,8 +3691,12 @@ inline size_t collect_in_family(const char* family, RID rid, ::std::vector<Base*
 
     if (!owner) return added;
 
+    auto mirror = owner->ridMirror.find(bare);
+    // Same candidacy rule as resolve_in_family: a named module also matches the
+    // own map when nothing mirrored the name, which is the collapsed build.
     if (owner != mine_node
-        && (!qualified || wanted_module == (owner->scope ? owner->scope : "")))
+        && (!qualified || wanted_module == (owner->scope ? owner->scope : "")
+            || mirror == owner->ridMirror.end()))
     {
         auto it = owner->ridMap.find(bare);
         if (it != owner->ridMap.end())
@@ -3663,7 +3704,6 @@ inline size_t collect_in_family(const char* family, RID rid, ::std::vector<Base*
             { out.push_back(static_cast<Base*>(p)); ++added; }
     }
 
-    auto mirror = owner->ridMirror.find(bare);
     if (mirror == owner->ridMirror.end()) return added;
     for (auto& row : mirror->second)
     {

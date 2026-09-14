@@ -123,6 +123,40 @@ int main(int, char**)
     check(ETCS::etcs_resolve_rid_anywhere(ldr, 0) == nullptr,
           "...and answers null for RID 0 rather than the first row");
 
+    // -- 5c. A QUALIFIED ASK WHEN NOTHING MIRRORED THE NAME -------------------
+    //
+    // THE COLLAPSED BUILD, which is what emscripten (and the kernel path later)
+    // actually is: one address space, the module's EventNode IS the loader's, so
+    // registerLoader skips the absorb and every module's list sits in ridMap with
+    // ridMirror empty. A qualified lookup that insists on a mirror row then
+    // refuses with the list in the very map it declined to read -- and that broke
+    // EVERY qualified lookup in the browser: the shell re-resolving the entity it
+    // was standing on, a global name's liveness check, a bound entity by
+    // conjugate key.
+    //
+    // Cannot be reproduced natively by loading modules -- the mirror is never
+    // empty here -- so the RULE is tested directly: a name this image publishes
+    // and nothing mirrors must answer a qualified ask naming any module, because
+    // with one image this image IS that module.
+    if (ldr)
+    {
+        const ETCS::Buffer probe_name("ZZCollapsedProbe");
+        ETCS::RIDList<ETCS::Entity*> probe_list;
+        ldr->ridMap[probe_name] = probe_list.handle("ZZCollapsedProbe");
+
+        check(ETCS::etcs_ridmap_named(ldr, probe_name) != nullptr,
+              "an unmirrored name answers a bare ask");
+        check(ETCS::etcs_ridmap_named(ldr, ETCS::Buffer("AnyProvider:ZZCollapsedProbe")) != nullptr,
+              "...and answers a QUALIFIED ask naming a foreign module (collapsed build)");
+
+        // And the opposite must still hold: a name that IS mirrored refuses a
+        // module that did not publish it, rather than falling through.
+        check(ETCS::etcs_ridmap_named(ldr, ETCS::Buffer("NoSuchProvider:Deletable")) == nullptr,
+              "a mirrored name still refuses a module that never published it");
+
+        ldr->ridMap.erase(probe_name);
+    }
+
     // -- 6. a bare FAMILY name with no RID has no single answer ---------------
     //
     // Refused rather than guessed: several providers publish Deletable, so

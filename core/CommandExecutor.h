@@ -2872,14 +2872,24 @@ inline ::std::vector<::std::pair<::std::string, ETCS::NameBinding>>
 repl_live_globals_for_module(const ::std::string& mod_name)
 {
     ::std::vector<::std::pair<::std::string, ETCS::NameBinding>> out;
-    auto& ridMap = ETCS::EventNode::getInstance().ridMap;
+    /*
+ * THROUGH THE ACCESSOR, and this one mattered more than a failed read.
+ *
+ * It did ridMap.find() on a hand-built "<module>:<tag>" key. That key has not
+ * existed since the origin prefix was collapsed, so the find missed every time
+ * -- and the else branch here does not merely skip the entry, it FORGETS the
+ * binding. Every global name in a module was retracted as dead on the first
+ * navigator visit, with the entity alive the whole time. A raw find on a
+ * composed key asserts the storage layout; etcs_ridmap_row asks the question
+ * this code means, which is "does that list still hold this RID".
+ */
+    ETCS::EventNode* node = &ETCS::EventNode::getInstance();
     for (auto& [name, b] : ETCS::GlobalNames::getInstance().snapshot())
     {
         if (b.module != mod_name) continue;
         ETCS::Buffer key;
         key.writeString((b.module + ":" + b.tag).c_str());
-        auto it = ridMap.find(key);
-        if (it != ridMap.end() && it->second.invoke_contains(b.rid))
+        if (ETCS::etcs_ridmap_row(node, key, b.rid))
             out.emplace_back(name, b);
         else
             ETCS::GlobalNames::getInstance().forget(name);   // dead: retract it
@@ -3160,25 +3170,35 @@ inline void repl_shell_action_loop(ETCS::Entity* e, ETCS::Root& nav_root,
 
     // Replaces the old still_alive() bool -- returning the pointer means a
     // caller can't keep using the stale one after a successful check.
+    /*
+ * THE SINGLE RE-RESOLUTION POINT, and it was answering null for everything.
+ *
+ * A raw ridMap.find() on "<module>:<tag>" -- a key the origin collapse removed
+ * -- so every action menu reported "destroyed while awaiting input" and dropped
+ * back to an instance list that still showed the entity live one line later.
+ * Two liveness answers from two different lookups, one of them asserting a
+ * layout instead of asking a question. Seen exactly that way in the wasm shell:
+ * spawn a Window, press enter, get told it was destroyed, see it listed as
+ * active immediately below.
+ */
     auto resolve_self = [&]() -> ETCS::Entity*
     {
         ETCS::Buffer key;
         key.writeString((mod_name + ":" + tag_name).c_str());
-        auto& ridMap = ETCS::EventNode::getInstance().ridMap;
-        auto it = ridMap.find(key);
-        if (it == ridMap.end()) return nullptr;
-        return it->second.invoke_get(target_rid);
+        ETCS::RIDListHandle* h =
+            ETCS::etcs_ridmap_row(&ETCS::EventNode::getInstance(), key, target_rid);
+        return h ? h->invoke_get(target_rid) : nullptr;
     };
 
+    // Same fix as resolve_self above, for the cross-module case.
     auto resolve_other = [](const ::std::string& m, const ::std::string& t,
                             ETCS::RID rid) -> ETCS::Entity*
     {
         ETCS::Buffer key;
         key.writeString((m + ":" + t).c_str());
-        auto& ridMap = ETCS::EventNode::getInstance().ridMap;
-        auto it = ridMap.find(key);
-        if (it == ridMap.end()) return nullptr;
-        return it->second.invoke_get(rid);
+        ETCS::RIDListHandle* h =
+            ETCS::etcs_ridmap_row(&ETCS::EventNode::getInstance(), key, rid);
+        return h ? h->invoke_get(rid) : nullptr;
     };
 
     while (true)

@@ -2653,9 +2653,10 @@ extern "C" ETCS_API ETCS::EventNode* RegisterDynamicLoader(void* ptr)
          * resolves"). If dylink aliases this node to the loader, registerLoader
          * detects identity and skips absorb.
          */
-        ETCS::etcs_flush_deferred_rid_registrars();
+        const size_t flushed = ETCS::etcs_flush_deferred_rid_registrars();
         ETCS_LOG("DynamicLoader",
-            "emscripten: collapsed hop -- flushed deferred RIDLists; no module stream.start");
+            "emscripten: collapsed hop -- flushed " << flushed << " deferred RIDList "
+            "registrar(s) (per-type AND per-family); no module stream.start");
         return &ETCS::EventNode::getInstance();
 #else
         ETCS::EventNode::getInstance().stream.start(

@@ -47,11 +47,20 @@ inline ::std::vector<void(*)()>& etcs_deferred_rid_registrars()
     static ::std::vector<void(*)()> v;
     return v;
 }
-inline void etcs_flush_deferred_rid_registrars()
+/*
+ * Returns HOW MANY ran, because otherwise nothing observable distinguishes
+ * "deferred and flushed" from "skipped and lost" -- which is exactly the bug the
+ * deferral fixes, and it was invisible in a browser log for precisely that
+ * reason. The caller logs the count.
+ */
+inline size_t etcs_flush_deferred_rid_registrars()
 {
-    for (void (*fn)() : etcs_deferred_rid_registrars())
-        if (fn) fn();
-    etcs_deferred_rid_registrars().clear();
+    auto& v = etcs_deferred_rid_registrars();
+    size_t ran = 0;
+    for (void (*fn)() : v)
+        if (fn) { fn(); ++ran; }
+    v.clear();
+    return ran;
 }
 } // namespace ETCS
 
