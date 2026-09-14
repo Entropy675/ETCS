@@ -183,12 +183,16 @@ inline void exec_warn(const ExecSource& src, const ::std::string& msg)
 inline const ETCS::RIDListHandle* get_handle(const ::std::string& module,
                                              const ::std::string& tag)
 {
+    // ONE lookup. The bare tag and "Module:Tag" reduce to the same key
+    // (etcs_bare_family_key), so trying both was two calls with one possible
+    // answer; the module half is now matched against the mirror ROW instead,
+    // which is what etcs_ridmap_named does with it.
     ETCS::EventNode* owner = &ETCS::EventNode::getInstance();
-    if (ETCS::RIDListHandle* h = ETCS::etcs_ridmap_handle(owner, tag))
-        return h;
     ETCS::Buffer qualified;
     qualified.writeString((module + ":" + tag).c_str());
-    return ETCS::etcs_ridmap_handle(owner, qualified);
+    if (ETCS::RIDListHandle* h = ETCS::etcs_ridmap_named(owner, qualified))
+        return h;
+    return ETCS::etcs_ridmap_named(owner, ETCS::Buffer(tag.c_str()));
 }
 
 // resolve_module — takes LifetimeOwner. A Root holds ONE module_ at a time,
@@ -248,16 +252,15 @@ inline ETCS::Entity* get_entity_by_rid(const ::std::string& module,
 // runtime-unique, so the first hit is the only hit.
 //
 // USE ONLY WHEN THE Module::Tag IS UNKNOWN. This walks every absorbed handle
-// in the loader's ridMap, and a handle wraps a RIDList in its module's image.
-// requestUnloadImpl now purges those rows, but a targeted get_handle touches
-// one row instead of all of them -- prefer resolve_bound_entity below.
+// in the loader's ridMirror, and a handle wraps a RIDList in its module's
+// image. unmapLibrary purges a module's rows by module, but a targeted
+// get_handle touches one row instead of all of them -- prefer
+// resolve_bound_entity below.
 inline ETCS::Entity* resolve_entity_anywhere(ETCS::RID rid)
 {
-    if (rid == 0) return nullptr;
-    auto& ridMap = ETCS::EventNode::getInstance().ridMap;
-    for (auto& [key, handle] : ridMap)
-        if (ETCS::Entity* e = handle.invoke_get(rid)) return e;
-    return nullptr;
+    // One walk, defined once (Entity.h): own lists then the mirror, which is
+    // where every module's lists actually are.
+    return ETCS::etcs_resolve_rid_anywhere(&ETCS::EventNode::getInstance(), rid);
 }
 
 // resolve_bound_entity — targeted; the one to reach for.
@@ -3641,8 +3644,8 @@ inline void repl_shell_tag_loop(const ::std::string& mod_name, ETCS::Root& nav_r
         for (size_t i = 0; i < tags.size(); ++i)
         {
             /*
-             * ridMap keys are the bare contract tag ("Shell"), not
-             * "Module:Tag". get_handle tries bare then qualified.
+             * Keys are the bare contract tag ("Shell") everywhere; which
+             * PROVIDER published it is the mirror row, not the key.
              */
             const ETCS::RIDListHandle* handle =
                 ETCS::get_handle(mod_name, tags[i].toString());

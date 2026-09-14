@@ -70,13 +70,6 @@ namespace ETCS {
         return nodes;
     }
 
-    inline ::std::unordered_map<::std::string, ::std::vector<Buffer>>&
-    module_ridmap_contributions()
-    {
-        static ::std::unordered_map<::std::string, ::std::vector<Buffer>> m;
-        return m;
-    }
-
     // Everything at once -- `log all file` / `log all term`. The loader's own
     // flag first, then every module's, through the trampoline each registered.
     inline void set_log_destination(bool to_file)
@@ -300,19 +293,27 @@ bool ETCS::Module::registerLoader(EventNode& st)
             ETCS::emscripten_deferred_module_nodes().push_back(node);
 #endif
             node->set_log_to_file(ETCS::get_log_to_file());
+            /*
+ * MIRROR, DO NOT MERGE. Every name this module publishes gets a row in the
+ * loader's ridMirror tagged with this module's name -- not a write into
+ * st.ridMap, which is the loader's OWN lists and has room for one handle per
+ * name. Nine providers publish "Deletable"; a write would have kept the last
+ * and lost eight, which is exactly what it did.
+ *
+ * NO KEY REWRITING. The name goes across as the module spelled it. The
+ * distinction between providers is the row, so there is nothing to encode into
+ * a string and nothing for a reader to parse back out.
+ */
             {
-                auto& contributed = ETCS::module_ridmap_contributions()[name];
-                contributed.clear();
+                const ETCS::Buffer mod_key(name.c_str());
+                size_t mirrored = 0;
                 for (const auto& [originalKey, handle] : node->ridMap)
                 {
-                    const ::std::string k = originalKey.toString();
-                    if (k.find(':') != ::std::string::npos) continue;
-                    st.ridMap[originalKey] = handle;
-                    contributed.push_back(originalKey);
-                    ETCS_LOG("EventNode:" << st.scope,
-                        "Absorbed RIDList type='" << originalKey
-                        << "' from module '" << name << "'");
+                    st.RegisterMirror(originalKey, mod_key, handle);
+                    ++mirrored;
                 }
+                ETCS_LOG("EventNode:" << st.scope, "Mirrored " << mirrored
+                    << " RIDList(s) from module '" << name << "'");
             }
         }
 #if defined(__EMSCRIPTEN__)
@@ -570,24 +571,24 @@ void ETCS::Module::unmapLibrary(ETCS::EventNode* node)
     interrupt.store(1, ::std::memory_order_release);
     terminate.store(1, ::std::memory_order_release);
 
-    // 2. Drop type-keyed loader-mirror rows this module contributed.
+    /*
+ * 2. Drop the loader-mirror rows THIS module published.
+ *
+ * BY MODULE, which is the only key that is this module's to drop. Dropping by
+ * NAME erased whichever provider happened to own the row -- and since the row
+ * was shared, unloading one module took another's still-live list down with
+ * it, or left a handle into memory about to be unmapped, depending on load
+ * order. The mirror carries the publisher on the row precisely so this step
+ * can be exact.
+ *
+ * Before the close, not after: a row must not stay reachable once the code
+ * behind its RIDList is gone.
+ */
     if (node)
     {
-        size_t purged = 0;
-        auto contrib_it = ETCS::module_ridmap_contributions().find(name);
-        if (contrib_it != ETCS::module_ridmap_contributions().end())
-        {
-            for (const ETCS::Buffer& key : contrib_it->second)
-            {
-                auto it = node->ridMap.find(key);
-                if (it == node->ridMap.end()) continue;
-                node->ridMap.erase(it);
-                ++purged;
-            }
-            ETCS::module_ridmap_contributions().erase(contrib_it);
-        }
+        const size_t purged = node->DropMirror(ETCS::Buffer(name.c_str()));
         if (purged)
-            ETCS_LOG("DynamicLoader:Module", "Purged " << purged << " ridMap row(s) for '"
+            ETCS_LOG("DynamicLoader:Module", "Purged " << purged << " mirror row(s) for '"
                      << name << "' -- their RIDLists are about to be unmapped.");
     }
 
@@ -2172,16 +2173,14 @@ ETCS::Entity* ETCS::EventNode::LoaderStream::loadImpl(
 bool ETCS::EventNode::LoaderStream::destroyImpl(const ::std::string& conjugate_key, ETCS::RID rid,
                                                  bool delete_children)
 {
-    ETCS::RIDListHandle* handle = ETCS::etcs_ridmap_handle(owner, conjugate_key);
+    // RID-aware: a family name has one list PER PROVIDER, and the RID is what
+    // says which. Asking by name alone could only answer for one of them.
+    ETCS::RIDListHandle* handle =
+        ETCS::etcs_ridmap_row(owner, ETCS::Buffer(conjugate_key.c_str()), rid);
     if (!handle)
     {
-        ETCS_LOG("DynamicLoader", "destroyImpl: no RIDList registered for: " << conjugate_key);
-        return false;
-    }
- 
-    if (!handle->invoke_contains(rid))
-    {
-        ETCS_LOG("DynamicLoader", "destroyImpl: RID " << rid << " not found in " << conjugate_key);
+        ETCS_LOG("DynamicLoader", "destroyImpl: RID " << rid
+                 << " is in no RIDList registered for: " << conjugate_key);
         return false;
     }
  

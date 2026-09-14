@@ -893,8 +893,10 @@ public:
  * something real, and the order is load-bearing:
  *   1. raise this module's own flags, so work it spawned observes the stop
  *      while its code is still mapped
- *   2. purge ridMap rows keyed "<name>:" -- their RIDLists live in THIS
- *      module's image, so a later bare-RID scan walks unmapped memory.
+ *   2. purge the loader's ridMirror rows published BY THIS MODULE -- their
+ *      RIDLists live in this module's image, so a later bare-RID scan walks
+ *      unmapped memory. By module, never by name: the name is shared across
+ *      providers, and dropping by it took other modules' live lists with it.
  *      Before the close, not after: the rows must not stay reachable once
  *      the code behind them is gone
  *   3. _Cleanup -- stops the module's ordering thread and drains its pool.

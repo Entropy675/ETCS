@@ -1,5 +1,6 @@
 #ifndef EVENTNODE_H__
 #define EVENTNODE_H__
+#include <vector>
 #include <unordered_map>
 #include <string>
 #include <sstream>
@@ -558,6 +559,88 @@ public:
     bool (*get_log_to_file)()     = nullptr;
 
     ::std::unordered_map<ETCS::Buffer, RIDListHandle> ridMap;
+
+    /*
+ * THE MIRROR -- lists that live in SOMEBODY ELSE'S image.
+ *
+ * ridMap above is THIS image's own lists, and one handle per name is the whole
+ * truth there: inside one image a family name names exactly one RIDList. The
+ * mirror is the other question, and it is a different question: which lists
+ * have OTHER images published under that name. A family spans providers, so
+ * the answer is a SET, and that is the whole reason this is a second structure
+ * rather than more rows in the first.
+ *
+ * IT REPLACES THE "Module:Tag" PREFIX, and the prefix was the wrong fix for
+ * the right problem. Qualifying the key did keep N providers' lists apart, but
+ * it did it by encoding the distinction in a STRING that every reader then had
+ * to parse back out -- and under a single-address-space build (emscripten, and
+ * the kernel path later) the module's map IS the loader's map, so the prefixed
+ * row was a duplicate alias of a row already there and every bare-family
+ * collect counted its members twice. Collapsing the prefix fixed that and cost
+ * the distinction: `st.ridMap[name] = handle` is an OVERWRITE, so with
+ * Deletable claimed by nine providers the loader's mirror held whichever
+ * loaded last and resolve_in_family answered null for the other eight.
+ * Measured: an ImageSurface that resolved as a Deletable stopped resolving the
+ * moment a LayoutProvider Layout existed.
+ *
+ * So the distinction moves out of the key and into the structure. No prefix
+ * anywhere, N rows per name, and under emscripten this map is simply EMPTY --
+ * there are no other images, every lookup answers out of ridMap, and nothing
+ * is counted twice. One shape, correct in both builds, rather than a spelling
+ * that is correct in one.
+ *
+ * THE MODULE NAME RIDES ALONG rather than being parsed off a key. It is what
+ * unmapLibrary needs to drop exactly its own rows (dropping by NAME erased
+ * whichever provider happened to own the row, which is how unloading one
+ * module could take another's live list with it), and what the ambiguity
+ * report needs to name the two providers a caller has to choose between.
+ *
+ * Declared here, immediately after ridMap, because this class has an
+ * #ifdef ETCS_LOADER fork below and the loader reads scope/ridMap out of a
+ * MODULE's EventNode: a member added before the fork shifts both builds
+ * identically, so the offsets the two sides agree on stay agreed. Added after
+ * it, it would exist at one offset in a loader build and another in a module
+ * one. See set_log_to_file's comment for what that cost last time.
+ */
+    struct MirrorRow
+    {
+        ETCS::Buffer   module;   // who published it -- for drop and for blame
+        RIDListHandle  handle;   // wraps a RIDList in THAT module's image
+    };
+    ::std::unordered_map<ETCS::Buffer, ::std::vector<MirrorRow>> ridMirror;
+
+    // Publish one of `module`'s lists under `name`. Idempotent per (name,
+    // module): a module that registers twice (a reload) replaces its own row
+    // rather than accumulating a stale handle beside the live one.
+    void RegisterMirror(const ETCS::Buffer& name, const ETCS::Buffer& module,
+                        RIDListHandle handle)
+    {
+        auto& rows = ridMirror[name];
+        for (MirrorRow& r : rows)
+            if (r.module == module) { r.handle = handle; return; }
+        rows.push_back(MirrorRow{module, handle});
+    }
+
+    // Drop every row `module` published. By MODULE, never by name -- the name
+    // is shared and dropping by it is what took other providers' live lists
+    // down with an unload. Returns how many rows went, which is what the
+    // teardown log reports.
+    size_t DropMirror(const ETCS::Buffer& module)
+    {
+        size_t dropped = 0;
+        for (auto it = ridMirror.begin(); it != ridMirror.end(); )
+        {
+            auto& rows = it->second;
+            for (auto r = rows.begin(); r != rows.end(); )
+            {
+                if (r->module == module) { r = rows.erase(r); ++dropped; }
+                else ++r;
+            }
+            if (rows.empty()) it = ridMirror.erase(it);
+            else ++it;
+        }
+        return dropped;
+    }
     // -----------------------------------------------------------------------
     // Tag bit index — maps each of THIS module's own contract tags (the
     // exact same, ordered, space-separated Tags string ETCS_MODULE_EXPORT_MAIN

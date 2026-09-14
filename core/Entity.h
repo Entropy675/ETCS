@@ -2549,18 +2549,45 @@ inline ETCS::ScopeTag::ScopeTag(ETCS::Entity* entity, const char* label,
  */
 ETCS::EventNode* etcs_loader_event_node();   // defined in DynamicLoader.h
 
+/*
+ * THE BARE NAME IS THE KEY, and a "Module:Tag" spelling is accepted and
+ * reduced rather than looked up.
+ *
+ * Callers hand over both shapes and always will: a conjugate_key is built as
+ * getSourceModule() + ":" + getSourceTag() because THAT string is what routes
+ * a DestroyEvent, so the same string arrives here wanting a list. The module
+ * half carries no information a list lookup can use -- which list a name names
+ * is settled by which image you are asking, not by a substring -- so it is
+ * stripped once, here, and nothing downstream sees a prefix. That is the whole
+ * of what "the origin prefix adds no info" means, and it is true of the KEY;
+ * see EventNode::ridMirror for the part of the distinction that is real and
+ * where it moved to.
+ */
+inline ETCS::Buffer etcs_bare_family_key(const ETCS::Buffer& key)
+{
+    const ::std::string s = key.toString();
+    const auto pos = s.rfind(':');
+    if (pos == ::std::string::npos || pos + 1 >= s.size()) return key;
+    ETCS::Buffer bare;
+    bare.writeString(s.c_str() + static_cast<::std::ptrdiff_t>(pos + 1));
+    return bare;
+}
+
+/*
+ * The list in the asked-of image, if that image publishes this name.
+ *
+ * OWN MAP ONLY -- the mirror is deliberately not consulted here, because this
+ * overload answers with ONE handle and the mirror's answer is a set. A caller
+ * that has a RID wants etcs_ridmap_row below, which can pick; a caller that
+ * only wants to know whether a name is published at all (a catalog listing, a
+ * live count) wants exactly this.
+ */
 inline ETCS::RIDListHandle* etcs_ridmap_handle(ETCS::EventNode* owner,
                                                 const ETCS::Buffer& key)
 {
     if (!owner || key.written == 0) return nullptr;
-    auto it = owner->ridMap.find(key);
-    if (it != owner->ridMap.end()) return &it->second;
-    const ::std::string s = key.toString();
-    const auto pos = s.rfind(':');
-    if (pos == ::std::string::npos || pos + 1 >= s.size()) return nullptr;
-    ETCS::Buffer tag_only;
-    tag_only.writeString(s.c_str() + static_cast<::std::ptrdiff_t>(pos + 1));
-    it = owner->ridMap.find(tag_only);
+    const ETCS::Buffer bare = etcs_bare_family_key(key);
+    auto it = owner->ridMap.find(bare);
     return (it != owner->ridMap.end()) ? &it->second : nullptr;
 }
 inline ETCS::RIDListHandle* etcs_ridmap_handle(ETCS::EventNode* owner,
@@ -2569,13 +2596,147 @@ inline ETCS::RIDListHandle* etcs_ridmap_handle(ETCS::EventNode* owner,
     return etcs_ridmap_handle(owner, ETCS::Buffer(key.c_str()));
 }
 
+/*
+ * THE LIST A NAME NAMES, WITH NO RID TO DISAMBIGUATE -- for the questions that
+ * are about the list rather than about an entity in it: is this type published,
+ * how many are live, search it by order.
+ *
+ * Takes "Module:Tag" or a bare tag. A per-TYPE name has one publisher, so its
+ * mirror bucket has one row and there is nothing to choose; a FAMILY name has
+ * several, and with no RID and no module named there is no answer, so it says
+ * so by returning null rather than picking the first. That refusal is the same
+ * one resolve_in_family makes on a genuine ambiguity, and for the same reason:
+ * a wrong answer here looks exactly like a right one.
+ */
+inline ETCS::RIDListHandle* etcs_ridmap_named(ETCS::EventNode* owner,
+                                              const ETCS::Buffer& key)
+{
+    if (!owner || key.written == 0) return nullptr;
+    const ::std::string s = key.toString();
+    const auto colon = s.rfind(':');
+    const ::std::string wanted = (colon == ::std::string::npos)
+                                 ? ::std::string() : s.substr(0, colon);
+    const ETCS::Buffer bare = etcs_bare_family_key(key);
+
+    /*
+ * A NAMED MODULE IS ANSWERED BY THAT MODULE OR NOT AT ALL. The caller said
+ * which; substituting a different provider's list would be answering a
+ * question nobody asked.
+ */
+    if (!wanted.empty())
+    {
+        if (wanted == (owner->scope ? owner->scope : ""))
+        {
+            auto it = owner->ridMap.find(bare);
+            return (it != owner->ridMap.end()) ? &it->second : nullptr;
+        }
+        auto mirror = owner->ridMirror.find(bare);
+        if (mirror == owner->ridMirror.end()) return nullptr;
+        for (auto& row : mirror->second)
+            if (row.module.toString() == wanted) return &row.handle;
+        return nullptr;
+    }
+
+    /*
+ * THE MIRROR FIRST, AND THE OWN MAP ONLY AS A FALLBACK -- the opposite of what
+ * reads naturally, and the order matters.
+ *
+ * In a LOADER build the loader's own ridMap has a row for every family in
+ * ontology.h, because ETCS_SUPERTYPE_BASE publishes one wherever the header is
+ * included -- and every one of them is EMPTY, since nothing is ever constructed
+ * in the loader's own image. Preferring the own map therefore shadowed the
+ * mirror with an empty list: a live-count for a family read 0 with entities in
+ * it, and this helper reported a multi-provider family as unambiguous. Caught by
+ * FamilyMirrorTesterLoader asserting the refusal below.
+ *
+ * So: one publisher is an answer, several is the ambiguity this refuses rather
+ * than guesses, and none means nobody but possibly this image has the name.
+ */
+    auto mirror = owner->ridMirror.find(bare);
+    if (mirror != owner->ridMirror.end())
+    {
+        auto& rows = mirror->second;
+        if (rows.size() == 1) return &rows.front().handle;
+        if (rows.size() > 1)  return nullptr;
+    }
+    auto it = owner->ridMap.find(bare);
+    return (it != owner->ridMap.end()) ? &it->second : nullptr;
+}
+
+/*
+ * THE LIST THAT ACTUALLY HOLDS THAT RID -- own map first, then every image
+ * that published the name.
+ *
+ * The RID is what makes a single answer possible where the name alone cannot
+ * give one. Nine providers publish "Deletable"; exactly one of their lists
+ * contains a given RID, so asking with the RID in hand is asking a question
+ * that HAS one answer, and the mirror walk is how it is found. Without the
+ * RID the honest answer is the set, which is collect_in_family's job.
+ *
+ * `which` reports the publishing module when the answer came out of the
+ * mirror, and is left untouched when it came out of the caller's own map --
+ * the ambiguity report and the unload log both want to name a provider, and
+ * reconstructing one by parsing a key string is what this replaces.
+ */
+inline ETCS::RIDListHandle* etcs_ridmap_row(ETCS::EventNode* owner,
+                                            const ETCS::Buffer& key, RID rid,
+                                            ETCS::Buffer* which = nullptr)
+{
+    if (!owner || key.written == 0 || rid == 0) return nullptr;
+    const ETCS::Buffer bare = etcs_bare_family_key(key);
+
+    auto it = owner->ridMap.find(bare);
+    if (it != owner->ridMap.end() && it->second.invoke_contains(rid))
+        return &it->second;
+
+    auto mirror = owner->ridMirror.find(bare);
+    if (mirror == owner->ridMirror.end()) return nullptr;
+    for (auto& row : mirror->second)
+        if (row.handle.invoke_contains(rid))
+        {
+            if (which) *which = row.module;
+            return &row.handle;
+        }
+    return nullptr;
+}
+
+/*
+ * AN ENTITY FROM A BARE RID, WITH NO TYPE AND NO FAMILY -- own lists first,
+ * then every image that published into the mirror.
+ *
+ * Sound because RIDs are runtime-unique, so the first hit is the only hit. USE
+ * ONLY WHEN THE TYPE IS GENUINELY UNKNOWN: it touches every row, where naming
+ * the type touches one.
+ *
+ * IT EXISTS HERE SO THAT IT EXISTS ONCE. This walk was hand-written in four
+ * modules (ConnectionManager, HttpServer, TarpitNode, ForumNode), each reading
+ * ETCS::getLoader().ridMap directly, because ridMap is a public member and the
+ * loop is three lines. When the absorbed lists moved from ridMap into ridMirror,
+ * all four silently stopped finding anything -- a subscriber that registered
+ * fine and then "no longer resolved" at dispatch, self-healed out of its own
+ * list, and a server that accepted connections and dropped every one. Four
+ * copies of a walk is four places a storage change has to be noticed, and it
+ * was noticed in none of them. So the walk is an accessor now, and a module
+ * that wants a bare RID asks rather than iterates.
+ */
+inline Entity* etcs_resolve_rid_anywhere(ETCS::EventNode* owner, RID rid)
+{
+    if (!owner || rid == 0) return nullptr;
+    for (auto& entry : owner->ridMap)
+        if (Entity* e = entry.second.invoke_get(rid)) return e;
+    for (auto& bucket : owner->ridMirror)
+        for (auto& row : bucket.second)
+            if (Entity* e = row.handle.invoke_get(rid)) return e;
+    return nullptr;
+}
+
 inline Entity* etcs_resolve_by_key(const ETCS::Buffer& conjugate_key, RID rid)
 {
     if (rid == 0 || conjugate_key.written == 0) return nullptr;
     ETCS::EventNode* owner = etcs_loader_event_node();
     if (!owner) return nullptr;
-    ETCS::RIDListHandle* h = etcs_ridmap_handle(owner, conjugate_key);
-    if (!h || !h->invoke_contains(rid)) return nullptr;
+    ETCS::RIDListHandle* h = etcs_ridmap_row(owner, conjugate_key, rid);
+    if (!h) return nullptr;
     return h->invoke_get(rid);
 }
 
@@ -3047,9 +3208,14 @@ inline void* etcs_true_type(Entity* e) { return e ? e->getTrueType() : nullptr; 
  * FIRST, before asking the loader, which is why resolving by RID was never a
  * liveness check.
  *
- * Both scopes in one call: the module's own map under the unqualified name, the
- * loader's under the origin-affixed one. The per-TYPE entry goes too -- same
- * kind of registration, made by ETCS_MAKE_INSTANCE rather than by fanout.
+ * ONE REMOVAL IS ENOUGH, and that is a consequence of what the mirror holds.
+ * A mirror row wraps the RIDList in the PUBLISHING MODULE's image -- the very
+ * list `mine` below names -- so removing from this module's own list is already
+ * removing from what every other image sees through it. The second removal this
+ * used to make through the loader was the same list a second time: a no-op in a
+ * multi-image build, and literally the identical object under emscripten. The
+ * per-TYPE entry goes too -- same kind of registration, made by
+ * ETCS_MAKE_INSTANCE rather than by fanout.
  */
 inline void etcs_supertype_fanin(Entity* e)
 {
@@ -3057,8 +3223,7 @@ inline void etcs_supertype_fanin(Entity* e)
     ::std::vector<ETCS::Buffer> families;
     e->getInterfaceFamilies(families);
 
-    const RID         rid    = e->getRID();
-    const ::std::string module = e->getSourceModule().toString();
+    const RID          rid     = e->getRID();
     const ETCS::Buffer own_tag = e->getSourceTag();
 
     // Everything this entity was published under, in the module's own spelling.
@@ -3066,16 +3231,11 @@ inline void etcs_supertype_fanin(Entity* e)
     if (own_tag.written) names.push_back(own_tag);
 
     auto& mine = ETCS::EventNode::getInstance().ridMap;
-    ETCS::EventNode* owner = etcs_loader_event_node();
 
     for (const ETCS::Buffer& name : names)
     {
         auto local = mine.find(name);
         if (local != mine.end()) local->second.invoke_remove(rid);
-
-        if (!owner) continue;
-        if (ETCS::RIDListHandle* h = etcs_ridmap_handle(owner, name))
-            h->invoke_remove(rid);
     }
 }
 
@@ -3362,7 +3522,13 @@ inline Base* resolve_in_family(const char* family, RID rid)
  */
     const ETCS::Buffer key(family);
     const ::std::string  name(family);
-    const bool qualified = (name.find(':') != ::std::string::npos);
+    // A "Provider:Family" spelling is a caller SAYING WHICH PROVIDER, which is
+    // still a meaningful thing to say -- it is the disambiguation the report
+    // below asks for. It is not a different key: etcs_bare_family_key reduces
+    // it, and the provider half is matched against the mirror row instead.
+    const auto        colon = name.rfind(':');
+    const bool        qualified = (colon != ::std::string::npos);
+    const ::std::string wanted_module = qualified ? name.substr(0, colon) : ::std::string();
 
     if (!qualified)
     {
@@ -3379,42 +3545,59 @@ inline Base* resolve_in_family(const char* family, RID rid)
     ETCS::EventNode* owner = etcs_loader_event_node();
     if (!owner) return nullptr;      // no loader: nothing has been composed
 
-    if (qualified)
-    {
-        ETCS::RIDListHandle* h = etcs_ridmap_handle(owner, key);
-        if (!h) return nullptr;
-        return static_cast<Base*>(h->invoke_get_iface(rid));
-    }
+    /*
+ * THE MIRROR BUCKET IS THE SEARCH SPACE, not the whole map.
+ *
+ * This used to scan every key in the loader's map and accept any that ENDED in
+ * ":Family" -- a linear walk over every published name plus a string compare,
+ * to reconstruct a grouping the key spelling had scattered. The grouping is now
+ * the structure (EventNode::ridMirror), so the candidates for a family are
+ * exactly one bucket lookup, and the provider each came from is a field rather
+ * than a substring.
+ *
+ * The ambiguity rule is unchanged and it is the reason this is not a
+ * first-match: RIDs are unique per provider-type, not per process, so the same
+ * value can name different entities under two providers. One match resolves,
+ * zero is "no such entity", more than one is a real ambiguity in the question
+ * and is refused rather than guessed.
+ */
+    const ETCS::Buffer bare = etcs_bare_family_key(key);
 
-    // Only keys that ARE this family under some provider are candidates, which
-    // is both the correctness filter and the whole of the search space.
-    const ::std::string suffix = ":" + name;
-    void*       found       = nullptr;
+    // This image's own list is a candidate too, and for a qualified ask only
+    // when the caller named THIS image.
+    void*         found = nullptr;
     ::std::string found_owner;
-    int         matches     = 0;
+    int           matches = 0;
 
-    for (auto& [k, handle] : owner->ridMap)
+    if (owner != &ETCS::EventNode::getInstance()
+        && (!qualified || wanted_module == (owner->scope ? owner->scope : "")))
     {
-        const ::std::string ks = k.toString();
-        const bool exact = (ks == name);
-        const bool legacy = (ks.size() > suffix.size()
-            && ks.compare(ks.size() - suffix.size(), suffix.size(), suffix) == 0);
-        if (!exact && !legacy) continue;
-
-        void* p = handle.invoke_get_iface(rid);
-        if (!p) continue;
-        if (++matches == 1) { found = p; found_owner = ks; }
-        else
-        {
-            ETCS_LOG("resolve_in_family", "RID:" << rid << " is ambiguous for family '"
-                     << name << "' -- it names an entity under BOTH " << found_owner
-                     << " and " << ks << ". RIDs are unique per provider-type, not per "
-                     "process. This overload can only answer with one, so it answers with "
-                     "none: use collect_in_family to get them all, or name the provider, "
-                     "e.g. resolve_in_family(\"" << ks << "\", rid).");
-            return nullptr;
-        }
+        auto it = owner->ridMap.find(bare);
+        if (it != owner->ridMap.end())
+            if (void* p = it->second.invoke_get_iface(rid))
+            { found = p; found_owner = owner->scope ? owner->scope : "(loader)"; ++matches; }
     }
+
+    auto mirror = owner->ridMirror.find(bare);
+    if (mirror != owner->ridMirror.end())
+        for (auto& row : mirror->second)
+        {
+            const ::std::string mod = row.module.toString();
+            if (qualified && mod != wanted_module) continue;
+            void* p = row.handle.invoke_get_iface(rid);
+            if (!p) continue;
+            if (++matches == 1) { found = p; found_owner = mod; }
+            else
+            {
+                ETCS_LOG("resolve_in_family", "RID:" << rid << " is ambiguous for family '"
+                         << name << "' -- it names an entity under BOTH " << found_owner
+                         << " and " << mod << ". RIDs are unique per provider-type, not per "
+                         "process. This overload can only answer with one, so it answers with "
+                         "none: use collect_in_family to get them all, or name the provider, "
+                         "e.g. resolve_in_family(\"" << mod << ":" << bare << "\", rid).");
+                return nullptr;
+            }
+        }
     return static_cast<Base*>(found);
 }
 
@@ -3442,36 +3625,50 @@ inline size_t collect_in_family(const char* family, RID rid, ::std::vector<Base*
     if (rid == 0) return 0;
     const ::std::string name(family);
     const ETCS::Buffer key(family);
+    const auto        colon = name.rfind(':');
+    const bool        qualified = (colon != ::std::string::npos);
+    const ::std::string wanted_module = qualified ? name.substr(0, colon) : ::std::string();
+    const ETCS::Buffer bare = etcs_bare_family_key(key);
     size_t added = 0;
 
-    if (name.find(':') != ::std::string::npos)
-    {
-        ETCS::EventNode* owner = etcs_loader_event_node();
-        if (!owner) return 0;
-        ETCS::RIDListHandle* h = etcs_ridmap_handle(owner, key);
-        if (!h) return 0;
-        if (void* p = h->invoke_get_iface(rid)) { out.push_back(static_cast<Base*>(p)); ++added; }
-        return added;
-    }
+    ETCS::EventNode* mine_node = &ETCS::EventNode::getInstance();
+    ETCS::EventNode* owner     = etcs_loader_event_node();
 
+    /*
+ * EACH LIST AT MOST ONCE, and that is the bug the mirror also fixes here.
+ *
+ * In a multi-image build the caller's own map and the loader's are different
+ * objects, so reading both was two different lists. Under a single-address-space
+ * build (emscripten) they are THE SAME MAP, and the old bare path read it twice
+ * -- once directly, once as the `exact` case of the suffix scan -- so every
+ * member came back duplicated. The identity check below is what makes one shape
+ * correct in both builds instead of one being a spelling that only works in one.
+ */
+    if (!qualified)
     {
-        auto& mine = ETCS::EventNode::getInstance().ridMap;
-        auto it = mine.find(key);
-        if (it != mine.end())
+        auto it = mine_node->ridMap.find(bare);
+        if (it != mine_node->ridMap.end())
             if (void* p = it->second.invoke_get_iface(rid))
             { out.push_back(static_cast<Base*>(p)); ++added; }
     }
 
-    ETCS::EventNode* owner = etcs_loader_event_node();
     if (!owner) return added;
 
-    const ::std::string suffix = ":" + name;
-    for (auto& [k, handle] : owner->ridMap)
+    if (owner != mine_node
+        && (!qualified || wanted_module == (owner->scope ? owner->scope : "")))
     {
-        const ::std::string ks = k.toString();
-        if (ks.size() <= suffix.size()) continue;
-        if (ks.compare(ks.size() - suffix.size(), suffix.size(), suffix) != 0) continue;
-        if (void* p = handle.invoke_get_iface(rid))
+        auto it = owner->ridMap.find(bare);
+        if (it != owner->ridMap.end())
+            if (void* p = it->second.invoke_get_iface(rid))
+            { out.push_back(static_cast<Base*>(p)); ++added; }
+    }
+
+    auto mirror = owner->ridMirror.find(bare);
+    if (mirror == owner->ridMirror.end()) return added;
+    for (auto& row : mirror->second)
+    {
+        if (qualified && row.module.toString() != wanted_module) continue;
+        if (void* p = row.handle.invoke_get_iface(rid))
         { out.push_back(static_cast<Base*>(p)); ++added; }
     }
     return added;
@@ -3526,7 +3723,7 @@ inline size_t search_in_family(const char* qualified, RID exemplar, ::std::vecto
 
     ETCS::EventNode* owner = etcs_loader_event_node();
     if (!owner) return 0;
-    ETCS::RIDListHandle* h = etcs_ridmap_handle(owner, ETCS::Buffer(qualified));
+    ETCS::RIDListHandle* h = etcs_ridmap_named(owner, ETCS::Buffer(qualified));
     if (!h) return 0;
 
     if (!h->invoke_searchable())
@@ -3558,7 +3755,7 @@ inline size_t search_in_family(const char* qualified, const Leaf& exemplar,
 
     ETCS::EventNode* owner = etcs_loader_event_node();
     if (!owner) return 0;
-    ETCS::RIDListHandle* h = etcs_ridmap_handle(owner, ETCS::Buffer(qualified));
+    ETCS::RIDListHandle* h = etcs_ridmap_named(owner, ETCS::Buffer(qualified));
     if (!h) return 0;
 
     if (!h->invoke_searchable())
