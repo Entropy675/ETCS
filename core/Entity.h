@@ -2548,15 +2548,35 @@ inline ETCS::ScopeTag::ScopeTag(ETCS::Entity* entity, const char* label,
  * Null means gone -- a real answer, not an error.
  */
 ETCS::EventNode* etcs_loader_event_node();   // defined in DynamicLoader.h
+
+inline ETCS::RIDListHandle* etcs_ridmap_handle(ETCS::EventNode* owner,
+                                                const ETCS::Buffer& key)
+{
+    if (!owner || key.written == 0) return nullptr;
+    auto it = owner->ridMap.find(key);
+    if (it != owner->ridMap.end()) return &it->second;
+    const ::std::string s = key.toString();
+    const auto pos = s.rfind(':');
+    if (pos == ::std::string::npos || pos + 1 >= s.size()) return nullptr;
+    ETCS::Buffer tag_only;
+    tag_only.writeString(s.c_str() + static_cast<::std::ptrdiff_t>(pos + 1));
+    it = owner->ridMap.find(tag_only);
+    return (it != owner->ridMap.end()) ? &it->second : nullptr;
+}
+inline ETCS::RIDListHandle* etcs_ridmap_handle(ETCS::EventNode* owner,
+                                                const ::std::string& key)
+{
+    return etcs_ridmap_handle(owner, ETCS::Buffer(key.c_str()));
+}
+
 inline Entity* etcs_resolve_by_key(const ETCS::Buffer& conjugate_key, RID rid)
 {
     if (rid == 0 || conjugate_key.written == 0) return nullptr;
     ETCS::EventNode* owner = etcs_loader_event_node();
     if (!owner) return nullptr;
-    auto it = owner->ridMap.find(conjugate_key);
-    if (it == owner->ridMap.end()) return nullptr;
-    if (!it->second.invoke_contains(rid)) return nullptr;
-    return it->second.invoke_get(rid);
+    ETCS::RIDListHandle* h = etcs_ridmap_handle(owner, conjugate_key);
+    if (!h || !h->invoke_contains(rid)) return nullptr;
+    return h->invoke_get(rid);
 }
 
 inline ETCS::ScopeTag::~ScopeTag()
@@ -3054,9 +3074,8 @@ inline void etcs_supertype_fanin(Entity* e)
         if (local != mine.end()) local->second.invoke_remove(rid);
 
         if (!owner) continue;
-        ETCS::Buffer qualified((module + ":" + name.toString()).c_str());
-        auto absorbed = owner->ridMap.find(qualified);
-        if (absorbed != owner->ridMap.end()) absorbed->second.invoke_remove(rid);
+        if (ETCS::RIDListHandle* h = etcs_ridmap_handle(owner, name))
+            h->invoke_remove(rid);
     }
 }
 
@@ -3362,9 +3381,9 @@ inline Base* resolve_in_family(const char* family, RID rid)
 
     if (qualified)
     {
-        auto it = owner->ridMap.find(key);
-        if (it == owner->ridMap.end()) return nullptr;
-        return static_cast<Base*>(it->second.invoke_get_iface(rid));
+        ETCS::RIDListHandle* h = etcs_ridmap_handle(owner, key);
+        if (!h) return nullptr;
+        return static_cast<Base*>(h->invoke_get_iface(rid));
     }
 
     // Only keys that ARE this family under some provider are candidates, which
@@ -3377,8 +3396,10 @@ inline Base* resolve_in_family(const char* family, RID rid)
     for (auto& [k, handle] : owner->ridMap)
     {
         const ::std::string ks = k.toString();
-        if (ks.size() <= suffix.size()) continue;
-        if (ks.compare(ks.size() - suffix.size(), suffix.size(), suffix) != 0) continue;
+        const bool exact = (ks == name);
+        const bool legacy = (ks.size() > suffix.size()
+            && ks.compare(ks.size() - suffix.size(), suffix.size(), suffix) == 0);
+        if (!exact && !legacy) continue;
 
         void* p = handle.invoke_get_iface(rid);
         if (!p) continue;
@@ -3427,9 +3448,9 @@ inline size_t collect_in_family(const char* family, RID rid, ::std::vector<Base*
     {
         ETCS::EventNode* owner = etcs_loader_event_node();
         if (!owner) return 0;
-        auto it = owner->ridMap.find(key);
-        if (it == owner->ridMap.end()) return 0;
-        if (void* p = it->second.invoke_get_iface(rid)) { out.push_back(static_cast<Base*>(p)); ++added; }
+        ETCS::RIDListHandle* h = etcs_ridmap_handle(owner, key);
+        if (!h) return 0;
+        if (void* p = h->invoke_get_iface(rid)) { out.push_back(static_cast<Base*>(p)); ++added; }
         return added;
     }
 
@@ -3505,10 +3526,10 @@ inline size_t search_in_family(const char* qualified, RID exemplar, ::std::vecto
 
     ETCS::EventNode* owner = etcs_loader_event_node();
     if (!owner) return 0;
-    auto it = owner->ridMap.find(ETCS::Buffer(qualified));
-    if (it == owner->ridMap.end()) return 0;
+    ETCS::RIDListHandle* h = etcs_ridmap_handle(owner, ETCS::Buffer(qualified));
+    if (!h) return 0;
 
-    if (!it->second.invoke_searchable())
+    if (!h->invoke_searchable())
     {
         ETCS_LOG("search_in_family", name << " declares no order, so there is nothing to "
                  "search on. A type becomes searchable by claiming Orderable and defining "
@@ -3517,7 +3538,7 @@ inline size_t search_in_family(const char* qualified, RID exemplar, ::std::vecto
     }
 
     const size_t before = out.size();
-    it->second.invoke_search_ordered_by(exemplar, out);
+    h->invoke_search_ordered_by(exemplar, out);
     return out.size() - before;
 }
 
@@ -3537,10 +3558,10 @@ inline size_t search_in_family(const char* qualified, const Leaf& exemplar,
 
     ETCS::EventNode* owner = etcs_loader_event_node();
     if (!owner) return 0;
-    auto it = owner->ridMap.find(ETCS::Buffer(qualified));
-    if (it == owner->ridMap.end()) return 0;
+    ETCS::RIDListHandle* h = etcs_ridmap_handle(owner, ETCS::Buffer(qualified));
+    if (!h) return 0;
 
-    if (!it->second.invoke_searchable())
+    if (!h->invoke_searchable())
     {
         ETCS_LOG("search_in_family", name << " declares no order, so there is nothing to "
                  "search on. A type becomes searchable by claiming Orderable and defining "
@@ -3549,7 +3570,7 @@ inline size_t search_in_family(const char* qualified, const Leaf& exemplar,
     }
 
     const size_t before = out.size();
-    it->second.invoke_search_ordered(static_cast<const void*>(&exemplar), out);
+    h->invoke_search_ordered(static_cast<const void*>(&exemplar), out);
     return out.size() - before;
 }
 

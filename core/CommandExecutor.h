@@ -183,11 +183,12 @@ inline void exec_warn(const ExecSource& src, const ::std::string& msg)
 inline const ETCS::RIDListHandle* get_handle(const ::std::string& module,
                                              const ::std::string& tag)
 {
-    ETCS::Buffer key;
-    key.writeString((module + ":" + tag).c_str());
-    auto& ridMap = ETCS::EventNode::getInstance().ridMap;
-    auto it = ridMap.find(key);
-    return (it != ridMap.end()) ? &it->second : nullptr;
+    ETCS::EventNode* owner = &ETCS::EventNode::getInstance();
+    if (ETCS::RIDListHandle* h = ETCS::etcs_ridmap_handle(owner, tag))
+        return h;
+    ETCS::Buffer qualified;
+    qualified.writeString((module + ":" + tag).c_str());
+    return ETCS::etcs_ridmap_handle(owner, qualified);
 }
 
 // resolve_module — takes LifetimeOwner. A Root holds ONE module_ at a time,

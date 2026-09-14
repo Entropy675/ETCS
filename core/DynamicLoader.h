@@ -61,6 +61,13 @@ namespace ETCS {
         return nodes;
     }
 
+    inline ::std::unordered_map<::std::string, ::std::vector<Buffer>>&
+    module_ridmap_contributions()
+    {
+        static ::std::unordered_map<::std::string, ::std::vector<Buffer>> m;
+        return m;
+    }
+
     // Everything at once -- `log all file` / `log all term`. The loader's own
     // flag first, then every module's, through the trampoline each registered.
     inline void set_log_destination(bool to_file)
@@ -284,17 +291,19 @@ bool ETCS::Module::registerLoader(EventNode& st)
             ETCS::emscripten_deferred_module_nodes().push_back(node);
 #endif
             node->set_log_to_file(ETCS::get_log_to_file());
-            // Absorb module ridMap entries directly via st (unchanged keying here;
-            // type-key absorb is a separate patch).
-            for (const auto& [originalKey, handle] : node->ridMap)
             {
-                ::std::stringstream ss;
-                ss << node->scope << ":" << originalKey;
-                ETCS::Buffer combinedKey;
-                ss >> combinedKey;
-                st.ridMap[combinedKey] = handle;
-                ETCS_LOG("EventNode:" << st.scope,
-                    "Absorbed module " << node->scope << " RIDList: " << originalKey);
+                auto& contributed = ETCS::module_ridmap_contributions()[name];
+                contributed.clear();
+                for (const auto& [originalKey, handle] : node->ridMap)
+                {
+                    const ::std::string k = originalKey.toString();
+                    if (k.find(':') != ::std::string::npos) continue;
+                    st.ridMap[originalKey] = handle;
+                    contributed.push_back(originalKey);
+                    ETCS_LOG("EventNode:" << st.scope,
+                        "Absorbed RIDList type='" << originalKey
+                        << "' from module '" << name << "'");
+                }
             }
         }
 #if defined(__EMSCRIPTEN__)
@@ -546,18 +555,21 @@ void ETCS::Module::unmapLibrary(ETCS::EventNode* node)
     interrupt.store(1, ::std::memory_order_release);
     terminate.store(1, ::std::memory_order_release);
 
-    // 2. registerLoader absorbs a module's ridMap under "<module>:<tag>"
-    //    keys, each handle wrapping a RIDList in the MODULE's image.
-    //    Per-entity removal empties those lists without unlinking the rows.
+    // 2. Drop type-keyed loader-mirror rows this module contributed.
     if (node)
     {
-        const ::std::string prefix = name + ":";
         size_t purged = 0;
-        for (auto it = node->ridMap.begin(); it != node->ridMap.end(); )
+        auto contrib_it = ETCS::module_ridmap_contributions().find(name);
+        if (contrib_it != ETCS::module_ridmap_contributions().end())
         {
-            const ::std::string key = it->first.toString();
-            if (key.compare(0, prefix.size(), prefix) == 0) { it = node->ridMap.erase(it); ++purged; }
-            else ++it;
+            for (const ETCS::Buffer& key : contrib_it->second)
+            {
+                auto it = node->ridMap.find(key);
+                if (it == node->ridMap.end()) continue;
+                node->ridMap.erase(it);
+                ++purged;
+            }
+            ETCS::module_ridmap_contributions().erase(contrib_it);
         }
         if (purged)
             ETCS_LOG("DynamicLoader:Module", "Purged " << purged << " ridMap row(s) for '"
@@ -2141,21 +2153,20 @@ ETCS::Entity* ETCS::EventNode::LoaderStream::loadImpl(
 bool ETCS::EventNode::LoaderStream::destroyImpl(const ::std::string& conjugate_key, ETCS::RID rid,
                                                  bool delete_children)
 {
-    ETCS::Buffer key(conjugate_key);
-    auto it = owner->ridMap.find(key);
-    if (it == owner->ridMap.end())
+    ETCS::RIDListHandle* handle = ETCS::etcs_ridmap_handle(owner, conjugate_key);
+    if (!handle)
     {
         ETCS_LOG("DynamicLoader", "destroyImpl: no RIDList registered for: " << conjugate_key);
         return false;
     }
  
-    if (!it->second.invoke_contains(rid))
+    if (!handle->invoke_contains(rid))
     {
         ETCS_LOG("DynamicLoader", "destroyImpl: RID " << rid << " not found in " << conjugate_key);
         return false;
     }
  
-    ETCS::Entity* target = it->second.invoke_get(rid);
+    ETCS::Entity* target = handle->invoke_get(rid);
 
     /*
  * THE GATE CLOSES BEFORE THE LISTS DO, and that order is the whole of it.
