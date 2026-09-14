@@ -34,6 +34,15 @@ namespace ETCS {
  */
     static EventNode& getLoader() { return *dynamicLoader.node; }
 
+#if defined(__EMSCRIPTEN__)
+    template <typename Pred>
+    inline void etcs_emscripten_spin(Pred&& pred)
+    {
+        while (!pred())
+            getLoader().stream.emscripten_poll();
+    }
+#endif
+
 #if defined(__EMSCRIPTEN__) && defined(ETCS_LOADER)
     // Defined below after LoaderStream::attachModule is complete.
     bool etcs_web_root_attach_module(Root& root, const ::std::string& module_name);
@@ -1360,7 +1369,11 @@ ETCS::DispatchResult ETCS::EventNode::LoaderStream::on_event(
  * out regardless.
  */
                     if (getLoader().stream.enqueue(DLInEventPtr{&recheck_evt}))
-                        while (!done.load(::std::memory_order_acquire));
+                    #if defined(__EMSCRIPTEN__)
+    etcs_emscripten_spin([&]{ return done.load(::std::memory_order_acquire); });
+#else
+    while (!done.load(::std::memory_order_acquire));
+#endif
                 });
                 if (!recheck_started)
                     ETCS_LOG("DynamicLoader:Module", "Module '" << target
@@ -2513,8 +2526,8 @@ inline void etcs_boot_runtime_threads()
     emscripten_deferred_module_nodes().clear();
 
     ETCS_LOG("ETCS", "[trace] etcs_boot: arming ThreadPool workers");
-    ETCS::ThreadPool::getInstance().arm_emscripten_workers();
-    ETCS_LOG("ETCS", "emscripten: ThreadPool workers armed");
+    // Keep workers deferred: browser pthread path still hits wasmMemory undefined.
+    ETCS_LOG("ETCS", "emscripten: ThreadPool workers left deferred (sync event path)");
     ETCS_LOG("ETCS", "[trace] etcs_boot: leave");
 }
 #endif
@@ -2765,7 +2778,14 @@ inline ETCS::Entity* ETCS::LoadEvent::operator()()
         return nullptr;
     }
     ETCS::Entity* e;
+#if defined(__EMSCRIPTEN__)
+    etcs_emscripten_spin([&]{
+        e = result.load(::std::memory_order_acquire);
+        return e != nullptr;
+    });
+#else
     while (!(e = result.load(::std::memory_order_acquire)));
+#endif
     return e == reinterpret_cast<ETCS::Entity*>(UINTPTR_MAX) ? nullptr : e;
 }
  
@@ -2785,7 +2805,14 @@ inline bool ETCS::ResolveEvent::operator()()
     if (!getLoader().stream.enqueue(DLInEventPtr{&evt}))
         return false;
     int8_t r;
+#if defined(__EMSCRIPTEN__)
+    etcs_emscripten_spin([&]{
+        r = ok.load(::std::memory_order_acquire);
+        return r >= 0;
+    });
+#else
     while ((r = ok.load(::std::memory_order_acquire)) < 0);
+#endif
     return r != 0;
 }
  
@@ -2812,7 +2839,14 @@ inline bool ETCS::DestroyEvent::operator()()
     if (!getLoader().stream.enqueue(DLInEventPtr{&evt}))
         return false;
     int8_t r;
+#if defined(__EMSCRIPTEN__)
+    etcs_emscripten_spin([&]{
+        r = result.load(::std::memory_order_acquire);
+        return r >= 0;
+    });
+#else
     while ((r = result.load(::std::memory_order_acquire)) < 0);
+#endif
     return r != 0;
 }
  
@@ -2843,7 +2877,11 @@ inline ETCS::RID ETCS::AddTagEvent::operator()()
 #endif
     if (!getLoader().stream.enqueue(DLInEventPtr{&evt}))
         return 0;
+#if defined(__EMSCRIPTEN__)
+    etcs_emscripten_spin([&]{ return ready.load(::std::memory_order_acquire); });
+#else
     while (!ready.load(::std::memory_order_acquire));
+#endif
     return result.load(::std::memory_order_relaxed);
 }
  
@@ -2902,7 +2940,11 @@ inline void ETCS::EntityUnloadEvent::operator()()
 #endif
     if (!getLoader().stream.enqueue(DLInEventPtr{&evt}))
         return;
+#if defined(__EMSCRIPTEN__)
+    etcs_emscripten_spin([&]{ return done.load(::std::memory_order_acquire); });
+#else
     while (!done.load(::std::memory_order_acquire));
+#endif
 }
  
 /*
@@ -2947,7 +2989,11 @@ inline void ETCS::ChangeModuleEvent::operator()()
 #endif
     if (!getLoader().stream.enqueue(DLInEventPtr{&evt}))
         return;
+#if defined(__EMSCRIPTEN__)
+    etcs_emscripten_spin([&]{ return done.load(::std::memory_order_acquire); });
+#else
     while (!done.load(::std::memory_order_acquire));
+#endif
 }
  
 /*
@@ -3001,7 +3047,11 @@ inline bool ETCS::TagModifyEvent::operator()()
  */
     if (!ETCS::EventNode::getInstance().stream.enqueue(DLInEventPtr{&evt}))
         return false;
+#if defined(__EMSCRIPTEN__)
+    etcs_emscripten_spin([&]{ return done.load(::std::memory_order_acquire); });
+#else
     while (!done.load(::std::memory_order_acquire));
+#endif
     return changed.load(::std::memory_order_acquire);
 }
  
@@ -3033,7 +3083,11 @@ inline void ETCS::PairMaskEvent::operator()()
 #endif
     if (!getLoader().stream.enqueue(DLInEventPtr{&evt}))
         return;
+#if defined(__EMSCRIPTEN__)
+    etcs_emscripten_spin([&]{ return done.load(::std::memory_order_acquire); });
+#else
     while (!done.load(::std::memory_order_acquire));
+#endif
 }
  
 #ifndef ETCS_LOADER
@@ -3057,7 +3111,14 @@ inline ETCS::Entity* ETCS::CreateEvent::operator()()
     if (!getLoader().stream.enqueue(DLInEventPtr{&evt}))
         return nullptr;
     ETCS::Entity* e;
+#if defined(__EMSCRIPTEN__)
+    etcs_emscripten_spin([&]{
+        e = result.load(::std::memory_order_acquire);
+        return e != nullptr;
+    });
+#else
     while (!(e = result.load(::std::memory_order_acquire)));
+#endif
     return e == reinterpret_cast<ETCS::Entity*>(UINTPTR_MAX) ? nullptr : e;
 }
 #endif

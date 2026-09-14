@@ -208,6 +208,7 @@ protected:
     ::std::atomic<uint64_t>     blocked_admissions_{ 0 };
     ::std::thread               ordering_thread_;
     bool                        pending_start_ = false;
+    bool                        sync_emscripten_ = false;
     MemoryArena*                pending_arena_ = nullptr;
     int                         pending_producer_count_ = 1;
     ::std::atomic<bool>         stop_{ false };
@@ -417,26 +418,69 @@ public:
         stop_.store(false, ::std::memory_order_relaxed);
         is_cleaning_up_.store(false, ::std::memory_order_relaxed);
 #if defined(__EMSCRIPTEN__)
-        if (!g_etcs_runtime_threads_started.load(::std::memory_order_acquire))
-        {
-            pending_start_ = true;
-            pending_arena_ = &arena;
-            pending_producer_count_ = producer_count;
-            ETCS_LOG("EventStream", "emscripten: deferring ordering thread until runtime armed");
-            return;
-        }
-#endif
+        /*
+         * No ordering pthread: browser workers often fail with wasmMemory
+         * undefined, so the background loop never drains and main spins
+         * forever on Load/Resolve/ChangeModule. Rings stay live; callers
+         * use emscripten_poll() while waiting.
+         */
+        sync_emscripten_ = true;
+        pending_start_ = false;
+        ETCS_LOG("EventStream",
+            "emscripten: sync ordering (main-thread poll, no ordering pthread)");
+        return;
+#else
         ordering_thread_ = ::std::thread([this]() { ordering_loop(); });
         ETCS_LOG("EventStream", "Ordering thread started.");
+#endif
     }
 
     void arm_emscripten_ordering_thread()
     {
 #if defined(__EMSCRIPTEN__)
-        if (!pending_start_ || ordering_thread_.joinable()) return;
-        pending_start_ = false;
-        if (pending_arena_)
+        if (pending_start_ && pending_arena_ && !input_ring_)
+        {
+            pending_start_ = false;
             start(*pending_arena_, pending_producer_count_);
+        }
+        ETCS_LOG("EventStream",
+            "emscripten: ordering armed (sync_poll="
+            << (sync_emscripten_ ? "yes" : "no") << ")");
+#endif
+    }
+
+    void emscripten_poll()
+    {
+#if defined(__EMSCRIPTEN__)
+        if (!input_ring_ || !sync_emscripten_) return;
+        if (stop_.load(::std::memory_order_acquire)) return;
+
+        drain_completions();
+        while (tail_seq_ < in_seq_ &&
+               reorder_.slots_[tail_seq_ % GAP_DEPTH].status == GapSlot::Status::Empty)
+            ++tail_seq_;
+
+        for (int n = 0; n < (int)GAP_DEPTH; ++n)
+        {
+            if (in_seq_ - tail_seq_ >= GAP_DEPTH)
+                break;
+            const LBuffer* buf = input_ring_->acquireRead(in_seq_);
+            if (!buf)
+                break;
+            InEvent evt;
+            ::std::memcpy(&evt, buf->buf, sizeof(InEvent));
+            input_ring_->markConsumed(in_seq_);
+            const TagMask mask = static_cast<Derived*>(this)->mask_for(state_, evt);
+            parked_[in_seq_ % GAP_DEPTH] = evt;
+            reorder_.acquire(in_seq_, mask);
+            if (!reorder_.blocked(in_seq_))
+                launch_slot(in_seq_);
+            else
+                blocked_admissions_.fetch_add(1, ::std::memory_order_relaxed);
+            service();
+            ++in_seq_;
+            drain_completions();
+        }
 #endif
     }
 
