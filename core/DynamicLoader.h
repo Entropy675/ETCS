@@ -364,28 +364,6 @@ bool ETCS::Module::registerLoader(EventNode& st)
             "Module missing 'RegisterRootSignalContext' export -- "
             "module will not receive live global signal authority.");
     }
-#if defined(__EMSCRIPTEN__)
-    /*
-     * Static init skipped RIDList publish (ETCS_MODULE_STATIC_REACH_LOADER=0).
-     * Without this, _make_T inserts into a private static list that never
-     * appears in EventNode::ridMap -- WorkBundle resolve always fails.
-     */
-    for (const auto& tag : tags)
-    {
-        const ::std::string sym = tag.toString() + "_RegisterRidList";
-        using RegFn = void (*)();
-        void* p = getTagFunction(sym);
-        if (!p)
-        {
-            ETCS_LOG("DynamicLoader:Module",
-                "emscripten: missing " << sym << " -- RID resolve will fail for this tag");
-            continue;
-        }
-        reinterpret_cast<RegFn>(p)();
-        ETCS_LOG("DynamicLoader:Module",
-            "emscripten: registered RIDList for tag '" << tag << "'");
-    }
-#endif
     ETCS_LOG("DynamicLoader:Module", "tags! " << tags.size());
     validBinary = true;
     return validBinary;
@@ -2676,8 +2654,9 @@ extern "C" ETCS_API ETCS::EventNode* RegisterDynamicLoader(void* ptr)
          * resolves"). If dylink aliases this node to the loader, registerLoader
          * detects identity and skips absorb.
          */
+        ETCS::etcs_flush_deferred_rid_registrars();
         ETCS_LOG("DynamicLoader",
-            "emscripten: collapsed hop -- no module stream.start; return node for RID absorb");
+            "emscripten: collapsed hop -- flushed deferred RIDLists; no module stream.start");
         return &ETCS::EventNode::getInstance();
 #else
         ETCS::EventNode::getInstance().stream.start(

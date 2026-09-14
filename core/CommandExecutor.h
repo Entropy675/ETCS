@@ -2790,6 +2790,13 @@ inline void preload_web_modules(ETCS::SignalContext& ctx)
  * answering, and an unanswered call leaves the buffer untouched, which reads as
  * finished.
  */
+#if defined(__EMSCRIPTEN__)
+#include <emscripten.h>
+/* MAIN_MODULE (etcs.cc) -- page Module.ccall; ReplLineSource polls here. */
+extern "C" int etcs_web_shell_try_pop_line(char* out, int cap);
+extern "C" void etcs_web_shell_write(const char* text);
+#endif
+
 inline ReplLineSource repl_shell_line_source(ETCS::Entity* shell, ETCS::SignalContext& sig)
 {
     return [shell, &sig](const ::std::string& prompt, ::std::string& out) -> bool
@@ -2797,6 +2804,32 @@ inline ReplLineSource repl_shell_line_source(ETCS::Entity* shell, ETCS::SignalCo
         if (!shell) return false;
         if (sig.isInterrupted() || sig.isTerminated()) return false;
 
+#if defined(__EMSCRIPTEN__)
+        /*
+         * Do NOT shell->call("Shell.ReadLine"): that is an indirect WorkBundle
+         * dispatch. ASYNCIFY cannot unwind through it (RuntimeError: unreachable
+         * on doRewind). Poll the MAIN queue with a *direct* emscripten_sleep so
+         * ASYNCIFY instruments this lambda in the main module.
+         * Link etcs with -sASYNCIFY=1.
+         */
+        (void)shell;
+        if (!prompt.empty())
+        {
+            etcs_web_shell_write(prompt.c_str());
+            ::std::cout << prompt << ::std::flush;
+        }
+        char buf[4096];
+        for (;;)
+        {
+            if (sig.isInterrupted() || sig.isTerminated()) return false;
+            if (etcs_web_shell_try_pop_line(buf, (int)sizeof(buf)))
+            {
+                out.assign(buf);
+                return true;
+            }
+            emscripten_sleep(50);
+        }
+#else
         ETCS::Buffer data;
         data.writeString(prompt.c_str());
         shell->call(ETCS::Buffer("Shell.ReadLine"), data, sig);
@@ -2805,6 +2838,7 @@ inline ReplLineSource repl_shell_line_source(ETCS::Entity* shell, ETCS::SignalCo
         if (reply.empty() || reply[0] != ETCS::SHELL_LINE_OK) return false;
         out.assign(reply, 1, ::std::string::npos);
         return !(sig.isInterrupted() || sig.isTerminated());
+#endif
     };
 }
 

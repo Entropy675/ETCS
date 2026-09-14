@@ -50,6 +50,60 @@ inline void etcs_web_trace(const char* msg)
 inline void etcs_web_trace(const char*) {}
 #endif
 
+#if defined(__EMSCRIPTEN__)
+/*
+ * Browser line queue on MAIN so Module.ccall hits real symbols (not side-module
+ * stubs). Polling + emscripten_sleep live in CommandExecutor's ReplLineSource
+ * as *direct* calls from the main module -- ASYNCIFY cannot unwind through
+ * WorkBundle's indirect Shell.ReadLine path (unreachable on rewind).
+ */
+#include <deque>
+#include <mutex>
+#include <cstring>
+namespace {
+std::mutex g_etcs_web_line_mu;
+std::deque<std::string> g_etcs_web_lines;
+}
+extern "C" {
+
+EMSCRIPTEN_KEEPALIVE
+void etcs_web_shell_push_line(const char* line)
+{
+    if (!line) return;
+    std::lock_guard<std::mutex> lock(g_etcs_web_line_mu);
+    g_etcs_web_lines.emplace_back(line);
+}
+
+EMSCRIPTEN_KEEPALIVE
+int etcs_web_shell_try_pop_line(char* out, int cap)
+{
+    if (!out || cap < 2) return 0;
+    std::lock_guard<std::mutex> lock(g_etcs_web_line_mu);
+    if (g_etcs_web_lines.empty()) return 0;
+    std::string line = std::move(g_etcs_web_lines.front());
+    g_etcs_web_lines.pop_front();
+    if ((int)line.size() >= cap) line.resize((size_t)cap - 1);
+    std::memcpy(out, line.data(), line.size());
+    out[line.size()] = '\0';
+    return 1;
+}
+
+EMSCRIPTEN_KEEPALIVE
+void etcs_web_shell_write(const char* text)
+{
+    if (!text) return;
+    EM_ASM({
+        var t = UTF8ToString($0);
+        if (typeof window.etcsTermWrite === 'function')
+            window.etcsTermWrite(t);
+        else if (typeof Module !== 'undefined' && Module.print)
+            Module.print(t);
+    }, text);
+}
+
+} // extern "C"
+#endif
+
 int main(int argc, char* argv[])
 {
     shell_startup();

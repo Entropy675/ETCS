@@ -40,6 +40,21 @@
 #  define ETCS_MODULE_STATIC_REACH_LOADER 1
 #endif
 
+#include <vector>
+namespace ETCS {
+inline ::std::vector<void(*)()>& etcs_deferred_rid_registrars()
+{
+    static ::std::vector<void(*)()> v;
+    return v;
+}
+inline void etcs_flush_deferred_rid_registrars()
+{
+    for (void (*fn)() : etcs_deferred_rid_registrars())
+        if (fn) fn();
+    etcs_deferred_rid_registrars().clear();
+}
+} // namespace ETCS
+
 // flags for make with -DETCS_PRODUCTION_BUILD module side (see ETCS.h for loader side)
 #ifdef ETCS_PRODUCTION_BUILD
     #define ETCS_LOG_TO_FILE
@@ -1076,19 +1091,19 @@ namespace ETCS
         static ETCS::RIDList<Name*> list;\
         return list;\
     }\
-    static bool _ridlist_##Name##_registered = []() {\
-        if (!ETCS_MODULE_STATIC_REACH_LOADER) return true; \
+    static void _ridlist_##Name##_publish() { \
         ETCS::ThreadPool::getInstance(); \
-        ETCS::EventNode::getInstance().RegisterRIDRegistry(\
-            #Name, \
-            _ridlist_##Name().handle(#Name) \
-        );\
-        return true;\
-    }(); \
-    extern "C" ETCS_API void Name##_RegisterRidList() { \
         ETCS::EventNode::getInstance().RegisterRIDRegistry( \
             #Name, _ridlist_##Name().handle(#Name)); \
     } \
+    static bool _ridlist_##Name##_registered = []() {\
+        if (!ETCS_MODULE_STATIC_REACH_LOADER) { \
+            ETCS::etcs_deferred_rid_registrars().push_back(&_ridlist_##Name##_publish); \
+            return true; \
+        } \
+        _ridlist_##Name##_publish(); \
+        return true;\
+    }(); \
     ETCS::Entity* _make_child_##Name(ETCS::Entity* parent) \
     { \
         if (!parent) return nullptr; \
