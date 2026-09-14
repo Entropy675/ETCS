@@ -2472,7 +2472,8 @@ inline void shutdown_detached_executors()
 namespace ETCS {
 inline bool& color_enabled()
 {
-#if defined(_WIN32) || defined(_WIN64)
+#if defined(_WIN32) || defined(_WIN64) || defined(__EMSCRIPTEN__)
+    /* Browser / HTML terminal is not a VT100: emit plain text, not ANSI. */
     static bool v = false;
 #else
     static bool v = (::isatty(STDOUT_FILENO) != 0);
@@ -3482,11 +3483,7 @@ inline void repl_shell_instance_loop(const ::std::string& mod_name, const ::std:
     {
         if (sig.isInterrupted() || sig.isTerminated()) break;
 
-        ETCS::Buffer key;
-        key.writeString((mod_name + ":" + tag_name).c_str());
-        auto& ridMap = ETCS::EventNode::getInstance().ridMap;
-        auto it = ridMap.find(key);
-        const ETCS::RIDListHandle* handle = (it != ridMap.end()) ? &it->second : nullptr;
+        const ETCS::RIDListHandle* handle = ETCS::get_handle(mod_name, tag_name);
         if (!handle)
         {
             ETCS_SHELL("Navigator", COLOR_WARN << " Tag is invalid!" << COLOR_RESET);
@@ -3643,11 +3640,13 @@ inline void repl_shell_tag_loop(const ::std::string& mod_name, ETCS::Root& nav_r
         ETCS_SHELL("Navigator", "\n--- Tags in " << COLOR_LIB << mod_name << COLOR_RESET << " ---");
         for (size_t i = 0; i < tags.size(); ++i)
         {
-            ETCS::Buffer key;
-            key.writeString((mod_name + ":" + tags[i].toString()).c_str());
-            auto& ridMap = ETCS::EventNode::getInstance().ridMap;
-            auto it = ridMap.find(key);
-            size_t live_count = (it != ridMap.end()) ? it->second.invoke_count() : 0;
+            /*
+             * ridMap keys are the bare contract tag ("Shell"), not
+             * "Module:Tag". get_handle tries bare then qualified.
+             */
+            const ETCS::RIDListHandle* handle =
+                ETCS::get_handle(mod_name, tags[i].toString());
+            size_t live_count = handle ? handle->invoke_count() : 0;
             ETCS_SHELL("Navigator", COLOR_LIB << "  [" << i << "] " << tags[i].toString()
                 << COLOR_RESET << "  (" << COLOR_RID << live_count << " live" << COLOR_RESET << ")");
         }
