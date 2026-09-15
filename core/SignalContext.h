@@ -4,7 +4,7 @@
 #include <csignal>
 #include <atomic>
 
-// Signal flags. std::atomic, not volatile: volatile gives no cross-thread
+// Signal flags. ::std::atomic, not volatile: volatile gives no cross-thread
 // ordering at all, so the old form worked on x86 only by TSO accident (and
 // by the optimizer choosing not to hoist ordinary loads across the volatile
 // read, which it was always free to do). Costs nothing on x86-64 -- acquire
@@ -20,7 +20,7 @@
 // intentional and inert -- AdoptRootSignalContext repoints a module's slot
 // at the loader's instance, so a module's own copies are never read.
 
-namespace ETCS { using SignalFlag = std::atomic<sig_atomic_t>; }
+namespace ETCS { using SignalFlag = ::std::atomic<sig_atomic_t>; }
 static_assert(ETCS::SignalFlag::is_always_lock_free,
               "signal flags must be lock-free to be async-signal-safe");
 
@@ -33,9 +33,9 @@ inline ETCS::SignalFlag g_sig_usr1{0};
 extern "C" inline void global_signal_handler(int sig)
 {
     switch(sig) {
-        case SIGINT:  g_sig_int .store(1, std::memory_order_release); break;
-        case SIGTERM: g_sig_term.store(1, std::memory_order_release); break;
-        case SIGUSR1: g_sig_usr1.store(1, std::memory_order_release); break;
+        case SIGINT:  g_sig_int .store(1, ::std::memory_order_release); break;
+        case SIGTERM: g_sig_term.store(1, ::std::memory_order_release); break;
+        case SIGUSR1: g_sig_usr1.store(1, ::std::memory_order_release); break;
     }
 }
 
@@ -45,7 +45,7 @@ extern "C" inline void global_signal_handler(int sig)
 // All three dispositions use sigaction with SA_RESTART deliberately cleared.
 // SA_RESTART controls only whether a blocked syscall restarts after the
 // handler returns -- it does not affect whether the handler runs or the
-// flag is set. The previous form used std::signal (implicit SA_RESTART on
+// flag is set. The previous form used ::std::signal (implicit SA_RESTART on
 // glibc) out of a mistaken concern: that an EINTR return would let the
 // outermost blocking call "consume" the interrupt before the owning scope
 // saw it. But the flag is already set by the handler; EINTR only controls
@@ -215,7 +215,7 @@ struct SignalContext
     // follows it.
     static bool raised(const SignalFlag* flag)
     {
-        return flag && flag->load(std::memory_order_acquire) != 0;
+        return flag && flag->load(::std::memory_order_acquire) != 0;
     }
 
     // Raised here, or anywhere above. Each level answers for its own flag
@@ -319,7 +319,7 @@ struct SignalContext
             if (c->closure_root) break;
         }
         if (!outermost) return false;
-        outermost->store(1, std::memory_order_release);
+        outermost->store(1, ::std::memory_order_release);
         return true;
     }
 

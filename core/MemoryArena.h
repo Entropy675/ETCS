@@ -85,13 +85,13 @@ bool etcs_retire_entity(Entity* e);
  * __cxa_finalize on dlclose for a module arena, __run_exit_handlers at
  * process exit for the loader's.
  *
- * It used to hold `static const std::vector<std::string> units`. A
+ * It used to hold `static const ::std::vector<::std::string> units`. A
  * function-local static is registered for destruction on its FIRST CALL, and
  * destroyed in reverse order of registration -- so `units` was registered
  * when something first logged a byte count, which is strictly LATER than the
  * arena's own construction, and therefore destroyed strictly EARLIER than the
  * arena. Every teardown log after that point read a freed vector and streamed
- * a freed std::string.
+ * a freed ::std::string.
  *
  * Reproduced under ASAN on both exit paths, from the current dev branch:
  *
@@ -118,18 +118,18 @@ bool etcs_retire_entity(Entity* e);
  * inline, too: this is a header, and a non-inline free function here is one
  * multi-TU module away from a duplicate symbol.
  */
-inline std::string formatBytesToString(uint64_t bytes)
+inline ::std::string formatBytesToString(uint64_t bytes)
 {
     static constexpr const char* units[] = {"B", "KB", "MB", "GB", "TB"};
     static constexpr int unit_count = static_cast<int>(sizeof(units) / sizeof(units[0]));
     if (bytes == 0) return "0B";
-    int magnitude = static_cast<int>(std::log2(bytes) / 10);
+    int magnitude = static_cast<int>(::std::log2(bytes) / 10);
     if (magnitude >= unit_count) magnitude = unit_count - 1;
     if (magnitude < 0)           magnitude = 0;
-    double value = static_cast<double>(bytes) / std::pow(1024, magnitude);
-    std::ostringstream out;
+    double value = static_cast<double>(bytes) / ::std::pow(1024, magnitude);
+    ::std::ostringstream out;
     if (magnitude == 0) out << bytes << units[0];
-    else out << std::fixed << std::setprecision(1) << value << units[magnitude];
+    else out << ::std::fixed << ::std::setprecision(1) << value << units[magnitude];
     return out.str();
 }
 
@@ -179,7 +179,7 @@ inline void* allocatePage(long long size, bool tryHuge, PageOrigin* origin_out =
 #if defined(_WIN32) || defined(_WIN64)
     void* ptr = VirtualAlloc(nullptr, static_cast<SIZE_T>(size),
                              MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!ptr) throw std::bad_alloc();
+    if (!ptr) throw ::std::bad_alloc();
     report(PageOrigin::Plain); // Windows large-page semantics not modeled here
     return ptr;
 #else
@@ -207,7 +207,7 @@ inline void* allocatePage(long long size, bool tryHuge, PageOrigin* origin_out =
     // Standard mmap fallback
     void* ptr = mmap(nullptr, static_cast<size_t>(size),
                      PROT_READ | PROT_WRITE, flags, -1, 0);
-    if (ptr == MAP_FAILED) throw std::bad_alloc();
+    if (ptr == MAP_FAILED) throw ::std::bad_alloc();
     report(PageOrigin::Plain);
     return ptr;
 #endif
@@ -268,7 +268,7 @@ private:
         bool      hugepage_aligned      = false;
         // This slab's OWN free-page stack -- fixed-size, embedded
         // directly in the struct rather than a separate heap container
-        // (no std::vector of its own), since the true capacity is
+        // (no ::std::vector of its own), since the true capacity is
         // already a known, bounded constant. Per-slab rather than one
         // flat pool-wide list specifically so a drain (unmapSlabLocked)
         // only ever touches the handful of entries that actually belong
@@ -302,7 +302,7 @@ private:
         // an arena that might itself be mid-teardown by the time this
         // Chunk's own destructor runs is exactly the wrong thing to add
         // here.
-        std::string owner_scope_tag;
+        ::std::string owner_scope_tag;
 
         // The cross-DSO fix -- see MemoryArena::global_arena_. Cached at
         // construction, the same moment and for the same reason as
@@ -311,9 +311,9 @@ private:
         // which never reaches releaseChildPage.
         MemoryArena* release_target = nullptr;
 
-        Chunk(char* buf, long long sz, bool pooled, std::string tag, MemoryArena* target)
+        Chunk(char* buf, long long sz, bool pooled, ::std::string tag, MemoryArena* target)
             : buffer(buf), size(sz), used(0), next(nullptr), from_pool(pooled),
-              owner_scope_tag(std::move(tag)), release_target(target) {}
+              owner_scope_tag(::std::move(tag)), release_target(target) {}
 
         ~Chunk();  // defined below MemoryArena's own class body -- needs
                    // releaseChildPage/freePage visible, and this is the
@@ -395,16 +395,16 @@ private:
     {
         size_t operator()(const FreeBlockKey& k) const
         {
-            return std::hash<long long>()(k.size) ^ (std::hash<long long>()(k.alignment) << 1);
+            return ::std::hash<long long>()(k.size) ^ (::std::hash<long long>()(k.alignment) << 1);
         }
     };
-    std::unordered_map<FreeBlockKey, std::vector<void*>, FreeBlockKeyHash> free_blocks_;
+    ::std::unordered_map<FreeBlockKey, ::std::vector<void*>, FreeBlockKeyHash> free_blocks_;
 
     // "Locked" pair -- assumes allocationMutex_ is ALREADY held by the
     // caller, same convention allocateRawLocked/registerDtorLocked
     // already use in this file. Internal callers that already hold the
     // lock (allocate<T>'s own free-list check) use these directly, to
-    // avoid a double-lock deadlock (std::mutex isn't recursive) that
+    // avoid a double-lock deadlock (::std::mutex isn't recursive) that
     // would result from calling the public, lock-taking versions below
     // instead. releaseToFreeListLocked does NOT zero -- zeroing doesn't
     // need the lock, so the public wrapper does it before ever taking
@@ -432,7 +432,7 @@ public:
     // what any other external, not-already-locked caller should use.
     void* tryAcquireFromFreeList(long long size, long long alignment)
     {
-        std::lock_guard<std::mutex> lock(allocationMutex_);
+        ::std::lock_guard<::std::mutex> lock(allocationMutex_);
         void* mem = tryAcquireFromFreeListLocked(size, alignment);
         if (mem)
             ETCS_ARENA_DEBUG_LOG("MemoryArena", "tryAcquireFromFreeList: [" << scope_tag_
@@ -455,8 +455,8 @@ public:
     void releaseToFreeList(void* ptr, long long size, long long alignment)
     {
         if (!ptr) return;
-        std::memset(ptr, 0, static_cast<size_t>(size));
-        std::lock_guard<std::mutex> lock(allocationMutex_);
+        ::std::memset(ptr, 0, static_cast<size_t>(size));
+        ::std::lock_guard<::std::mutex> lock(allocationMutex_);
         releaseToFreeListLocked(ptr, size, alignment);
         ETCS_ARENA_DEBUG_LOG("MemoryArena", "releaseToFreeList: [" << scope_tag_
                  << "] pushed size=" << size << " align=" << alignment << " mem=" << ptr);
@@ -468,7 +468,7 @@ private:
     // hardcoded literal -- superseding the old smallPageSize (2048)
     // constant, which predates this pool and was never actually reached
     // in practice anyway (DEFAULT_ARENA_START_PAGE == 4096 already
-    // dominated it via chunkSize_'s own std::max). Any child request up
+    // dominated it via chunkSize_'s own ::std::max). Any child request up
     // to and including this size is served from the pool's carved pages;
     // anything larger is treated as a dedicated blob -- see
     // allocateNewChunk's own comment.
@@ -559,9 +559,9 @@ private:
     // reaches that call at all) shows up here as "root" rather than
     // silently unlabeled, so a teardown log full of same-sized releases
     // can actually be told apart by WHICH scope they belonged to.
-    std::string  scope_tag_ = "root";
+    ::std::string  scope_tag_ = "root";
 
-    mutable std::mutex  allocationMutex_;
+    mutable ::std::mutex  allocationMutex_;
     Chunk*              head_         = nullptr;
     Chunk*              current_      = nullptr;
     Chunk*              tail_         = nullptr;  // O(1) append
@@ -593,13 +593,13 @@ private:
     // of a lock-ordering cycle: pool-mutex-guarded code here never
     // reaches back into any child's own allocationMutex_ at all.
     // ---------------------------------------------------------------------
-    std::mutex                        poolMutex_;
-    std::vector<Slab*>                available_slabs_;  // slabs with free_count > 0 --
+    ::std::mutex                        poolMutex_;
+    ::std::vector<Slab*>                available_slabs_;  // slabs with free_count > 0 --
                                                             // popped from directly on acquire,
                                                             // NOT a flat page-level list; see
                                                             // Slab::free_slots' own comment
-    std::unordered_map<char*, Slab*>  slabs_by_base_;     // every still-live slab, keyed by base
-    std::unordered_map<char*, Slab*>  page_registry_;     // per-PAGE owner lookup -- populated
+    ::std::unordered_map<char*, Slab*>  slabs_by_base_;     // every still-live slab, keyed by base
+    ::std::unordered_map<char*, Slab*>  page_registry_;     // per-PAGE owner lookup -- populated
                                                             // for EVERY page of every slab,
                                                             // unconditionally; the sole
                                                             // resolution path now -- see
@@ -720,7 +720,7 @@ private:
         ETCS_ARENA_DEBUG_LOG("MemoryArena", "unmapSlabLocked: releasing slab base="
                  << static_cast<void*>(slab->base) << " back to the OS");
 
-        auto it = std::find(available_slabs_.begin(), available_slabs_.end(), slab);
+        auto it = ::std::find(available_slabs_.begin(), available_slabs_.end(), slab);
         if (it != available_slabs_.end())
         {
             *it = available_slabs_.back();
@@ -783,7 +783,7 @@ private:
 
     void* allocateRawLocked(long long size, long long alignment)
     {
-        if (isTeardown_) throw std::runtime_error("MemoryArena: Allocation after teardown.");
+        if (isTeardown_) throw ::std::runtime_error("MemoryArena: Allocation after teardown.");
         if (!current_) allocateNewChunk(size);
 
         long long cp       = reinterpret_cast<long long>(current_->buffer + current_->used);
@@ -799,7 +799,7 @@ private:
             offset   = na - reinterpret_cast<long long>(current_->buffer);
             required = offset + size;
 
-            if (required > current_->size) throw std::bad_alloc();
+            if (required > current_->size) throw ::std::bad_alloc();
         }
 
         void* memory    = current_->buffer + offset;
@@ -847,7 +847,7 @@ private:
     {
         long long base = (hugePageSize > 0) ? hugePageSize : pageSize;
         long long n    = (minSize + base - 1) / base;
-        return base * std::max(n, 1LL);
+        return base * ::std::max(n, 1LL);
     }
 
 public:
@@ -901,13 +901,13 @@ public:
         {
             // Standard OS page size granularity for non-performance sub-arenas
             long long standard = kStandardPageSize();
-            chunkSize_ = alignUp(std::max(initialSize, standard), standard);
+            chunkSize_ = alignUp(::std::max(initialSize, standard), standard);
         }
 
         allocateNewChunk(chunkSize_); // parent_ is already set above -- correctly routes
                                        // to the pool here if this is a child arena.
         // Only the global root publishes liveness -- see s_alive.
-        if (!parent_) s_alive.store(true, std::memory_order_release);
+        if (!parent_) s_alive.store(true, ::std::memory_order_release);
     }
 
     // Liveness of THIS DSO's global root arena, readable AFTER it has been
@@ -918,8 +918,8 @@ public:
     // a local sub-arena), so an unguarded store would let any child arena's
     // ordinary destruction report the global root as dead while it is still
     // fully alive -- turning a guard into a silent skip of real cleanup.
-    inline static std::atomic<bool> s_alive{false};
-    static bool alive() { return s_alive.load(std::memory_order_acquire); }
+    inline static ::std::atomic<bool> s_alive{false};
+    static bool alive() { return s_alive.load(::std::memory_order_acquire); }
 
     static MemoryArena& getInstance()
     {
@@ -932,7 +932,7 @@ public:
     }
     ~MemoryArena()
     {
-        if (!parent_) s_alive.store(false, std::memory_order_release);
+        if (!parent_) s_alive.store(false, ::std::memory_order_release);
         memoryTeardown();
     }
 
@@ -947,14 +947,14 @@ public:
     // nothing ever calls this on stays "root", which is itself useful
     // diagnostic information (it means nothing along this specific
     // creation path knew, or bothered, to identify it).
-    void               setScopeTag(const std::string& tag) { scope_tag_ = tag; }
-    const std::string& getScopeTag() const                 { return scope_tag_; }
+    void               setScopeTag(const ::std::string& tag) { scope_tag_ = tag; }
+    const ::std::string& getScopeTag() const                 { return scope_tag_; }
 
     // --- Public API ---
 
-    void* allocateRaw(long long size, long long alignment = alignof(std::max_align_t))
+    void* allocateRaw(long long size, long long alignment = alignof(::std::max_align_t))
     {
-        std::lock_guard<std::mutex> lock(allocationMutex_);
+        ::std::lock_guard<::std::mutex> lock(allocationMutex_);
         return allocateRawLocked(size, alignment);
     }
 
@@ -994,7 +994,7 @@ public:
             return static_cast<char*>(p);
         }
 
-        std::lock_guard<std::mutex> lock(poolMutex_);
+        ::std::lock_guard<::std::mutex> lock(poolMutex_);
         if (available_slabs_.empty())
             mintSlabLocked();
 
@@ -1023,9 +1023,9 @@ public:
     // pool's own generic complaint. Defaults to "" for the few call
     // sites that don't have one (none currently -- every real call
     // already goes through Chunk::~Chunk(), which always has one).
-    void releaseChildPage(char* ptr, long long size, const std::string& caller_tag = "")
+    void releaseChildPage(char* ptr, long long size, const ::std::string& caller_tag = "")
     {
-        std::memset(ptr, 0, static_cast<size_t>(size));
+        ::std::memset(ptr, 0, static_cast<size_t>(size));
 
         if (size > kStandardPageSize())
         {
@@ -1035,7 +1035,7 @@ public:
             return;
         }
 
-        std::lock_guard<std::mutex> lock(poolMutex_);
+        ::std::lock_guard<::std::mutex> lock(poolMutex_);
         Slab* owner = resolveSlabLocked(ptr);
         if (!owner)
         {
@@ -1114,7 +1114,7 @@ public:
     // any lock spanned construction, any T whose constructor itself
     // allocates from this same arena (directly, or transitively through
     // a member that does) would self-deadlock on allocationMutex_, since
-    // std::mutex is non-recursive. Entity is exactly such a T: its
+    // ::std::mutex is non-recursive. Entity is exactly such a T: its
     // constructor allocates an entity-local MemoryArena out of this same
     // global instance. registerDtor<T> is called here only AFTER T's
     // constructor has already fully run (unlocked) -- the same invariant
@@ -1122,7 +1122,7 @@ public:
     // instead of duplicated inline.
     //
     // as_entity/run_entity_delete capture: if constexpr
-    // (std::is_base_of<Entity, T>) inside registerDtor<T> -- this only
+    // (::std::is_base_of<Entity, T>) inside registerDtor<T> -- this only
     // type-checks correctly at each ACTUAL call site's instantiation
     // point (two-phase template lookup), by which point every real
     // caller (always compiled after Entity.h is fully included — every
@@ -1142,11 +1142,11 @@ public:
     template<typename T, typename... Args>
     T* allocate(Args&&... args)
     {
-        if constexpr (!std::is_trivially_destructible_v<T>)
+        if constexpr (!::std::is_trivially_destructible_v<T>)
         {
             void* mem;
             {
-                std::lock_guard<std::mutex> lock(allocationMutex_);
+                ::std::lock_guard<::std::mutex> lock(allocationMutex_);
                 // Check this arena's own free list first, via the SAME
                 // primitive ArenaAllocator<T>/registerDtorLocked/
                 // reclaimEntity all now share (tryAcquireFromFreeListLocked,
@@ -1184,7 +1184,7 @@ public:
             // this arena (allocateRaw / allocate<U> / registerDtor) —
             // those each take and release the lock independently.
             T* obj;
-            if constexpr (std::is_same_v<T, MemoryArena>)
+            if constexpr (::std::is_same_v<T, MemoryArena>)
                 // MemoryArena::getInstance() evaluated HERE, not later --
                 // this exact point is guaranteed to be executing as the
                 // OWNING module's own compiled code (construction only
@@ -1192,9 +1192,9 @@ public:
                 // flow), so this resolves to the correct DSO's singleton.
                 // Threaded through as global_arena_ -- this one-time
                 // resolution is what closes the cross-DSO pool mismatch.
-                obj = new (mem) T(std::forward<Args>(args)..., this, &MemoryArena::getInstance());
+                obj = new (mem) T(::std::forward<Args>(args)..., this, &MemoryArena::getInstance());
             else
-                obj = new (mem) T(std::forward<Args>(args)...);
+                obj = new (mem) T(::std::forward<Args>(args)...);
 
             registerDtor<T>(obj);
 
@@ -1204,20 +1204,20 @@ public:
         {
             void* mem;
             {
-                std::lock_guard<std::mutex> lock(allocationMutex_);
+                ::std::lock_guard<::std::mutex> lock(allocationMutex_);
                 mem = allocateRawLocked(
                     static_cast<long long>(sizeof(T)),
                     static_cast<long long>(alignof(T))
                 );
             }
-            return new (mem) T(std::forward<Args>(args)...);
+            return new (mem) T(::std::forward<Args>(args)...);
         }
     }
 
     template<typename T>
     T* allocateArray(size_t count)
     {
-        std::lock_guard<std::mutex> lock(allocationMutex_);
+        ::std::lock_guard<::std::mutex> lock(allocationMutex_);
         long long sizeBytes = static_cast<long long>(count * sizeof(T));
         void*     mem       = allocateRawLocked(sizeBytes, alignof(T));
         return static_cast<T*>(mem);
@@ -1245,12 +1245,12 @@ public:
     template<typename T>
     void registerDtor(T* ptr)
     {
-        if constexpr (!std::is_trivially_destructible_v<T>)
+        if constexpr (!::std::is_trivially_destructible_v<T>)
         {
-            std::lock_guard<std::mutex> lock(allocationMutex_);
+            ::std::lock_guard<::std::mutex> lock(allocationMutex_);
             if (!isTeardown_)
             {
-                if constexpr (std::is_base_of<Entity, T>::value)
+                if constexpr (::std::is_base_of<Entity, T>::value)
                     registerDtorLocked(ptr, [](void* p) { static_cast<T*>(p)->~T(); },
                         [](void* p) -> Entity* { return static_cast<Entity*>(static_cast<T*>(p)); },
                         [](void* p, MemoryArena& parentArena, bool delete_children)
@@ -1363,7 +1363,7 @@ public:
                                 // case this check exists for (SocketConnectionState,
                                 // which never addTag<T>s anything) is untouched --
                                 // it has nothing hosted here either way.
-                                std::vector<std::pair<ETCS::Buffer, ETCS_RID_SIZE>> hosted;
+                                ::std::vector<::std::pair<ETCS::Buffer, ETCS_RID_SIZE>> hosted;
                                 e->getTypedChildren(hosted);
                                 e->reparentChildrenTo(e->getParent());
                                 parentArena.reclaimEntity(e, sizeof(T), alignof(T));
@@ -1389,7 +1389,7 @@ public:
     // callers (Module*, MemoryArena*), which are never polymorphic.
     DestructorRecord* unlinkRecord(Entity* target)
     {
-        std::lock_guard<std::mutex> lock(allocationMutex_);
+        ::std::lock_guard<::std::mutex> lock(allocationMutex_);
         if (isTeardown_) return nullptr;
         DestructorRecord* prevRec = nullptr;
         DestructorRecord* cur = dtorHead_;
@@ -1409,7 +1409,7 @@ public:
  
     DestructorRecord* unlinkRecord(void* target)
     {
-        std::lock_guard<std::mutex> lock(allocationMutex_);
+        ::std::lock_guard<::std::mutex> lock(allocationMutex_);
         if (isTeardown_) return nullptr;
         DestructorRecord* prevRec = nullptr;
         DestructorRecord* cur = dtorHead_;
@@ -1638,7 +1638,7 @@ public:
             void* rawPtr = nullptr;
             Entity* (*to_entity)(void*) = nullptr;
             {
-                std::lock_guard<std::mutex> lock(allocationMutex_);
+                ::std::lock_guard<::std::mutex> lock(allocationMutex_);
                 for (DestructorRecord* rec = dtorHead_; rec; rec = rec->prev)
                 {
                     if (rec->as_entity && rec->run_entity_delete)
@@ -1665,7 +1665,7 @@ public:
         void (*callback)(void*, MemoryArena&, bool) = nullptr;
         void* rawPtr = nullptr;
         {
-            std::lock_guard<std::mutex> lock(allocationMutex_);
+            ::std::lock_guard<::std::mutex> lock(allocationMutex_);
             DestructorRecord* rec = dtorHead_;
             while (rec)
             {
@@ -1733,7 +1733,7 @@ public:
     template<typename Pred>
     Entity* findNextCandidateScope(Pred&& pred, Entity* exclude = nullptr)
     {
-        std::lock_guard<std::mutex> lock(allocationMutex_);
+        ::std::lock_guard<::std::mutex> lock(allocationMutex_);
         for (DestructorRecord* rec = dtorHead_; rec; rec = rec->prev)
         {
             if (!rec->as_entity) continue;
@@ -1746,7 +1746,7 @@ public:
  
     void cleanupTypedEntities()
     {
-        std::lock_guard<std::mutex> lock(allocationMutex_);
+        ::std::lock_guard<::std::mutex> lock(allocationMutex_);
         if (isTeardown_) return;
  
         DestructorRecord* rec = dtorHead_;
@@ -1758,7 +1758,7 @@ public:
     {
         DestructorRecord* rec;
         {
-            std::lock_guard<std::mutex> lock(allocationMutex_);
+            ::std::lock_guard<::std::mutex> lock(allocationMutex_);
             if (isTeardown_) return;
             rec = dtorHead_;
             dtorHead_ = nullptr;
@@ -1773,9 +1773,9 @@ public:
         // allocation machinery, which itself takes allocationMutex_.
         // Holding that lock across this whole loop (as this function
         // used to) meant such a destructor would re-lock a non-
-        // recursive std::mutex from the SAME thread -- undefined
+        // recursive ::std::mutex from the SAME thread -- undefined
         // behavior, not a guaranteed clean deadlock -- and is exactly
-        // what a real, reproduced SIGFPE inside std::unordered_map's own
+        // what a real, reproduced SIGFPE inside ::std::unordered_map's own
         // operator[] traced back to (free_blocks_'s own bucket state
         // corrupted by two logically-concurrent, unsynchronized mutations
         // of the same map). This was invisible before ArenaAllocator's
@@ -1783,7 +1783,7 @@ public:
         // was always POSSIBLE, just inert.
         while (rec) { runRecordDtor(rec); rec = rec->prev; }
  
-        std::lock_guard<std::mutex> lock(allocationMutex_);
+        ::std::lock_guard<::std::mutex> lock(allocationMutex_);
         // Every chunk goes back to used=0 below -- any block this arena's
         // own free_blocks_ was tracking as an in-chunk "hole" is now
         // meaningless (the whole chunk is free again via the bump
@@ -1809,14 +1809,14 @@ public:
     {
         const int columns = 5;
  
-        const std::string RED_START = "\033[1;31m";
-        const std::string RESET     = "\033[0m";
+        const ::std::string RED_START = "\033[1;31m";
+        const ::std::string RESET     = "\033[0m";
  
         ETCS_LOG("MemoryArena", "[" << scope_tag_ << "] teardown attempt, already clean: " << isTeardown_);
  
         DestructorRecord* rec;
         {
-            std::lock_guard<std::mutex> lock(allocationMutex_);
+            ::std::lock_guard<::std::mutex> lock(allocationMutex_);
             if (isTeardown_) return;
             isTeardown_ = true;
             rec = dtorHead_;
@@ -1827,12 +1827,12 @@ public:
         // for the full reasoning: a destructor legitimately calling back
         // into this same arena's own allocation machinery (which itself
         // takes allocationMutex_) would otherwise re-lock a non-recursive
-        // std::mutex from the same thread -- undefined behavior, and
-        // exactly what a real, reproduced SIGFPE inside std::
+        // ::std::mutex from the same thread -- undefined behavior, and
+        // exactly what a real, reproduced SIGFPE inside ::std::
         // unordered_map's own operator[] traced back to.
         while (rec) { runRecordDtor(rec); rec = rec->prev; }
  
-        std::lock_guard<std::mutex> lock(allocationMutex_);
+        ::std::lock_guard<::std::mutex> lock(allocationMutex_);
         free_blocks_.clear(); // every chunk backing these addresses is about
                                // to be freed below regardless -- cleared here
                                // for explicitness, matching this method's own
@@ -1857,7 +1857,7 @@ public:
         {
             long long dedicated_count = 0, dedicated_bytes = 0;
             long long pooled_count    = 0, pooled_bytes    = 0;
-            std::unordered_map<char*, long long> slab_live_pages; // slab base -> live_pages, deduped
+            ::std::unordered_map<char*, long long> slab_live_pages; // slab base -> live_pages, deduped
  
             for (Chunk* c = head_; c; c = c->next)
             {
@@ -1892,13 +1892,13 @@ public:
             }
         }
  
-        auto flushRow = [&](std::ostringstream& row, long long rowStart, long long rowEnd)
+        auto flushRow = [&](::std::ostringstream& row, long long rowStart, long long rowEnd)
         {
             row << "  ["
-                << std::setw(3) << std::setfill('0') << rowStart
+                << ::std::setw(3) << ::std::setfill('0') << rowStart
                 << "-"
-                << std::setw(3) << std::setfill('0') << rowEnd
-                << "]" << std::setfill(' ');
+                << ::std::setw(3) << ::std::setfill('0') << rowEnd
+                << "]" << ::std::setfill(' ');
             ETCS_LOG("MemoryArena", row.str());
             row.str("");
             row.clear();
@@ -1906,7 +1906,7 @@ public:
  
         Chunk*            chunk = head_;
         long long         idx   = 0;
-        std::ostringstream row;
+        ::std::ostringstream row;
  
         while (chunk)
         {
@@ -1917,9 +1917,9 @@ public:
  
             if (isLarge) { row << RED_START; addr |= 1; }
  
-            row << std::hex << std::setw(12) << std::setfill('0')
+            row << ::std::hex << ::std::setw(12) << ::std::setfill('0')
                 << addr
-                << std::dec << std::setfill(' ');
+                << ::std::dec << ::std::setfill(' ');
  
             if (isLarge) row << RESET;
  
@@ -1940,7 +1940,7 @@ public:
             long long filled  = idx % columns;
             long long missing = columns - filled;
             for (long long i = 0; i < missing; ++i)
-                row << " " << std::setw(12) << std::setfill(' ') << "";
+                row << " " << ::std::setw(12) << ::std::setfill(' ') << "";
             flushRow(row, idx - filled, idx - 1);
         }
  
@@ -1967,7 +1967,7 @@ public:
         // the dependency on that reasoning staying correct forever.
         if (!parent_)
         {
-            std::lock_guard<std::mutex> pool_lock(poolMutex_);
+            ::std::lock_guard<::std::mutex> pool_lock(poolMutex_);
             for (auto& [base, slab] : slabs_by_base_)
             {
                 freePage(slab->base, kHugeSlabSize);
@@ -1982,7 +1982,7 @@ public:
     // --- Stats ---
     long long getCapacity() const
     {
-        std::lock_guard<std::mutex> lock(allocationMutex_);
+        ::std::lock_guard<::std::mutex> lock(allocationMutex_);
         long long total = 0;
         for (Chunk* c = head_; c; c = c->next) total += c->size;
         return total;
@@ -1990,7 +1990,7 @@ public:
  
     long long getUsage() const
     {
-        std::lock_guard<std::mutex> lock(allocationMutex_);
+        ::std::lock_guard<::std::mutex> lock(allocationMutex_);
         long long total = 0;
         for (Chunk* c = head_; c; c = c->next) total += c->used;
         return total;
@@ -1998,7 +1998,7 @@ public:
  
     long long getDtorRecordCount() const
     {
-        std::lock_guard<std::mutex> lock(allocationMutex_);
+        ::std::lock_guard<::std::mutex> lock(allocationMutex_);
         long long count = 0;
         for (DestructorRecord* r = dtorHead_; r; r = r->prev) count++;
         return count;
@@ -2023,7 +2023,7 @@ public:
     };
     PageUsageInfo queryPageUsage(char* page_addr)
     {
-        std::lock_guard<std::mutex> lock(poolMutex_);
+        ::std::lock_guard<::std::mutex> lock(poolMutex_);
         Slab* owner = resolveSlabLocked(page_addr);
         if (!owner) return PageUsageInfo{};
         return PageUsageInfo{true, owner->live_pages, Slab::kMaxPages, owner->base};

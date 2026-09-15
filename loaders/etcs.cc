@@ -17,6 +17,9 @@
 // `etcs` must pass -DETCS_REPL_SHELL. A target without it is the
 // daemon/environment binary.
 #undef ETCS_PRODUCTION_BUILD
+#if defined(__EMSCRIPTEN__)
+#include <emscripten.h>
+#endif
 #include "../ETCS.h"
 #include <fstream>
 #include <iostream>
@@ -28,10 +31,121 @@
 // ANSI codes when stdout is a terminal, empty strings when it is a pipe or a
 // file, in either binary. No fallback needed here.
 
+
+#if defined(__EMSCRIPTEN__)
+// Force a line to the page terminal even when main is spinning (no stop-script needed).
+inline void etcs_web_trace(const char* msg)
+{
+    EM_ASM({
+        var s = UTF8ToString($0);
+        if (typeof Module !== 'undefined' && Module.print)
+            Module.print(s + (s.endsWith('\n') ? "" : '\n'));
+        else
+            console.log(s);
+    }, msg);
+    ::std::fflush(stdout);
+    ::std::fflush(stderr);
+}
+#else
+inline void etcs_web_trace(const char*) {}
+#endif
+
+#if defined(__EMSCRIPTEN__)
+/*
+ * Browser line queue on MAIN so Module.ccall hits real symbols (not side-module
+ * stubs). Polling + emscripten_sleep live in CommandExecutor's ReplLineSource
+ * as *direct* calls from the main module -- ASYNCIFY cannot unwind through
+ * WorkBundle's indirect Shell.ReadLine path (unreachable on rewind).
+ */
+#include <deque>
+#include <mutex>
+#include <cstring>
+namespace {
+std::mutex g_etcs_web_line_mu;
+std::deque<std::string> g_etcs_web_lines;
+}
+extern "C" {
+
+EMSCRIPTEN_KEEPALIVE
+void etcs_web_shell_push_line(const char* line)
+{
+    if (!line) return;
+    std::lock_guard<std::mutex> lock(g_etcs_web_line_mu);
+    g_etcs_web_lines.emplace_back(line);
+}
+
+EMSCRIPTEN_KEEPALIVE
+int etcs_web_shell_try_pop_line(char* out, int cap)
+{
+    if (!out || cap < 2) return 0;
+    std::lock_guard<std::mutex> lock(g_etcs_web_line_mu);
+    if (g_etcs_web_lines.empty()) return 0;
+    std::string line = std::move(g_etcs_web_lines.front());
+    g_etcs_web_lines.pop_front();
+    if ((int)line.size() >= cap) line.resize((size_t)cap - 1);
+    std::memcpy(out, line.data(), line.size());
+    out[line.size()] = '\0';
+    return 1;
+}
+
+EMSCRIPTEN_KEEPALIVE
+void etcs_web_shell_write(const char* text)
+{
+    if (!text) return;
+    /*
+     * MAIN_THREAD_EM_ASM, NOT EM_ASM: callers include the REPL thread.
+     *
+     * EM_ASM runs in the CALLING thread's JS scope, and a Worker's scope has no
+     * document, no window and no etcsTermWrite -- output would land in a Worker
+     * console nobody reads while the terminal sat empty. This proxies to the
+     * page's scope, where the terminal is, for a postMessage per write.
+     */
+    MAIN_THREAD_EM_ASM({
+        var t = UTF8ToString($0);
+        if (typeof window.etcsTermWrite === 'function')
+            window.etcsTermWrite(t);
+        else if (typeof Module !== 'undefined' && Module.print)
+            Module.print(t);
+    }, text);
+}
+
+} // extern "C"
+#endif
+
 int main(int argc, char* argv[])
 {
     shell_startup();
+#if defined(__EMSCRIPTEN__)
+    /*
+     * STATIC HERE, because main() does not outlive the session in a browser.
+     *
+     * drive_main_loop_then_exit hands the REPL to a Worker and returns, so main()
+     * returns while that thread is still running and noExitRuntime keeps the page
+     * alive around it. As ordinary locals these would take the SignalContext the
+     * REPL thread uses, and the Root its entities are parented to, down with them.
+     *
+     * Otherwise identical to WIRE_CONTEXT, ctx included -- still parented to
+     * RootSignalContext(), so signal authority is unchanged.
+     */
+    static ETCS::SignalContext ctx;
+    ctx.setParent(&ETCS::RootSignalContext());
+    static ETCS::Root root(ctx);
+    static ETCS::ExecSource loader{"(loader)", 0};
+    static ETCS::ExecutionContext env(&root, &ctx);
+#else
     WIRE_CONTEXT();
+#endif
+#if defined(__EMSCRIPTEN__)
+    // 1) Bind modules on THIS thread via attachModule (no ChangeModuleEvent).
+    //    Ordering thread is still deferred — no concurrent LoaderStream consumer.
+    etcs_web_trace("[trace] before preload_web_modules");
+    ETCS::preload_web_modules(ctx);
+    etcs_web_trace("[trace] after preload_web_modules");
+    // 2) Then arm ThreadPool workers + loader ordering thread for the rest of the run.
+    etcs_web_trace("[trace] before etcs_boot_runtime_threads");
+    etcs_boot_runtime_threads();
+    etcs_web_trace("[trace] after etcs_boot_runtime_threads");
+#endif
     // drive_main_loop_then_exit (CommandExecutor.h) is what every path through
     // main() funnels through so that, once whichever top-level loop
     // applies actually returns -- the user leaving the REPL (`exit`/
@@ -50,6 +164,7 @@ int main(int argc, char* argv[])
         // wait_for_environment_drain returns immediately (see its own comment,
         // CommandExecutor.h, on why an empty registry is correct-and-trivial,
         // not an error) -- this is a legitimate, if uninteresting, no-op.
+        etcs_web_trace("[trace] before drive_main_loop_then_exit");
         return drive_main_loop_then_exit(ctx, 0);
     }
     // ── Script file mode ──────────────────────────────────────────────────────

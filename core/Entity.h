@@ -72,12 +72,12 @@ inline uint64_t generateRID()
 {
     static const uint64_t rid_seed = [](){
         char composed[256];
-        std::snprintf(composed, sizeof(composed), "%s.%s",
+        ::std::snprintf(composed, sizeof(composed), "%s.%s",
             ETCS_MODULE_NAME, Derived::TAG); // module name is defined in module decl
-        return XXH64(composed, std::strlen(composed), 0);
+        return XXH64(composed, ::std::strlen(composed), 0);
     }();
-    static std::atomic<uint64_t> counter{0};
-    uint64_t idx = counter.fetch_add(1, std::memory_order_relaxed);
+    static ::std::atomic<uint64_t> counter{0};
+    uint64_t idx = counter.fetch_add(1, ::std::memory_order_relaxed);
     return XXH64(&idx, sizeof(idx), rid_seed);
 }
 /*
@@ -125,14 +125,14 @@ inline ETCS::TagMask streamPairMask()
 inline ETCS::TagMask resolvePairModuleMask(const ETCS::Buffer& tag_a,
                                            const ETCS::Buffer& tag_b)
 {
-    static std::mutex m;
-    static std::unordered_map<std::string, ETCS::TagMask> cache;
+    static ::std::mutex m;
+    static ::std::unordered_map<::std::string, ETCS::TagMask> cache;
     /*
  * \x1f between the halves -- not a character a tag can contain, so "ab"+"c"
  * and "a"+"bc" cannot collide on one entry.
  */
-    std::string key = tag_a.toString() + "\x1f" + tag_b.toString();
-    std::lock_guard<std::mutex> g(m);
+    ::std::string key = tag_a.toString() + "\x1f" + tag_b.toString();
+    ::std::lock_guard<::std::mutex> g(m);
     auto it = cache.find(key);
     if (it != cache.end()) return it->second;
     /*
@@ -142,7 +142,7 @@ inline ETCS::TagMask resolvePairModuleMask(const ETCS::Buffer& tag_a,
     if (ETCS::EventNode::on_ordering_thread) return ETCS::TagMask::all();
     ETCS::PairMaskEvent evt(tag_a, tag_b);
     evt();
-    cache.emplace(std::move(key), evt.result);
+    cache.emplace(::std::move(key), evt.result);
     return evt.result;
 }
 
@@ -184,11 +184,11 @@ public:
     Module module_;
 private:
     template<typename K, typename V>
-    using ArenaMap = std::unordered_map<
+    using ArenaMap = ::std::unordered_map<
         K, V,
-        std::hash<K>,
-        std::equal_to<K>,
-        ArenaAllocator<std::pair<const K, V>>
+        ::std::hash<K>,
+        ::std::equal_to<K>,
+        ArenaAllocator<::std::pair<const K, V>>
     >;
     struct TagEntry
     {
@@ -204,11 +204,11 @@ private:
         ModuleBundle* bundle = nullptr;
         Entity*       child  = nullptr;
     };
-    mutable std::mutex                  m_tagMutex;
+    mutable ::std::mutex                  m_tagMutex;
     // The delete gate -- see tryHold() for what these two mean together and
     // why neither alone is enough.
-    std::atomic<int>                    lifetime_holds_{ 0 };
-    std::atomic<bool>                   retiring_{ false };
+    ::std::atomic<int>                    lifetime_holds_{ 0 };
+    ::std::atomic<bool>                   retiring_{ false };
     /*
  * ---------------------------------------------------------------------
  * owning_arena_ - the arena this entity's OWN outer object and its
@@ -318,7 +318,7 @@ private:
  * branch, under the same m_tagMutex lock and the same loader-ordering-
  * thread single-writer guarantee that branch already relies on.
  */
-    std::vector<ETCS::Buffer, ArenaAllocator<ETCS::Buffer>> typed_child_order_{
+    ::std::vector<ETCS::Buffer, ArenaAllocator<ETCS::Buffer>> typed_child_order_{
         ArenaAllocator<ETCS::Buffer>(local_arena_)
     };
     /*
@@ -501,7 +501,7 @@ private:
     template<typename Strategy, typename Page>
     Page* allocatePage(uint64_t rid)
     {
-        if constexpr (std::is_same<Strategy, ETCS::StrategyLMAX>::value)
+        if constexpr (::std::is_same<Strategy, ETCS::StrategyLMAX>::value)
         {
             return ETCS::LMAXSequentialSharedPage::allocate(
                 getArena(), rid, /* slot_count */ 64);
@@ -519,10 +519,10 @@ public:
                                                 : &MemoryArena::getInstance())
         , local_arena_(owning_arena_->allocate<MemoryArena>(
               DEFAULT_ARENA_START_PAGE, /* performance */ false))
-        , tags(ArenaAllocator<std::pair<const ETCS::Buffer, TagEntry>>(local_arena_))
-        , flags_(ArenaAllocator<std::pair<const ETCS::Buffer, bool>>(local_arena_))
-        , interface_pointers_(ArenaAllocator<std::pair<const ETCS::Buffer, void*>>(local_arena_))
-        , typed_children_(ArenaAllocator<std::pair<const ETCS::Buffer, RIDListHandle>>(local_arena_))
+        , tags(ArenaAllocator<::std::pair<const ETCS::Buffer, TagEntry>>(local_arena_))
+        , flags_(ArenaAllocator<::std::pair<const ETCS::Buffer, bool>>(local_arena_))
+        , interface_pointers_(ArenaAllocator<::std::pair<const ETCS::Buffer, void*>>(local_arena_))
+        , typed_children_(ArenaAllocator<::std::pair<const ETCS::Buffer, RIDListHandle>>(local_arena_))
     {}
     /*
  * -----------------------------------------------------------------------
@@ -573,7 +573,7 @@ public:
  * `this` once more before its own next isInterrupted() check.
  * Same, already-accepted property every other volatile
  * sig_atomic_t signal in this codebase already has (a cross-
- * thread signal-handler-safety primitive, not std::atomic) --
+ * thread signal-handler-safety primitive, not ::std::atomic) --
  * not a new weakness this introduces.
  * Last resort only. By the time this runs the destructor has already
  * begun, so signalling here cannot prevent a concurrent scope from
@@ -584,7 +584,7 @@ public:
  * Root leaving scope), where signalling late beats not signalling.
  */
         {
-            std::lock_guard<std::mutex> lock(m_tagMutex);
+            ::std::lock_guard<::std::mutex> lock(m_tagMutex);
             scope_.interruptAll();
         }
         destructed_ = true;
@@ -720,12 +720,12 @@ public:
     }
     template<class F, class... Args>
     auto schedule(int priority, SignalContext ctx, F&& f, Args&&... args)
-        -> std::future<std::invoke_result_t<F, Args...>>
+        -> ::std::future<::std::invoke_result_t<F, Args...>>
     {
         return getThreadPool().enqueue(
             priority, ctx,
-            std::forward<F>(f),
-            std::forward<Args>(args)...
+            ::std::forward<F>(f),
+            ::std::forward<Args>(args)...
         );
     }
     /*
@@ -762,8 +762,8 @@ public:
     {
         const char* s = flag.c_str();
         if (!s || !s[0] || s[0] < 'a' || s[0] > 'z')
-            throw std::invalid_argument(
-                std::string("addTag: flag must start with a lowercase letter: ")
+            throw ::std::invalid_argument(
+                ::std::string("addTag: flag must start with a lowercase letter: ")
                 + (s ? s : ""));
         return ETCS::TagModifyEvent{this, flag, false, &Entity::tagModifyImpl}();
     }
@@ -777,8 +777,8 @@ public:
     {
         const char* s = flag.c_str();
         if (!s || !s[0] || s[0] < 'a' || s[0] > 'z')
-            throw std::invalid_argument(
-                std::string("addTag: flag must start with a lowercase letter: ")
+            throw ::std::invalid_argument(
+                ::std::string("addTag: flag must start with a lowercase letter: ")
                 + (s ? s : ""));
         return ETCS::TagModifyEvent{this, flag, false, &Entity::tagModifyImpl, extra}();
     }
@@ -820,11 +820,11 @@ public:
     template<typename T, typename... Args>
     T* addTag(Args&&... args)
     {
-        static_assert(std::is_base_of<Entity, T>::value,
+        static_assert(::std::is_base_of<Entity, T>::value,
                       "addTag<T>: T must derive from Entity");
         MemoryArena* saved = s_pending_parent_arena_;
         s_pending_parent_arena_ = &getArena();
-        T* child = getArena().allocate<T>(std::forward<Args>(args)...);
+        T* child = getArena().allocate<T>(::std::forward<Args>(args)...);
         s_pending_parent_arena_ = saved;
         child->getArena().setScopeTag(T::CONTRACT_TAG);   /*
  * CONTRACT_TAG -- not getSourceTag(), still empty here (setModuleSource
@@ -874,10 +874,10 @@ public:
     {
         const char* s = type_tag.c_str();
         if (!s || !s[0] || s[0] < 'A' || s[0] > 'Z')
-            throw std::invalid_argument(
-                std::string("addTypeTag: type tag must start with an uppercase letter: ")
+            throw ::std::invalid_argument(
+                ::std::string("addTypeTag: type tag must start with an uppercase letter: ")
                 + (s ? s : ""));
-        std::lock_guard<std::mutex> lock(m_tagMutex);
+        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
         tags.emplace(type_tag, TagEntry{});
     }
 
@@ -903,7 +903,7 @@ public:
 
     void removeTypedChild(RID rid)
     {
-        std::lock_guard<std::mutex> lock(m_tagMutex);
+        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
         for (auto& [tag, handle] : typed_children_)
         {
             if (handle.invoke_contains(rid))
@@ -923,14 +923,14 @@ public:
  * can inspect what's actually live without touching typed_children_
  * directly.
  */
-    void getTypedChildren(std::vector<std::pair<ETCS::Buffer, RID>>& out) const
+    void getTypedChildren(::std::vector<::std::pair<ETCS::Buffer, RID>>& out) const
     {
-        std::lock_guard<std::mutex> lock(m_tagMutex);
+        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
         for (const auto& tag : typed_child_order_)
         {
             auto it = typed_children_.find(tag);
             if (it == typed_children_.end()) continue;
-            std::vector<RID> rids;
+            ::std::vector<RID> rids;
             it->second.invoke_collect_rids(rids);
             for (RID r : rids) out.emplace_back(tag, r);
         }
@@ -958,14 +958,14 @@ public:
  * cross-group step is a stable merge over an almost-sorted sequence instead
  * of a full sort over an arbitrary one.
  */
-    void getOrderedTypedChildren(std::vector<std::pair<ETCS::Buffer, RID>>& out) const
+    void getOrderedTypedChildren(::std::vector<::std::pair<ETCS::Buffer, RID>>& out) const
     {
-        std::lock_guard<std::mutex> lock(m_tagMutex);
+        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
         for (const auto& tag : typed_child_order_)
         {
             auto it = typed_children_.find(tag);
             if (it == typed_children_.end()) continue;
-            std::vector<RID> rids;
+            ::std::vector<RID> rids;
             it->second.invoke_collect_rids_ordered(rids);
             for (RID r : rids) out.emplace_back(tag, r);
         }
@@ -985,13 +985,13 @@ public:
  */
     void reorderTypedChild(RID rid)
     {
-        std::lock_guard<std::mutex> lock(m_tagMutex);
+        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
         for (auto& entry : typed_children_)
             if (entry.second.invoke_contains(rid)) { entry.second.invoke_reorder(); return; }
     }
     Entity* getTypedChild(const ETCS::Buffer& tag, RID rid) const
     {
-        std::lock_guard<std::mutex> lock(m_tagMutex);
+        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
         auto it = typed_children_.find(tag);
         if (it == typed_children_.end()) return nullptr;
         return it->second.invoke_get(rid);
@@ -1001,9 +1001,9 @@ public:
  * "active_scope_<label>" flag string is ScopeTag's own business now, and
  * the registry has no reason to store the prefix on every entry.
  */
-    Scope::Registration registerScope(const std::string& label, const SignalContext& ctx)
+    Scope::Registration registerScope(const ::std::string& label, const SignalContext& ctx)
     {
-        std::lock_guard<std::mutex> lock(m_tagMutex);
+        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
         return scope_.registerContext(label, ctx);
     }
     /*
@@ -1012,9 +1012,9 @@ public:
  * carrying that label. See Scope's own comment for why index is a
  * position rather than an identity.
  */
-    bool interruptScopeAt(const std::string& label, size_t index)
+    bool interruptScopeAt(const ::std::string& label, size_t index)
     {
-        std::lock_guard<std::mutex> lock(m_tagMutex);
+        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
         return scope_.interruptAt(label, index);
     }
 
@@ -1026,9 +1026,9 @@ public:
  * signalled, so a caller can distinguish "asked several to stop" from
  * "there was nothing by that name".
  */
-    size_t interruptAllOfLabel(const std::string& label)
+    size_t interruptAllOfLabel(const ::std::string& label)
     {
-        std::lock_guard<std::mutex> lock(m_tagMutex);
+        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
         return scope_.interruptLabel(label);
     }
 
@@ -1037,9 +1037,9 @@ public:
  * index, so what a caller sees and what it can subsequently target are
  * produced identically.
  */
-    void collectScopes(std::vector<Scope::View>& out) const
+    void collectScopes(::std::vector<Scope::View>& out) const
     {
-        std::lock_guard<std::mutex> lock(m_tagMutex);
+        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
         scope_.collect(out);
     }
     /*
@@ -1049,17 +1049,17 @@ public:
  */
     void interruptAllScopes()
     {
-        std::lock_guard<std::mutex> lock(m_tagMutex);
+        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
         scope_.interruptAll();
     }
     Scope::Removal unregisterScope(uint64_t scope_id)
     {
-        std::lock_guard<std::mutex> lock(m_tagMutex);
+        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
         return scope_.unregisterContext(scope_id);
     }
     bool anyScopeActive() const
     {
-        std::lock_guard<std::mutex> lock(m_tagMutex);
+        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
         return !scope_.empty();
     }
     /*
@@ -1082,7 +1082,7 @@ public:
     {
         /*
  * newParent == this would self-deadlock on the second lock below
- * (std::mutex is not recursive) and is meaningless anyway. nullptr
+ * (::std::mutex is not recursive) and is meaningless anyway. nullptr
  * never reaches here from the real caller -- run_entity_delete's
  * non-global branch is gated on getParent() != nullptr -- but this
  * is public, so it's checked rather than assumed.
@@ -1111,8 +1111,8 @@ public:
  * parent's list by a concurrent getTypedChildren()/getTypedChild()
  * on some other thread.
  */
-        std::lock_guard<std::mutex> self_lock(m_tagMutex);
-        std::lock_guard<std::mutex> dest_lock(newParent->m_tagMutex);
+        ::std::lock_guard<::std::mutex> self_lock(m_tagMutex);
+        ::std::lock_guard<::std::mutex> dest_lock(newParent->m_tagMutex);
         for (auto& [tag, handle] : typed_children_)
         {
             /*
@@ -1120,13 +1120,13 @@ public:
  * a live iterator would be walking, so the RIDs have to be
  * collected before any mutation begins.
  */
-            std::vector<ETCS::RID> child_rids;
+            ::std::vector<ETCS::RID> child_rids;
             handle.invoke_collect_rids(child_rids);
             if (child_rids.empty()) continue;
             /*
  * Pointer into newParent's own map, not an iterator: emplace()
  * below can rehash, which invalidates iterators but NOT
- * references or pointers to elements (std::unordered_map is
+ * references or pointers to elements (::std::unordered_map is
  * node-based, and ArenaMap only changes where those nodes are
  * allocated from, not that guarantee).
  */
@@ -1227,7 +1227,7 @@ public:
  */
     void addTag(ModuleBundle& bundle, ETCS::Entity* child = nullptr)
     {
-        std::lock_guard<std::mutex> lock(m_tagMutex);
+        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
     /*
  * Overwriting assignment, NOT emplace -- addTypeTag (below) can
  * already have inserted a BARE marker (TagEntry{}, null bundle)
@@ -1299,7 +1299,7 @@ public:
  */
     bool hasTag(const ETCS::Buffer& tag) const
     {
-        std::lock_guard<std::mutex> lock(m_tagMutex);
+        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
         const char* s = tag.c_str();
         bool is_flag = s && s[0] >= 'a' && s[0] <= 'z';
         return is_flag ? (flags_.find(tag) != flags_.end())
@@ -1345,24 +1345,24 @@ public:
         }
         return it->second.bundle;
     }
-    void getTags(std::vector<ETCS::Buffer>& result) const
+    void getTags(::std::vector<ETCS::Buffer>& result) const
     {
-        std::lock_guard<std::mutex> lock(m_tagMutex);
+        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
         for (auto const& [key, _] : tags) result.push_back(key);
     }
-    void getFlags(std::vector<ETCS::Buffer>& result) const
+    void getFlags(::std::vector<ETCS::Buffer>& result) const
     {
-        std::lock_guard<std::mutex> lock(m_tagMutex);
+        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
         for (auto const& [key, _] : flags_) result.push_back(key);
     }
     void registerInterfacePointer(const ETCS::Buffer& family, void* ptr)
     {
-        std::lock_guard<std::mutex> lock(m_tagMutex);
+        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
         interface_pointers_[family] = ptr;
     }
     void* getInterfacePointer(const ETCS::Buffer& family) const
     {
-        std::lock_guard<std::mutex> lock(m_tagMutex);
+        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
         auto it = interface_pointers_.find(family);
         return it != interface_pointers_.end() ? it->second : nullptr;
     }
@@ -1409,24 +1409,24 @@ public:
  */
     bool tryHold()
     {
-        if (retiring_.load(std::memory_order_seq_cst)) return false;
-        lifetime_holds_.fetch_add(1, std::memory_order_seq_cst);
+        if (retiring_.load(::std::memory_order_seq_cst)) return false;
+        lifetime_holds_.fetch_add(1, ::std::memory_order_seq_cst);
         // Re-read AFTER the raise: beginRetire may have landed in between, and
         // it reads the count after its own store. Two seq_cst pairs, so
         // "I got a hold" and "I saw nobody holding" cannot both be true.
-        if (retiring_.load(std::memory_order_seq_cst))
+        if (retiring_.load(::std::memory_order_seq_cst))
         {
-            lifetime_holds_.fetch_sub(1, std::memory_order_seq_cst);
+            lifetime_holds_.fetch_sub(1, ::std::memory_order_seq_cst);
             return false;
         }
         return true;
     }
-    void releaseHold() { lifetime_holds_.fetch_sub(1, std::memory_order_seq_cst); }
+    void releaseHold() { lifetime_holds_.fetch_sub(1, ::std::memory_order_seq_cst); }
 
     // Callable from anywhere: has the gate closed on this entity? A false is
     // only a snapshot -- take a hold if you are about to USE it.
-    bool isRetiring() const { return retiring_.load(std::memory_order_seq_cst); }
-    void beginRetire()      { retiring_.store(true, std::memory_order_seq_cst); }
+    bool isRetiring() const { return retiring_.load(::std::memory_order_seq_cst); }
+    void beginRetire()      { retiring_.store(true, ::std::memory_order_seq_cst); }
 
     // True once nothing is inside. The deadline is so that a walk which breaks
     // the no-event rule degrades to the old behaviour with a line naming it,
@@ -1435,19 +1435,19 @@ public:
     {
         for (int waited = 0; waited < budget_ms; ++waited)
         {
-            if (lifetime_holds_.load(std::memory_order_seq_cst) == 0) return true;
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            if (lifetime_holds_.load(::std::memory_order_seq_cst) == 0) return true;
+            ::std::this_thread::sleep_for(::std::chrono::milliseconds(1));
         }
-        return lifetime_holds_.load(std::memory_order_seq_cst) == 0;
+        return lifetime_holds_.load(::std::memory_order_seq_cst) == 0;
     }
-    int lifetimeHolds() const { return lifetime_holds_.load(std::memory_order_seq_cst); }
+    int lifetimeHolds() const { return lifetime_holds_.load(::std::memory_order_seq_cst); }
 
-    void getInterfaceFamilies(std::vector<ETCS::Buffer>& result) const
+    void getInterfaceFamilies(::std::vector<ETCS::Buffer>& result) const
     {
-        std::lock_guard<std::mutex> lock(m_tagMutex);
+        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
         for (auto const& [family, _] : interface_pointers_) result.push_back(family);
     }
-    void getAllActions(std::vector<ETCS::Buffer>& all_actions)
+    void getAllActions(::std::vector<ETCS::Buffer>& all_actions)
     {
         for (auto const& [tag_name, entry] : tags)
         {
@@ -1693,7 +1693,7 @@ public:
                     (*b)(producer_entity->getRID(), producer_entity->myConjugateKey(),
                          action, transportProducer, ctx);
             }
-            catch (const std::exception& e)
+            catch (const ::std::exception& e)
             {
                 ETCS_LOG("[CALL]", "Producer failed: " << e.what());
             }
@@ -1748,7 +1748,7 @@ public:
  */
             consumer.closeRead();
 
-            using namespace std::chrono;
+            using namespace ::std::chrono;
             const auto deadline = steady_clock::now() + seconds(2);
             while (producer.producerBusy())
             {
@@ -1760,7 +1760,7 @@ public:
                                 "interrupt.");
                     break;
                 }
-                std::this_thread::sleep_for(milliseconds(1));
+                ::std::this_thread::sleep_for(milliseconds(1));
             }
         };
         try
@@ -1768,7 +1768,7 @@ public:
             if (ModuleBundle* b = safeBundleFor(tag_type_r, "consumer"))
                 (*b)(getRID(), myConjugateKey(), action_r, transportConsumer, ctx);
         }
-        catch (const std::exception& e)
+        catch (const ::std::exception& e)
         {
             ETCS_LOG("[CALL]", "Consumer failed: " << e.what());
             wait_for_producer();
@@ -1878,7 +1878,7 @@ public:
                 (*b)(producer_entity->getRID(), producer_entity->myConjugateKey(),
                          action, transportProducer, ctx);
         }
-        catch (const std::exception& e)
+        catch (const ::std::exception& e)
         {
             ETCS_LOG("[CALL] Producer failed: " << e.what());
         }
@@ -1887,7 +1887,7 @@ public:
             if (ModuleBundle* b = safeBundleFor(tag_type_r, "consumer"))
                 (*b)(getRID(), myConjugateKey(), action_r, transportConsumer, ctx);
         }
-        catch (const std::exception& e)
+        catch (const ::std::exception& e)
         {
             ETCS_LOG("[CALL] Consumer failed: " << e.what());
             ETCS::MirrorBuffer::teardownPair<Strategy, Page>(producer, consumer, page);
@@ -1896,20 +1896,20 @@ public:
         ETCS::MirrorBuffer::teardownPair<Strategy, Page>(producer, consumer, page);
     }
  
-    static std::pair<ETCS::Buffer, ETCS::Buffer> parseConjugateActionKey(const ETCS::Buffer& key)
+    static ::std::pair<ETCS::Buffer, ETCS::Buffer> parseConjugateActionKey(const ETCS::Buffer& key)
     {
         const char* raw = key.c_str();
-        const char* dot = std::strchr(raw, '.');
+        const char* dot = ::std::strchr(raw, '.');
         if (!dot || dot == raw || dot == raw + key.written)
-            throw std::runtime_error(std::string("Invalid component key format. Expected 'tag_type.action'. Received: ") + raw);
+            throw ::std::runtime_error(::std::string("Invalid component key format. Expected 'tag_type.action'. Received: ") + raw);
         ETCS::Buffer tag_type, action;
         size_t tag_len = static_cast<size_t>(dot - raw);
-        std::memcpy(tag_type.buf, raw, tag_len);
+        ::std::memcpy(tag_type.buf, raw, tag_len);
         tag_type.buf[tag_len] = '\0';
         tag_type.written = tag_len;
         const char* action_start = dot + 1;
         size_t action_len = key.written - tag_len - 1;
-        std::memcpy(action.buf, action_start, action_len);
+        ::std::memcpy(action.buf, action_start, action_len);
         action.buf[action_len] = '\0';
         action.written = action_len;
         return {tag_type, action};
@@ -1982,7 +1982,7 @@ public:
     virtual bool myTagInto(ETCS::Buffer& buffer)
     {
         const char* tag_str = myTag();
-        size_t tag_len = std::strlen(tag_str);
+        size_t tag_len = ::std::strlen(tag_str);
         size_t required_space = tag_len + 1;
  
         if (buffer.written + required_space > buffer.bufsize)
@@ -1992,7 +1992,7 @@ public:
             return false;
         }
  
-        std::memcpy(buffer.buf + buffer.written, tag_str, tag_len);
+        ::std::memcpy(buffer.buf + buffer.written, tag_str, tag_len);
         buffer.buf[buffer.written + tag_len] = '\0';
         buffer.written += tag_len;
         return true;
@@ -2088,7 +2088,7 @@ public:
     {
         auto it = tags.find(getSourceTag());
         if (it == tags.end())
-            throw std::runtime_error("mySelf(): no tags entry for source tag '"
+            throw ::std::runtime_error("mySelf(): no tags entry for source tag '"
                 + getSourceTag().toString() + "' on entity of type " + myTag());
         return *(it->second.bundle);
     }
@@ -2206,7 +2206,7 @@ private:
     {
         if (!is_remove)
         {
-            std::lock_guard<std::mutex> lock(target->m_tagMutex);
+            ::std::lock_guard<::std::mutex> lock(target->m_tagMutex);
             return target->flags_.emplace(key, true).second;
         }
  
@@ -2229,13 +2229,13 @@ private:
  * actually leaves.
  */
         {
-            const std::string key_full = key.toString();
-            const std::string prefix   = ETCS::ScopeTag::kPrefix;
+            const ::std::string key_full = key.toString();
+            const ::std::string prefix   = ETCS::ScopeTag::kPrefix;
             if (key_full.size() > prefix.size()
                 && key_full.compare(0, prefix.size(), prefix) == 0)
             {
-                const std::string label = key_full.substr(prefix.size());
-                std::lock_guard<std::mutex> lock(target->m_tagMutex);
+                const ::std::string label = key_full.substr(prefix.size());
+                ::std::lock_guard<::std::mutex> lock(target->m_tagMutex);
                 /*
  * COARSE by design: this flag is shared by every live call
  * carrying `label`, so removing it asks all of them to stop.
@@ -2254,7 +2254,7 @@ private:
             }
         }
  
-        std::string key_str = key.toString();
+        ::std::string key_str = key.toString();
         if (key_str == target->myTag() || key_str == target->getSourceTag().toString())
         {
             ETCS_LOG("Entity", "removeTag: '" << key_str
@@ -2265,7 +2265,7 @@ private:
         Entity* child_to_delete = nullptr;
         bool    changed          = false;
         {
-            std::lock_guard<std::mutex> lock(target->m_tagMutex);
+            ::std::lock_guard<::std::mutex> lock(target->m_tagMutex);
             auto it = target->tags.find(key);
             /*
  * A BARE IS-A MARKER IS NOT REMOVABLE, and this is the other half of
@@ -2352,7 +2352,7 @@ private:
 template<typename T>
     static RID addTagTrampoline(Entity* parent, Entity* child, const ETCS::Buffer& tag)
     {
-        std::lock_guard<std::mutex> lock(parent->m_tagMutex);
+        ::std::lock_guard<::std::mutex> lock(parent->m_tagMutex);
  
         auto it = parent->typed_children_.find(tag);
         if (it == parent->typed_children_.end())
@@ -2500,7 +2500,7 @@ inline ETCS::ScopeTag::ScopeTag(ETCS::Entity* entity, const char* label,
  * instance, and the per-instance targeting moved to a real interface that
  * can carry an index.
  */
-    tag = ETCS::Buffer((std::string(kPrefix) + label).c_str());
+    tag = ETCS::Buffer((::std::string(kPrefix) + label).c_str());
     /*
  * Register BEFORE addTag, same reversal as before: registerScope is a
  * plain locked insert on THIS thread; addTag fires a blocking
@@ -2548,15 +2548,222 @@ inline ETCS::ScopeTag::ScopeTag(ETCS::Entity* entity, const char* label,
  * Null means gone -- a real answer, not an error.
  */
 ETCS::EventNode* etcs_loader_event_node();   // defined in DynamicLoader.h
+
+/*
+ * THE BARE NAME IS THE KEY, and a "Module:Tag" spelling is accepted and
+ * reduced rather than looked up.
+ *
+ * Callers hand over both shapes and always will: a conjugate_key is built as
+ * getSourceModule() + ":" + getSourceTag() because THAT string is what routes
+ * a DestroyEvent, so the same string arrives here wanting a list. The module
+ * half carries no information a list lookup can use -- which list a name names
+ * is settled by which image you are asking, not by a substring -- so it is
+ * stripped once, here, and nothing downstream sees a prefix. That is the whole
+ * of what "the origin prefix adds no info" means, and it is true of the KEY;
+ * see EventNode::ridMirror for the part of the distinction that is real and
+ * where it moved to.
+ */
+inline ETCS::Buffer etcs_bare_family_key(const ETCS::Buffer& key)
+{
+    const ::std::string s = key.toString();
+    const auto pos = s.rfind(':');
+    if (pos == ::std::string::npos || pos + 1 >= s.size()) return key;
+    ETCS::Buffer bare;
+    bare.writeString(s.c_str() + static_cast<::std::ptrdiff_t>(pos + 1));
+    return bare;
+}
+
+/*
+ * The list in the asked-of image, if that image publishes this name.
+ *
+ * OWN MAP ONLY -- the mirror is deliberately not consulted here, because this
+ * overload answers with ONE handle and the mirror's answer is a set. A caller
+ * that has a RID wants etcs_ridmap_row below, which can pick; a caller that
+ * only wants to know whether a name is published at all (a catalog listing, a
+ * live count) wants exactly this.
+ */
+inline ETCS::RIDListHandle* etcs_ridmap_handle(ETCS::EventNode* owner,
+                                                const ETCS::Buffer& key)
+{
+    if (!owner || key.written == 0) return nullptr;
+    const ETCS::Buffer bare = etcs_bare_family_key(key);
+    auto it = owner->ridMap.find(bare);
+    return (it != owner->ridMap.end()) ? &it->second : nullptr;
+}
+inline ETCS::RIDListHandle* etcs_ridmap_handle(ETCS::EventNode* owner,
+                                                const ::std::string& key)
+{
+    return etcs_ridmap_handle(owner, ETCS::Buffer(key.c_str()));
+}
+
+/*
+ * THE LIST A NAME NAMES, WITH NO RID TO DISAMBIGUATE -- for the questions that
+ * are about the list rather than about an entity in it: is this type published,
+ * how many are live, search it by order.
+ *
+ * Takes "Module:Tag" or a bare tag. A per-TYPE name has one publisher, so its
+ * mirror bucket has one row and there is nothing to choose; a FAMILY name has
+ * several, and with no RID and no module named there is no answer, so it says
+ * so by returning null rather than picking the first. That refusal is the same
+ * one resolve_in_family makes on a genuine ambiguity, and for the same reason:
+ * a wrong answer here looks exactly like a right one.
+ */
+inline ETCS::RIDListHandle* etcs_ridmap_named(ETCS::EventNode* owner,
+                                              const ETCS::Buffer& key)
+{
+    if (!owner || key.written == 0) return nullptr;
+    const ::std::string s = key.toString();
+    const auto colon = s.rfind(':');
+    const ::std::string wanted = (colon == ::std::string::npos)
+                                 ? ::std::string() : s.substr(0, colon);
+    const ETCS::Buffer bare = etcs_bare_family_key(key);
+
+    /*
+ * A NAMED MODULE IS ANSWERED BY THAT MODULE OR NOT AT ALL. The caller said
+ * which; substituting a different provider's list would be answering a
+ * question nobody asked.
+ */
+    if (!wanted.empty())
+    {
+        if (wanted == (owner->scope ? owner->scope : ""))
+        {
+            auto it = owner->ridMap.find(bare);
+            return (it != owner->ridMap.end()) ? &it->second : nullptr;
+        }
+        auto mirror = owner->ridMirror.find(bare);
+        if (mirror != owner->ridMirror.end())
+        {
+            for (auto& row : mirror->second)
+                if (row.module.toString() == wanted) return &row.handle;
+            // The name IS mirrored, just not by that module. A different
+            // provider's list is not an answer to a question that named one.
+            return nullptr;
+        }
+        /*
+ * NO MIRROR BUCKET AT ALL MEANS THERE IS ONLY ONE IMAGE, so this image is that
+ * module -- and the own map is the answer whatever the qualifier says.
+ *
+ * THIS IS THE COLLAPSED BUILD, and getting it wrong is what a single address
+ * space does to an assumption built on several. A mirror row is how a SEPARATE
+ * image announces a list; under emscripten (and the kernel path later) the
+ * module's EventNode IS the loader's, registerLoader detects the identity and
+ * skips the absorb, so every module's list sits in ridMap and ridMirror is
+ * empty. Asking for "WindowProvider:Window" then looked for a mirror row tagged
+ * WindowProvider, found no mirror whatsoever, and refused -- with the list
+ * sitting in the very map it had just declined to read. Every QUALIFIED lookup
+ * in the browser failed that way, which is a whole class of them: a shell
+ * re-resolving the entity it is standing on, a global name being checked for
+ * liveness, a bound entity being reached by conjugate key.
+ *
+ * In a multi-image build this fires only when nothing mirrored the name, where
+ * the own map is the sole candidate anyway -- so the rule is not a special case
+ * for one platform, it is the general statement the mirror was always making.
+ */
+        auto it = owner->ridMap.find(bare);
+        return (it != owner->ridMap.end()) ? &it->second : nullptr;
+    }
+
+    /*
+ * THE MIRROR FIRST, AND THE OWN MAP ONLY AS A FALLBACK -- the opposite of what
+ * reads naturally, and the order matters.
+ *
+ * In a LOADER build the loader's own ridMap has a row for every family in
+ * ontology.h, because ETCS_SUPERTYPE_BASE publishes one wherever the header is
+ * included -- and every one of them is EMPTY, since nothing is ever constructed
+ * in the loader's own image. Preferring the own map therefore shadowed the
+ * mirror with an empty list: a live-count for a family read 0 with entities in
+ * it, and this helper reported a multi-provider family as unambiguous. Caught by
+ * FamilyMirrorTesterLoader asserting the refusal below.
+ *
+ * So: one publisher is an answer, several is the ambiguity this refuses rather
+ * than guesses, and none means nobody but possibly this image has the name.
+ */
+    auto mirror = owner->ridMirror.find(bare);
+    if (mirror != owner->ridMirror.end())
+    {
+        auto& rows = mirror->second;
+        if (rows.size() == 1) return &rows.front().handle;
+        if (rows.size() > 1)  return nullptr;
+    }
+    auto it = owner->ridMap.find(bare);
+    return (it != owner->ridMap.end()) ? &it->second : nullptr;
+}
+
+/*
+ * THE LIST THAT ACTUALLY HOLDS THAT RID -- own map first, then every image
+ * that published the name.
+ *
+ * The RID is what makes a single answer possible where the name alone cannot
+ * give one. Nine providers publish "Deletable"; exactly one of their lists
+ * contains a given RID, so asking with the RID in hand is asking a question
+ * that HAS one answer, and the mirror walk is how it is found. Without the
+ * RID the honest answer is the set, which is collect_in_family's job.
+ *
+ * `which` reports the publishing module when the answer came out of the
+ * mirror, and is left untouched when it came out of the caller's own map --
+ * the ambiguity report and the unload log both want to name a provider, and
+ * reconstructing one by parsing a key string is what this replaces.
+ */
+inline ETCS::RIDListHandle* etcs_ridmap_row(ETCS::EventNode* owner,
+                                            const ETCS::Buffer& key, RID rid,
+                                            ETCS::Buffer* which = nullptr)
+{
+    if (!owner || key.written == 0 || rid == 0) return nullptr;
+    const ETCS::Buffer bare = etcs_bare_family_key(key);
+
+    auto it = owner->ridMap.find(bare);
+    if (it != owner->ridMap.end() && it->second.invoke_contains(rid))
+        return &it->second;
+
+    auto mirror = owner->ridMirror.find(bare);
+    if (mirror == owner->ridMirror.end()) return nullptr;
+    for (auto& row : mirror->second)
+        if (row.handle.invoke_contains(rid))
+        {
+            if (which) *which = row.module;
+            return &row.handle;
+        }
+    return nullptr;
+}
+
+/*
+ * AN ENTITY FROM A BARE RID, WITH NO TYPE AND NO FAMILY -- own lists first,
+ * then every image that published into the mirror.
+ *
+ * Sound because RIDs are runtime-unique, so the first hit is the only hit. USE
+ * ONLY WHEN THE TYPE IS GENUINELY UNKNOWN: it touches every row, where naming
+ * the type touches one.
+ *
+ * IT EXISTS HERE SO THAT IT EXISTS ONCE. This walk was hand-written in four
+ * modules (ConnectionManager, HttpServer, TarpitNode, ForumNode), each reading
+ * ETCS::getLoader().ridMap directly, because ridMap is a public member and the
+ * loop is three lines. When the absorbed lists moved from ridMap into ridMirror,
+ * all four silently stopped finding anything -- a subscriber that registered
+ * fine and then "no longer resolved" at dispatch, self-healed out of its own
+ * list, and a server that accepted connections and dropped every one. Four
+ * copies of a walk is four places a storage change has to be noticed, and it
+ * was noticed in none of them. So the walk is an accessor now, and a module
+ * that wants a bare RID asks rather than iterates.
+ */
+inline Entity* etcs_resolve_rid_anywhere(ETCS::EventNode* owner, RID rid)
+{
+    if (!owner || rid == 0) return nullptr;
+    for (auto& entry : owner->ridMap)
+        if (Entity* e = entry.second.invoke_get(rid)) return e;
+    for (auto& bucket : owner->ridMirror)
+        for (auto& row : bucket.second)
+            if (Entity* e = row.handle.invoke_get(rid)) return e;
+    return nullptr;
+}
+
 inline Entity* etcs_resolve_by_key(const ETCS::Buffer& conjugate_key, RID rid)
 {
     if (rid == 0 || conjugate_key.written == 0) return nullptr;
     ETCS::EventNode* owner = etcs_loader_event_node();
     if (!owner) return nullptr;
-    auto it = owner->ridMap.find(conjugate_key);
-    if (it == owner->ridMap.end()) return nullptr;
-    if (!it->second.invoke_contains(rid)) return nullptr;
-    return it->second.invoke_get(rid);
+    ETCS::RIDListHandle* h = etcs_ridmap_row(owner, conjugate_key, rid);
+    if (!h) return nullptr;
+    return h->invoke_get(rid);
 }
 
 inline ETCS::ScopeTag::~ScopeTag()
@@ -2605,15 +2812,15 @@ inline HASH_TYPE GenerateEnvironmentSignature(const ETCS::Buffer& uniqueName)
  
     auto& manifest = ETCS::Entity::getManifest();
     for (auto const& [key, val] : manifest) {
-        picohash_update(&ctx, key, std::strlen(key));
-        picohash_update(&ctx, val, std::strlen(val));
+        picohash_update(&ctx, key, ::std::strlen(key));
+        picohash_update(&ctx, val, ::std::strlen(val));
     }
  
     unsigned char digest[PICOHASH_SHA256_DIGEST_LENGTH];
     picohash_final(&ctx, digest);
  
     HASH_TYPE result;
-    std::memcpy(&result, digest, sizeof(HASH_TYPE));
+    ::std::memcpy(&result, digest, sizeof(HASH_TYPE));
     return result;
 }
  
@@ -2812,7 +3019,7 @@ public:
  * method on Entity/Root lives there rather than here).
  * -----------------------------------------------------------------------
  */
-    void changeModule(const std::string& targetModule);
+    void changeModule(const ::std::string& targetModule);
  
 private:
     const uint64_t m_rid = ETCS::generateRID<Root>();
@@ -2843,7 +3050,7 @@ inline ETCS::Module& ETCS::LifetimeOwner::module() const
         case Kind::Entity: return as_entity->module_;
         case Kind::Root:   return as_root->module_;
         default:
-            throw std::runtime_error(
+            throw ::std::runtime_error(
                 "LifetimeOwner::module(): kind is None -- nothing to dereference.");
     }
 }
@@ -2851,14 +3058,14 @@ inline ETCS::Module& ETCS::LifetimeOwner::module() const
 inline ETCS::Entity& ETCS::LifetimeOwner::asEntity() const
 {
     if (kind != Kind::Entity)
-        throw std::runtime_error("LifetimeOwner::asEntity(): does not hold an Entity.");
+        throw ::std::runtime_error("LifetimeOwner::asEntity(): does not hold an Entity.");
     return *as_entity;
 }
  
 inline ETCS::Root& ETCS::LifetimeOwner::asRoot() const
 {
     if (kind != Kind::Root)
-        throw std::runtime_error("LifetimeOwner::asRoot(): does not hold a Root.");
+        throw ::std::runtime_error("LifetimeOwner::asRoot(): does not hold a Root.");
     return *as_root;
 }
  
@@ -2897,9 +3104,9 @@ inline ETCS::Root& ETCS::LifetimeOwner::asRoot() const
 template<typename T, typename... Args>
 T* spawn(Args&&... args)
 {
-    static_assert(std::is_base_of<Entity, T>::value, "spawn<T>: T must derive from Entity");
-    T* entity = ETCS::MemoryArena::getInstance().allocate<T>(std::forward<Args>(args)...);
-    ETCS::LoadEvent evt((std::string(ETCS_MODULE_NAME) + ":" + T::CONTRACT_TAG).c_str());
+    static_assert(::std::is_base_of<Entity, T>::value, "spawn<T>: T must derive from Entity");
+    T* entity = ETCS::MemoryArena::getInstance().allocate<T>(::std::forward<Args>(args)...);
+    ETCS::LoadEvent evt((::std::string(ETCS_MODULE_NAME) + ":" + T::CONTRACT_TAG).c_str());
     evt.prebuilt = entity;
     ETCS::Entity* result = evt();
     return result ? static_cast<T*>(result) : nullptr;
@@ -2908,7 +3115,7 @@ T* spawn(Args&&... args)
 template<typename T, typename... Args>
 T* spawn(ETCS::MemoryArena& arena, Args&&... args)
 {
-    static_assert(std::is_base_of<Entity, T>::value, "spawn<T>(arena): T must derive from Entity");
+    static_assert(::std::is_base_of<Entity, T>::value, "spawn<T>(arena): T must derive from Entity");
     /*
  * NOTE: entity->owning_arena_ will read as the GLOBAL singleton, not
  * `arena` -- Entity's ctor resolves it from s_pending_parent_arena_,
@@ -2922,8 +3129,8 @@ T* spawn(ETCS::MemoryArena& arena, Args&&... args)
  * the call site that has to be reconciled first.
  */
  
-    T* entity = arena.allocate<T>(std::forward<Args>(args)...);
-    ETCS::LoadEvent evt((std::string(ETCS_MODULE_NAME) + ":" + T::CONTRACT_TAG).c_str());
+    T* entity = arena.allocate<T>(::std::forward<Args>(args)...);
+    ETCS::LoadEvent evt((::std::string(ETCS_MODULE_NAME) + ":" + T::CONTRACT_TAG).c_str());
     evt.prebuilt = entity;
     ETCS::Entity* result = evt();
     return result ? static_cast<T*>(result) : nullptr;
@@ -2953,7 +3160,7 @@ inline ETCS::DestroyEvent::DestroyEvent(const ETCS::Buffer& key, ETCS::Entity* t
  * current practice it is always a Root, since every caller of this
  * function threads it straight from ExecutionContext::root_entity.
  */
-inline Entity* spawn(const std::string& module_name, const std::string& tag,
+inline Entity* spawn(const ::std::string& module_name, const ::std::string& tag,
                       LifetimeOwner root_for_bootstrap)
 {
     LoadEvent evt((module_name + ":" + tag).c_str());
@@ -3027,36 +3234,34 @@ inline void* etcs_true_type(Entity* e) { return e ? e->getTrueType() : nullptr; 
  * FIRST, before asking the loader, which is why resolving by RID was never a
  * liveness check.
  *
- * Both scopes in one call: the module's own map under the unqualified name, the
- * loader's under the origin-affixed one. The per-TYPE entry goes too -- same
- * kind of registration, made by ETCS_MAKE_INSTANCE rather than by fanout.
+ * ONE REMOVAL IS ENOUGH, and that is a consequence of what the mirror holds.
+ * A mirror row wraps the RIDList in the PUBLISHING MODULE's image -- the very
+ * list `mine` below names -- so removing from this module's own list is already
+ * removing from what every other image sees through it. The second removal this
+ * used to make through the loader was the same list a second time: a no-op in a
+ * multi-image build, and literally the identical object under emscripten. The
+ * per-TYPE entry goes too -- same kind of registration, made by
+ * ETCS_MAKE_INSTANCE rather than by fanout.
  */
 inline void etcs_supertype_fanin(Entity* e)
 {
     if (!e) return;
-    std::vector<ETCS::Buffer> families;
+    ::std::vector<ETCS::Buffer> families;
     e->getInterfaceFamilies(families);
 
-    const RID         rid    = e->getRID();
-    const std::string module = e->getSourceModule().toString();
+    const RID          rid     = e->getRID();
     const ETCS::Buffer own_tag = e->getSourceTag();
 
     // Everything this entity was published under, in the module's own spelling.
-    std::vector<ETCS::Buffer> names = families;
+    ::std::vector<ETCS::Buffer> names = families;
     if (own_tag.written) names.push_back(own_tag);
 
     auto& mine = ETCS::EventNode::getInstance().ridMap;
-    ETCS::EventNode* owner = etcs_loader_event_node();
 
     for (const ETCS::Buffer& name : names)
     {
         auto local = mine.find(name);
         if (local != mine.end()) local->second.invoke_remove(rid);
-
-        if (!owner) continue;
-        ETCS::Buffer qualified((module + ":" + name.toString()).c_str());
-        auto absorbed = owner->ridMap.find(qualified);
-        if (absorbed != owner->ridMap.end()) absorbed->second.invoke_remove(rid);
     }
 }
 
@@ -3129,7 +3334,7 @@ inline bool etcs_retire_entity(Entity* e)
 inline void etcs_supertype_fanout(Entity* e)
 {
     if (!e) return;
-    std::vector<ETCS::Buffer> families;
+    ::std::vector<ETCS::Buffer> families;
     e->getInterfaceFamilies(families);
     if (families.empty()) return;
 
@@ -3242,7 +3447,7 @@ class Held
 {
 public:
     Held() = default;
-    Held(Base* p, LifetimeHold&& h) : ptr_(p), hold_(std::move(h)) {}
+    Held(Base* p, LifetimeHold&& h) : ptr_(p), hold_(::std::move(h)) {}
 
     explicit operator bool() const { return ptr_ != nullptr; }
     Base* operator->() const { return ptr_; }
@@ -3280,7 +3485,7 @@ inline Held<Base> resolve_held(const char* family, RID rid)
     // upcast -- it is the reverse direction that needs RTTI.
     LifetimeHold h(static_cast<Entity*>(p));
     if (!h) return {};
-    return Held<Base>(p, std::move(h));
+    return Held<Base>(p, ::std::move(h));
 }
 
 template <typename Base>
@@ -3342,8 +3547,14 @@ inline Base* resolve_in_family(const char* family, RID rid)
  * Qualification is how a caller that does know says so.
  */
     const ETCS::Buffer key(family);
-    const std::string  name(family);
-    const bool qualified = (name.find(':') != std::string::npos);
+    const ::std::string  name(family);
+    // A "Provider:Family" spelling is a caller SAYING WHICH PROVIDER, which is
+    // still a meaningful thing to say -- it is the disambiguation the report
+    // below asks for. It is not a different key: etcs_bare_family_key reduces
+    // it, and the provider half is matched against the mirror row instead.
+    const auto        colon = name.rfind(':');
+    const bool        qualified = (colon != ::std::string::npos);
+    const ::std::string wanted_module = qualified ? name.substr(0, colon) : ::std::string();
 
     if (!qualified)
     {
@@ -3360,40 +3571,70 @@ inline Base* resolve_in_family(const char* family, RID rid)
     ETCS::EventNode* owner = etcs_loader_event_node();
     if (!owner) return nullptr;      // no loader: nothing has been composed
 
-    if (qualified)
+    /*
+ * THE MIRROR BUCKET IS THE SEARCH SPACE, not the whole map.
+ *
+ * This used to scan every key in the loader's map and accept any that ENDED in
+ * ":Family" -- a linear walk over every published name plus a string compare,
+ * to reconstruct a grouping the key spelling had scattered. The grouping is now
+ * the structure (EventNode::ridMirror), so the candidates for a family are
+ * exactly one bucket lookup, and the provider each came from is a field rather
+ * than a substring.
+ *
+ * The ambiguity rule is unchanged and it is the reason this is not a
+ * first-match: RIDs are unique per provider-type, not per process, so the same
+ * value can name different entities under two providers. One match resolves,
+ * zero is "no such entity", more than one is a real ambiguity in the question
+ * and is refused rather than guessed.
+ */
+    const ETCS::Buffer bare = etcs_bare_family_key(key);
+
+    // This image's own list is a candidate too, and for a qualified ask only
+    // when the caller named THIS image.
+    void*         found = nullptr;
+    ::std::string found_owner;
+    int           matches = 0;
+
+    auto mirror = owner->ridMirror.find(bare);
+
+    /*
+ * The asked-of image's own list is a candidate when the caller named THIS
+ * image, named nothing, or named a module in a build where no separate image
+ * mirrored this name at all -- the collapsed case, where one map holds every
+ * module's lists (see etcs_ridmap_named for the full reasoning).
+ */
+    const bool own_is_candidate =
+        !qualified
+        || wanted_module == (owner->scope ? owner->scope : "")
+        || mirror == owner->ridMirror.end();
+
+    if (owner != &ETCS::EventNode::getInstance() && own_is_candidate)
     {
-        auto it = owner->ridMap.find(key);
-        if (it == owner->ridMap.end()) return nullptr;
-        return static_cast<Base*>(it->second.invoke_get_iface(rid));
+        auto it = owner->ridMap.find(bare);
+        if (it != owner->ridMap.end())
+            if (void* p = it->second.invoke_get_iface(rid))
+            { found = p; found_owner = owner->scope ? owner->scope : "(loader)"; ++matches; }
     }
 
-    // Only keys that ARE this family under some provider are candidates, which
-    // is both the correctness filter and the whole of the search space.
-    const std::string suffix = ":" + name;
-    void*       found       = nullptr;
-    std::string found_owner;
-    int         matches     = 0;
-
-    for (auto& [k, handle] : owner->ridMap)
-    {
-        const std::string ks = k.toString();
-        if (ks.size() <= suffix.size()) continue;
-        if (ks.compare(ks.size() - suffix.size(), suffix.size(), suffix) != 0) continue;
-
-        void* p = handle.invoke_get_iface(rid);
-        if (!p) continue;
-        if (++matches == 1) { found = p; found_owner = ks; }
-        else
+    if (mirror != owner->ridMirror.end())
+        for (auto& row : mirror->second)
         {
-            ETCS_LOG("resolve_in_family", "RID:" << rid << " is ambiguous for family '"
-                     << name << "' -- it names an entity under BOTH " << found_owner
-                     << " and " << ks << ". RIDs are unique per provider-type, not per "
-                     "process. This overload can only answer with one, so it answers with "
-                     "none: use collect_in_family to get them all, or name the provider, "
-                     "e.g. resolve_in_family(\"" << ks << "\", rid).");
-            return nullptr;
+            const ::std::string mod = row.module.toString();
+            if (qualified && mod != wanted_module) continue;
+            void* p = row.handle.invoke_get_iface(rid);
+            if (!p) continue;
+            if (++matches == 1) { found = p; found_owner = mod; }
+            else
+            {
+                ETCS_LOG("resolve_in_family", "RID:" << rid << " is ambiguous for family '"
+                         << name << "' -- it names an entity under BOTH " << found_owner
+                         << " and " << mod << ". RIDs are unique per provider-type, not per "
+                         "process. This overload can only answer with one, so it answers with "
+                         "none: use collect_in_family to get them all, or name the provider, "
+                         "e.g. resolve_in_family(\"" << mod << ":" << bare << "\", rid).");
+                return nullptr;
+            }
         }
-    }
     return static_cast<Base*>(found);
 }
 
@@ -3416,41 +3657,58 @@ inline Base* resolve_in_family(const char* family, RID rid)
  * families into one list. Returns how many THIS call added.
  */
 template <typename Base>
-inline size_t collect_in_family(const char* family, RID rid, std::vector<Base*>& out)
+inline size_t collect_in_family(const char* family, RID rid, ::std::vector<Base*>& out)
 {
     if (rid == 0) return 0;
-    const std::string name(family);
+    const ::std::string name(family);
     const ETCS::Buffer key(family);
+    const auto        colon = name.rfind(':');
+    const bool        qualified = (colon != ::std::string::npos);
+    const ::std::string wanted_module = qualified ? name.substr(0, colon) : ::std::string();
+    const ETCS::Buffer bare = etcs_bare_family_key(key);
     size_t added = 0;
 
-    if (name.find(':') != std::string::npos)
-    {
-        ETCS::EventNode* owner = etcs_loader_event_node();
-        if (!owner) return 0;
-        auto it = owner->ridMap.find(key);
-        if (it == owner->ridMap.end()) return 0;
-        if (void* p = it->second.invoke_get_iface(rid)) { out.push_back(static_cast<Base*>(p)); ++added; }
-        return added;
-    }
+    ETCS::EventNode* mine_node = &ETCS::EventNode::getInstance();
+    ETCS::EventNode* owner     = etcs_loader_event_node();
 
+    /*
+ * EACH LIST AT MOST ONCE, and that is the bug the mirror also fixes here.
+ *
+ * In a multi-image build the caller's own map and the loader's are different
+ * objects, so reading both was two different lists. Under a single-address-space
+ * build (emscripten) they are THE SAME MAP, and the old bare path read it twice
+ * -- once directly, once as the `exact` case of the suffix scan -- so every
+ * member came back duplicated. The identity check below is what makes one shape
+ * correct in both builds instead of one being a spelling that only works in one.
+ */
+    if (!qualified)
     {
-        auto& mine = ETCS::EventNode::getInstance().ridMap;
-        auto it = mine.find(key);
-        if (it != mine.end())
+        auto it = mine_node->ridMap.find(bare);
+        if (it != mine_node->ridMap.end())
             if (void* p = it->second.invoke_get_iface(rid))
             { out.push_back(static_cast<Base*>(p)); ++added; }
     }
 
-    ETCS::EventNode* owner = etcs_loader_event_node();
     if (!owner) return added;
 
-    const std::string suffix = ":" + name;
-    for (auto& [k, handle] : owner->ridMap)
+    auto mirror = owner->ridMirror.find(bare);
+    // Same candidacy rule as resolve_in_family: a named module also matches the
+    // own map when nothing mirrored the name, which is the collapsed build.
+    if (owner != mine_node
+        && (!qualified || wanted_module == (owner->scope ? owner->scope : "")
+            || mirror == owner->ridMirror.end()))
     {
-        const std::string ks = k.toString();
-        if (ks.size() <= suffix.size()) continue;
-        if (ks.compare(ks.size() - suffix.size(), suffix.size(), suffix) != 0) continue;
-        if (void* p = handle.invoke_get_iface(rid))
+        auto it = owner->ridMap.find(bare);
+        if (it != owner->ridMap.end())
+            if (void* p = it->second.invoke_get_iface(rid))
+            { out.push_back(static_cast<Base*>(p)); ++added; }
+    }
+
+    if (mirror == owner->ridMirror.end()) return added;
+    for (auto& row : mirror->second)
+    {
+        if (qualified && row.module.toString() != wanted_module) continue;
+        if (void* p = row.handle.invoke_get_iface(rid))
         { out.push_back(static_cast<Base*>(p)); ++added; }
     }
     return added;
@@ -3492,10 +3750,10 @@ inline size_t collect_in_family(const char* family, RID rid, std::vector<Base*>&
  * outside the module that owns it while the QUESTION stays askable by anyone
  * holding a RID. The relation belongs to the type; asking about it does not.
  */
-inline size_t search_in_family(const char* qualified, RID exemplar, std::vector<RID>& out)
+inline size_t search_in_family(const char* qualified, RID exemplar, ::std::vector<RID>& out)
 {
-    const std::string name(qualified);
-    if (name.find(':') == std::string::npos)
+    const ::std::string name(qualified);
+    if (name.find(':') == ::std::string::npos)
     {
         ETCS_LOG("search_in_family", "'" << name << "' is a bare family name, and an order "
                  "search needs one concrete type: the comparison belongs to the pointee, so "
@@ -3505,10 +3763,10 @@ inline size_t search_in_family(const char* qualified, RID exemplar, std::vector<
 
     ETCS::EventNode* owner = etcs_loader_event_node();
     if (!owner) return 0;
-    auto it = owner->ridMap.find(ETCS::Buffer(qualified));
-    if (it == owner->ridMap.end()) return 0;
+    ETCS::RIDListHandle* h = etcs_ridmap_named(owner, ETCS::Buffer(qualified));
+    if (!h) return 0;
 
-    if (!it->second.invoke_searchable())
+    if (!h->invoke_searchable())
     {
         ETCS_LOG("search_in_family", name << " declares no order, so there is nothing to "
                  "search on. A type becomes searchable by claiming Orderable and defining "
@@ -3517,16 +3775,16 @@ inline size_t search_in_family(const char* qualified, RID exemplar, std::vector<
     }
 
     const size_t before = out.size();
-    it->second.invoke_search_ordered_by(exemplar, out);
+    h->invoke_search_ordered_by(exemplar, out);
     return out.size() - before;
 }
 
 template <typename Leaf>
 inline size_t search_in_family(const char* qualified, const Leaf& exemplar,
-                               std::vector<RID>& out)
+                               ::std::vector<RID>& out)
 {
-    const std::string name(qualified);
-    if (name.find(':') == std::string::npos)
+    const ::std::string name(qualified);
+    if (name.find(':') == ::std::string::npos)
     {
         ETCS_LOG("search_in_family", "'" << name << "' is a bare family name, and an order "
                  "search needs one concrete type: the comparison belongs to the pointee, so "
@@ -3537,10 +3795,10 @@ inline size_t search_in_family(const char* qualified, const Leaf& exemplar,
 
     ETCS::EventNode* owner = etcs_loader_event_node();
     if (!owner) return 0;
-    auto it = owner->ridMap.find(ETCS::Buffer(qualified));
-    if (it == owner->ridMap.end()) return 0;
+    ETCS::RIDListHandle* h = etcs_ridmap_named(owner, ETCS::Buffer(qualified));
+    if (!h) return 0;
 
-    if (!it->second.invoke_searchable())
+    if (!h->invoke_searchable())
     {
         ETCS_LOG("search_in_family", name << " declares no order, so there is nothing to "
                  "search on. A type becomes searchable by claiming Orderable and defining "
@@ -3549,7 +3807,7 @@ inline size_t search_in_family(const char* qualified, const Leaf& exemplar,
     }
 
     const size_t before = out.size();
-    it->second.invoke_search_ordered(static_cast<const void*>(&exemplar), out);
+    h->invoke_search_ordered(static_cast<const void*>(&exemplar), out);
     return out.size() - before;
 }
 

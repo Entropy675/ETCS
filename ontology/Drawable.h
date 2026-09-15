@@ -117,9 +117,9 @@ public:
  * getInterfacePointer is the rule here even when the sibling is
  * yourself.
  */
-    void collectDrawableChildren(std::vector<Drawable_*>& out)
+    void collectDrawableChildren(::std::vector<Drawable_*>& out)
     {
-        std::vector<std::pair<ETCS::Buffer, ETCS::RID>> kids;
+        ::std::vector<::std::pair<ETCS::Buffer, ETCS::RID>> kids;
         getOrderedTypedChildren(kids);
         out.reserve(kids.size());
         for (const auto& entry : kids)
@@ -130,7 +130,7 @@ public:
             if (!iface) continue;
             out.push_back(static_cast<Drawable_*>(iface));
         }
-        std::stable_sort(out.begin(), out.end(),
+        ::std::stable_sort(out.begin(), out.end(),
                          [](Drawable_* a, Drawable_* b) { return a->Order() < b->Order(); });
     }
 
@@ -185,7 +185,7 @@ public:
  */
     bool anyChildAnimating()
     {
-        std::vector<Drawable_*> ordered;
+        ::std::vector<Drawable_*> ordered;
         collectDrawableChildren(ordered);
         for (Drawable_* child : ordered)
             if (child->Animating()) return true;
@@ -229,9 +229,9 @@ protected:
     // of use. Order is snapshotted because only the sort needs it.
     struct ChildRef { ETCS::Buffer tag; ETCS::RID rid; int32_t order; };
 
-    void collectDrawableChildRefs(std::vector<ChildRef>& out)
+    void collectDrawableChildRefs(::std::vector<ChildRef>& out)
     {
-        std::vector<std::pair<ETCS::Buffer, ETCS::RID>> kids;
+        ::std::vector<::std::pair<ETCS::Buffer, ETCS::RID>> kids;
         getOrderedTypedChildren(kids);
         out.reserve(kids.size());
         for (const auto& entry : kids)
@@ -243,7 +243,7 @@ protected:
             out.push_back(ChildRef{entry.first, entry.second,
                                    static_cast<Drawable_*>(iface)->Order()});
         }
-        std::stable_sort(out.begin(), out.end(),
+        ::std::stable_sort(out.begin(), out.end(),
                          [](const ChildRef& a, const ChildRef& b) { return a.order < b.order; });
     }
 
@@ -260,7 +260,7 @@ protected:
     void drawChildren(Surface_* dst)
     {
         if (!dst) return;
-        std::vector<ChildRef> ordered;
+        ::std::vector<ChildRef> ordered;
         collectDrawableChildRefs(ordered);
         for (const ChildRef& c : ordered)
         {

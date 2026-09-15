@@ -103,18 +103,18 @@ struct LMAXSequentialSharedPage
     // a non-trivial member this assert fires rather than the copy silently
     // ceasing to be a memcpy. (The broader assert covering Buffer/BBuffer/
     // MBuffer belongs next to the alias declarations in Buffer.h.)
-    static_assert(std::is_trivially_copyable_v<LBuffer>,
+    static_assert(::std::is_trivially_copyable_v<LBuffer>,
                   "LBuffer must stay trivially copyable — it crosses DSO and ring boundaries");
 
     char*                  buffer;
     long long              slot_count_;
     long long              index_mask_;
 
-    alignas(64) std::atomic<uint64_t>  sequence_;
-    alignas(64) std::atomic<uint64_t>  publisher_cursor_;
-    alignas(64) std::atomic<uint64_t>  consumer_cursor_;
+    alignas(64) ::std::atomic<uint64_t>  sequence_;
+    alignas(64) ::std::atomic<uint64_t>  publisher_cursor_;
+    alignas(64) ::std::atomic<uint64_t>  consumer_cursor_;
 
-    std::atomic<bool>      tombstoned;
+    ::std::atomic<bool>      tombstoned;
     uint64_t               reader_rid;
     
     static constexpr long long headerSize()
@@ -176,11 +176,11 @@ struct LMAXSequentialSharedPage
             new (slot + sizeof(SequentialFrame)) LBuffer{};
         }
 
-        page->sequence_.store(0, std::memory_order_relaxed);
-        page->publisher_cursor_.store(UINT64_MAX, std::memory_order_relaxed);
-        page->consumer_cursor_.store(0, std::memory_order_relaxed);
+        page->sequence_.store(0, ::std::memory_order_relaxed);
+        page->publisher_cursor_.store(UINT64_MAX, ::std::memory_order_relaxed);
+        page->consumer_cursor_.store(0, ::std::memory_order_relaxed);
 
-        page->tombstoned.store(false, std::memory_order_relaxed);
+        page->tombstoned.store(false, ::std::memory_order_relaxed);
         page->reader_rid = reader_rid;
 
         return page;
@@ -188,15 +188,15 @@ struct LMAXSequentialSharedPage
 
     uint64_t write(uint64_t writer_rid, const LBuffer& payload)
     {
-        assert(!tombstoned.load(std::memory_order_relaxed));
+        assert(!tombstoned.load(::std::memory_order_relaxed));
 
         uint64_t seq;
         uint64_t consumer;
 
         while (true)
         {
-            seq      = sequence_.load(std::memory_order_relaxed);
-            consumer = consumer_cursor_.load(std::memory_order_acquire);
+            seq      = sequence_.load(::std::memory_order_relaxed);
+            consumer = consumer_cursor_.load(::std::memory_order_acquire);
 
             if (seq - consumer >= static_cast<uint64_t>(slot_count_))
                 return UINT64_MAX;
@@ -204,8 +204,8 @@ struct LMAXSequentialSharedPage
             if (sequence_.compare_exchange_weak(
                     seq,
                     seq + 1,
-                    std::memory_order_acq_rel,
-                    std::memory_order_relaxed))
+                    ::std::memory_order_acq_rel,
+                    ::std::memory_order_relaxed))
             {
                 break;
             }
@@ -224,7 +224,7 @@ struct LMAXSequentialSharedPage
         // fields were new while the flag had not been re-cleared, with the
         // lap guard as the sole defence. Clearing first makes the invariant
         // structural: ready==true implies every field below is visible.
-        frame->ready.store(false, std::memory_order_relaxed);
+        frame->ready.store(false, ::std::memory_order_relaxed);
 
         frame->sequence     = seq;
         frame->writer_rid   = writer_rid;
@@ -233,7 +233,7 @@ struct LMAXSequentialSharedPage
         LBuffer* dest = reinterpret_cast<LBuffer*>(slot + sizeof(SequentialFrame));
         copyPayload(dest, payload);
 
-        frame->ready.store(true, std::memory_order_release);
+        frame->ready.store(true, ::std::memory_order_release);
 
         tryAdvancePublisher(seq);
         return seq;
@@ -241,7 +241,7 @@ struct LMAXSequentialSharedPage
 
     const LBuffer* acquireRead(uint64_t expected_seq) const
     {
-        uint64_t pub = publisher_cursor_.load(std::memory_order_acquire);
+        uint64_t pub = publisher_cursor_.load(::std::memory_order_acquire);
 
         // NOTE: plain comparison, not isSequenceAhead(). Correct given the
         // UINT64_MAX sentinel is screened on the same line, and uint64 seq
@@ -272,32 +272,32 @@ struct LMAXSequentialSharedPage
         SequentialFrame* frame =
             reinterpret_cast<SequentialFrame*>(buffer + slot_index * SLOT_SIZE);
 
-        frame->ready.store(false, std::memory_order_relaxed);
+        frame->ready.store(false, ::std::memory_order_relaxed);
 
-        consumer_cursor_.store(seq + 1, std::memory_order_release);
+        consumer_cursor_.store(seq + 1, ::std::memory_order_release);
     }
 
     bool isFull() const
     {
-        uint64_t seq      = sequence_.load(std::memory_order_relaxed);
-        uint64_t consumer = consumer_cursor_.load(std::memory_order_acquire);
+        uint64_t seq      = sequence_.load(::std::memory_order_relaxed);
+        uint64_t consumer = consumer_cursor_.load(::std::memory_order_acquire);
 
         return (seq - consumer) >= static_cast<uint64_t>(slot_count_);
     }
 
     uint64_t frameCount() const
     {
-        return sequence_.load(std::memory_order_acquire);
+        return sequence_.load(::std::memory_order_acquire);
     }
 
     uint64_t publishedUpTo() const
     {
-        return publisher_cursor_.load(std::memory_order_acquire);
+        return publisher_cursor_.load(::std::memory_order_acquire);
     }
 
     void tombstone()
     {
-        tombstoned.store(true, std::memory_order_release);
+        tombstoned.store(true, ::std::memory_order_release);
     }
 
     // shutdown() and tombstone() were byte-identical — a false difference
@@ -310,11 +310,11 @@ struct LMAXSequentialSharedPage
 
     void reset()
     {
-        assert(!tombstoned.load(std::memory_order_relaxed));
+        assert(!tombstoned.load(::std::memory_order_relaxed));
 
-        sequence_.store(0, std::memory_order_relaxed);
-        publisher_cursor_.store(UINT64_MAX, std::memory_order_relaxed);
-        consumer_cursor_.store(0, std::memory_order_relaxed);
+        sequence_.store(0, ::std::memory_order_relaxed);
+        publisher_cursor_.store(UINT64_MAX, ::std::memory_order_relaxed);
+        consumer_cursor_.store(0, ::std::memory_order_relaxed);
     }
 
     // -----------------------------------------------------------------------
@@ -327,7 +327,7 @@ struct LMAXSequentialSharedPage
         if (counter < ETCS_SPIN_HINT_LIMIT)
             ETCS_CPU_RELAX();
         else
-            std::this_thread::yield();
+            ::std::this_thread::yield();
         counter++;
     }
 
@@ -348,7 +348,7 @@ struct LMAXSequentialSharedPage
         if (counter < ETCS_SPIN_HINT_LIMIT / 4)
             ETCS_CPU_RELAX();
         else if (counter < ETCS_SPIN_YIELD_LIMIT)
-            std::this_thread::yield();
+            ::std::this_thread::yield();
         else
         {
             // Doubles every 64 sleeps, capped. Below the ~50us default timer
@@ -356,7 +356,7 @@ struct LMAXSequentialSharedPage
             const int over  = counter - ETCS_SPIN_YIELD_LIMIT;
             int       shift = 0;
             for (int n = over >> 6; n > 0 && shift < ETCS_SPIN_SLEEP_MAX_SHIFT; n >>= 1) ++shift;
-            std::this_thread::sleep_for(std::chrono::microseconds(1 << shift));
+            ::std::this_thread::sleep_for(::std::chrono::microseconds(1 << shift));
         }
         if (counter < (1 << 30)) ++counter;   // saturate; ++ past INT_MAX is UB
     }
@@ -417,7 +417,7 @@ private:
     {
         const size_t n = src.written < LBuffer::bufsize ? src.written
                                                         : LBuffer::bufsize;
-        std::memcpy(dest->buf, src.buf, n);
+        ::std::memcpy(dest->buf, src.buf, n);
         if (n < LBuffer::bufsize) dest->buf[n] = '\0';
 
         dest->written     = n;
@@ -429,7 +429,7 @@ private:
         // Fast path: if the cursor isn't immediately behind us,
         // we're not the blocker — bail and let whoever holds
         // the gap sequence do the sweep when they publish.
-        uint64_t current = publisher_cursor_.load(std::memory_order_acquire);
+        uint64_t current = publisher_cursor_.load(::std::memory_order_acquire);
 
         if (current != my_seq && current + 1 != my_seq)
         {
@@ -439,7 +439,7 @@ private:
             const SequentialFrame* frame = reinterpret_cast<const SequentialFrame*>(
                 buffer + slot_index * SLOT_SIZE);
 
-            if (!frame->ready.load(std::memory_order_acquire) ||
+            if (!frame->ready.load(::std::memory_order_acquire) ||
                  frame->sequence != next)
                 return; // gap still open, not our problem
         }
@@ -453,7 +453,7 @@ private:
         // part is correct by construction, not by x86's TSO.
         while (true)
         {
-            uint64_t cur  = publisher_cursor_.load(std::memory_order_relaxed);
+            uint64_t cur  = publisher_cursor_.load(::std::memory_order_relaxed);
             uint64_t next = cur + 1;
 
             long long slot_index = static_cast<long long>(
@@ -461,7 +461,7 @@ private:
             const SequentialFrame* frame = reinterpret_cast<const SequentialFrame*>(
                 buffer + slot_index * SLOT_SIZE);
 
-            if (!frame->ready.load(std::memory_order_acquire))
+            if (!frame->ready.load(::std::memory_order_acquire))
                 return; // gap — whoever fills this will advance past us
 
             if (frame->sequence != next)
@@ -469,8 +469,8 @@ private:
 
             if (!publisher_cursor_.compare_exchange_weak(
                     cur, next,
-                    std::memory_order_release,
-                    std::memory_order_relaxed))
+                    ::std::memory_order_release,
+                    ::std::memory_order_relaxed))
                 continue;
 
             // Advanced — keep walking. This is the sweep that covers all the

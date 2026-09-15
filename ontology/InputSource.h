@@ -142,7 +142,7 @@ struct InputRing
     {
         for (uint8_t i = 0; i < INPUT_MAX_OBSERVERS; ++i)
         {
-            tails[i].store(0, std::memory_order_relaxed);
+            tails[i].store(0, ::std::memory_order_relaxed);
             active[i] = false;
         }
     }
@@ -154,7 +154,7 @@ struct InputRing
         for (uint8_t i = 0; i < INPUT_MAX_OBSERVERS; ++i)
             if (!active[i])
             {
-                tails[i].store(head.load(std::memory_order_acquire), std::memory_order_release);
+                tails[i].store(head.load(::std::memory_order_acquire), ::std::memory_order_release);
                 active[i] = true;
                 return i;
             }
@@ -178,14 +178,14 @@ struct InputRing
     {
         if (id >= INPUT_MAX_OBSERVERS || !active[id]) return false;
 
-        const uint32_t t = tails[id].load(std::memory_order_acquire);
-        const uint32_t backlog = head.load(std::memory_order_acquire) - t;
+        const uint32_t t = tails[id].load(::std::memory_order_acquire);
+        const uint32_t backlog = head.load(::std::memory_order_acquire) - t;
 
         if (backlog == 0) return false;
         if (backlog > CAP - 1) { active[id] = false; return false; }   // lapped
 
         out = slots[t % CAP];
-        tails[id].store(t + 1, std::memory_order_release);
+        tails[id].store(t + 1, ::std::memory_order_release);
         return true;
     }
 
@@ -195,14 +195,14 @@ struct InputRing
     // process.
     void write(const InputEvent& ev)
     {
-        const uint32_t h = head.load(std::memory_order_relaxed);
+        const uint32_t h = head.load(::std::memory_order_relaxed);
         slots[h % CAP] = ev;
-        head.store(h + 1, std::memory_order_release);
+        head.store(h + 1, ::std::memory_order_release);
     }
 
     InputEvent            slots[CAP] = {};
-    std::atomic<uint32_t> head{ 0 };
-    std::atomic<uint32_t> tails[INPUT_MAX_OBSERVERS];
+    ::std::atomic<uint32_t> head{ 0 };
+    ::std::atomic<uint32_t> tails[INPUT_MAX_OBSERVERS];
     bool                  active[INPUT_MAX_OBSERVERS] = {};
 };
 
@@ -320,7 +320,7 @@ private:
     {
         InputEvent ev{};
         if (!ring.read(id, ev)) return false;
-        std::memcpy(out.buf, &ev, INPUT_SLOT_SIZE);
+        ::std::memcpy(out.buf, &ev, INPUT_SLOT_SIZE);
         out.written = INPUT_SLOT_SIZE;
         out.read_offset = 0;
         return true;

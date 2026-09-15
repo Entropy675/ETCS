@@ -18,6 +18,10 @@ ifeq ($(OS),Windows_NT)
 else
     LIB_EXT := so
 endif
+# Web builds produce side modules named *.wasm. Host uname is still Linux
+# under emscripten, so LIB_EXT alone cannot name the artifact -- MODULE_EXTS
+# is every suffix a module target may leave in modules/<name>/.
+MODULE_EXTS := $(LIB_EXT) wasm
 
 # Registration/Hash files
 ONTOLOGY_HASH_FILE := ./ontology_hashes.h
@@ -38,6 +42,10 @@ ifeq ($(ASAN),1)
     export CFLAGS   += -fsanitize=address -fno-omit-frame-pointer
     export CXXFLAGS += -fsanitize=address -fno-omit-frame-pointer
     export LDFLAGS  += -fsanitize=address
+endif
+# emscripten: module/loader Makefiles key on ifdef EMSCRIPTEN.
+ifdef EMSCRIPTEN
+    export EMSCRIPTEN
 endif
 
 # ====================================================================
@@ -76,11 +84,13 @@ module_%: generate_hashes
 	fi
 	$(MAKE) -C $(MODULES_DIR)/$*
 	@mkdir -p $(TARGET_DIR)
-	@for f in $(MODULES_DIR)/$*/*.$(LIB_EXT); do \
-		if [ -f "$$f" ]; then \
-			mv -f "$$f" $(TARGET_DIR)/; \
-			echo "✓ Moved: $$f -> $(TARGET_DIR)/"; \
-		fi; \
+	@for ext in $(MODULE_EXTS); do \
+		for f in $(MODULES_DIR)/$*/*.$$ext; do \
+			if [ -f "$$f" ]; then \
+				mv -f "$$f" $(TARGET_DIR)/; \
+				echo "✓ Moved: $$f -> $(TARGET_DIR)/"; \
+			fi; \
+		done; \
 	done
 
 clean_module_%:
@@ -88,7 +98,7 @@ clean_module_%:
 		echo "[-] Error: Module '$*' not found in $(MODULES_DIR)/"; exit 1; \
 	fi
 	$(MAKE) -C $(MODULES_DIR)/$* clean
-	@rm -f $(TARGET_DIR)/$*.$(LIB_EXT)
+	@rm -f $(TARGET_DIR)/$*.$(LIB_EXT) $(TARGET_DIR)/$*.wasm
 
 # ====================================================================
 # HASH GENERATION
@@ -153,11 +163,13 @@ copy_modules:
 	@mkdir -p $(TARGET_DIR)
 	@echo "\n--- Moving Modules to $(TARGET_DIR)/ ---"
 	@for dir in $(MODULE_SUBDIRS); do \
-		for f in $$dir/*.$(LIB_EXT); do \
-			if [ -f "$$f" ]; then \
-				mv -f "$$f" $(TARGET_DIR)/; \
-				echo "✓ Moved module: $$f -> $(TARGET_DIR)/"; \
-			fi; \
+		for ext in $(MODULE_EXTS); do \
+			for f in $$dir/*.$$ext; do \
+				if [ -f "$$f" ]; then \
+					mv -f "$$f" $(TARGET_DIR)/; \
+					echo "✓ Moved module: $$f -> $(TARGET_DIR)/"; \
+				fi; \
+			done; \
 		done; \
 	done
 
@@ -174,7 +186,7 @@ clean:
 	done
 	@rm -f $(ONTOLOGY_HASH_FILE) $(LIBS_HASH_FILE) $(CORE_HASH_FILE)
 	@rm -f $(TARGET_DIR)/Run_*
-	@rm -f $(TARGET_DIR)/*.$(LIB_EXT)
+	@rm -f $(TARGET_DIR)/*.$(LIB_EXT) $(TARGET_DIR)/*.wasm
 	@echo "--- Cleanup Complete ---\n"
 
 clean_loaders:
@@ -188,5 +200,5 @@ clean_modules:
 	@for dir in $(MODULE_SUBDIRS); do \
 		if [ -d "$$dir" ]; then $(MAKE) -C "$$dir" clean; fi; \
 	done
-	@rm -f $(TARGET_DIR)/*.$(LIB_EXT)
+	@rm -f $(TARGET_DIR)/*.$(LIB_EXT) $(TARGET_DIR)/*.wasm
 	@echo "--- Module Cleanup Complete ---\n"
