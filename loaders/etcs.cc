@@ -39,7 +39,7 @@ inline void etcs_web_trace(const char* msg)
     EM_ASM({
         var s = UTF8ToString($0);
         if (typeof Module !== 'undefined' && Module.print)
-            Module.print(s + (s.endsWith('\n') ? '' : '\n'));
+            Module.print(s + (s.endsWith('\n') ? "" : '\n'));
         else
             console.log(s);
     }, msg);
@@ -92,7 +92,15 @@ EMSCRIPTEN_KEEPALIVE
 void etcs_web_shell_write(const char* text)
 {
     if (!text) return;
-    EM_ASM({
+    /*
+     * MAIN_THREAD_EM_ASM, NOT EM_ASM: callers include the REPL thread.
+     *
+     * EM_ASM runs in the CALLING thread's JS scope, and a Worker's scope has no
+     * document, no window and no etcsTermWrite -- output would land in a Worker
+     * console nobody reads while the terminal sat empty. This proxies to the
+     * page's scope, where the terminal is, for a postMessage per write.
+     */
+    MAIN_THREAD_EM_ASM({
         var t = UTF8ToString($0);
         if (typeof window.etcsTermWrite === 'function')
             window.etcsTermWrite(t);
@@ -107,7 +115,26 @@ void etcs_web_shell_write(const char* text)
 int main(int argc, char* argv[])
 {
     shell_startup();
+#if defined(__EMSCRIPTEN__)
+    /*
+     * STATIC HERE, because main() does not outlive the session in a browser.
+     *
+     * drive_main_loop_then_exit hands the REPL to a Worker and returns, so main()
+     * returns while that thread is still running and noExitRuntime keeps the page
+     * alive around it. As ordinary locals these would take the SignalContext the
+     * REPL thread uses, and the Root its entities are parented to, down with them.
+     *
+     * Otherwise identical to WIRE_CONTEXT, ctx included -- still parented to
+     * RootSignalContext(), so signal authority is unchanged.
+     */
+    static ETCS::SignalContext ctx;
+    ctx.setParent(&ETCS::RootSignalContext());
+    static ETCS::Root root(ctx);
+    static ETCS::ExecSource loader{"(loader)", 0};
+    static ETCS::ExecutionContext env(&root, &ctx);
+#else
     WIRE_CONTEXT();
+#endif
 #if defined(__EMSCRIPTEN__)
     // 1) Bind modules on THIS thread via attachModule (no ChangeModuleEvent).
     //    Ordering thread is still deferred — no concurrent LoaderStream consumer.

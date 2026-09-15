@@ -210,60 +210,50 @@ inline size_t etcs_flush_deferred_rid_registrars()
 #include <chrono>
 #if defined(__EMSCRIPTEN__)
 // Unconditionally, not only under ETCS_DLL_EXPORTS: etcs_cooperative_pause_ms
-// below needs emscripten_sleep and emscripten_is_main_browser_thread in every
-// translation unit that waits, loader and module alike.
+// needs emscripten_is_main_browser_thread in every translation unit that waits,
+// loader and module alike.
 #include <emscripten/emscripten.h>
 #include <emscripten/threading.h>
 #endif
 
 /*
- * A WAIT THAT GIVES THE BROWSER ITS TURN.
+ * A WAIT, AND ON THE BROWSER'S MAIN THREAD A REFUSAL.
  *
- * Same switch and same shape as EventStream's sync ordering: under emscripten
- * there is no second thread to do the waiting on, so a wait has to RETURN TO THE
- * EVENT LOOP instead of holding it. emscripten_sleep is ASYNCIFY's yield -- the
- * stack is unwound, the browser runs, and the call resumes where it left off.
- *
- * WHY sleep_for AND yield ARE BOTH WRONG THERE, and not merely wasteful:
- *
- *   std::this_thread::yield() on the browser's main thread is an INFINITE HANG
- *   whenever the condition it spins on can only change from a DOM callback --
- *   which is every GLFW event, since glfw's emscripten backend delivers through
- *   the event loop this loop is refusing to return to. A spin waiting for a
- *   window to become active can therefore never see it become active.
- *
- *   std::this_thread::sleep_for blocks the same thread for real, so a 1ms poll
- *   loop starves the page at a thousand stalls a second.
- *
- * On every other platform this is exactly the sleep it replaces, so a producer
- * written for a pool worker keeps its own behaviour and gains a browser one.
+ * Returns false only when it could not wait, which is only ever the browser's
+ * main thread. A caller that gets false must RETURN; there is nothing it can
+ * usefully loop on.
  */
-inline void etcs_cooperative_pause_ms(unsigned ms)
+inline bool etcs_cooperative_pause_ms(unsigned ms)
 {
 #if defined(__EMSCRIPTEN__)
     /*
-     * ASYNCIFY ONLY ON THE MAIN THREAD, and this distinction is the whole of it.
+     * A pthread is a Worker and can block outright, so the sleep below is
+     * exactly right there.
      *
-     * emscripten_sleep unwinds and rewinds the stack -- it is how the ONE thread
-     * that owns the event loop gives the browser a turn without ending its own
-     * call. On a pthread there is no event loop to give a turn to and nothing to
-     * unwind for: the Worker can block outright, which is what a Worker is for,
-     * and asyncify-unwinding there is both pointless and a known way to land on
-     * "unreachable on doRewind" (CommandExecutor.h says the same about
-     * Shell.ReadLine through WorkBundle).
+     * THE MAIN THREAD CANNOT WAIT AT ALL. Each of the three ways to try is
+     * broken in its own way:
      *
-     * Which matters here specifically because this function is called from BOTH:
-     * the pump's producers run on a detached thread, while Window.Run's idle wait
-     * can be on the main one. Picking by where you actually are is the only
-     * version that is right in both.
+     *   sleep_for blocks the one thread that delivers whatever is being waited
+     *   for, so a 1ms poll starves the page and a longer one freezes the tab;
+     *
+     *   yield() never returns to the event loop, so a spin on a condition that
+     *   flips from a DOM callback -- every GLFW event -- can never end;
+     *
+     *   emscripten_sleep needs -sASYNCIFY, and Asyncify is unavailable to any
+     *   build that calls module functions from pool threads. It replaces a
+     *   module's exports with JS closures, dylink stores those as the library's
+     *   exports, and emscripten's cross-thread table catch-up then has no
+     *   signature to re-table them with.
+     *
+     * So this does not try. It says it could not, and the caller returns to the
+     * event loop -- the only thing that lets the condition change. Reaching this
+     * branch means work that should have been detached was not.
      */
     if (emscripten_is_main_browser_thread())
-        emscripten_sleep(ms);
-    else
-        ::std::this_thread::sleep_for(::std::chrono::milliseconds(ms));
-#else
-    ::std::this_thread::sleep_for(::std::chrono::milliseconds(ms));
+        return false;
 #endif
+    ::std::this_thread::sleep_for(::std::chrono::milliseconds(ms));
+    return true;
 }
 
 #include <string>

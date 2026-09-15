@@ -2722,7 +2722,7 @@ inline ::std::vector<::std::string> discover_web_module_names()
     {
         while (dirent* ent = ::readdir(dir))
         {
-            if (!ent->d_name) continue;
+            if (ent->d_name[0] == '\0') continue;
             ::std::string f = ent->d_name;
             if (f.size() <= ext.size()) continue;
             if (f.compare(f.size() - ext.size(), ext.size(), ext) != 0) continue;
@@ -2810,11 +2810,17 @@ inline ReplLineSource repl_shell_line_source(ETCS::Entity* shell, ETCS::SignalCo
 
 #if defined(__EMSCRIPTEN__)
         /*
-         * Do NOT shell->call("Shell.ReadLine"): that is an indirect WorkBundle
-         * dispatch. ASYNCIFY cannot unwind through it (RuntimeError: unreachable
-         * on doRewind). Poll the MAIN queue with a *direct* emscripten_sleep so
-         * ASYNCIFY instruments this lambda in the main module.
-         * Link etcs with -sASYNCIFY=1.
+         * A BLOCKING POLL, ON A WORKER.
+         *
+         * drive_main_loop_then_exit runs this loop off the main thread, so waiting
+         * here costs the page nothing -- the queue is filled by
+         * etcs_web_shell_push_line from the page, and the page is not the one
+         * waiting. An asyncify sleep is not an option: see
+         * etcs_cooperative_pause_ms (ETCS_API.h) for why Asyncify is unavailable
+         * to a build that calls module functions from pool threads.
+         *
+         * NOT shell->call("Shell.ReadLine"): that is an indirect WorkBundle
+         * dispatch, and this queue is what the page's ccall already feeds.
          */
         (void)shell;
         if (!prompt.empty())
@@ -2831,7 +2837,7 @@ inline ReplLineSource repl_shell_line_source(ETCS::Entity* shell, ETCS::SignalCo
                 out.assign(buf);
                 return true;
             }
-            emscripten_sleep(50);
+            ::std::this_thread::sleep_for(::std::chrono::milliseconds(50));
         }
 #else
         ETCS::Buffer data;
@@ -3861,6 +3867,11 @@ inline void repl_shell_loop_with(ETCS::SignalContext& sig, ReplLineSource& in)
         ::std::string target_str;
         iss >> target_str;
 
+        // A line of nothing but whitespace is not a target. mod_input.empty()
+        // above does not catch it, and everything below this point treats what it
+        // has as a name to resolve.
+        if (target_str.empty()) continue;
+
         ::std::string mod_name = target_str;
         try {
             if (!target_str.empty() && ::std::isdigit((unsigned char)target_str[0]))
@@ -3973,6 +3984,31 @@ inline void repl_shell_loop_with(ETCS::SignalContext& sig, ReplLineSource& in)
         }
 
         try {
+#if defined(__EMSCRIPTEN__)
+            /*
+             * ALREADY-LOADED MODULES ONLY, in the browser.
+             *
+             * The web runtime's module set is fixed at boot: the page stages what
+             * modules.json names and preload_web_modules opens all of it before any
+             * thread exists. A name that is not live therefore cannot be found, and
+             * letting it reach ResolveEvent means dlopen failing inside the
+             * navigator -- "could not load dynamic lib: 1.wasm", then a RangeError
+             * out of emscripten's own failure path. Refusing by name says the same
+             * thing without the wreckage.
+             */
+            {
+                auto& live = ETCS::EventNode::getInstance().stream.module_registry;
+                auto it = live.find(mod_name);
+                if (it == live.end() || !it->second)
+                {
+                    ETCS_SHELL("Navigator", COLOR_WARN
+                        << "'" << mod_name << "' is not a loaded module. The browser "
+                           "runtime loads what modules.json names and nothing after "
+                           "that -- add it there and reload." << COLOR_RESET);
+                    continue;
+                }
+            }
+#endif
             ETCS::Root nav_root(sig);
             if (!ETCS::ResolveEvent{mod_name.c_str(), &nav_root}())
             {
@@ -4141,6 +4177,83 @@ inline int drive_main_loop_then_exit(ETCS::SignalContext& ctx, int code,
                                      const ::std::string& control_socket = "")
 {
     ETCS_LOG("ETCS", "[trace] drive_main_loop_then_exit enter");
+
+#if defined(__EMSCRIPTEN__) && defined(ETCS_REPL_SHELL)
+    /*
+     * THE REPL RUNS ON A WORKER; THE MAIN THREAD STAYS ON THE EVENT LOOP.
+     *
+     * The REPL has to wait for a line, and the browser's main thread cannot wait
+     * (etcs_cooperative_pause_ms, ETCS_API.h). A Worker can. So the whole session
+     * -- Root, Shell, console and loop -- is built on that Worker and this returns
+     * immediately, which is also what the canvas needs: GLFW delivers through the
+     * main thread, and the page cannot paint while a REPL sits on it.
+     *
+     * Safe here because this runs after preload_web_modules and
+     * etcs_boot_runtime_threads: every module is open and the pool is armed. ctx
+     * is static in the emscripten build of main() (loaders/etcs.cc) so that this
+     * thread may outlive it. Output crosses back through
+     * etcs_web_shell_write's MAIN_THREAD_EM_ASM.
+     */
+    {
+        static bool web_repl_started = false;
+        if (!web_repl_started)
+        {
+            web_repl_started = true;
+            (void)control_socket;
+            ::std::thread([&ctx]() {
+              /*
+               * CATCH AT THE THREAD BOUNDARY. An exception escaping a pthread is
+               * std::terminate, and in a Worker that surfaces on the page as
+               * "[object WebAssembly.Exception]" with no message, file or line --
+               * the thrown object never reached a handler that could describe it.
+               * This is the outermost frame on this thread, so it is the only
+               * place that can.
+               */
+              try {
+                ETCS::Root    shell_host(ctx);
+                ETCS::Entity* shell = ETCS::ensure_session_shell(shell_host, ctx);
+                ETCS_LOG("ETCS", "[trace] web repl thread: shell=" << (void*)shell);
+                if (!shell)
+                {
+                    repl_err() << COLOR_WARN
+                               << "etcs: no Shell could be spawned; no prompt."
+                               << COLOR_RESET << "\n";
+                    return;
+                }
+                ETCS::Buffer none;
+                shell->call(ETCS::Buffer("Shell.OpenConsole"), none, ctx);
+                repl_owns_console  = true;
+                repl_console_shell = shell;
+
+                ReplLineSource in = repl_shell_line_source(shell, ctx);
+                repl_shell_loop_with(ctx, in);
+
+                repl_console_shell = nullptr;
+                repl_owns_console  = false;
+                shell->call(ETCS::Buffer("Shell.CloseConsole"), none, ctx);
+                ETCS_LOG("ETCS", "[trace] web repl thread: left the loop");
+              }
+              catch (const ::std::exception& ex)
+              {
+                repl_err() << COLOR_WARN << "etcs: REPL thread died: " << ex.what()
+                           << COLOR_RESET << "\n";
+                ETCS_LOG("ETCS", "web repl thread: uncaught std::exception -- " << ex.what());
+              }
+              catch (...)
+              {
+                repl_err() << COLOR_WARN
+                           << "etcs: REPL thread died on a non-std exception."
+                           << COLOR_RESET << "\n";
+                ETCS_LOG("ETCS", "web repl thread: uncaught non-std exception");
+              }
+            }).detach();
+        }
+    }
+    ETCS_LOG("ETCS", "[trace] drive_main_loop_then_exit: REPL detached to a worker, "
+                     "returning the main thread to the event loop");
+    return code;
+#endif
+
     // The session's Shell, spawned in EVERY mode and held until this returns.
     // Interactive asks it for a console; drain and --listen simply keep it, so
     // the runtime has its lifetime anchor whether or not anyone is typing.
