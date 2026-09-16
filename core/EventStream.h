@@ -209,6 +209,15 @@ protected:
     ::std::thread               ordering_thread_;
     bool                        pending_start_ = false;
     bool                        sync_emscripten_ = false;
+#if defined(__EMSCRIPTEN__)
+    // Which thread currently DRIVES emscripten_poll, and how deep it is in.
+    // There is no ordering thread in the browser, so the loop runs inline in a
+    // waiter -- and more than one waiter is the normal case. See
+    // emscripten_poll. poll_depth_ is only ever touched by the owner, so it
+    // needs no atomicity of its own.
+    ::std::atomic<::std::thread::id> poll_owner_{ ::std::thread::id{} };
+    int                              poll_depth_ = 0;
+#endif
     MemoryArena*                pending_arena_ = nullptr;
     int                         pending_producer_count_ = 1;
     ::std::atomic<bool>         stop_{ false };
@@ -297,31 +306,7 @@ protected:
                 constexpr uint64_t MAX_REPORTS = 8;
                 const bool sustained = retry >= SUSTAINED && (retry & (SUSTAINED - 1)) == 0;
                 if (stall_reports_ < MAX_REPORTS && (stall_reports_ == 0 || sustained))
-                {
-                    size_t pending = 0, running = 0, complete = 0, blocked = 0;
-                    for (size_t i = 0; i < GAP_DEPTH; ++i)
-                    {
-                        switch (reorder_.slots_[i].status)
-                        {
-                            case GapSlot::Status::Pending:  ++pending;  break;
-                            case GapSlot::Status::Running:  ++running;  break;
-                            case GapSlot::Status::Complete: ++complete; break;
-                            default: break;
-                        }
-                        if (reorder_.blocked_by_[i]) ++blocked;
-                    }
-                    // pending>0 is admission blocking (masks too coarse, or a
-                    // blocker stuck). running>0 is async work that never posted.
-                    // blocked==0 on a full window is plain slot exhaustion --
-                    // saturation, not a fault.
-                    ++stall_reports_;
-                    ETCS_LOG("EventStream", "REORDER STALL in=" << in_seq_
-                             << " tail=" << tail_seq_ << " cmp=" << cmp_seq_
-                             << " pending=" << pending << " running=" << running
-                             << " complete=" << complete << " blocked=" << blocked
-                             << (stall_reports_ == MAX_REPORTS
-                                 ? " (further stall reports suppressed)" : ""));
-                }
+                    reportReorderState("REORDER STALL");
                 LMAXSequentialSharedPage::progressiveYield(retry);
                 continue;
             }
@@ -358,6 +343,50 @@ protected:
             << blocked_admissions_.load(::std::memory_order_relaxed));
     }
 public:
+    /*
+     * WHAT THE REORDER WINDOW LOOKS LIKE RIGHT NOW, for a caller that has been
+     * waiting long enough to suspect it is not going to finish.
+     *
+     * The three counts are three different faults and the point of printing
+     * them together is to tell them apart:
+     *   pending  > 0  admission blocking -- a slot's mask meets a live one's,
+     *                 so it arrived and could not start. Masks too coarse, or
+     *                 the blocker itself is stuck.
+     *   running  > 0  a handler took the slot and never completed it: async
+     *                 work that never posted its WorkResult, or a handler
+     *                 waiting on something that needs this same loop.
+     *   blocked == 0 on a full window is plain slot exhaustion -- saturation,
+     *                 which is normal backpressure rather than a fault.
+     *
+     * Capped by stall_reports_, shared with the ordering loop's own reporting,
+     * because a stall that does not clear would otherwise log per attempt and
+     * make the terminal the bottleneck.
+     */
+    void reportReorderState(const char* why)
+    {
+        size_t pending = 0, running = 0, complete = 0, blocked = 0;
+        for (size_t i = 0; i < GAP_DEPTH; ++i)
+        {
+            switch (reorder_.slots_[i].status)
+            {
+                case GapSlot::Status::Pending:  ++pending;  break;
+                case GapSlot::Status::Running:  ++running;  break;
+                case GapSlot::Status::Complete: ++complete; break;
+                default: break;
+            }
+            if (reorder_.blocked_by_[i]) ++blocked;
+        }
+        constexpr uint64_t MAX_REPORTS = 8;
+        ++stall_reports_;
+        ETCS_LOG("EventStream", why << " in=" << in_seq_
+                 << " tail=" << tail_seq_ << " cmp=" << cmp_seq_
+                 << " pending=" << pending << " running=" << running
+                 << " complete=" << complete << " blocked=" << blocked
+                 << (stall_reports_ >= MAX_REPORTS
+                     ? " (further stall reports suppressed)" : ""));
+    }
+    bool stallReportsExhausted() const { return stall_reports_ >= 8; }
+
     // See blocked_admissions_. Ratio against in_seq_ is the useful reading:
     // what fraction of arrivals this stream's masks refused to let start.
     uint64_t blockedAdmissions() const
@@ -435,6 +464,32 @@ public:
 #endif
     }
 
+    /*
+     * THE BROWSER GETS A REAL ORDERING THREAD HERE, and until it does, nothing
+     * drains this stream unless somebody happens to be waiting on it.
+     *
+     * start() cannot take one: it runs during preload, while the main module is
+     * still inside loadDynamicLibrary, and a Worker started there finds
+     * wasmMemory undefined. So the browser begins in sync_emscripten_ mode, where
+     * the loop runs inline in whichever waiter drives it (emscripten_poll) --
+     * which is correct for preload, where the main thread is the only thread and
+     * every event has a waiter behind it.
+     *
+     * IT IS NOT CORRECT ONCE THE SESSION IS RUNNING. A pump, a frame edge and a
+     * pointer edge all emit onto this stream WITHOUT waiting for anything, so
+     * their events sit in a ring nobody is draining until the next thread happens
+     * to block on something. The window fills, admission stops, and the symptom is
+     * whatever the ring does when it laps -- not a clean refusal.
+     *
+     * By the time this runs the condition start() was avoiding is gone:
+     * etcs_boot_runtime_threads is called after preload_web_modules has finished
+     * every dlopen (loaders/etcs.cc calls them in that order, deliberately), which
+     * is the same argument the ThreadPool's own deferred arming makes. So the
+     * stream takes the ordering thread it would have had on any other platform,
+     * sync_emscripten_ goes off, and emscripten_poll stops admitting drivers --
+     * leaving etcs_emscripten_spin as a plain sleeping wait, exactly like the
+     * desktop's.
+     */
     void arm_emscripten_ordering_thread()
     {
 #if defined(__EMSCRIPTEN__)
@@ -443,17 +498,88 @@ public:
             pending_start_ = false;
             start(*pending_arena_, pending_producer_count_);
         }
+        // Already armed. Module EventNodes alias the loader's under emscripten
+        // (registerLoader detects the identity), so this is reached once per
+        // module for ONE stream and must not spawn a second consumer on it.
+        if (ordering_thread_.joinable() || !input_ring_)
+        {
+            ETCS_LOG("EventStream", "emscripten: ordering already armed -- "
+                     "no second consumer for one stream.");
+            return;
+        }
+        // No new inline driver may be admitted once a thread owns the loop. Safe
+        // to flip without waiting out a current one: this runs on the main thread
+        // at boot, before any other thread exists, so the only possible owner is
+        // this thread and it is not inside the loop right now.
+        sync_emscripten_ = false;
+        ordering_thread_ = ::std::thread([this]() { ordering_loop(); });
         ETCS_LOG("EventStream",
-            "emscripten: ordering armed (sync_poll="
-            << (sync_emscripten_ ? "yes" : "no") << ")");
+            "emscripten: ordering thread started -- the stream now drains "
+            "continuously instead of only while something waits on it.");
 #endif
     }
 
-    void emscripten_poll()
+    /*
+     * THE ORDERING LOOP, RUN INLINE BY A WAITER -- and only ever by ONE of
+     * them at a time, which is what the claim below is for.
+     *
+     * Everything this touches is the ordering thread's private state on the
+     * OS side: in_seq_, tail_seq_, parked_[] and the reorder slots are
+     * single-writer by construction there, because exactly one thread is in
+     * ordering_loop(). In the browser there is no such thread (see start()),
+     * so the loop belongs to whoever is waiting -- and waiting is not rare:
+     * every resolve_module/changeModule/spawn_entity spins here, so the REPL
+     * coming up while a boot script runs puts two threads in this function
+     * within milliseconds of each other.
+     *
+     * Two drivers is not a slow path, it is corruption: both read the same
+     * in_seq_, both markConsumed the same ring slot, both write parked_ and
+     * both launch it -- which is how a sequence walks past the ring and lands
+     * as "memory access out of bounds" inside enqueue, several frames away
+     * from anything that looks responsible. The other half of the symptom is
+     * quieter: one driver consumes the event the OTHER is waiting for the
+     * completion of, and that waiter never finishes.
+     *
+     * So the loop is claimed, not locked: a thread that does not get it
+     * returns false at once and its spin yields (etcs_emscripten_spin) rather
+     * than fighting for the claim. The driver services every waiter's events,
+     * which is the whole point -- nobody needs to drive their own.
+     *
+     * THE OWNER MAY RE-ENTER, and must be able to. Work the loop launches
+     * blocks on further events of its own -- a receiver-scoped spawn is an
+     * AddTag whose trampoline fires more -- and the only thread that can serve
+     * those is the one already inside here. Refusing the owner turns this
+     * function into the deadlock it was written to prevent, so the claim is
+     * per-thread and counted, and the admission step publishes in_seq_ before
+     * running anything so that a nested pass and its caller cannot both
+     * advance over the same event.
+     *
+     * Returns whether this call actually drove the loop.
+     */
+    bool emscripten_poll()
     {
 #if defined(__EMSCRIPTEN__)
-        if (!input_ring_ || !sync_emscripten_) return;
-        if (stop_.load(::std::memory_order_acquire)) return;
+        if (!input_ring_ || !sync_emscripten_) return false;
+        if (stop_.load(::std::memory_order_acquire)) return false;
+
+        const ::std::thread::id self = ::std::this_thread::get_id();
+        if (poll_owner_.load(::std::memory_order_acquire) != self)
+        {
+            ::std::thread::id none{};
+            if (!poll_owner_.compare_exchange_strong(none, self,
+                    ::std::memory_order_acq_rel, ::std::memory_order_acquire))
+                return false;
+        }
+        ++poll_depth_;
+        struct Release {
+            ::std::atomic<::std::thread::id>* owner;
+            int*                              depth;
+            ~Release()
+            {
+                if (--*depth == 0)
+                    owner->store(::std::thread::id{}, ::std::memory_order_release);
+            }
+        } release{ &poll_owner_, &poll_depth_ };
 
         drain_completions();
         while (tail_seq_ < in_seq_ &&
@@ -464,23 +590,32 @@ public:
         {
             if (in_seq_ - tail_seq_ >= GAP_DEPTH)
                 break;
-            const LBuffer* buf = input_ring_->acquireRead(in_seq_);
+            const uint64_t seq = in_seq_;
+            const LBuffer* buf = input_ring_->acquireRead(seq);
             if (!buf)
                 break;
             InEvent evt;
             ::std::memcpy(&evt, buf->buf, sizeof(InEvent));
-            input_ring_->markConsumed(in_seq_);
+            input_ring_->markConsumed(seq);
             const TagMask mask = static_cast<Derived*>(this)->mask_for(state_, evt);
-            parked_[in_seq_ % GAP_DEPTH] = evt;
-            reorder_.acquire(in_seq_, mask);
-            if (!reorder_.blocked(in_seq_))
-                launch_slot(in_seq_);
+            parked_[seq % GAP_DEPTH] = evt;
+            reorder_.acquire(seq, mask);
+            // ADMITTED BEFORE IT RUNS, which is what makes the nesting above
+            // safe: launch_slot and service address their slot by sequence,
+            // never by in_seq_, so publishing the advance first means a nested
+            // poll starts at the NEXT event and this frame does not advance a
+            // second time over whatever that nested poll consumed.
+            in_seq_ = seq + 1;
+            if (!reorder_.blocked(seq))
+                launch_slot(seq);
             else
                 blocked_admissions_.fetch_add(1, ::std::memory_order_relaxed);
             service();
-            ++in_seq_;
             drain_completions();
         }
+        return true;
+#else
+        return false;
 #endif
     }
 

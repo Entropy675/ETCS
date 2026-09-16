@@ -26,7 +26,18 @@
 
 
 inline ::std::string getCurrentModulePath() {
-#ifdef _WIN32
+#if defined(__EMSCRIPTEN__)
+    /*
+     * One name for the whole image, because in the browser there IS one image.
+     *
+     * dladdr resolves through the dynamic linker's record of which .so a symbol
+     * came from, and under emscripten every module shares the loader's address
+     * space and its EventNode -- so there is no per-module file to name and the
+     * lookup has nothing to answer with. It returned the not-found string, which
+     * then prefixed every log line in the page.
+     */
+    return "WASM";
+#elif defined(_WIN32)
     char path[MAX_PATH];
     HMODULE hm = NULL;
     // Get the handle of the module containing THIS function

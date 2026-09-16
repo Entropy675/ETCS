@@ -295,7 +295,54 @@ int main(int argc, char* argv[])
     // wait_for_environment_drain, which is exactly the gserver.etcs shape
     // this whole switch was added for: run the two `detach` lines, then
     // block on the environment they set up, no prompt involved at all.
+#if defined(__EMSCRIPTEN__)
+    /*
+     * THE SCRIPT RUNS ON A WORKER, so that the same .etcs file runs here and on
+     * the OS side without being written differently for the browser.
+     *
+     * A top-level `->` edge, or a Window.Run, holds the thread that stated it for
+     * as long as the edge lives -- which on the OS side is the point: the script
+     * thread is where a session waits. In a browser the thread reading argv[1] is
+     * the page's, and holding it stops the event loop that delivers every GLFW
+     * event the script is waiting for, so the page freezes with the window half
+     * built. Running the script off that thread makes the blocking form correct
+     * again, and a script that returns immediately is unaffected.
+     *
+     * Detached rather than joined for the same reason: joining would put the wait
+     * back on the main thread. The runtime outlives main() here (see the static
+     * context above), so the thread keeps its script's entities alive.
+     *
+     * Modules are already open and the pool is already armed at this point.
+     */
+    {
+        static std::string  s_script_path = filepath;
+        static std::ifstream s_script_file(std::move(file));
+        static ETCS::ExecutionContext s_script_ctx = script_ctx;
+        ETCS_LOG("ETCS", "[trace] handing '" << s_script_path << "' to a worker");
+        std::thread([]() {
+            ETCS_LOG("ETCS", "[trace] web script thread: entered for '" << s_script_path << "'");
+            try
+            {
+                ETCS::run_script(s_script_file, s_script_path, s_script_ctx);
+                ETCS_LOG("ETCS", "[trace] web script thread: '" << s_script_path << "' returned");
+            }
+            catch (const std::exception& ex)
+            {
+                // An exception escaping a pthread is std::terminate, and in a
+                // Worker that reaches the page with no message at all.
+                ETCS_LOG("ETCS", "web script thread: '" << s_script_path
+                         << "' threw -- " << ex.what());
+            }
+            catch (...)
+            {
+                ETCS_LOG("ETCS", "web script thread: '" << s_script_path
+                         << "' threw a non-std exception.");
+            }
+        }).detach();
+    }
+#else
     ETCS::run_script(file, filepath, script_ctx);
+#endif
     // Clear the interrupt flag so the following loop doesn't instantly exit
     g_sig_int = 0;
     // Drop into whichever top-level loop applies after script completion or

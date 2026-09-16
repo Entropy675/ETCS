@@ -353,9 +353,19 @@ inline ETCS::Entity* spawn_entity(const ::std::string& module, const ::std::stri
 // Deliberately NOT addTag<T>(): that template needs the concrete type's
 // header compiled into THIS binary, which would give it its own
 // independently-initialized TAG_MASK/CONTRACT_TAG, disjoint from the one the
-// provider module's own ETCS_TAG_DECLARE populated. "<Tag>_MakeChild" is
-// dlsym-resolved off the module's own registry entry instead -- no second
-// compiled copy of the type, because there IS no compiled copy here at all.
+// provider module's own ETCS_TAG_DECLARE populated. The module's own
+// "<Tag>_MakeChild" export is called instead -- no second compiled copy of the
+// type, because there IS no compiled copy here at all.
+//
+// FROM THE CATALOG, NOT A dlsym HERE, and that is a correctness requirement in
+// the browser rather than a saved lookup. emscripten's dlsym, when the symbol
+// is not yet in the calling thread's table, blocks that thread until EVERY other
+// live pthread has replayed the new entry -- and a thread replays it only on
+// coming out of a futex wait (_emscripten_yield -> _emscripten_process_dlopen_
+// queue). A thread that waits by spinning never does, so one spinning thread
+// anywhere in the process hangs the spawn forever. The module's catalog already
+// resolves every other symbol it needs at load time, on the thread that loaded
+// it; this one now goes with them (ModuleBundle::makeChildFunc).
 //
 // Called on THIS thread, never the ordering thread: the export blocks on an
 // AddTagEvent internally, which the ordering thread would have to service.
@@ -367,7 +377,7 @@ inline ETCS::Entity* make_typed_child(const ::std::string& module, const ::std::
     // member, so this one operation cannot be served from a module host.
     (void)module; (void)tag; (void)parent;
     exec_warn(src, "spawn/ensure child: receiver-scoped spawn needs the loader; "
-                   "this host cannot dlsym a module's _MakeChild.");
+                   "this host has no module catalog to take a _MakeChild from.");
     return nullptr;
 #else
     auto& registry = ETCS::EventNode::getInstance().stream.module_registry;
@@ -377,15 +387,21 @@ inline ETCS::Entity* make_typed_child(const ::std::string& module, const ::std::
         exec_warn(src, "spawn/ensure child: module '" + module + "' is not anchored.");
         return nullptr;
     }
-    void* addr = it->second->getTagFunction(tag + "_MakeChild");
-    if (!addr)
+    auto& catalog = it->second->catalog();
+    auto  entry   = catalog.find(tag);
+    if (entry == catalog.end())
+    {
+        exec_warn(src, "spawn/ensure child: '" + tag + "' is not in " + module
+                     + "'s catalog.");
+        return nullptr;
+    }
+    ETCS::MakeChildFunc make_child = entry->second.makeChildFunc;
+    if (!make_child)
     {
         exec_warn(src, "spawn/ensure child: '" + tag + "' in " + module
                      + " exports no _MakeChild -- rebuild the module.");
         return nullptr;
     }
-    using MakeChildResolver = ETCS::MakeChildFunc (*)();
-    ETCS::MakeChildFunc make_child = reinterpret_cast<MakeChildResolver>(addr)();
     try { return make_child(parent); }
     catch (const ::std::exception& ex)
     {

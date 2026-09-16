@@ -26,20 +26,41 @@
 //   Xvfb :99 -screen 0 1024x768x24 &
 //   DISPLAY=:99 ./Run_RenderProviderTesterLoader 60
 //
-// argv[1] -- frames to render (default 60). Paths are cwd-relative, so run
-// it from the ETCS root (that is where modules/RenderProvider/shaders/
-// resolves from), same convention run_website.etcs uses for ./www.
+// argv[1] -- frames to render (default 60). argv[2] -- the shader directory,
+// which is otherwise FOUND rather than assumed: the documented cwd is the ETCS
+// root (same convention run_website.etcs uses for ./www), but the suite runs
+// every loader from bin/ on purpose -- REPLTesterLoader execvp's './etcs' and
+// only resolves there -- so a root-relative default made this the one test the
+// suite could not run. It did not fail either: surface creation with no shaders
+// to compile does not come back, so a wrong cwd showed up as a 240-second HANG
+// with no output after the module load. Trying both is two lines; the hang
+// itself is a separate defect and still there for whoever calls with a genuinely
+// bad path.
 
 #include "../ETCS.h"
 
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <string>
+
+namespace {
+// Present means the vertex shader this test actually needs is readable there.
+bool shaders_at(const std::string& dir)
+{
+    std::ifstream probe(dir + "blit.vert.spv");
+    return probe.good();
+}
+}
 
 int main(int argc, char** argv)
 {
     const uint32_t frames = (argc > 1) ? static_cast<uint32_t>(std::atoi(argv[1])) : 60;
-    const std::string shader_dir = (argc > 2) ? argv[2] : "modules/RenderProvider/shaders/";
+    std::string shader_dir = "modules/RenderProvider/shaders/";
+    if (argc > 2)
+        shader_dir = argv[2];
+    else if (!shaders_at(shader_dir) && shaders_at("../" + shader_dir))
+        shader_dir = "../" + shader_dir;
 
     WIRE_CONTEXT();
 

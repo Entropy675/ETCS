@@ -557,6 +557,32 @@ public:
  */
     void (*set_log_to_file)(bool) = nullptr;
     bool (*get_log_to_file)()     = nullptr;
+    /*
+ * RUN ONE PASS OF THIS NODE'S ORDERING LOOP, IN THE DSO THAT OWNS IT.
+ *
+ * A trampoline for a sharper version of set_log_to_file's reason. The browser
+ * has no ordering thread (EventStream::start), so a waiter drives the loop
+ * itself -- and every blocking event a MODULE fires (addTag<T>, the unload and
+ * destroy events) waits on the LOADER's stream. Calling emscripten_poll()
+ * through a module's own `stream` looks right and is not: the member offsets
+ * agree, because LoaderStream and ModuleProxy share the same EventStream base,
+ * but the dispatch does not. EventStream::launch_slot calls
+ * static_cast<Derived*>(this)->on_event, and Derived is whatever the CALLER
+ * compiled -- so a module drives the loader's events into
+ * ModuleProxy::on_event, which forwards everything that is not a TagModify
+ * straight back onto the same stream. The result is a loop that consumes and
+ * re-enqueues at full speed with nothing ever completing: in_seq_ climbing by
+ * hundreds of thousands, every slot Empty, and the waiter blocked forever.
+ *
+ * So the poll goes through the pointer the OWNING image installed, which is
+ * the only image whose Derived is the real one. Returns whether the call
+ * actually drove the loop -- see EventStream::emscripten_poll on why more than
+ * one driver is refused.
+ *
+ * ABOVE the #ifdef ETCS_LOADER fork for the same layout reason as the two
+ * above it: a module reads this out of the loader's node.
+ */
+    bool (*drive_ordering)()      = nullptr;
 
     ::std::unordered_map<ETCS::Buffer, RIDListHandle> ridMap;
 
@@ -1136,6 +1162,14 @@ public:
         // owning DSO, and these must be that DSO's own functions.
         set_log_to_file = &ETCS::set_log_to_file;
         get_log_to_file = &ETCS::get_log_to_file;
+#if defined(__EMSCRIPTEN__)
+        // Bound to THIS object rather than to getInstance(): under emscripten a
+        // module's getInstance() answers the loader's node, so a lambda calling
+        // it would be correct only by accident, and wrong the moment a module
+        // ever gets a node of its own again.
+        static EventNode* s_self = this;
+        drive_ordering = []() { return s_self->stream.emscripten_poll(); };
+#endif
         stream.owner = this; // wire back-pointer now that EventNode is complete --
                               // both LoaderStream and ModuleProxy have this member.
         s_alive.store(true, ::std::memory_order_release);

@@ -35,11 +35,47 @@ namespace ETCS {
     static EventNode& getLoader() { return *dynamicLoader.node; }
 
 #if defined(__EMSCRIPTEN__)
+    /*
+     * Wait for `pred` by DRIVING the loader's ordering loop, because in the
+     * browser nothing else will (EventStream::start takes no ordering thread).
+     *
+     * The loop admits one driver at a time, so a waiter that does not get it
+     * stands down rather than spinning on the claim: the thread that does have
+     * it is servicing this waiter's event too, and taking the CPU off it is the
+     * one way to make the wait longer.
+     *
+     * A SHORT SLEEP, NOT yield(). sched_yield is a no-op in wasm, so a yield
+     * spin never leaves the thread -- and leaving it is what makes the thread
+     * cooperative. emscripten runs a thread's share of the runtime's own
+     * proxied work on the way out of a futex wait (_emscripten_yield), which is
+     * the only place a thread replays a dlopen or a new dlsym table entry; a
+     * thread that only ever yields is invisible to that and can hold up any
+     * other thread waiting for it. The sleep is short enough not to add latency
+     * worth measuring and is the whole difference between a thread that
+     * participates and one that merely burns.
+     */
     template <typename Pred>
     inline void etcs_emscripten_spin(Pred&& pred)
     {
+        // A wait this long is not slow, it is stuck: every event this function
+        // waits on is serviced by the loop it is driving, so a second of it
+        // means the window will not clear on its own. The reorder snapshot names
+        // which of the three ways it went wrong -- and without it the browser
+        // path had no stall diagnostics at all, which is why a blocked admission
+        // there read as "the script simply stopped".
+        constexpr unsigned STUCK = 5000;   // x200us
+        unsigned spins = 0;
+        EventNode& node = getLoader();
         while (!pred())
-            getLoader().stream.emscripten_poll();
+        {
+            // Through the node's own trampoline, NEVER node.stream.emscripten_poll()
+            // -- see EventNode::drive_ordering for what a module's copy of that
+            // template does to the loader's events.
+            if (!node.drive_ordering || !node.drive_ordering())
+                ::std::this_thread::sleep_for(::std::chrono::microseconds(200));
+            if (++spins % STUCK == 0 && !node.stream.stallReportsExhausted())
+                node.stream.reportReorderState("REORDER STALL (web waiter)");
+        }
     }
 #endif
 
@@ -375,10 +411,12 @@ bool ETCS::Module::registerLoader(EventNode& st)
 ETCS::ModuleBundle ETCS::Module::getTagAddress(const ::std::string& tag)
 {
 #ifdef ETCS_LOADER
-    ::std::string hashFuncSymbol = tag + "_GetHash";
-    ::std::string makeFuncSymbol = tag + "_Make";
-    void* hashAddr = getTagFunction(hashFuncSymbol);
-    void* makeAddr = getTagFunction(makeFuncSymbol);
+    ::std::string hashFuncSymbol      = tag + "_GetHash";
+    ::std::string makeFuncSymbol      = tag + "_Make";
+    ::std::string makeChildFuncSymbol = tag + "_MakeChild";
+    void* hashAddr      = getTagFunction(hashFuncSymbol);
+    void* makeAddr      = getTagFunction(makeFuncSymbol);
+    void* makeChildAddr = getTagFunction(makeChildFuncSymbol);
     if (!makeAddr) throw ::std::runtime_error("Failed to find '" + makeFuncSymbol + "' in " + name);
     if (!hashAddr) throw ::std::runtime_error("Failed to find '" + hashFuncSymbol + "' in " + name);
     ETCS_LOG("DynamicLoader:ModuleBundle", "Raw "     << makeAddr << " from " << tag << "!");
@@ -388,6 +426,16 @@ ETCS::ModuleBundle ETCS::Module::getTagAddress(const ::std::string& tag)
     using HashFunc         = HASH_TYPE(*)();
     MakeFunc  actualMake = reinterpret_cast<MakeFuncResolver>(makeAddr)();
     HASH_TYPE actualHash = reinterpret_cast<HashFunc>(hashAddr)();
+    /*
+     * Absence is not fatal here, unlike _Make. A tag whose block predates
+     * receiver-scoped spawn still has a perfectly good top-level factory; only
+     * `parent.spawn` is unavailable to it, and make_typed_child names the tag
+     * when that happens rather than the whole module failing to load.
+     */
+    using MakeChildResolver = MakeChildFunc (*)();
+    MakeChildFunc actualMakeChild = makeChildAddr
+        ? reinterpret_cast<MakeChildResolver>(makeChildAddr)()
+        : nullptr;
     ETCS_LOG("DynamicLoader:ModuleBundle", "Got " << tag << " from " << name << "!");
     ETCS::FlatMap<ETCS::Buffer, WorkBundle> actions;
     Manifest* actionsHashes = discoverActions(tag, actions);
@@ -404,7 +452,8 @@ ETCS::ModuleBundle ETCS::Module::getTagAddress(const ::std::string& tag)
  * see real OS signals, not just this Module's own local flags.
  */
     moduleSignals.setParent(&ETCS::RootSignalContext());
-    return {tag, this, actualHash, actualMake, actionsHashes, actions, moduleSignals, ETCS::Buffer()};
+    return {tag, this, actualHash, actualMake, actualMakeChild,
+            actionsHashes, actions, moduleSignals, ETCS::Buffer()};
 #else
     (void)tag;
     return {};

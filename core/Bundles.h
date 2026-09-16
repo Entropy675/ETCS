@@ -780,6 +780,17 @@ struct ModuleBundle
     Module* owner = nullptr;
     const HASH_TYPE hash = 0;
     const MakeFunc makeFunc = nullptr;
+    /*
+     * <Tag>_MakeChild, resolved WITH the rest of the catalog rather than at the
+     * spawn that needs it. A receiver-scoped spawn (`main.spawn(Mod::Type x)`)
+     * is the only thing that reaches for this symbol, and resolving it there
+     * made it the program's only dlsym after load -- which the browser cannot
+     * afford: emscripten's dlsym blocks the calling thread until every other
+     * live pthread has replayed the new table entry, and a thread that waits by
+     * spinning rather than sleeping never replays it (see make_typed_child).
+     * Resolved here it costs nothing at spawn time on either substrate.
+     */
+    const MakeChildFunc makeChildFunc = nullptr;
     const Manifest* actions_hashes = nullptr;
     ETCS::FlatMap<ETCS::Buffer, WorkBundle> actions;
     SignalContext ctx;
