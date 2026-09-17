@@ -66,6 +66,25 @@ static constexpr uint8_t INPUT_MOTION = 2;
 static constexpr uint8_t INPUT_BUTTON_DOWN = 3;
 static constexpr uint8_t INPUT_BUTTON_UP   = 4;
 
+/*
+ * SCROLL, and it travels the POINTER ring for the same reason buttons do.
+ *
+ * A wheel notch happens AT a position and means something different depending on
+ * where -- zoom about here, scroll this pane, not that one -- so it belongs with
+ * the channel that carries positions rather than with keys. x and y are the
+ * DELTA, not a position, which is the one place this struct's fields change
+ * meaning by action; there is no such thing as an absolute scroll
+ * (PointerState says the same of its own scroll_x/scroll_y).
+ *
+ * WHY AN EVENT AS WELL AS PointerState's deltas. The two are not duplicates:
+ * Pointer_::ReadPointer answers "how much has it scrolled since I last looked",
+ * which is what a per-frame consumer wants, and this answers "a notch happened,
+ * here" -- which is what a consumer that only wakes on input can act on. A UI
+ * that polled would miss nothing; one that waits on a stream would never see a
+ * wheel at all.
+ */
+static constexpr uint8_t INPUT_SCROLL = 5;
+
 static constexpr uint32_t INPUT_SLOT_SIZE = sizeof(InputEvent);
 static constexpr uint8_t  INPUT_MAX_OBSERVERS = 16;
 static constexpr uint8_t  INPUT_INVALID_OBSERVER = 0xFF;
@@ -254,6 +273,37 @@ protected:
     }
 
     /*
+ * A wheel notch, and the accumulator behind PointerState's deltas.
+ *
+ * Flushes the pending position first, exactly as a button does, so the notch
+ * lands in the ring AFTER the position it happened at -- a consumer replaying
+ * the stream then has the right position current when the scroll arrives.
+ *
+ * Deltas are ALSO accumulated for Pointer_::ReadPointer, because the two
+ * readers want different things (see INPUT_SCROLL). Reading through
+ * takeScrollX/Y consumes them; the event copy does not.
+ */
+    void pushScroll(float dx, float dy)
+    {
+        flushPointerPosition();
+        m_scroll_x += dx;
+        m_scroll_y += dy;
+        m_pointer.write({ 0, INPUT_SCROLL, 0,
+                          clamp16(static_cast<int>(dx)), clamp16(static_cast<int>(dy)) });
+    }
+
+    // Consumed on read -- a delta that survived being read would be applied
+    // twice. Pointer_::ReadPointer is the only intended caller.
+    float takeScrollX() { const float v = m_scroll_x; m_scroll_x = 0.0f; return v; }
+    float takeScrollY() { const float v = m_scroll_y; m_scroll_y = 0.0f; return v; }
+
+    // What the pointer ring last recorded, for a Pointer_ that answers "where is
+    // it now" rather than "what happened". Not the ring's tail: a poller must
+    // not consume events a stream reader is also owed.
+    int32_t currentPointerX() const { return m_pendingX; }
+    int32_t currentPointerY() const { return m_pendingY; }
+
+    /*
  * COALESCING, and why the pointer gets it and keys never can.
  *
  * A pointer reports as fast as its hardware does and nothing downstream
@@ -304,6 +354,9 @@ private:
     int  m_pendingX = 0;
     int  m_pendingY = 0;
     bool m_pendingMotion = false;
+    // Accumulated since the last ReadPointer -- see pushScroll.
+    float m_scroll_x = 0.0f;
+    float m_scroll_y = 0.0f;
 
     void pushKey(InputEvent ev)
     {
