@@ -88,6 +88,85 @@ int etcs_web_shell_try_pop_line(char* out, int cap)
     return 1;
 }
 
+/*
+ * ONE SCRIPT LINE, CALLED FROM THE PAGE.
+ *
+ *     etcs_web_call("input", "Pointer", "412, 22")
+ *
+ * is the JS spelling of
+ *
+ *     input.Pointer(412, 22)
+ *
+ * and it goes through the same dispatch the executor uses for an ordinary action
+ * -- resolve the name, build "<Tag>.<Work>", hand the argument text to the work
+ * function to parse. Nothing here knows what any particular work function means,
+ * which is the point: every verb a module exports is reachable from the page the
+ * moment the module is loaded, with no per-verb glue to write and nothing to keep
+ * in step.
+ *
+ * BY GLOBAL NAME, NOT BY RID, and that is not only convenience. A RID is a full
+ * 64-bit hash; a JS number carries 53 bits, so a RID that crossed this boundary
+ * as a number would arrive silently wrong for most values. Names are what the
+ * script already introduced -- a boot script runs as root, so its names ARE the
+ * globals (run_root_script sets is_root) -- and they are what a reader of the
+ * page and a reader of the script can match up by eye.
+ *
+ * Returns 1 if the call was dispatched, 0 if the name does not resolve. It does
+ * NOT report what the work function decided: a work function's answer is its own
+ * business (it logs), and a bool here would suggest this layer knew.
+ *
+ * ON THE CALLING THREAD, which for a DOM handler is the main thread, and that
+ * bounds what this is good for: discrete events -- a click, a key, a button --
+ * not a stream. A call per pointer move would put the page's event loop behind
+ * the module's stream for every sample; that traffic belongs on an edge
+ * (ProducePointer -> ConsumePointer), which is why the window has one.
+ */
+EMSCRIPTEN_KEEPALIVE
+int etcs_web_call(const char* name, const char* work, const char* args)
+{
+    if (!name || !*name || !work || !*work) return 0;
+    if (!ETCS::EventNode::alive()) return 0;
+
+    auto bound = ETCS::live_global(name);
+    if (!bound)
+    {
+        ETCS_LOG("ETCS", "etcs_web_call: '" << name << "' is not a live global name. "
+                 "A boot script's own names become the globals; anything else has to "
+                 "be spawned before the page can reach it.");
+        return 0;
+    }
+    ETCS::Entity* target = ETCS::resolve_bound_entity(*bound);
+    if (!target)
+    {
+        ETCS_LOG("ETCS", "etcs_web_call: '" << name << "' (RID:" << bound->rid
+                 << ") no longer resolves.");
+        return 0;
+    }
+
+    ETCS::Buffer act;
+    act.write((bound->tag + "." + work).c_str());
+    ETCS::Buffer payload;
+    if (args && *args) payload.write(args);
+
+    try
+    {
+        target->call(act, payload, ETCS::RootSignalContext());
+    }
+    catch (const std::exception& ex)
+    {
+        ETCS_LOG("ETCS", "etcs_web_call: " << name << "." << work << " threw: "
+                 << ex.what());
+        return 0;
+    }
+    catch (...)
+    {
+        ETCS_LOG("ETCS", "etcs_web_call: " << name << "." << work
+                 << " threw an unknown exception.");
+        return 0;
+    }
+    return 1;
+}
+
 EMSCRIPTEN_KEEPALIVE
 void etcs_web_shell_write(const char* text)
 {

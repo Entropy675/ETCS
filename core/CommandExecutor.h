@@ -2491,8 +2491,22 @@ inline void shutdown_detached_executors()
 namespace ETCS {
 inline bool& color_enabled()
 {
-#if defined(_WIN32) || defined(_WIN64) || defined(__EMSCRIPTEN__)
-    /* Browser / HTML terminal is not a VT100: emit plain text, not ANSI. */
+#if defined(__EMSCRIPTEN__)
+    /*
+     * ON in the browser, and the HTML terminal renders the escapes.
+     *
+     * It was off here on the grounds that a page is not a VT100, which is true
+     * of the ELEMENT and beside the point for the QUESTION. The alternative to
+     * emitting ANSI is a second colouring mechanism for the web -- some other
+     * channel carrying which span is a RID and which is a warning -- and then
+     * two tables that have to agree about what COLOR_LIB means. Emitting the
+     * same bytes the terminal gets makes them agree by construction: there is
+     * one vocabulary, and the page is one more thing that reads it
+     * (ShellProvider's page parses SGR into spans).
+     */
+    static bool v = true;
+#elif defined(_WIN32) || defined(_WIN64)
+    /* No VT processing enabled on the legacy console: emit plain text. */
     static bool v = false;
 #else
     static bool v = (::isatty(STDOUT_FILENO) != 0);
