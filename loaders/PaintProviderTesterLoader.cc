@@ -102,16 +102,22 @@ int main()
     { std::cerr << "ImageSurface exposes no Pixels interface -- nothing can be verified\n"; return 1; }
 
     ETCS::Entity* tool  = ETCS::spawn_entity("PaintProvider", "PaintTool",     env, loader);
-    ETCS::Entity* layer = ETCS::spawn_entity("PaintProvider", "PaintLayer",    env, loader);
     ETCS::Entity* doc   = ETCS::spawn_entity("PaintProvider", "PaintDocument", env, loader);
     ETCS::Entity* psurf = ETCS::spawn_entity("PaintProvider", "PaintSurface",  env, loader);
     ETCS::Entity* pin   = ETCS::spawn_entity("PaintProvider", "PaintInput",    env, loader);
-    if (!tool || !layer || !doc || !psurf || !pin)
+    if (!tool || !doc || !psurf || !pin)
     { std::cerr << "cannot spawn the PaintProvider tags\n"; return 1; }
 
-    layer->call("PaintLayer.Create", SIZE.c_str(), ctx);
     doc->call("PaintDocument.Create", (SIZE + " test").c_str(), ctx);
-    doc->call("PaintDocument.AddLayer", rid_arg(layer).c_str(), ctx);
+
+    // A CHILD OF THE DOCUMENT, because that is what puts it in the document.
+    // make_typed_child is the C++ spelling of `doc.spawn(...)`; there is no
+    // AddLayer to call afterwards, and nothing to keep in step -- membership is
+    // parenthood (PaintDocument::OrderedLayers).
+    ETCS::Entity* layer = ETCS::make_typed_child("PaintProvider", "PaintLayer", doc, loader);
+    if (!layer) { std::cerr << "cannot spawn PaintProvider:PaintLayer under the document\n"; return 1; }
+
+    layer->call("PaintLayer.Create", SIZE.c_str(), ctx);
     doc->call("PaintDocument.SetActiveLayer", rid_arg(layer).c_str(), ctx);
     psurf->call("PaintSurface.Create", rid_arg(canvas).c_str(), ctx);
     psurf->call("PaintSurface.AttachDocument", rid_arg(doc).c_str(), ctx);

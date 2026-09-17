@@ -989,6 +989,43 @@ public:
         for (auto& entry : typed_children_)
             if (entry.second.invoke_contains(rid)) { entry.second.invoke_reorder(); return; }
     }
+    /*
+ * collectSiblingOrder(rid, out) - the ordered contents of whichever of this
+ * entity's typed-children lists holds `rid`.
+ *
+ * The read half of the seam reorderTypedChild is the write half of, and found
+ * the same way: by searching for the RID rather than by taking a tag, because
+ * a caller knows its own RID and not the key its parent filed it under. That
+ * symmetry is the point -- Orderable_::Reorder() says "my key moved" and
+ * Layer_::Neighbourhood asks "who is near me", and both reach the same one
+ * list through the same lookup.
+ *
+ * ONE LIST, NOT THE MERGED SET. Neighbourhood is a question in a metric, and
+ * a metric belongs to one concrete type: two unrelated leaf types have no
+ * comparison between them, which is exactly why the relation lives on the
+ * pointee (core/RIDList.h). A caller that wants one order over a mixed set
+ * wants the scalar question instead -- Drawable_::Order() -- and that is a
+ * different call with a different answer.
+ *
+ * The ORDER is whatever the list sorts by, read through the same dispatch
+ * getOrderedTypedChildren uses. For a scalar key that is collect_ordered's
+ * stable sort; for a list indexed some other way it is that index's answer,
+ * and nothing here changes.
+ *
+ * False when no list holds it -- root-level, or already removed. Neither is an
+ * error; nothing is holding it in an order.
+ */
+    bool collectSiblingOrder(RID rid, ::std::vector<RID>& out) const
+    {
+        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
+        for (const auto& entry : typed_children_)
+            if (entry.second.invoke_contains(rid))
+            {
+                entry.second.invoke_collect_rids_ordered(out);
+                return true;
+            }
+        return false;
+    }
     Entity* getTypedChild(const ETCS::Buffer& tag, RID rid) const
     {
         ::std::lock_guard<::std::mutex> lock(m_tagMutex);
