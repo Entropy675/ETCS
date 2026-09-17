@@ -150,18 +150,21 @@ layout.FollowResize(@main)
 # another. Resizing larger shows more of the canvas's own background; smaller
 # crops the view, not the paper.
 
-spawn PaintProvider::PaintLayer paper
-paper.Create(1280, 740)
-paper.Clear(1.0, 1.0, 1.0, 1.0)
-
-spawn PaintProvider::PaintLayer ink
-ink.Create(1280, 740)
-ink.Clear(0.0, 0.0, 0.0, 0.0)
-
 spawn PaintProvider::PaintDocument doc
-doc.Create(1280, 740, 'untitled')
-doc.AddLayer(@paper)
-doc.AddLayer(@ink)
+doc.Create(1280, 800, 'untitled')
+
+doc.spawn(PaintProvider::PaintLayer paper)
+paper.Create(1280, 800)
+paper.Clear(1.0, 1.0, 1.0, 1.0)
+paper.SetName(Paper)
+paper.SetOrder(0)
+
+doc.spawn(PaintProvider::PaintLayer ink)
+ink.Create(1280, 800)
+ink.Clear(0.0, 0.0, 0.0, 0.0)
+ink.SetName(Ink)
+ink.SetOrder(1)
+
 doc.SetActiveLayer(@ink)
 
 spawn PaintProvider::PaintTool brush

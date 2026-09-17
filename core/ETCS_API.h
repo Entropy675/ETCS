@@ -5,6 +5,12 @@
 #ifdef ETCS_DLL_EXPORTS
     #ifdef _WIN32 // Windows-specific export/import
         #define ETCS_API __declspec(dllexport)
+    #elif defined(__EMSCRIPTEN__)
+        // Side/main module: keep the symbol in the wasm export table so JS
+        // (and dylink) can call it. EMSCRIPTEN_KEEPALIVE is the keep-loaded
+        // marker; visibility default is required for dylink to see it.
+        #include <emscripten/emscripten.h>
+        #define ETCS_API EMSCRIPTEN_KEEPALIVE __attribute__((visibility("default")))
     #else // Linux/macOS (GCC/Clang) - visibility default often handles it
         #define ETCS_API __attribute__((visibility("default")))
     #endif
@@ -12,10 +18,52 @@
     // When NOT building the DLL, we are using it, so we IMPORT symbols.
     #ifdef _WIN32
         #define ETCS_API __declspec(dllimport)
+    #elif defined(__EMSCRIPTEN__)
+        // Import side: still need the symbol visible for cross-module calls;
+        // keep-alive is on the defining side (ETCS_DLL_EXPORTS).
+        #define ETCS_API __attribute__((visibility("default")))
     #else
         #define ETCS_API
     #endif
 #endif
+
+// Under emscripten SIDE_MODULE, C++ static-init runs while the main module is
+// still inside loadDynamicLibrary. EventNode/ThreadPool/MemoryArena symbols
+// resolve to the *loader* (GOT imports), not a private per-DSO copy the way a
+// native .so does. Touching them from a module static lambda is therefore a
+// reach into the loader mid-load — hang / re-entry. Defer those registrations;
+// the loader's post-dlopen calls (RegisterEventNode / Name()) perform the real
+// work once both sides are live.
+#if defined(__EMSCRIPTEN__) && !defined(ETCS_LOADER)
+#  define ETCS_MODULE_STATIC_REACH_LOADER 0
+#else
+#  define ETCS_MODULE_STATIC_REACH_LOADER 1
+#endif
+
+#include <vector>
+namespace ETCS {
+inline ::std::vector<void(*)()>& etcs_deferred_rid_registrars()
+{
+    static ::std::vector<void(*)()> v;
+    return v;
+}
+/*
+ * Returns HOW MANY ran, because otherwise nothing observable distinguishes
+ * "deferred and flushed" from "skipped and lost" -- which is exactly the bug the
+ * deferral fixes, and it was invisible in a browser log for precisely that
+ * reason. The caller logs the count.
+ */
+inline size_t etcs_flush_deferred_rid_registrars()
+{
+    auto& v = etcs_deferred_rid_registrars();
+    size_t ran = 0;
+    for (void (*fn)() : v)
+        if (fn) { fn(); ++ran; }
+    v.clear();
+    return ran;
+}
+} // namespace ETCS
+
 // flags for make with -DETCS_PRODUCTION_BUILD module side (see ETCS.h for loader side)
 #ifdef ETCS_PRODUCTION_BUILD
     #define ETCS_LOG_TO_FILE
@@ -82,7 +130,67 @@
 // up to 336 bytes together -- a sixth of the old budget, in a field that also
 // holds config. Cheaper than making config's headroom depend on tag count.
 #define MAX_MIRROR_TRANSPORT_SIZE       4096
+/*
+ * HEADERS AND ANYTHING SIZED LIKE A HEADER. 64 KiB, which is what a request
+ * line plus headers plus a parser accumulator actually needs.
+ *
+ * IT WAS RAISED TO 2 MiB and that was one constant doing four jobs. The reason
+ * was real -- a .wasm asset is sent in ONE shot, so the send buffer had to hold
+ * the whole binary -- but this macro also sizes the RECEIVE buffer, both TLS
+ * ciphertext staging buffers, the HTTP parser's accumulator, and ETCS::NBuffer.
+ * Measured: HttpServer.Start went from ~4 MiB to 160 MiB of committed RSS with
+ * zero clients connected (8 pooled connections x ~16 MiB, memset in the
+ * connection constructor so it is resident, not lazy), and sizeof(HtmlPage_)
+ * went from 192 KiB to 6 MiB -- per entity, with FileHtmlPage creating one per
+ * directory entry, in a bump arena that cannot reclaim them individually.
+ *
+ * A CONSTANT IS THE WRONG SHAPE FOR ANY OF IT, which is why the split below is
+ * a stopgap and says so. Two things replace it, and neither is a tuned number:
+ *
+ *   CHUNKING on the send path. A body sent across several sends needs a buffer
+ *   sized by the transfer unit, not by the largest asset it will ever carry.
+ *
+ *   ELASTIC per-connection buffers, grown and shrunk on the same discipline
+ *   ConnectionManager already applies to the connections themselves -- expand
+ *   under load, rebalance back down when it passes.
+ *
+ *   AND THE ARENA MAKES THAT CHEAP RATHER THAN MERELY TIDY, which is the part
+ *   worth being precise about: the root arena is GROW-ONLY, so shrinking gives
+ *   nothing back to the OS. What it does is return a page to its SIZE CLASS,
+ *   and same-sized requests reuse it. So the cost of a 2 MiB buffer is not the
+ *   buffer, it is the 2 MiB size class existing at all -- and with elastic
+ *   sizing that class only gets pages when something genuinely serves a 2 MiB
+ *   asset, after which those same pages carry the next one. A fixed constant
+ *   instead charges the high-water mark to every connection on the first
+ *   accept, whether anything ever asks for an asset or not.
+ *
+ * With both, these two constants become a ceiling nobody reaches rather than an
+ * allocation everybody pays. Until then the send path keeps its own constant so
+ * the cost stays where the need was instead of being charged to every
+ * connection and every page.
+ */
 #define ETCS_NETWORK_MAX_HEADER_SIZE    8*8192
+/*
+ * WHAT ONE SEND CALL MUST BE ABLE TO HOLD -- a whole response, headers and body
+ * together, because there is no chunked path yet.
+ *
+ * 8 MiB, WHICH IS EXACTLY WHAT THE SEND BUFFER ALREADY HAD -- kSendBufSize was
+ * ETCS_NETWORK_MAX_HEADER_SIZE * 4 against a 2 MiB macro. Stated as its own
+ * number rather than as a multiple of the header size, because the multiple is
+ * what tied the two together and made raising one raise the other.
+ *
+ * NOT a reduction. Splitting the constant must not quietly shrink the one
+ * buffer the split exists to preserve: a 3 MiB etcs.wasm fits here and would
+ * not have fitted a 2 MiB buffer, so picking the "tidier" number would have
+ * turned a memory fix into a refusal to serve the very asset this was raised
+ * for. The whole cost of the split lands on the four buffers that never needed
+ * the room, and none of it on this one.
+ *
+ * A CEILING, not a target, once the send buffer can chunk and resize -- at
+ * which point this stops being an allocation and becomes the refusal threshold
+ * it already reads like.
+ */
+#define ETCS_NETWORK_MAX_ASSET_SIZE     (8*1024*1024)
 #define ETCS_SLOT_SIZE                  64
 #define ETCS_SEQUENTIAL_FRAME_SIZE      32
 #define ETCS_BUFFER_METADATA_SIZE       16
@@ -90,7 +198,7 @@
 #define MAX_LMAX_BUFFER_SIZE   (ETCS_SLOT_SIZE - ETCS_BUFFER_METADATA_SIZE - ETCS_SEQUENTIAL_FRAME_SIZE)
 // you get 16 bytes, fit a ptr & action type
 #define DEFAULT_THREAD_POOL_THREADS  4
-// can maybe be std::thread::hardware_concurrency()
+// can maybe be ::std::thread::hardware_concurrency()
 // default hash size/type
 #define HASH_TYPE uint64_t
 #define BASE_SOURCE_STRING "ETCS_Kernel_v1.0"
@@ -98,12 +206,71 @@
 #include <cstdint>
 #include <cstring>
 #include <atomic>   // WIRE_TYPE_IDENTITY's TAG_CLOSURE generation counter
+#include <thread>
+#include <chrono>
+#if defined(__EMSCRIPTEN__)
+// Unconditionally, not only under ETCS_DLL_EXPORTS: etcs_cooperative_pause_ms
+// needs emscripten_is_main_browser_thread in every translation unit that waits,
+// loader and module alike.
+#include <emscripten/emscripten.h>
+#include <emscripten/threading.h>
+#endif
+
+/*
+ * A WAIT, AND ON THE BROWSER'S MAIN THREAD A REFUSAL.
+ *
+ * Returns false only when it could not wait, which is only ever the browser's
+ * main thread. A caller that gets false must RETURN; there is nothing it can
+ * usefully loop on.
+ */
+inline bool etcs_cooperative_pause_ms(unsigned ms)
+{
+#if defined(__EMSCRIPTEN__)
+    /*
+     * A pthread is a Worker and can block outright, so the sleep below is
+     * exactly right there.
+     *
+     * THE MAIN THREAD CANNOT WAIT AT ALL. Each of the three ways to try is
+     * broken in its own way:
+     *
+     *   sleep_for blocks the one thread that delivers whatever is being waited
+     *   for, so a 1ms poll starves the page and a longer one freezes the tab;
+     *
+     *   yield() never returns to the event loop, so a spin on a condition that
+     *   flips from a DOM callback -- every GLFW event -- can never end;
+     *
+     *   emscripten_sleep needs -sASYNCIFY, and Asyncify is unavailable to any
+     *   build that calls module functions from pool threads. It replaces a
+     *   module's exports with JS closures, dylink stores those as the library's
+     *   exports, and emscripten's cross-thread table catch-up then has no
+     *   signature to re-table them with.
+     *
+     * So this does not try. It says it could not, and the caller returns to the
+     * event loop -- the only thing that lets the condition change. Reaching this
+     * branch means work that should have been detached was not.
+     */
+    if (emscripten_is_main_browser_thread())
+        return false;
+#endif
+    ::std::this_thread::sleep_for(::std::chrono::milliseconds(ms));
+    return true;
+}
+
 #include <string>
 #include <cstddef>
 #include <unordered_map>
 #include <map>
 #include <sstream>
 #include <vector>
+// ====================================================================
+// Emscripten: no std::thread until main arms the runtime (etcs_boot_runtime_threads).
+// ThreadPool / EventStream consult this before creating Web Workers.
+// ====================================================================
+#if defined(__EMSCRIPTEN__)
+inline ::std::atomic<bool> g_etcs_runtime_threads_started{false};
+#endif
+
+
 // ====================================================================
 // PLATFORM-SPECIFIC HEADER INCLUDES
 // ====================================================================
@@ -114,13 +281,24 @@
     #define DL_EXTENSION ".dll"
     #define RENAME_CMD(old_name, new_name) MoveFileExA(old_name.c_str(), new_name.c_str(), MOVEFILE_REPLACE_EXISTING)
     #define GET_CWD() _getcwd(nullptr, 0)
+#elif defined(__EMSCRIPTEN__)
+    // Compile-time only when the translation unit is built by em++.
+    // Native g++/clang never define __EMSCRIPTEN__, so DL_EXTENSION stays
+    // ".so" and existing Linux module loading is unchanged.
+    #include <dlfcn.h>
+    #include <unistd.h>
+    #include <sys/stat.h>
+    using library_handle_t = void*;
+    #define DL_EXTENSION ".wasm"
+    #define RENAME_CMD(old_name, new_name) ::std::rename(old_name.c_str(), new_name.c_str())
+    #define GET_CWD() getcwd(nullptr, 0)
 #else
     #include <dlfcn.h>
     #include <unistd.h> // For getcwd
     #include <sys/stat.h> // For stat
     using library_handle_t = void*;
     #define DL_EXTENSION ".so"
-    #define RENAME_CMD(old_name, new_name) std::rename(old_name.c_str(), new_name.c_str())
+    #define RENAME_CMD(old_name, new_name) ::std::rename(old_name.c_str(), new_name.c_str())
     #define GET_CWD() getcwd(nullptr, 0)
 #endif
 #include "Buffer.h"
@@ -273,7 +451,7 @@ public: \
      * SAME MODULE ONLY, self-guarded -- TAG_MASK is assigned by this module's \
      * own ETCS_TAG_DECLARE, so a foreign type reads empty and contributes \
      * nothing (see addTagTrampoline). Two modules' tag bits must never meet. */ \
-    inline static std::atomic<uint64_t> TAG_CLOSURE_W[ETCS::TAG_WORDS]{}; \
+    inline static ::std::atomic<uint64_t> TAG_CLOSURE_W[ETCS::TAG_WORDS]{}; \
     /* Atomic words plus a generation: a reader on any pool worker can be \
      * mid-read while the loader's ordering thread records a first \
      * acquisition. The atomics make each word coherent (and keep TSan quiet); \
@@ -281,7 +459,7 @@ public: \
      * sampled either side, falling back to all(), so tearing fails SHUT \
      * instead of dropping a bit. All writes are on that one thread, so there \
      * is no writer-writer case; fetch_or covers it regardless. */ \
-    inline static std::atomic<uint32_t> TAG_CLOSURE_GEN{0}; \
+    inline static ::std::atomic<uint32_t> TAG_CLOSURE_GEN{0}; \
     void* getTrueType() override { return static_cast<void*>(this); } \
     const char* myTag() override { return TAG; } \
     const ETCS::TagMask& myTagMask() const override { return TAG_MASK; } \
@@ -290,11 +468,11 @@ public: \
      * reference would be a data race. */ \
     static ETCS::TagMask readTagClosure() \
     { \
-        const uint32_t g0 = TAG_CLOSURE_GEN.load(std::memory_order_acquire); \
+        const uint32_t g0 = TAG_CLOSURE_GEN.load(::std::memory_order_acquire); \
         ETCS::TagMask m; \
         for (size_t i = 0; i < ETCS::TAG_WORDS; ++i) \
-            m.w[i] = TAG_CLOSURE_W[i].load(std::memory_order_relaxed); \
-        if (TAG_CLOSURE_GEN.load(std::memory_order_acquire) != g0) \
+            m.w[i] = TAG_CLOSURE_W[i].load(::std::memory_order_relaxed); \
+        if (TAG_CLOSURE_GEN.load(::std::memory_order_acquire) != g0) \
             return ETCS::TagMask::all(); \
         return TAG_MASK | m; \
     } \
@@ -303,8 +481,8 @@ public: \
     { \
         if (!other.any()) return; \
         for (size_t i = 0; i < ETCS::TAG_WORDS; ++i) \
-            if (other.w[i]) TAG_CLOSURE_W[i].fetch_or(other.w[i], std::memory_order_relaxed); \
-        TAG_CLOSURE_GEN.fetch_add(1, std::memory_order_release); \
+            if (other.w[i]) TAG_CLOSURE_W[i].fetch_or(other.w[i], ::std::memory_order_relaxed); \
+        TAG_CLOSURE_GEN.fetch_add(1, ::std::memory_order_release); \
     } \
     uint64_t getRID() const override { return m_rid; } \
 // for the locals ctx and root, auto registering ctx to globals.
@@ -419,17 +597,35 @@ public: \
         static ETCS::RIDList<Name##_*> list; \
         return list; \
     } \
-    inline bool _etcs_supertype_registered_##Name = []() { \
+    /* Direct ridMap write, not RegisterRIDRegistry -- that method only     \
+     * exists on module-scope EventNode (its own #ifndef ETCS_LOADER        \
+     * branch); this macro expands in ontology headers included by BOTH the \
+     * loader (ETCS.h) and every module, so it can only rely on members     \
+     * declared unconditionally on EventNode, before either branch of that  \
+     * split. ridMap itself is exactly such a member. */ \
+    inline void _etcs_supertype_publish_##Name() { \
         ETCS::ThreadPool::getInstance(); \
-        /* Direct ridMap write, not RegisterRIDRegistry -- that method    \
-         * only exists on module-scope EventNode (its own #ifndef         \
-         * ETCS_LOADER branch); this macro expands in ontology headers    \
-         * included by BOTH the loader (ETCS.h) and every module, so it   \
-         * can only rely on members declared unconditionally on           \
-         * EventNode, before either branch of that split. ridMap itself   \
-         * is exactly such a member. */ \
         ETCS::EventNode::getInstance().ridMap[ETCS::Buffer(#Name)] = \
             _etcs_supertype_list_##Name().handle(#Name); \
+    } \
+    /* DEFERRED, NOT SKIPPED, and the difference is the whole family.       \
+     * Under emscripten a module's static init runs while the loader is     \
+     * still inside loadDynamicLibrary, so reaching EventNode here is a     \
+     * re-entry (see ETCS_MODULE_STATIC_REACH_LOADER) -- but returning      \
+     * early without queueing meant the family RIDList was never published  \
+     * AT ALL, and etcs_supertype_fanout skips any family its map has no    \
+     * row for. Every family insert silently did nothing in the browser:    \
+     * per-TYPE lists worked (they already deferred, so a shell resolved),  \
+     * and every resolve_in_family / collect_in_family / search_in_family   \
+     * answered null. That is the entire cross-family seam -- a camera      \
+     * found by family name, a surface, a device -- so it fails exactly     \
+     * when the render path starts asking, not when the shell does. */ \
+    inline bool _etcs_supertype_registered_##Name = []() { \
+        if (!ETCS_MODULE_STATIC_REACH_LOADER) { \
+            ETCS::etcs_deferred_rid_registrars().push_back(&_etcs_supertype_publish_##Name); \
+            return true; \
+        } \
+        _etcs_supertype_publish_##Name(); \
         return true; \
     }(); \
     template <typename Derived> class Name##Base : public Name##_
@@ -607,7 +803,7 @@ public: \
          * as leaving. */ \
         ETCS::SharedPage* _live_token = stream.producerEnter(); \
         try { \
-        self->getThreadPool().enqueue(ETCS::Priority::Medium, ctx, [self, stream = std::move(stream), config, _pair_mod, _live_token, _auto_scope = std::move(_auto_scope)]() mutable { \
+        self->getThreadPool().enqueue(ETCS::Priority::Medium, ctx, [self, stream = ::std::move(stream), config, _pair_mod, _live_token, _auto_scope = ::std::move(_auto_scope)]() mutable { \
             ETCS::ProducerLiveGuard _auto_live(_live_token); \
             ETCS::PairScope _pair_scope(_pair_mod); \
             ETCS_CAUSAL_SCOPE(Type, Name); \
@@ -653,7 +849,7 @@ public: \
          * move below; PairScope copies. */ \
         ETCS::PairScope _pair_scope(stream.pairModuleMask()); \
         ETCS_CAUSAL_SCOPE(Type, Name); \
-        _implConsume_##Type##_##Name(*self, std::move(stream), config, _auto_scope.ctx()); \
+        _implConsume_##Type##_##Name(*self, ::std::move(stream), config, _auto_scope.ctx()); \
     } \
  \
     void _implConsume_##Type##_##Name(Type& self, ETCS::MirrorBuffer stream, ETCS::Buffer data, ETCS::SignalContext ctx)
@@ -677,8 +873,8 @@ public: \
  * settled answer or the fallback, never a half-written one.
  */
 #define ETCS_CAUSAL_EDGE_STORE(Type, Name) \
-    static std::atomic<uint64_t> _edge_w_##Type##_##Name[ETCS::TAG_WORDS]{}; \
-    static std::atomic<bool>     _edge_set_##Type##_##Name{false};
+    static ::std::atomic<uint64_t> _edge_w_##Type##_##Name[ETCS::TAG_WORDS]{}; \
+    static ::std::atomic<bool>     _edge_set_##Type##_##Name{false};
 
 #define ETCS_CAUSAL_SCOPE(Type, Name) \
     ETCS::CausalScope _causal_edge_scope( \
@@ -705,7 +901,7 @@ namespace ETCS
 {
     // etcs_count_tags / etcs_tag_index — constexpr tokenization of a
     // module's own Tags string, splitting on the same whitespace class
-    // std::stringstream's own operator>> uses (see
+    // ::std::stringstream's own operator>> uses (see
     // ETCS_MODULE_EXPORT_MAIN's own static-init loop, which feeds
     // RegisterTagBitIndex). Same string, same tokenizer, same order --
     // so the compile-time bit position and the static-init one agree by
@@ -836,10 +1032,25 @@ namespace ETCS
      * Retained even though dispatch no longer reads it: \
      * DecodeTagClosureMask still needs the reverse mapping to name which \
      * types were actually colliding when diagnosing a stall. */ \
+    /* Deferred rather than skipped under emscripten, same as the RIDLists: \
+     * dropped entirely, DecodeTagClosureMask has no reverse mapping and a \
+     * reorder stall in the browser cannot name the types that collided -- \
+     * the one job this map still exists for. */ \
+    static void Name##_publish_tag_bit_index_() { \
+        ::std::vector<::std::string> ordered_tags; \
+        ::std::stringstream ss(Tags); \
+        ::std::string tok; \
+        while (ss >> tok) ordered_tags.push_back(tok); \
+        ETCS::EventNode::getInstance().RegisterTagBitIndex(ordered_tags); \
+    } \
     static const bool Name##_tag_bit_index_registered_ = []() { \
-        std::vector<std::string> ordered_tags; \
-        std::stringstream ss(Tags); \
-        std::string tok; \
+        if (!ETCS_MODULE_STATIC_REACH_LOADER) { \
+            ETCS::etcs_deferred_rid_registrars().push_back(&Name##_publish_tag_bit_index_); \
+            return true; \
+        } \
+        ::std::vector<::std::string> ordered_tags; \
+        ::std::stringstream ss(Tags); \
+        ::std::string tok; \
         while (ss >> tok) ordered_tags.push_back(tok); \
         ETCS::EventNode::getInstance().RegisterTagBitIndex(ordered_tags); \
         return true; \
@@ -864,6 +1075,7 @@ namespace ETCS
      * than just eventually-true, since this runs mid-static-init instead \
      * of at the loader's first runtime call into Name(). */ \
     static const bool Name##_loader_manifest_checked_ = []() { \
+        if (!ETCS_MODULE_STATIC_REACH_LOADER) return true; \
         void* getterAddr = ETCS::etcs_find_loader_manifest_getter(); \
         if (!getterAddr) return true; \
         using LoaderManifestGetter = void* (*)(); \
@@ -871,9 +1083,9 @@ namespace ETCS
         if (!loaderManifestPtr) return true; \
         auto* loaderManifest = static_cast<ETCS::Manifest*>(loaderManifestPtr); \
         if (ETCS::compareManifests(ETCS::Entity::getManifest(), loaderManifest, #Name)) { \
-            std::cerr << "FATAL: module '" #Name "' and the loader disagree on " \
+            ::std::cerr << "FATAL: module '" #Name "' and the loader disagree on " \
                          "CORE:/HEADER:/ONTOLOGY: hashes -- built for different epochs. " \
-                         "Refusing to run." << std::endl; \
+                         "Refusing to run." << ::std::endl; \
             /* TODO(recovery): re-fetch whichever of {this module, the \
              * loader} is older from anticurrententropy.com and retry once \
              * before aborting. A SECURITY boundary as much as a \
@@ -885,7 +1097,7 @@ namespace ETCS
              * goes straight to abort() rather than trusting an \
              * unverifiable replacement, or running as one that already \
              * disagrees with the loader. */ \
-            std::abort(); \
+            ::std::abort(); \
         } \
         return true; \
     }(); \
@@ -1020,7 +1232,7 @@ namespace ETCS
             ETCS_LOG("ETCS_TAG_DECLARE", "FATAL: " #Name "'s concrete type already " \
                      "carries a TAG_MASK (answering to '" << Name::CONTRACT_TAG \
                      << "'). Two contract tags alias one concrete type."); \
-            std::abort(); \
+            ::std::abort(); \
         } \
         Name::CONTRACT_TAG = #Name; \
         Name::TAG_MASK     = ETCS::TagMask::bit(_tag_bit_##Name); \
@@ -1030,12 +1242,17 @@ namespace ETCS
         static ETCS::RIDList<Name*> list;\
         return list;\
     }\
-    static bool _ridlist_##Name##_registered = []() {\
+    static void _ridlist_##Name##_publish() { \
         ETCS::ThreadPool::getInstance(); \
-        ETCS::EventNode::getInstance().RegisterRIDRegistry(\
-            #Name, \
-            _ridlist_##Name().handle(#Name) \
-        );\
+        ETCS::EventNode::getInstance().RegisterRIDRegistry( \
+            #Name, _ridlist_##Name().handle(#Name)); \
+    } \
+    static bool _ridlist_##Name##_registered = []() {\
+        if (!ETCS_MODULE_STATIC_REACH_LOADER) { \
+            ETCS::etcs_deferred_rid_registrars().push_back(&_ridlist_##Name##_publish); \
+            return true; \
+        } \
+        _ridlist_##Name##_publish(); \
         return true;\
     }(); \
     ETCS::Entity* _make_child_##Name(ETCS::Entity* parent) \

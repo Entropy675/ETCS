@@ -63,7 +63,7 @@ ETCS_SUPERTYPE_BASE(Threaded)
  */
     bool Halt() override final
     {
-        if (m_halted.exchange(true, std::memory_order_acq_rel)) return false;
+        if (m_halted.exchange(true, ::std::memory_order_acq_rel)) return false;
         ETCS::Entity* self = static_cast<Derived*>(this);
         if (!ETCS::EventNode::on_ordering_thread && ETCS::lifetime_hold_depth == 0)
             self->addTag(ETCS::Buffer("halted"));
@@ -74,7 +74,7 @@ ETCS_SUPERTYPE_BASE(Threaded)
 
     bool Halted() const override
     {
-        return m_halted.load(std::memory_order_acquire);
+        return m_halted.load(::std::memory_order_acquire);
     }
 
     /*
@@ -102,7 +102,7 @@ ETCS_SUPERTYPE_BASE(Threaded)
  */
     bool Stop() override final
     {
-        if (m_stopped.exchange(true, std::memory_order_acq_rel)) return false;
+        if (m_stopped.exchange(true, ::std::memory_order_acq_rel)) return false;
         ETCS::Entity* self = static_cast<Derived*>(this);
         if (!ETCS::EventNode::on_ordering_thread && ETCS::lifetime_hold_depth == 0)
         {
@@ -116,7 +116,7 @@ ETCS_SUPERTYPE_BASE(Threaded)
 
     bool Stopped() const override final
     {
-        return m_stopped.load(std::memory_order_acquire);
+        return m_stopped.load(::std::memory_order_acquire);
     }
 
     ETCS::WorkShape Shape() const override { return ETCS::WorkShape::Held; }
@@ -131,10 +131,10 @@ ETCS_SUPERTYPE_BASE(Threaded)
     ETCS::SignalContext Signals() override { return ETCS::SignalContext{}; }
 
 private:
-    std::atomic<bool> m_halted{false};
+    ::std::atomic<bool> m_halted{false};
     // The destination, latched separately from the request -- an entity can be
     // asked and not yet gone, or gone without ever being asked.
-    std::atomic<bool> m_stopped{false};
+    ::std::atomic<bool> m_stopped{false};
 };
 
 #endif

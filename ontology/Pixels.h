@@ -105,7 +105,7 @@ public:
         if (m_pixels.empty()) return;
         const uint8_t px[4] = { toByte(r), toByte(g), toByte(b), toByte(a) };
         for (size_t i = 0; i < m_pixels.size(); i += 4)
-            std::memcpy(m_pixels.data() + i, px, 4);
+            ::std::memcpy(m_pixels.data() + i, px, 4);
         etcs_mark_observed(this);
     }
 
@@ -165,7 +165,7 @@ public:
     }
 
 protected:
-    std::vector<uint8_t> m_pixels;
+    ::std::vector<uint8_t> m_pixels;
     uint32_t             m_pw    = 0;
     uint32_t             m_ph    = 0;
 

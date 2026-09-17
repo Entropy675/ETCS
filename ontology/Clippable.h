@@ -126,15 +126,15 @@ protected:
         const int64_t bx0 = b.x, by0 = b.y;
         const int64_t bx1 = bx0 + static_cast<int64_t>(b.w), by1 = by0 + static_cast<int64_t>(b.h);
 
-        const int64_t x0 = std::max(ax0, bx0), y0 = std::max(ay0, by0);
-        const int64_t x1 = std::min(ax1, bx1), y1 = std::min(ay1, by1);
+        const int64_t x0 = ::std::max(ax0, bx0), y0 = ::std::max(ay0, by0);
+        const int64_t x1 = ::std::min(ax1, bx1), y1 = ::std::min(ay1, by1);
         if (x1 <= x0 || y1 <= y0)
             return ClipRect{ static_cast<int32_t>(x0), static_cast<int32_t>(y0), 0, 0 };
         return ClipRect{ static_cast<int32_t>(x0), static_cast<int32_t>(y0),
                          static_cast<uint32_t>(x1 - x0), static_cast<uint32_t>(y1 - y0) };
     }
 
-    std::vector<ClipRect> m_clipStack;
+    ::std::vector<ClipRect> m_clipStack;
 };
 
 #endif

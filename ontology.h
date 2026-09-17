@@ -36,6 +36,10 @@
 // Lower suspicion graphical/window ontology types (mostly RenderProvider/WindowProvider):
 #include "ontology/ResizableBase.h"
 #include "ontology/ClippableBase.h"
+// Layer before Surface, because Surface refines it: an order with a frame of
+// reference, which is where orderability is claimed for this whole lineage.
+// Reachable on its own for the leaf that is a layer without being a surface.
+#include "ontology/LayerBase.h"
 #include "ontology/SurfaceBase.h"
 #include "ontology/PresentableBase.h"
 

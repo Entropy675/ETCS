@@ -41,7 +41,7 @@ ETCS_SUPERTYPE_BASE(Lifecycle)
  */
     bool Release() override final
     {
-        if (m_released.exchange(true, std::memory_order_acq_rel)) return false;
+        if (m_released.exchange(true, ::std::memory_order_acq_rel)) return false;
         static_cast<Derived*>(this)->ReleaseConcrete();
         // Delete is NOT called from here, and the obvious version of that hangs:
         //
@@ -79,7 +79,7 @@ ETCS_SUPERTYPE_BASE(Lifecycle)
 
     bool Released() const override
     {
-        return m_released.load(std::memory_order_acquire);
+        return m_released.load(::std::memory_order_acquire);
     }
 
     // Marked by the type's own Create, on success and nowhere else. Release
@@ -88,7 +88,7 @@ ETCS_SUPERTYPE_BASE(Lifecycle)
     bool Established() const override { return m_established; }
 
 private:
-    std::atomic<bool> m_released{false};
+    ::std::atomic<bool> m_released{false};
     bool              m_established = false;
 };
 

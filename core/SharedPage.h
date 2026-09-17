@@ -12,8 +12,8 @@ struct SharedPage
 {
     char*       buffer;
     long long   capacity;
-    std::atomic<long long> written;
-    std::atomic<bool>      tombstoned;
+    ::std::atomic<long long> written;
+    ::std::atomic<bool>      tombstoned;
     uint64_t    reader_rid;
 
     /*
@@ -42,14 +42,14 @@ struct SharedPage
  * against the same page, and `busy` is then the count, not the last
  * one to leave.
  */
-    std::atomic<int>       producers_live;
+    ::std::atomic<int>       producers_live;
 
     static SharedPage* allocate(MemoryArena& arena, uint64_t reader_rid)
     {
         long long chunk_size  = arena.getChunkSize();
         long long header_size = static_cast<long long>(
-            (sizeof(SharedPage) + alignof(std::max_align_t) - 1)
-            & ~(alignof(std::max_align_t) - 1)
+            (sizeof(SharedPage) + alignof(::std::max_align_t) - 1)
+            & ~(alignof(::std::max_align_t) - 1)
         );
         long long buffer_size = chunk_size - header_size;
 
@@ -57,10 +57,10 @@ struct SharedPage
         SharedPage* page      = new (mem) SharedPage{};
         page->buffer          = static_cast<char*>(mem) + header_size;
         page->capacity        = buffer_size;
-        page->written.store(0, std::memory_order_relaxed);
-        page->tombstoned.store(false, std::memory_order_relaxed);
+        page->written.store(0, ::std::memory_order_relaxed);
+        page->tombstoned.store(false, ::std::memory_order_relaxed);
         page->reader_rid      = reader_rid;
-        page->producers_live.store(0, std::memory_order_relaxed);
+        page->producers_live.store(0, ::std::memory_order_relaxed);
         return page;
     }
 
@@ -82,12 +82,12 @@ struct SharedPage
  */
     char* acquireWrite(long long size)
     {
-        if (tombstoned.load(std::memory_order_acquire)) return nullptr;
+        if (tombstoned.load(::std::memory_order_acquire)) return nullptr;
 
-        long long offset = written.fetch_add(size, std::memory_order_seq_cst);
+        long long offset = written.fetch_add(size, ::std::memory_order_seq_cst);
         if (offset + size > capacity)
         {
-            written.fetch_sub(size, std::memory_order_seq_cst);
+            written.fetch_sub(size, ::std::memory_order_seq_cst);
             return nullptr;
         }
         return buffer + offset;
@@ -95,26 +95,26 @@ struct SharedPage
 
     const char* acquireRead(long long& out_len) const
     {
-        out_len = written.load(std::memory_order_acquire);
+        out_len = written.load(::std::memory_order_acquire);
         return buffer;
     }
 
     bool isFull() const
     {
-        return written.load(std::memory_order_relaxed) >= capacity;
+        return written.load(::std::memory_order_relaxed) >= capacity;
     }
 
     void tombstone()
     {
-        tombstoned.store(true, std::memory_order_release);
+        tombstoned.store(true, ::std::memory_order_release);
     }
 
     // Same reachability as acquireWrite, and the same answer: a page nobody
     // reads any more has nothing to rewind.
     void reset()
     {
-        if (tombstoned.load(std::memory_order_acquire)) return;
-        written.store(0, std::memory_order_relaxed);
+        if (tombstoned.load(::std::memory_order_acquire)) return;
+        written.store(0, ::std::memory_order_relaxed);
     }
 };
 
@@ -127,7 +127,7 @@ struct alignas(8) SequentialFrame
     uint64_t  sequence;    // monotonic sequence number — assigned at write time
     uint64_t  writer_rid;  // producing entity's RID
     long long payload_size; // bytes immediately following this header
-    std::atomic<bool> ready;   // set last by producer after payload is written
+    ::std::atomic<bool> ready;   // set last by producer after payload is written
     // payload follows contiguously in buffer — no pointer, no indirection
 };
 
@@ -155,17 +155,17 @@ struct SequentialSharedPage
 {
     char*                  buffer;
     long long              capacity;
-    std::atomic<long long> cursor_;    // physical write cursor
-    std::atomic<uint64_t>  sequence_;  // next sequence number to assign
-    std::atomic<bool>      tombstoned;
+    ::std::atomic<long long> cursor_;    // physical write cursor
+    ::std::atomic<uint64_t>  sequence_;  // next sequence number to assign
+    ::std::atomic<bool>      tombstoned;
     uint64_t               reader_rid;
 
     static SequentialSharedPage* allocate(MemoryArena& arena, uint64_t reader_rid)
     {
         long long chunk_size  = arena.getChunkSize();
         long long header_size = static_cast<long long>(
-            (sizeof(SequentialSharedPage) + alignof(std::max_align_t) - 1)
-            & ~(alignof(std::max_align_t) - 1)
+            (sizeof(SequentialSharedPage) + alignof(::std::max_align_t) - 1)
+            & ~(alignof(::std::max_align_t) - 1)
         );
         long long buffer_size = chunk_size - header_size;
 
@@ -173,9 +173,9 @@ struct SequentialSharedPage
         SequentialSharedPage* page   = new (mem) SequentialSharedPage{};
         page->buffer                 = static_cast<char*>(mem) + header_size;
         page->capacity               = buffer_size;
-        page->cursor_.store(0,  std::memory_order_relaxed);
-        page->sequence_.store(0, std::memory_order_relaxed);
-        page->tombstoned.store(false, std::memory_order_relaxed);
+        page->cursor_.store(0,  ::std::memory_order_relaxed);
+        page->sequence_.store(0, ::std::memory_order_relaxed);
+        page->tombstoned.store(false, ::std::memory_order_relaxed);
         page->reader_rid             = reader_rid;
         return page;
     }
@@ -184,32 +184,32 @@ struct SequentialSharedPage
     // perspective. Returns the sequence number assigned, or UINT64_MAX on failure.
     uint64_t write(uint64_t writer_rid, const char* payload, long long payload_size)
     {
-        assert(!tombstoned.load(std::memory_order_relaxed) &&
+        assert(!tombstoned.load(::std::memory_order_relaxed) &&
                "write on tombstoned SequentialSharedPage — causal violation");
 
         long long frame_size = static_cast<long long>(sizeof(SequentialFrame)) + payload_size;
 
         // Claim physical slot
-        long long offset = cursor_.fetch_add(frame_size, std::memory_order_seq_cst);
+        long long offset = cursor_.fetch_add(frame_size, ::std::memory_order_seq_cst);
         if (offset + frame_size > capacity)
         {
-            cursor_.fetch_sub(frame_size, std::memory_order_seq_cst);
+            cursor_.fetch_sub(frame_size, ::std::memory_order_seq_cst);
             return UINT64_MAX; // page full
         }
 
         // Claim sequence number — independent of physical slot
-        uint64_t seq = sequence_.fetch_add(1, std::memory_order_seq_cst);
+        uint64_t seq = sequence_.fetch_add(1, ::std::memory_order_seq_cst);
 
         // Write frame header then payload into claimed slot
         SequentialFrame* frame = reinterpret_cast<SequentialFrame*>(buffer + offset);
         frame->sequence        = seq;
         frame->writer_rid      = writer_rid;
         frame->payload_size    = payload_size;
-        frame->ready.store(false, std::memory_order_relaxed);
-        std::memcpy(buffer + offset + sizeof(SequentialFrame), payload, static_cast<size_t>(payload_size));
+        frame->ready.store(false, ::std::memory_order_relaxed);
+        ::std::memcpy(buffer + offset + sizeof(SequentialFrame), payload, static_cast<size_t>(payload_size));
         
         // Release store — consumer's acquire scan will see completed frame
-        frame->ready.store(true, std::memory_order_release);
+        frame->ready.store(true, ::std::memory_order_release);
         return seq;
     }
 
@@ -222,10 +222,10 @@ struct SequentialSharedPage
     // a bottleneck an index can be layered on top without changing the page layout.
     const char* acquireRead(uint64_t expected_seq, long long& out_size) const
     {
-        assert(!tombstoned.load(std::memory_order_relaxed) &&
+        assert(!tombstoned.load(::std::memory_order_relaxed) &&
                "acquireRead on tombstoned SequentialSharedPage — causal violation");
 
-        long long physical_end = cursor_.load(std::memory_order_acquire);
+        long long physical_end = cursor_.load(::std::memory_order_acquire);
         long long offset       = 0;
 
         while (offset + static_cast<long long>(sizeof(SequentialFrame)) <= physical_end)
@@ -234,7 +234,7 @@ struct SequentialSharedPage
                 reinterpret_cast<const SequentialFrame*>(buffer + offset);
 
             // Frame header may be partially written — check ready flag first
-            if (!frame->ready.load(std::memory_order_acquire))
+            if (!frame->ready.load(::std::memory_order_acquire))
                 return nullptr; // producer hasn't finished writing this slot yet
 
             if (frame->sequence == expected_seq)
@@ -252,25 +252,25 @@ struct SequentialSharedPage
     // Total number of frames committed so far
     uint64_t frameCount() const
     {
-        return sequence_.load(std::memory_order_acquire);
+        return sequence_.load(::std::memory_order_acquire);
     }
 
     bool isFull() const
     {
-        return cursor_.load(std::memory_order_relaxed) >= capacity;
+        return cursor_.load(::std::memory_order_relaxed) >= capacity;
     }
 
     void tombstone()
     {
-        tombstoned.store(true, std::memory_order_release);
+        tombstoned.store(true, ::std::memory_order_release);
     }
 
     void reset()
     {
-        assert(!tombstoned.load(std::memory_order_relaxed) &&
+        assert(!tombstoned.load(::std::memory_order_relaxed) &&
                "reset on tombstoned SequentialSharedPage — already deleted");
-        cursor_.store(0,  std::memory_order_relaxed);
-        sequence_.store(0, std::memory_order_relaxed);
+        cursor_.store(0,  ::std::memory_order_relaxed);
+        sequence_.store(0, ::std::memory_order_relaxed);
     }
 };
 

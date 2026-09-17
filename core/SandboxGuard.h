@@ -42,7 +42,7 @@ struct SandboxRegistry
     {
         if (h != INVALID_NATIVE_HANDLE) 
         {
-            std::lock_guard<std::mutex> lock(mtx);
+            ::std::lock_guard<::std::mutex> lock(mtx);
             handles.push_back(h);
         }
     }
@@ -51,16 +51,16 @@ struct SandboxRegistry
     {
         if (h != INVALID_NATIVE_HANDLE) 
         {
-            std::lock_guard<std::mutex> lock(mtx); // Erase-Remove idiom
-            handles.erase(std::remove(handles.begin(), handles.end(), h), handles.end());
+            ::std::lock_guard<::std::mutex> lock(mtx); // Erase-Remove idiom
+            handles.erase(::std::remove(handles.begin(), handles.end(), h), handles.end());
         }
     }
 
     SandboxRegistry() = default;
     ~SandboxRegistry() {} // SandboxGuard should always drain before this fires
 
-    std::mutex mtx;
-    std::vector<NativeHandle> handles;
+    ::std::mutex mtx;
+    ::std::vector<NativeHandle> handles;
 };
 
 }
@@ -79,9 +79,9 @@ static CloseHandle_t OriginalCloseHandle = nullptr;
 
 BOOL WINAPI HookedCloseHandle(HANDLE h) {
     {
-        std::lock_guard<std::mutex> lock(ETCS::SandboxRegistry::get().mtx);
+        ::std::lock_guard<::std::mutex> lock(ETCS::SandboxRegistry::get().mtx);
         auto& v = ETCS::SandboxRegistry::get().handles;
-        v.erase(std::remove(v.begin(), v.end(), h), v.end());
+        v.erase(::std::remove(v.begin(), v.end(), h), v.end());
     }
     return OriginalCloseHandle(h);
 }
@@ -204,7 +204,7 @@ struct SandboxGuard
             return;
         }
 
-        std::lock_guard<std::mutex> lock(ETCS::SandboxRegistry::get().mtx);
+        ::std::lock_guard<::std::mutex> lock(ETCS::SandboxRegistry::get().mtx);
         ETCS_LOG("SandboxGuard", "Exiting sandbox guard...");
         for (auto h : ETCS::SandboxRegistry::get().handles) {
 #ifdef _WIN32
@@ -243,11 +243,11 @@ private:
 #endif
     }
 
-    std::atomic<bool> cleaned_{false};
+    ::std::atomic<bool> cleaned_{false};
 };
 
 // --- LINUX PROXIES ---
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <stdarg.h>

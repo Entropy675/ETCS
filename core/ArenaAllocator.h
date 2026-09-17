@@ -7,11 +7,11 @@ template<typename T>
 struct ArenaAllocator
 {
     using value_type = T;
-    using size_type = std::size_t;
-    using difference_type = std::ptrdiff_t;
-    using propagate_on_container_copy_assignment = std::true_type;
-    using propagate_on_container_move_assignment = std::true_type;
-    using propagate_on_container_swap = std::true_type;
+    using size_type = ::std::size_t;
+    using difference_type = ::std::ptrdiff_t;
+    using propagate_on_container_copy_assignment = ::std::true_type;
+    using propagate_on_container_move_assignment = ::std::true_type;
+    using propagate_on_container_swap = ::std::true_type;
     MemoryArena* arena;
     
     ArenaAllocator() noexcept : arena(nullptr) {}
@@ -25,7 +25,7 @@ struct ArenaAllocator
     // see that method's own comment (MemoryArena.h) for the full
     // reasoning. This is what makes EVERY ArenaAllocator-backed
     // container's node churn individually reclaim-capable, not just
-    // Entity outer shells: a std::unordered_map (or any other STL
+    // Entity outer shells: a ::std::unordered_map (or any other STL
     // container) built on this allocator already calls deallocate()
     // faithfully on every node erase -- that call was previously a
     // no-op (see deallocate's own comment below for why that was
@@ -38,15 +38,15 @@ struct ArenaAllocator
     // count -- correct either way, just less effective for that rarer,
     // more size-varying case than for the much more common
     // fixed-size-node case.
-    T* allocate(std::size_t n)
+    T* allocate(::std::size_t n)
     {
-        if (!arena) throw std::bad_alloc();
+        if (!arena) throw ::std::bad_alloc();
         long long size  = static_cast<long long>(n * sizeof(T));
         long long align = static_cast<long long>(alignof(T));
         void* ptr = arena->tryAcquireFromFreeList(size, align);
         if (!ptr)
             ptr = arena->allocateRaw(size, align);
-        if (!ptr) throw std::bad_alloc();
+        if (!ptr) throw ::std::bad_alloc();
         return static_cast<T*>(ptr);
     }
 
@@ -65,7 +65,7 @@ struct ArenaAllocator
     // contract -- destroy() always precedes deallocate()), so
     // releaseToFreeList's own zeroing is writing into memory whose C++
     // object lifetime has already ended, never into a live object.
-    void deallocate(T* ptr, std::size_t n) noexcept
+    void deallocate(T* ptr, ::std::size_t n) noexcept
     {
         if (!arena || !ptr) return;
         arena->releaseToFreeList(ptr,

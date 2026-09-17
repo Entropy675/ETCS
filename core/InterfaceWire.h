@@ -260,7 +260,7 @@ struct IWireThread
 // ---------------------------------------------------------------------------
 // The observer's own end of one edge. Defined in core because it crosses the
 // wire: two words, trivially copyable, fixed layout -- the same reason TBuffer
-// exists rather than std::string.
+// exists rather than ::std::string.
 //
 // slot is a CACHE of the RID->position inversion, never a replacement for it.
 // The RID stays the identity; the slot makes reading the edge a load and a
