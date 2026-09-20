@@ -68,6 +68,8 @@ public:
     ETCS::ObserverEdge Observe(uint64_t observer_rid) override = 0;
     void Unobserve(uint64_t observer_rid) override = 0;
     void MarkObserved(uint64_t origin_rid) override = 0;
+    void BeginBatch() override = 0;
+    void EndBatch() override   = 0;
     bool TakeObserved(const ETCS::ObserverEdge& edge) override = 0;
     bool TakeObserved(uint64_t observer_rid) override = 0;
 
@@ -125,6 +127,39 @@ inline void etcs_mark_observed(ETCS::Entity* from)
         if (ETCS::IWireObservable* o = etcs_observable_of(n))
         { o->MarkObserved(from->getRID()); return; }
 }
+
+/*
+ * A batch on whatever Observable `target` is, for the length of a scope.
+ *
+ * The family verbs are on ObservableBase (BeginBatch/EndBatch, which say why),
+ * and a caller in another module holds neither the leaf type nor the base -- it
+ * holds an RID or an Entity*. So the hop is by family name like every other one
+ * here, and a target that never claimed Observable is simply not batched rather
+ * than an error: the sequence still runs and still marks per write, which is the
+ * behaviour that existed before batching did.
+ *
+ * SCOPED, because the one thing a batch must not do is leak. An early return or
+ * a throw between Begin and End would leave an entity that never announces
+ * anything again, which presents as a picture frozen for no visible reason --
+ * far worse than the over-announcing it replaces.
+ */
+class etcs_observed_batch
+{
+public:
+    explicit etcs_observed_batch(ETCS::Entity* target)
+        : m_o(etcs_observable_of(target))
+    { if (m_o) m_o->BeginBatch(); }
+
+    ~etcs_observed_batch() { if (m_o) m_o->EndBatch(); }
+
+    etcs_observed_batch(const etcs_observed_batch&)            = delete;
+    etcs_observed_batch& operator=(const etcs_observed_batch&) = delete;
+
+    bool held() const { return m_o != nullptr; }
+
+private:
+    ETCS::IWireObservable* m_o = nullptr;
+};
 
 /*
  * The downward counterpart: say that what `from` hands its children has moved.

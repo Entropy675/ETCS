@@ -158,6 +158,16 @@ ETCS_SUPERTYPE_BASE(Observable)
  */
     void MarkObserved(uint64_t origin_rid) override
     {
+        // A batch in progress means this mark is one write inside a sequence that
+        // is not finished. The local edges are set -- an observer's copy IS stale
+        // from the first write -- but the walk upward waits, and EndBatch makes it
+        // once. See BeginBatch.
+        if (m_batch.load(::std::memory_order_acquire) > 0)
+        {
+            MarkObservedLocal(origin_rid);
+            m_batch_marked.store(true, ::std::memory_order_release);
+            return;
+        }
         MarkObservedLocal(origin_rid);
         for (ETCS::Entity* n = static_cast<Derived*>(this)->getParent(); n; n = n->getParent())
         {
@@ -167,6 +177,53 @@ ETCS_SUPERTYPE_BASE(Observable)
             return;
         }
     }
+
+    /*
+ * ── A SEQUENCE OF WRITES IS ONE CHANGE ───────────────────────────────────
+ *
+ * "What I contain changed" is true once for a sequence, and every raster op in
+ * the ontology says it separately: Pixels_::ClearTo, FillRect, FillDisc and
+ * Composite each mark (ontology/Pixels.h), so a caller that clears a view and
+ * blits two layers into it makes three statements about one picture. Each one
+ * walks to the nearest Observable ancestor and repeats, so the cost is per write
+ * and per level, and anything DERIVED from a mark runs that many times too.
+ *
+ * Measured, before this existed: a compositor rebuilding its subtree marked the
+ * compositor above it 23,746 times during a 40-point stroke -- ~580 per pointer
+ * event, one per draw call -- and that parent, correctly believing a descendant
+ * had changed, rebuilt its whole tree every frame.
+ *
+ * WORSE THAN THE COST, THE INTERMEDIATE STATES ARE WRONG. A reader that acts on
+ * a mark -- a compositor copying a frame out, a device uploading a texture --
+ * acts on the buffer as it stands at that mark, which during a sequence is a
+ * cleared view, or a page with no ink on it yet. A mark means CHANGED; only the
+ * end of a batch means FINISHED, and a reader that needs the difference has no
+ * other way to ask.
+ *
+ * So: BeginBatch, write, EndBatch, and ONE mark upward for the sequence -- and
+ * only if something in it actually marked, because a batch that wrote nothing is
+ * not news. Re-entrant by depth, because a batched sequence may call something
+ * that batches too, and the OUTERMOST one is the sequence that matters.
+ *
+ * WHAT IT IS NOT: a lock. Nothing here excludes a concurrent writer or a reader;
+ * it changes WHEN a statement is made, not who may write. Two threads assembling
+ * one raster still need to agree between themselves.
+ */
+    void BeginBatch() override
+    {
+        if (m_batch.fetch_add(1, ::std::memory_order_acq_rel) == 0)
+            m_batch_marked.store(false, ::std::memory_order_release);
+    }
+
+    void EndBatch() override
+    {
+        if (m_batch.fetch_sub(1, ::std::memory_order_acq_rel) != 1) return;
+        if (!m_batch_marked.exchange(false, ::std::memory_order_acq_rel)) return;
+        // The whole sequence, as one statement, from this entity.
+        MarkObserved(static_cast<Derived*>(this)->getRID());
+    }
+
+    bool InBatch() const { return m_batch.load(::std::memory_order_acquire) > 0; }
 
     /*
  * Mine only, no walk. The primitive both directions are built from.
@@ -396,6 +453,11 @@ private:
     // This entity's own edge index, or -1. Cached because "the origin is me" is
     // nearly every mark in the system; see MarkObservedLocal.
     ::std::atomic<int32_t>  m_selfEdge{-1};
+
+    // Batch depth, and whether anything marked inside the outermost one. See
+    // BeginBatch.
+    ::std::atomic<int32_t>  m_batch{0};
+    ::std::atomic<bool>     m_batch_marked{false};
 };
 
 #endif

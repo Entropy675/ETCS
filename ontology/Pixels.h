@@ -135,6 +135,57 @@ public:
         etcs_mark_observed(this);
     }
 
+    /*
+     * The second raster primitive, and it is here for the same reason the first
+     * one is: a DISC IS WHAT A NIB IS, everywhere, and every caller that wanted
+     * one was reaching for rectangles to approximate it.
+     *
+     * Both roundings were in the tree at once and they disagreed. A paint layer
+     * kept dx^2+dy^2 <= r^2 and committed a circle; the live preview of that same
+     * dab drew one 2r-square DrawRect, so the nib under the pointer was square
+     * and the stroke turned round as soon as the document re-rendered. The other
+     * way out is a span per row through the surface verb -- exactly round, but
+     * 2r+1 dispatched calls, and with each of them marking (see above) that is
+     * 2r+1 invalidations for one dab, which a compositor above then takes as
+     * 2r+1 separate changes.
+     *
+     * ONE CALL, ONE MARK, ONE SHAPE. Same test as the layer's, so the preview and
+     * the mark it becomes are the same discrete circle rather than two roundings
+     * of one idea. A device-backed destination still has to span it, because it
+     * has no host address to write -- that is a backend's problem, not a reason
+     * for the host path to be wrong.
+     */
+    void FillDisc(int32_t cx, int32_t cy, uint32_t radius,
+                  float r, float g, float b, float a)
+    {
+        if (m_pixels.empty() || a <= 0.0f || radius == 0) return;
+
+        const int64_t rad = radius;
+        const int64_t r2  = rad * rad;
+        const uint8_t sr = toByte(r), sg = toByte(g), sb = toByte(b), sa = toByte(a);
+
+        int64_t dy0 = -rad, dy1 = rad;
+        if (cy + dy0 < 0)    dy0 = -cy;
+        if (cy + dy1 > m_ph - 1) dy1 = static_cast<int64_t>(m_ph) - 1 - cy;
+
+        for (int64_t dy = dy0; dy <= dy1; ++dy)
+        {
+            // Half-chord at this row: the largest dx with dx^2 + dy^2 <= r^2.
+            int64_t k = 0;
+            while ((k + 1) * (k + 1) + dy * dy <= r2) ++k;
+
+            int64_t x0 = cx - k, x1 = cx + k;
+            if (x0 < 0) x0 = 0;
+            if (x1 > static_cast<int64_t>(m_pw) - 1) x1 = static_cast<int64_t>(m_pw) - 1;
+            if (x0 > x1) continue;
+
+            uint8_t* row = m_pixels.data() + (static_cast<size_t>(cy + dy) * PixelStride());
+            for (int64_t px = x0; px <= x1; ++px)
+                blendPixel(row + px * 4, sr, sg, sb, sa);
+        }
+        etcs_mark_observed(this);
+    }
+
     // Source-over composite of another Pixels_ into this one at (x, y),
     // scaled by a uniform opacity. Nearest-neighbour, no scaling: a
     // layered editor composites layers at 1:1 and lets the DEVICE scale
