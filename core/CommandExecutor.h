@@ -1756,6 +1756,43 @@ inline ExecuteResult execute_command(const Command& cmd,
             ETCS_LOG("CommandExecutor", "detach: launching " << script_path
                      << " [id:" << exec_id << "]");
  
+            /*
+ * THE LAUNCHER READS THE SCRIPT, not the thread it launches.
+ *
+ * This used to open an ifstream inside the child, which is the obvious
+ * shape and is wrong on the web for a reason worth writing down, because
+ * the symptom names nothing:
+ *
+ *     null function or function signature mismatch
+ *       locale::__imp::release()  <- locale::~locale  <- ~basic_streambuf
+ *       <- ~basic_filebuf  <- this lambda  <- invokeEntryPoint
+ *
+ * A file stream carries a std::locale, and destroying one releases the
+ * locale's imp -- a chain of indirect calls through the function table. A
+ * pthread is a Worker whose table is brought up to date by
+ * __emscripten_dlsync_self at entry (emscripten's invokeEntryPoint), and a
+ * detach launched while module loading is still settling can reach that
+ * destructor before the slots it needs agree. It faulted on roughly three
+ * loads in five, always here, and never on the blocking `run` path -- which
+ * opens its stream on the thread that is already running.
+ *
+ * Reading here removes the stream from the child entirely. It is also the
+ * better contract independently of the browser: "could not open" is the
+ * launcher's answer to give, synchronously, to whoever typed `detach` --
+ * reporting it from a thread nobody is waiting on is a message with no
+ * audience. The child parses from memory, which it can do on any substrate
+ * without touching a filesystem at all.
+ */
+            ::std::string source;
+            {
+                ::std::ifstream in(script_path);
+                if (!in.is_open())
+                    return {ExecuteStatus::Error,
+                            "detach: could not open '" + script_path + "'."};
+                source.assign(::std::istreambuf_iterator<char>(in),
+                              ::std::istreambuf_iterator<char>());
+            }
+
             // Deliberately NOT capturing ctx.root_entity for the child. The
             // old version handed the parent's Root straight to the child --
             // meaning every detached script sharing one parent fought over
@@ -1766,16 +1803,10 @@ inline ExecuteResult execute_command(const Command& cmd,
             // now constructs its OWN fresh Root, and binds "root" to THAT
             // Root's RID.
             ::std::thread child_thread([script_path, child_names, exec,
-                                      child_entity, child_sig]() mutable
+                                      child_entity, child_sig,
+                                      source = ::std::move(source)]() mutable
             {
-                ::std::ifstream in(script_path);
-                if (!in.is_open())
-                {
-                    ::std::cerr << "[CommandExecutor] detach: could not open '"
-                              << script_path << "'\n";
-                    exec->finished.store(true, ::std::memory_order_release);
-                    return;
-                }
+                ::std::istringstream in(::std::move(source));
                 // The child Thread entity is this job's root when there is
                 // one: everything the script spawns is then owned by the job
                 // that ran it, which is what makes a session's history a
