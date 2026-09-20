@@ -78,6 +78,18 @@ public:
     // future device-side offscreen surface would be read by copying its
     // image instead, with no CPU bytes anywhere. Naming Pixels_ here would
     // have frozen the first of those into the contract.
+    //
+    // w/h ARE THE DESTINATION EXTENT: the source is resampled to fill exactly
+    // that rectangle, and passing the source's own size is the 1:1 case rather
+    // than a separate one. Zero in either means "the source's size", so a
+    // caller that has no opinion states none.
+    //
+    // This is the only place a scale CAN live. A caller denied it grows its own,
+    // and a caller's scaler walks the SOURCE -- one virtual draw per sample,
+    // fidelity bounded by how many calls it can afford. Destination-driven is
+    // both cheaper and the only form that is correct: every output pixel is
+    // written exactly once, its source found by inverse mapping. Implementors
+    // share render_composite_scaled rather than each answering this separately.
     virtual void Blit(Surface_* source, int32_t x, int32_t y,
                        uint32_t w, uint32_t h, float opacity) = 0;
 };

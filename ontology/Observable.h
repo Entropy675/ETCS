@@ -109,6 +109,15 @@ inline ETCS::IWireObservable* etcs_observable_of(ETCS::Entity* e)
  * Walks up when `from` has no Observable half rather than giving up: a leaf
  * that never claimed the family still gets its ancestors told, so forgetting
  * the claim degrades the signal instead of dropping it.
+ *
+ * ORIGIN IS `from`, WHICH EXCLUDES from's OWN SELF EDGE (MarkObservedLocal
+ * skips the edge whose observer is the origin -- a node is not news to itself).
+ * So a writer reaching a node from outside marks every edge INTO that node and
+ * not the node's view of itself: a compositor asking "did my subtree change"
+ * correctly hears nothing about a stroke someone painted straight into its
+ * pixels, while every destination holding a copy of those pixels is told. A
+ * cache gated on the self edge alone therefore never sees foreign writes; gate
+ * it on the edge to whoever is reading (CompositeDrawable2D's published frame).
  */
 inline void etcs_mark_observed(ETCS::Entity* from)
 {

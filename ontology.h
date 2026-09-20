@@ -57,6 +57,12 @@
 #include "ontology/PixelsBase.h"
 #include "ontology/RenderableBase.h"
 
+// Not a family: the resample every implementor of Surface_::Blit owes, and
+// every caller that projects Pixels_ into Pixels_ without being a surface.
+// Here because it is Pixels_ arithmetic with no backend in it -- see the
+// header, and Surface_::Blit's contract on what w/h mean.
+#include "ontology/ScaledComposite.h"
+
 // The Drawable lineage: Surface refined into a node that occupies space in
 // a parent and nests. DrawableBase composes SurfaceBase, the two leaf bases
 // compose DrawableBase, and CameraBase composes the 2D leaf -- a camera is
