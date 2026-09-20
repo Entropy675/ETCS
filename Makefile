@@ -57,27 +57,59 @@ endif
 # ====================================================================
 # TOP LEVEL TARGETS
 # ====================================================================
-all: generate_hashes modules loaders
+# THE PHASES ARE ORDERED BY A RECIPE, NOT BY PREREQUISITES.
+#
+# As three prerequisites these ran CONCURRENTLY under -j, and two of them ask
+# for generate_hashes themselves -- so a parallel `all` had one process
+# rewriting ontology_hashes.h while another compiled against it. Ordering them
+# here costs nothing: the parallelism worth having is INSIDE modules and
+# loaders, and each sub-make inherits -j through MAKEFLAGS.
+#
+# generate_hashes is not listed separately because both phases below already
+# depend on it, so this now runs the pass twice instead of three times.
+all:
+	$(MAKE) modules
+	$(MAKE) loaders
 
-loaders: clean_loaders generate_hashes
+# generate_hashes IS A PREREQUISITE ONLY WHEN NOBODY ELSE HAS RUN IT.
+#
+# ace does the hash pass once before a batch and then builds the modules
+# concurrently; without this guard every one of those makes would re-run it,
+# which is both N redundant openssl sweeps and N writers on the same three
+# headers. Set in the environment by ace, so it reaches every nested make
+# without being passed along by hand.
+HASH_PREREQ := generate_hashes
+ifdef ACE_HASHES_READY
+    HASH_PREREQ :=
+endif
+
+loaders: clean_loaders $(HASH_PREREQ)
 	@echo "\n--- Building Loaders ---"
 	$(MAKE) -C $(LOADERS_DIR)
 	$(MAKE) copy_loaders
 
-modules: clean_modules generate_hashes
+# ONE RECIPE PER MODULE, NOT ONE LOOP OVER ALL OF THEM.
+#
+# This was a shell `for` loop, and a loop inside a recipe is ONE command to make:
+# -j could not touch it, so every module compiled in series no matter what the
+# build was told. The per-directory rule it needed already existed and was simply
+# never used ($(MODULE_SUBDIRS), under BUILD RULES below).
+#
+# STILL A SUB-MAKE, and that part is deliberate rather than leftover. Listing the
+# modules as prerequisites of this target would let -j run them CONCURRENTLY WITH
+# clean_modules and generate_hashes, which is a race that deletes artifacts out
+# from under a compile and reads hash headers while they are being rewritten. The
+# phases have to stay ordered; only the middle one parallelises. The sub-make
+# inherits -j through MAKEFLAGS, so nothing has to be passed on by hand.
+modules: clean_modules $(HASH_PREREQ)
 	@echo "\n--- Building Modules ---"
-	@for dir in $(MODULE_SUBDIRS); do \
-		if [ -d "$$dir" ]; then \
-			echo "\n--- Building Module: $$dir ---"; \
-			$(MAKE) -C "$$dir"; \
-		fi; \
-	done
+	$(MAKE) $(MODULE_SUBDIRS)
 	$(MAKE) copy_modules
 
 # ====================================================================
 # SINGLE MODULE TARGETS
 # ====================================================================
-module_%: generate_hashes
+module_%: $(HASH_PREREQ)
 	@echo "\n--- Building Module: $(MODULES_DIR)/$* ---"
 	@if [ ! -d "$(MODULES_DIR)/$*" ]; then \
 		echo "[-] Error: Module '$*' not found in $(MODULES_DIR)/"; exit 1; \

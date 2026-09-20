@@ -4,8 +4,9 @@
 # A window, its input edge, a scene, and a rendering edge -- then the script
 # ENDS, on purpose, and you land in the ETCS shell with all of it still live.
 #
-# Run it with the interactive build (`ace make loader`, which is the one that
-# gets -DETCS_REPL_SHELL) from the ETCS root:
+# Run it from the ETCS root. Any `ace make loader`/`loaders` build works: every
+# loader is built with -DETCS_REPL_SHELL now, and -UETCS_REPL_SHELL is how you ask
+# for the draining one instead.
 #
 #     ./bin/etcs scripts/scene_demo.etcs
 #
