@@ -60,12 +60,16 @@ inline HASH_TYPE GenerateEnvironmentSignature(const ETCS::Buffer& uniqueName);
  * per-TU counter would silently break that determinism the instant a
  * module's leaf types were referenced from two .cc files instead of one.
  *
- * Each dlopen'd module .so gets its own independent instantiation
- * regardless (RTLD_LOCAL means no symbol merging across the dlopen
- * boundary, matching how MemoryArena::getInstance()/EventNode::getInstance()
- * are already independently-scoped per module) -- this was already true
- * of the original member-template version and is unaffected by moving it
- * out of Entity.
+ * Each dlopen'd module gets its own independent instantiation regardless,
+ * matching how MemoryArena::getInstance()/EventNode::getInstance() are
+ * already independently-scoped per module. What guarantees it on every
+ * platform is -fvisibility=hidden, which makes the definition local to its
+ * image: natively RTLD_LOCAL would keep the copies apart even without it,
+ * but under wasm dylink hidden is the ONLY thing that does -- a
+ * default-visibility definition is reached through the GOT and resolves to
+ * the loader's copy, seed and counter both. This was already true of the
+ * original member-template version and is unaffected by moving it out of
+ * Entity.
  */
 template<typename Derived>
 inline uint64_t generateRID()

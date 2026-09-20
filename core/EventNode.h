@@ -583,6 +583,21 @@ public:
  * above it: a module reads this out of the loader's node.
  */
     bool (*drive_ordering)()      = nullptr;
+    /*
+ * START THIS NODE'S DEFERRED THREADS, IN THE DSO THAT OWNS IT.
+ *
+ * The browser cannot spawn a Worker while the main module is inside a dlopen,
+ * so a module's ordering thread and its ThreadPool workers wait until every
+ * module is loaded (etcs_boot_runtime_threads). The loader does the arming,
+ * and it must not touch either object directly: `stream` sits below the
+ * #ifdef ETCS_LOADER fork, so the loader's view of a module's node has the
+ * wrong Derived (see drive_ordering); and ThreadPool::getInstance() in loader
+ * code is the loader's pool, never the module's. Both are reached only
+ * through the pointer the owning image installed at construction.
+ *
+ * ABOVE the fork, for the same layout reason as the three above it.
+ */
+    void (*arm_runtime)()         = nullptr;
 
     ::std::unordered_map<ETCS::Buffer, RIDListHandle> ridMap;
 
@@ -599,21 +614,21 @@ public:
  * IT REPLACES THE "Module:Tag" PREFIX, and the prefix was the wrong fix for
  * the right problem. Qualifying the key did keep N providers' lists apart, but
  * it did it by encoding the distinction in a STRING that every reader then had
- * to parse back out -- and under a single-address-space build (emscripten, and
- * the kernel path later) the module's map IS the loader's map, so the prefixed
- * row was a duplicate alias of a row already there and every bare-family
- * collect counted its members twice. Collapsing the prefix fixed that and cost
- * the distinction: `st.ridMap[name] = handle` is an OVERWRITE, so with
- * Deletable claimed by nine providers the loader's mirror held whichever
- * loaded last and resolve_in_family answered null for the other eight.
+ * to parse back out -- and in a build where the module's map IS the loader's
+ * map (a module compiled without -fvisibility=hidden under dylink, the kernel
+ * path later) the prefixed row was a duplicate alias of a row already there
+ * and every bare-family collect counted its members twice. Collapsing the
+ * prefix fixed that and cost the distinction: `st.ridMap[name] = handle` is
+ * an OVERWRITE, so with Deletable claimed by nine providers the loader's
+ * mirror held whichever loaded last and resolve_in_family answered null for
+ * the other eight.
  * Measured: an ImageSurface that resolved as a Deletable stopped resolving the
  * moment a LayoutProvider Layout existed.
  *
  * So the distinction moves out of the key and into the structure. No prefix
- * anywhere, N rows per name, and under emscripten this map is simply EMPTY --
- * there are no other images, every lookup answers out of ridMap, and nothing
- * is counted twice. One shape, correct in both builds, rather than a spelling
- * that is correct in one.
+ * anywhere, N rows per name; and in a build with one image the map is simply
+ * EMPTY -- every lookup answers out of ridMap, and nothing is counted twice.
+ * One shape, correct in both, rather than a spelling that is correct in one.
  *
  * THE MODULE NAME RIDES ALONG rather than being parsed off a key. It is what
  * unmapLibrary needs to drop exactly its own rows (dropping by NAME erased
@@ -1163,12 +1178,15 @@ public:
         set_log_to_file = &ETCS::set_log_to_file;
         get_log_to_file = &ETCS::get_log_to_file;
 #if defined(__EMSCRIPTEN__)
-        // Bound to THIS object rather than to getInstance(): under emscripten a
-        // module's getInstance() answers the loader's node, so a lambda calling
-        // it would be correct only by accident, and wrong the moment a module
-        // ever gets a node of its own again.
+        // Bound to THIS object rather than to getInstance(): the trampolines
+        // exist to be called from another image, where getInstance() names
+        // that image's node. One EventNode per image, so the static IS this.
         static EventNode* s_self = this;
         drive_ordering = []() { return s_self->stream.emscripten_poll(); };
+        arm_runtime    = []() {
+            s_self->stream.arm_emscripten_ordering_thread();
+            ETCS::ThreadPool::getInstance().arm_emscripten_workers();
+        };
 #endif
         stream.owner = this; // wire back-pointer now that EventNode is complete --
                               // both LoaderStream and ModuleProxy have this member.

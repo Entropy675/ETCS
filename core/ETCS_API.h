@@ -28,12 +28,15 @@
 #endif
 
 // Under emscripten SIDE_MODULE, C++ static-init runs while the main module is
-// still inside loadDynamicLibrary. EventNode/ThreadPool/MemoryArena symbols
-// resolve to the *loader* (GOT imports), not a private per-DSO copy the way a
-// native .so does. Touching them from a module static lambda is therefore a
-// reach into the loader mid-load — hang / re-entry. Defer those registrations;
-// the loader's post-dlopen calls (RegisterEventNode / Name()) perform the real
-// work once both sides are live.
+// still inside loadDynamicLibrary: dlopen has not returned, the module's
+// exports are not yet in the dylink tables, and no Worker has the library.
+// The RIDList registrations a module's statics would perform are queued
+// instead and flushed by RegisterDynamicLoader -- the first call the loader
+// makes INTO the module, so the flush runs after dlopen has settled and its
+// count is logged (a lost registration is otherwise indistinguishable from a
+// completed one). The singletons a registrar touches are this module's own
+// under -fvisibility=hidden, same as a native .so; what the deferral buys is
+// the ordering, not protection from the loader's objects.
 #if defined(__EMSCRIPTEN__) && !defined(ETCS_LOADER)
 #  define ETCS_MODULE_STATIC_REACH_LOADER 0
 #else
@@ -610,8 +613,8 @@ public: \
     } \
     /* DEFERRED, NOT SKIPPED, and the difference is the whole family.       \
      * Under emscripten a module's static init runs while the loader is     \
-     * still inside loadDynamicLibrary, so reaching EventNode here is a     \
-     * re-entry (see ETCS_MODULE_STATIC_REACH_LOADER) -- but returning      \
+     * still inside loadDynamicLibrary, so the publish waits for            \
+     * RegisterDynamicLoader (see ETCS_MODULE_STATIC_REACH_LOADER) -- but returning \
      * early without queueing meant the family RIDList was never published  \
      * AT ALL, and etcs_supertype_fanout skips any family its map has no    \
      * row for. Every family insert silently did nothing in the browser:    \

@@ -36,8 +36,13 @@ namespace ETCS {
 
 #if defined(__EMSCRIPTEN__)
     /*
-     * Wait for `pred` by DRIVING the loader's ordering loop, because in the
-     * browser nothing else will (EventStream::start takes no ordering thread).
+     * Wait for `pred` by DRIVING an ordering loop, because in the browser
+     * nothing else will until etcs_boot_runtime_threads arms the ordering
+     * threads (EventStream::start takes none). The loop driven is `node`'s:
+     * the loader's for everything that enqueues onto getLoader().stream, which
+     * is the default; a module's own for the one event that orders locally
+     * (TagModifyEvent), since driving the loader's loop while a ring nobody
+     * services holds the event is a wait that cannot end.
      *
      * The loop admits one driver at a time, so a waiter that does not get it
      * stands down rather than spinning on the claim: the thread that does have
@@ -55,7 +60,7 @@ namespace ETCS {
      * participates and one that merely burns.
      */
     template <typename Pred>
-    inline void etcs_emscripten_spin(Pred&& pred)
+    inline void etcs_emscripten_spin(EventNode& node, Pred&& pred)
     {
         // A wait this long is not slow, it is stuck: every event this function
         // waits on is serviced by the loop it is driving, so a second of it
@@ -65,7 +70,6 @@ namespace ETCS {
         // there read as "the script simply stopped".
         constexpr unsigned STUCK = 5000;   // x200us
         unsigned spins = 0;
-        EventNode& node = getLoader();
         while (!pred())
         {
             // Through the node's own trampoline, NEVER node.stream.emscripten_poll()
@@ -76,6 +80,11 @@ namespace ETCS {
             if (++spins % STUCK == 0 && !node.stream.stallReportsExhausted())
                 node.stream.reportReorderState("REORDER STALL (web waiter)");
         }
+    }
+    template <typename Pred>
+    inline void etcs_emscripten_spin(Pred&& pred)
+    {
+        etcs_emscripten_spin(getLoader(), ::std::forward<Pred>(pred));
     }
 #endif
 
@@ -352,20 +361,21 @@ bool ETCS::Module::registerLoader(EventNode& st)
                     << " RIDList(s) from module '" << name << "'");
             }
         }
-#if defined(__EMSCRIPTEN__)
         else if (node == &st || node == &getLoader())
         {
+            /*
+ * The module's EventNode::getInstance() answered with the LOADER's node, so
+ * the module is binding header-inline statics to this image instead of its
+ * own -- every per-DSO invariant in core/ (arena ownership, RID seeds, the
+ * ordering stream this node fronts) is void. A build without
+ * -fvisibility=hidden does exactly this under dylink. Refused here, where
+ * the cause is nameable, rather than run in a model nothing else expects.
+ */
             ETCS_LOG("DynamicLoader:Module",
-                "emscripten: shared EventNode with loader for '" << name
-                << "' -- RIDLists live on the single map (no absorb copy)");
-        }
-        else if (!node)
-        {
-            ETCS_LOG("DynamicLoader:Module",
-                "emscripten: RegisterDynamicLoader returned null for '" << name << "'");
+                "Module '" << name << "' shares the loader's EventNode -- it was "
+                "built without -fvisibility=hidden. Refusing to register it.");
             return false;
         }
-#endif
         else
         {
             ETCS_LOG("DynamicLoader:Module", "Module returned a null EventNode!");
@@ -2545,12 +2555,6 @@ ETCS::DispatchResult ETCS::EventNode::ModuleProxy::on_event(
  
 #ifdef ETCS_LOADER
 #if defined(__EMSCRIPTEN__)
-inline ::std::vector<ETCS::EventNode*>& emscripten_deferred_module_nodes()
-{
-    static ::std::vector<ETCS::EventNode*> nodes;
-    return nodes;
-}
-
 inline void etcs_boot_runtime_threads()
 {
     ETCS_LOG("ETCS", "[trace] etcs_boot: enter");
@@ -2565,19 +2569,25 @@ inline void etcs_boot_runtime_threads()
     loader_node.stream.arm_emscripten_ordering_thread();
     ETCS_LOG("ETCS", "emscripten: loader ordering thread armed");
 
-    for (ETCS::EventNode* mod_node : emscripten_deferred_module_nodes())
+    /*
+ * Each module's node, through its own trampoline (EventNode::arm_runtime):
+ * this starts the module's ordering thread AND its ThreadPool workers, both
+ * of which are that image's own objects. ETCS::emscripten_deferred_module_nodes
+ * is the list registerLoader filled -- the ETCS:: one, spelled out because a
+ * second, global-scope definition of the same name once shadowed it here and
+ * drained an always-empty list.
+ */
+    for (ETCS::EventNode* mod_node : ETCS::emscripten_deferred_module_nodes())
     {
-        if (!mod_node) continue;
-        ETCS_LOG("ETCS", "[trace] etcs_boot: arming module ordering thread scope="
+        if (!mod_node || !mod_node->arm_runtime) continue;
+        ETCS_LOG("ETCS", "[trace] etcs_boot: arming module runtime scope="
                  << (mod_node->scope ? mod_node->scope : "(null)")
-                 << " node=" << (void*)mod_node
-                 << " loader_node=" << (void*)&loader_node
-                 << (mod_node == &loader_node ? " SAME_AS_LOADER" : " distinct"));
-        mod_node->stream.arm_emscripten_ordering_thread();
-        ETCS_LOG("ETCS", "emscripten: module ordering thread armed scope="
+                 << " node=" << (void*)mod_node);
+        mod_node->arm_runtime();
+        ETCS_LOG("ETCS", "emscripten: module ordering thread and workers armed scope="
                  << mod_node->scope);
     }
-    emscripten_deferred_module_nodes().clear();
+    ETCS::emscripten_deferred_module_nodes().clear();
 
     /*
  * NOW THE WORKERS, AND THIS IS THE POINT OF THE DEFERRAL RATHER THAN A
@@ -2717,24 +2727,29 @@ extern "C" ETCS_API ETCS::EventNode* RegisterDynamicLoader(void* ptr)
         ETCS_LOG("DynamicLoader", "Passed ThreadPool! ");
 #if defined(__EMSCRIPTEN__)
         /*
-         * Single-hop: do NOT stream.start() (MAIN owns LoaderStream / sync poll).
-         * Still return THIS DSO's EventNode so registerLoader can absorb RIDList
-         * handles. Returning null skipped absorb and left spawn RIDs invisible
-         * to etcs_resolve_by_key on the loader map (Create/ReadLine "no longer
-         * resolves"). If dylink aliases this node to the loader, registerLoader
-         * detects identity and skips absorb.
+         * The registrations static-init queued instead of running (see
+         * ETCS_MODULE_STATIC_REACH_LOADER): this is the first point the loader
+         * is on the other end of a call into this module, and the count is
+         * logged because a skipped flush looks exactly like a completed one.
          */
         const size_t flushed = ETCS::etcs_flush_deferred_rid_registrars();
         ETCS_LOG("DynamicLoader",
-            "emscripten: collapsed hop -- flushed " << flushed << " deferred RIDList "
-            "registrar(s) (per-type AND per-family); no module stream.start");
-        return &ETCS::EventNode::getInstance();
-#else
+            "emscripten: flushed " << flushed << " deferred RIDList registrar(s) "
+            "(per-type AND per-family)");
+#endif
+        /*
+         * THIS module's own stream, on every platform. In the browser start()
+         * allocates the rings and returns in sync-poll mode; the ordering thread
+         * comes later, from etcs_boot_runtime_threads through arm_runtime, once
+         * every dlopen is done. It cannot be skipped there: TagModifyEvent orders
+         * locally, onto this stream, and an addTag from a work function reaches
+         * a ring that was never allocated -- a spin that never returns, with
+         * nothing logged.
+         */
         ETCS::EventNode::getInstance().stream.start(
             ETCS::MemoryArena::getInstance(), 1);
         ETCS_LOG("DynamicLoader", "Passed EventNode stream start! ");
         return &ETCS::EventNode::getInstance();
-#endif
     }
     catch (const ETCS::EventStreamZombieException&)
     {
@@ -2836,11 +2851,12 @@ inline ETCS::Entity* ETCS::LoadEvent::operator()()
     evt.entity_out = &result;
     evt.prebuilt_entity = prebuilt;
     evt.bootstrap_root = root;
-#if !defined(ETCS_LOADER) && !defined(__EMSCRIPTEN__)
+#if !defined(ETCS_LOADER)
     /*
  * Module-side caller: reply_to lets the loader ack back onto THIS
- * module's own stream after it finishes.
- * Emscripten: single EventNode; leave reply_to null (no self-proxy wait).
+ * module's own stream after it finishes. Every platform, the browser
+ * included: the module's node and stream are its own there too, and the
+ * ack is what orders the completion on the module's ordering thread.
  */
     evt.reply_to = &ETCS::EventNode::getInstance();
     evt.origin_extra_mask = ETCS::ActivePairModuleMask();
@@ -2878,7 +2894,7 @@ inline bool ETCS::ResolveEvent::operator()()
     evt.conjugate_key  = conjugate_key;
     evt.resolve_target = target;
     evt.resolve_ok     = &ok;
-#if !defined(ETCS_LOADER) && !defined(__EMSCRIPTEN__)
+#if !defined(ETCS_LOADER)
     evt.reply_to = &ETCS::EventNode::getInstance();
     evt.origin_extra_mask = ETCS::ActivePairModuleMask();
 #endif
@@ -2912,7 +2928,7 @@ inline bool ETCS::DestroyEvent::operator()()
     evt.rid = rid;
     evt.destroy_children = delete_children;
     evt.tri_out = &result;
-#if !defined(ETCS_LOADER) && !defined(__EMSCRIPTEN__)
+#if !defined(ETCS_LOADER)
     evt.reply_to = &ETCS::EventNode::getInstance();
     evt.origin_extra_mask = ETCS::ActivePairModuleMask();
 #endif
@@ -2951,7 +2967,7 @@ inline ETCS::RID ETCS::AddTagEvent::operator()()
     evt.addtag_trampoline = trampoline;
     evt.rid_out           = &result;
     evt.ready_out         = &ready;
-#if !defined(ETCS_LOADER) && !defined(__EMSCRIPTEN__)
+#if !defined(ETCS_LOADER)
     evt.reply_to = &ETCS::EventNode::getInstance();
     evt.origin_extra_mask = ETCS::ActivePairModuleMask();
 #endif
@@ -3014,7 +3030,7 @@ inline void ETCS::EntityUnloadEvent::operator()()
     evt.unload_target           = target;
     evt.unload_delete_children  = delete_children;
     evt.unload_done             = &done;
-#if !defined(ETCS_LOADER) && !defined(__EMSCRIPTEN__)
+#if !defined(ETCS_LOADER)
     evt.reply_to = &ETCS::EventNode::getInstance();
     evt.origin_extra_mask = ETCS::ActivePairModuleMask();
 #endif
@@ -3063,7 +3079,7 @@ inline void ETCS::ChangeModuleEvent::operator()()
     evt.conjugate_key      = conjugate_key;
     evt.changemodule_root  = root;
     evt.changemodule_done  = &done;
-#if !defined(ETCS_LOADER) && !defined(__EMSCRIPTEN__)
+#if !defined(ETCS_LOADER)
     evt.reply_to = &ETCS::EventNode::getInstance();
     evt.origin_extra_mask = ETCS::ActivePairModuleMask();
 #endif
@@ -3128,7 +3144,9 @@ inline bool ETCS::TagModifyEvent::operator()()
     if (!ETCS::EventNode::getInstance().stream.enqueue(DLInEventPtr{&evt}))
         return false;
 #if defined(__EMSCRIPTEN__)
-    etcs_emscripten_spin([&]{ return done.load(::std::memory_order_acquire); });
+    // This node's loop, not the loader's: the event is on THIS stream.
+    etcs_emscripten_spin(ETCS::EventNode::getInstance(),
+                         [&]{ return done.load(::std::memory_order_acquire); });
 #else
     while (!done.load(::std::memory_order_acquire));
 #endif
@@ -3157,7 +3175,7 @@ inline void ETCS::PairMaskEvent::operator()()
     evt.pairmask_tag_b = tag_b;
     evt.pairmask_out   = &result;
     evt.pairmask_done  = &done;
-#if !defined(ETCS_LOADER) && !defined(__EMSCRIPTEN__)
+#if !defined(ETCS_LOADER)
     evt.reply_to = &ETCS::EventNode::getInstance();
     evt.origin_extra_mask = ETCS::ActivePairModuleMask();
 #endif

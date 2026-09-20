@@ -498,9 +498,8 @@ public:
             pending_start_ = false;
             start(*pending_arena_, pending_producer_count_);
         }
-        // Already armed. Module EventNodes alias the loader's under emscripten
-        // (registerLoader detects the identity), so this is reached once per
-        // module for ONE stream and must not spawn a second consumer on it.
+        // Already armed, or never started: one consumer per stream, and a
+        // stream with no rings has nothing for a thread to drain.
         if (ordering_thread_.joinable() || !input_ring_)
         {
             ETCS_LOG("EventStream", "emscripten: ordering already armed -- "
