@@ -29,7 +29,62 @@
 ETCS_SUPERTYPE_BASE(Drawable), public SurfaceBase<Derived>
 {
     ETCS_MAKE_INSTANCE(Drawable)
-    ETCS_DISPATCH_METHOD(void, DrawInto, (Surface_*, dst));
+
+    /*
+     * ── HIDDEN, AND WHY IT IS HERE ────────────────────────────────────────
+     *
+     * A drawable had no way to be present and not drawn, and the gap is not
+     * cosmetic: a POPUP needs one. The alternative arrangements are all worse
+     * in the same way -- each makes "is it showing" a second fact that can
+     * disagree with the first. Unparenting and reparenting moves a subtree in
+     * and out of a tree that other things hold RIDs into; parking it at a
+     * position off the canvas means the thing is still there, still picked,
+     * still composited, and "closed" becomes a coordinate. The colour wheel had
+     * taken a third route and simply never been drawn at all, so open governed
+     * routing while nothing governed appearance.
+     *
+     * So the fact is stated once, on the node, and the DRAW is what reads it.
+     *
+     * DrawInto RATHER THAN EVERY CONTAINER'S WALK, which is what makes it
+     * reliable: a hidden node draws nothing wherever it is reached from, so no
+     * present or future container has to remember to ask. The children of a
+     * hidden node are skipped with it, because a container draws its children
+     * from inside its own DrawInto.
+     *
+     * PICKING TOO, and that is not an extra: it was left out of the first version
+     * on the reasoning that "not drawn" and "not clickable" are separate
+     * questions, and the result was measured within the hour. A popup hidden but
+     * still in the pick tree swallowed every pointer sample over its rectangle,
+     * so a stroke painted its first dab and then died the moment it crossed an
+     * invisible panel. Drawable2D_::PickAt asks this as well.
+     *
+     * ContainsLocal is untouched, because that is a question about a rectangle
+     * rather than about a node's participation -- and a router that keeps its own
+     * set of live panes has its own answer.
+     *
+     * The expansion of the dispatch macro, written out, because the guard has to
+     * sit between the family entry and the leaf's Concrete.
+     */
+    virtual void DrawIntoConcrete(Surface_* dst) = 0;
+
+    void DrawInto(Surface_* dst)
+    {
+        if (m_hidden) return;
+        static_cast<Derived*>(this)->DrawIntoConcrete(dst);
+    }
+
+    // Marked, because whoever holds a merged copy of this node has to rebuild
+    // without it -- appearing and disappearing are changes like any other.
+    void SetHidden(bool hidden)
+    {
+        if (m_hidden == hidden) return;
+        m_hidden = hidden;
+        etcs_mark_observed(static_cast<Derived*>(this));
+    }
+    bool Hidden() const override { return m_hidden; }
+
+private:
+    bool m_hidden = false;
 };
 
 #endif

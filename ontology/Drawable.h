@@ -162,6 +162,18 @@ public:
     virtual bool Animating() { return false; }
 
     /*
+     * PRESENT BUT NOT DRAWN -- answered by DrawableBase, which owns the flag and
+     * says why it exists (ontology/DrawableBase.h).
+     *
+     * Declared here, on the interface, because the two things that must honour it
+     * are a container's DRAW and a container's PICK, and the pick walks children
+     * as Drawable_ (Drawable2D_::PickAt). A hidden node that still answered clicks
+     * would be the worst of the three arrangements this replaced: invisible and
+     * in the way. If you cannot see it, you cannot hit it.
+     */
+    virtual bool Hidden() const { return false; }
+
+    /*
  * The recursion the comment above calls the point, written once.
  *
  * Every compositing node needs the same walk -- "is anything under me still

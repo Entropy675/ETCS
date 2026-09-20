@@ -232,10 +232,17 @@ public:
         void* as_drawable = getInterfacePointer(ETCS::Buffer("Drawable"));
         if (!as_drawable) return Pick2D{ this, local };  // no lineage: nothing nested
 
+        // A hidden node is not hit, and neither is anything inside it -- see
+        // Drawable_::Hidden. Asked here as well as in the draw because a popup
+        // that is merely undrawn still swallows every click over its rectangle,
+        // which presents as input dying in one region of the picture.
+        if (static_cast<Drawable_*>(as_drawable)->Hidden()) return {};
+
         ::std::vector<Drawable_*> ordered;
         static_cast<Drawable_*>(as_drawable)->collectDrawableChildren(ordered);
         for (size_t i = ordered.size(); i-- > 0; )
         {
+            if (ordered[i]->Hidden()) continue;
             void* as_2d = ordered[i]->getInterfacePointer(ETCS::Buffer("Drawable2D"));
             if (!as_2d) continue;        // a 3D child is not pickable in this plane
             Drawable2D_* d = static_cast<Drawable2D_*>(as_2d);
