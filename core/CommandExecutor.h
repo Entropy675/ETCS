@@ -503,6 +503,11 @@ inline ::std::optional<NameBinding> lookup_live(ExecutionContext& ctx,
     return live_global(name);
 }
 
+// Defined below, beside get_ace_root and the #IMPORT machinery it was written
+// for. Declared here because substitute_name_tokens now answers the same
+// question for an ordinary statement -- see its ACE_ROOT block.
+inline ::std::string resolve_ace_root_placeholder(const ::std::string& raw_target);
+
 // substitute_name_tokens — @name becomes its RID; everything else is
 // byte-identical. The sigil is required because payloads carry paths and free
 // text that could collide with a name. An unresolved @name is left as written.
@@ -537,6 +542,47 @@ inline ::std::string substitute_name_tokens(const ::std::string& payload,
         }
         if (ch == '\'' && !in_double) { in_single = !in_single; out += ch; ++i; continue; }
         if (ch == '"'  && !in_single) { in_double = !in_double; out += ch; ++i; continue; }
+
+        /*
+ * ACE_ROOT IN AN ORDINARY STATEMENT, not only in an #IMPORT directive.
+ *
+ * A path in an argument used to be resolved by the process's WORKING
+ * DIRECTORY, which is not a property of the script and not one the script can
+ * see. `tree.MountFile(x ../../RenderProvider/scripts/x.etcs)` is correct from
+ * one directory and silently wrong from every other -- and silently is the
+ * word: MountFile refuses cleanly, the page still answers 200 from whatever
+ * else is at that URL, and the failure surfaces as a script thread dying with
+ * nothing pointing back here. `run` and `detach` never had this problem
+ * because resolve_script_path already resolves them against the SCRIPT, which
+ * is the same fix one layer down.
+ *
+ * ANCHORED AT A TOKEN START, and that is what keeps it from eating prose.
+ * Only an ACE_ROOT that begins an argument -- start of payload, or straight
+ * after a separator -- and is followed by '/' or ends the token is a path;
+ * 'my ACE_ROOT notes' and ACE_ROOTED are left exactly as written. Quoted spans
+ * are skipped like every other substitution here. There is no sigil because
+ * this one is a word rather than a name, and a word in a path position that
+ * happens to be spelled ACE_ROOT is a path.
+ *
+ * Unresolvable ('ace' not on PATH) is left verbatim rather than blanked: the
+ * callee then reports a path it cannot open, which names the problem, where an
+ * empty string would name nothing.
+ */
+        if (ch == 'A' && !in_single && !in_double
+            && payload.compare(i, 8, "ACE_ROOT") == 0
+            && (i == 0 || payload[i - 1] == ' ' || payload[i - 1] == '\t'
+                || payload[i - 1] == '(' || payload[i - 1] == ',')
+            && (i + 8 == payload.size() || payload[i + 8] == '/'))
+        {
+            size_t end = payload.find_first_of(" \t,)", i);
+            if (end == ::std::string::npos) end = payload.size();
+            const ::std::string token = payload.substr(i, end - i);
+            const ::std::string abs = resolve_ace_root_placeholder(token);
+            out += abs.empty() ? token : abs;
+            i = end;
+            continue;
+        }
+
         if (ch != '@' || in_single || in_double) { out += ch; ++i; continue; }
 
         size_t start = i + 1;
@@ -1791,6 +1837,48 @@ inline ExecuteResult execute_command(const Command& cmd,
                             "detach: could not open '" + script_path + "'."};
                 source.assign(::std::istreambuf_iterator<char>(in),
                               ::std::istreambuf_iterator<char>());
+            }
+
+            /*
+ * AND IT PARSES HERE TOO, for the same reason it READS here.
+ *
+ * The child would find this by itself a moment later and refuse correctly --
+ * onto a thread nobody is waiting on, which is the failure the paragraph above
+ * already rejected for "could not open". The launching script carries on as
+ * though the detach took, and what it goes on to do usually depends on it: a
+ * page whose frame pump is a detached script gets a BLACK CANVAS and a runtime
+ * that is otherwise working perfectly, with nothing at the call site connecting
+ * the two.
+ *
+ * The source is already in hand on this thread. Parsing it costs one pass over
+ * text that is about to be parsed anyway, and turns a silent thread death into
+ * the ordinary refusal any other bad statement gets.
+ *
+ * ONLY SYNTAX. Whether the script's `requires` are satisfiable is the CHILD's
+ * question -- it depends on what exists when the child runs, not on what
+ * exists now, and answering it here would refuse a detach that would have
+ * worked. A line that is not a line is true whenever it is asked.
+ */
+            {
+                ::std::istringstream probe(source);
+                ::std::vector<ScriptLine> plines;
+                read_script(probe, plines);
+                ::std::string bad;
+                size_t n = 0;
+                for (const auto& sl : plines)
+                    if (::std::holds_alternative<CmdError>(sl.cmd))
+                    {
+                        if (++n <= 3)
+                            bad += "\n  line " + ::std::to_string(sl.number) + ": "
+                                 + ::std::get<CmdError>(sl.cmd).message;
+                    }
+                if (n)
+                    return {ExecuteStatus::Error,
+                            "detach: '" + script_path + "' is not a script -- "
+                            + ::std::to_string(n) + " line(s) did not parse."
+                            + bad + (n > 3 ? "\n  ..." : "")
+                            + "\n  Nothing was launched. If this path is served rather "
+                              "than local, what arrived is probably not the file."};
             }
 
             // Deliberately NOT capturing ctx.root_entity for the child. The
