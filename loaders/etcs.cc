@@ -167,25 +167,140 @@ int etcs_web_call(const char* name, const char* work, const char* args)
     return 1;
 }
 
-EMSCRIPTEN_KEEPALIVE
-void etcs_web_shell_write(const char* text)
+/*
+ * ── the terminal's output, in chunks rather than in lines ────────────────
+ *
+ * A LINE OF LOG USED TO COST A CROSS-THREAD PROXY AND A REFLOW. Every
+ * ETCS_LOG reaching the browser went through MAIN_THREAD_EM_ASM, which BLOCKS
+ * the calling thread until the main thread runs the body; then the page
+ * postMessage'd it to the terminal frame, which built spans for it, appended
+ * them to a live document and read scrollHeight to follow the tail -- a forced
+ * synchronous layout, per line. Boot prints several thousand lines (the
+ * manifest handshake alone is ~900 rows per module), so the terminal was not
+ * showing the boot, it was pacing it.
+ *
+ * SO THE WRITERS ONLY ACCUMULATE. Appending to a string under a mutex is what
+ * a write costs now -- no proxy, no DOM, no layout. The page drains the buffer
+ * on its own clock (etcs_web_shell_drain) and hands the whole chunk to the
+ * terminal in one go, so a hundred lines that arrive inside one frame are one
+ * postMessage and one reflow instead of a hundred of each.
+ *
+ * AND IT STILL PUSHES IF NOBODY PULLS. A page that does not drain -- an older
+ * copy of the shell page, or one whose timer has stopped -- would otherwise
+ * accumulate silently, so a write that finds no recent pull falls back to the
+ * old proxied push. That is the only path that still pays per write, and only
+ * for as long as nothing is draining.
+ *
+ * THE LOCK IS NEVER HELD ACROSS THE PROXY. MAIN_THREAD_EM_ASM waits for the
+ * main thread, and the main thread's drain wants this same mutex: holding it
+ * over the push is a deadlock with a real path to it. The chunk is swapped out
+ * under the lock and pushed after it is released.
+ */
+namespace {
+std::mutex  g_shell_out_mu;
+std::string g_shell_out;
+double      g_shell_last_pull = 0.0;   // emscripten_get_now() of the last drain
+
+// How stale a pull has to be before a writer decides nobody is draining, and
+// how much may pile up before it pushes anyway (a hidden tab's timers are
+// throttled, not stopped, so this is a ceiling and not the usual path).
+constexpr double  SHELL_PULL_STALE_MS = 750.0;
+constexpr size_t  SHELL_HARD_CAP      = 1u << 20;
+}
+
+namespace {
+/*
+ * Append, and push only if nobody is draining. The one place that decides,
+ * shared by the stdout redirect and by etcs_web_shell_write -- two callers
+ * with the same question.
+ */
+void shell_out_append(const char* text, size_t n)
 {
-    if (!text) return;
-    /*
-     * MAIN_THREAD_EM_ASM, NOT EM_ASM: callers include the REPL thread.
-     *
-     * EM_ASM runs in the CALLING thread's JS scope, and a Worker's scope has no
-     * document, no window and no etcsTermWrite -- output would land in a Worker
-     * console nobody reads while the terminal sat empty. This proxies to the
-     * page's scope, where the terminal is, for a postMessage per write.
-     */
+    if (!text || n == 0) return;
+    std::string chunk;
+    {
+        std::lock_guard<std::mutex> lock(g_shell_out_mu);
+        g_shell_out.append(text, n);
+        const double now = emscripten_get_now();
+        const bool nobody_pulling = (now - g_shell_last_pull) > SHELL_PULL_STALE_MS;
+        if (!nobody_pulling && g_shell_out.size() < SHELL_HARD_CAP) return;
+        chunk.swap(g_shell_out);
+    }
     MAIN_THREAD_EM_ASM({
         var t = UTF8ToString($0);
         if (typeof window.etcsTermWrite === 'function')
             window.etcsTermWrite(t);
         else if (typeof Module !== 'undefined' && Module.print)
             Module.print(t);
-    }, text);
+    }, chunk.c_str());
+}
+
+/*
+ * ── std::cout, into the same buffer ──────────────────────────────────────
+ *
+ * AND THIS IS THE ONE THAT MATTERED. ETCS_LOG's default sink is std::cout and
+ * it flushes per line (Log.h says why: one line, one write, so a transcript
+ * cannot interleave mid-line). Under emscripten that flush is a write to
+ * stdout, stdout is emscripten's `out()`, and out() calls Module.print -- and
+ * from a pthread the whole path is PROXIED TO THE MAIN THREAD, which blocks
+ * the logging thread until the main thread gets a turn. Measured: the boot
+ * script's output arrived at a flat ~54 lines a second, about 18ms each --
+ * one main-thread turn per line -- and the paint page took ~60s to draw a
+ * canvas the runtime had finished building in 0.6s. The terminal was not
+ * showing the boot, it was pacing it.
+ *
+ * So cout goes here instead: an append under a mutex, no FS, no proxy, no DOM.
+ * The page drains it (etcs_web_shell_drain) and hands the terminal one chunk
+ * per tick. Nothing about WHAT is logged changes, and the per-line flush stays
+ * exactly as atomic as it was -- a flush now costs a string append.
+ *
+ * stderr is left alone: it is rare, it is what an abort has time to say, and a
+ * buffered channel is the wrong place for the last words of a dying process.
+ */
+class ShellOutBuf : public ::std::streambuf
+{
+protected:
+    int overflow(int c) override
+    {
+        if (c == traits_type::eof()) return traits_type::not_eof(c);
+        const char ch = static_cast<char>(c);
+        shell_out_append(&ch, 1);
+        return c;
+    }
+    ::std::streamsize xsputn(const char* s, ::std::streamsize n) override
+    {
+        shell_out_append(s, static_cast<size_t>(n));
+        return n;
+    }
+};
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE
+const char* etcs_web_shell_drain()
+{
+    // MAIN THREAD ONLY, and the string outlives the call because ccall's
+    // 'string' return copies it out before anything can run again here.
+    static std::string held;
+    std::lock_guard<std::mutex> lock(g_shell_out_mu);
+    held.swap(g_shell_out);
+    g_shell_out.clear();
+    g_shell_last_pull = emscripten_get_now();
+    return held.c_str();
+}
+
+/*
+ * The explicit write, through the same buffer as everything else. The fallback
+ * push inside shell_out_append is MAIN_THREAD_EM_ASM and not EM_ASM for the
+ * reason it always was: callers include the REPL thread, EM_ASM runs in the
+ * CALLING thread's JS scope, and a Worker's scope has no document, no window
+ * and no etcsTermWrite -- output would land in a Worker console nobody reads
+ * while the terminal sat empty.
+ */
+EMSCRIPTEN_KEEPALIVE
+void etcs_web_shell_write(const char* text)
+{
+    if (!text) return;
+    shell_out_append(text, ::std::strlen(text));
 }
 
 } // extern "C"
@@ -193,6 +308,16 @@ void etcs_web_shell_write(const char* text)
 
 int main(int argc, char* argv[])
 {
+#if defined(__EMSCRIPTEN__)
+    /*
+     * BEFORE ANYTHING LOGS. Redirecting cout is what takes the per-line proxy
+     * off every ETCS_LOG in the process (see ShellOutBuf); doing it after
+     * shell_startup would leave the first few hundred lines on the slow path,
+     * and those are the ones somebody is watching for.
+     */
+    static ShellOutBuf etcs_web_cout_buf;
+    ::std::cout.rdbuf(&etcs_web_cout_buf);
+#endif
     shell_startup();
 #if defined(__EMSCRIPTEN__)
     /*
