@@ -112,6 +112,23 @@ public:
         x = top.x; y = top.y; w = top.w; h = top.h;
     }
 
+    // Narrow a rectangle to the region in effect, in place. w or h comes back
+    // zero when nothing survives, which is the caller's cue to draw nothing.
+    //
+    // A COMPANION TO CurrentClip, not a second way to do the same thing. A
+    // backend that reads the clip at draw time never wants the region for its
+    // own sake -- it wants the rectangle it was handed, narrowed. Offering only
+    // the region leaves every such backend to write the intersection itself,
+    // and the reason the arithmetic lives down in intersect is precisely that a
+    // backend writing its own is a backend that can invert the empty case.
+    void clipToCurrent(int32_t& x, int32_t& y, uint32_t& w, uint32_t& h) const
+    {
+        int32_t cx, cy; uint32_t cw, ch;
+        CurrentClip(cx, cy, cw, ch);
+        const ClipRect r = intersect(ClipRect{cx, cy, cw, ch}, ClipRect{x, y, w, h});
+        x = r.x; y = r.y; w = r.w; h = r.h;
+    }
+
 protected:
     struct ClipRect { int32_t x; int32_t y; uint32_t w; uint32_t h; };
 
