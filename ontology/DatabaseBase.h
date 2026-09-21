@@ -53,5 +53,12 @@ ETCS_SUPERTYPE_BASE(Database)
     ETCS_DISPATCH_METHOD(void, CreateConnection, (const ETCS::Buffer&,  db));
     ETCS_DISPATCH_METHOD(bool, ExecuteRaw,       (ETCS::Buffer&,        data));
     ETCS_DISPATCH_METHOD(bool, InitializeSchema, (const ETCS::Buffer&,  schema));
+    // The bound-statement surface -- Database.h says why it is part of what a
+    // database owes and not a convenience of the sqlite leaf.
+    ETCS_DISPATCH_METHOD(void*, Prepare,  (const char*,          sql));
+    ETCS_DISPATCH_METHOD(bool,  Bind,     (void*, stmt), (int, index), (const DatabaseValue&, v));
+    ETCS_DISPATCH_METHOD(int,   Step,     (void*, stmt));
+    ETCS_DISPATCH_METHOD(bool,  Column,   (void*, stmt), (int, col), (DatabaseValue&, out));
+    ETCS_DISPATCH_METHOD(void,  Finalize, (void*, stmt));
 };
 #endif
