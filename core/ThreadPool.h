@@ -440,6 +440,34 @@ public:
         workers_.reserve(threads);
         for (size_t i = 0; i < threads; ++i)
         {
+            /*
+ * A THREAD THAT WAS NOT CREATED IS REPORTED HERE, and this is the controlled
+ * point the alternative lacks.
+ *
+ * ::std::thread's constructor throws when the platform refuses, and this loop
+ * used to let that escape into whatever was arming the pool -- which, on the
+ * web, is a deferred boot step running under the module's static init, where an
+ * escaping exception is a bare `unreachable` with no thread, no count and no
+ * name attached to it. What the operator needs to know is a NUMBER, and the
+ * number is only available right here.
+ *
+ * IT CARRIES ON WITH WHAT IT GOT rather than unwinding. A pool of six where
+ * eight were asked for still runs every task that is queued, just with less
+ * overlap; a pool that threw during arming leaves workers_started_ true and no
+ * workers at all, so every later enqueue waits on a condition variable nobody
+ * is going to signal. Degrading is the difference between a slower runtime and
+ * one that has silently stopped.
+ *
+ * WHY IT IS USUALLY MEMORY, and worth saying in the message because the browser
+ * will not: under emscripten every one of these is a Worker, and a Worker
+ * created after the dynamic libraries are open re-instantiates all of them for
+ * itself. So the cost is workers x modules, the pool size is PER IMAGE
+ * (DEFAULT_THREAD_POOL_THREADS, ETCS_API.h) and a session with six images pays
+ * it six times over. That is the arithmetic to reach for, not the heap size --
+ * this allocation does not come out of the wasm heap at all.
+ */
+            try
+            {
             workers_.emplace_back([this]()
             {
                 while (true)
@@ -480,10 +508,41 @@ public:
                     }
                 }
             });
+            }
+            catch (const ::std::exception& e)
+            {
+                ETCS_LOG("ThreadPool", "worker " << (i + 1) << " of " << threads
+                         << " could not be created: " << e.what()
+                         << " -- running with " << workers_.size()
+                         << ". This pool is PER IMAGE, and under emscripten each"
+                         " worker re-instantiates every open dynamic library for"
+                         " itself, so the cost is workers x modules and it is"
+                         " browser memory, not the wasm heap. Lower"
+                         " DEFAULT_THREAD_POOL_THREADS (core/ETCS_API.h) or load"
+                         " fewer providers; raising INITIAL_MEMORY will not help.");
+                break;
+            }
         }
 
-        watchdog_thread_ = ::std::thread(&ThreadPool::watchdog_loop, this);
-        io_thread_       = ::std::thread(&ThreadPool::io_completion_loop, this);
+        // Said every time, not only on failure: the count is the one number that
+        // makes the paragraph above actionable, and nothing else in the boot log
+        // reports it. Six images asking for four each is twenty-four workers
+        // that no single line of output previously mentioned.
+        ETCS_LOG("ThreadPool", "workers started: " << workers_.size() << " of "
+                 << threads << " requested.");
+
+        // The watchdog and the io loop are NOT optional the way a worker is --
+        // one is how a wedged task is noticed and the other is how completions
+        // come back -- so a failure here is reported as the degradation it is
+        // rather than folded into the count above.
+        try { watchdog_thread_ = ::std::thread(&ThreadPool::watchdog_loop, this); }
+        catch (const ::std::exception& e)
+        { ETCS_LOG("ThreadPool", "no watchdog thread: " << e.what()
+                   << " -- a task that wedges will not be noticed."); }
+        try { io_thread_ = ::std::thread(&ThreadPool::io_completion_loop, this); }
+        catch (const ::std::exception& e)
+        { ETCS_LOG("ThreadPool", "no io completion thread: " << e.what()
+                   << " -- queued io will be submitted and never reaped."); }
         s_alive.store(true, ::std::memory_order_release);
     }
 

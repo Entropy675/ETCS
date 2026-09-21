@@ -210,8 +210,40 @@ inline size_t etcs_flush_deferred_rid_registrars()
 #define ETCS_RID_SIZE                   uint64_t
 #define MAX_LMAX_BUFFER_SIZE   (ETCS_SLOT_SIZE - ETCS_BUFFER_METADATA_SIZE - ETCS_SEQUENTIAL_FRAME_SIZE)
 // you get 16 bytes, fit a ptr & action type
+/*
+ * HOW MANY WORKERS ONE IMAGE'S POOL KEEPS, and it is not one number because a
+ * worker is not one thing.
+ *
+ * PER IMAGE is the part that surprises, and it is the whole of the arithmetic:
+ * every DSO gets its own ThreadPool -- the per-DSO grain this core is built on
+ * -- so the figure below is multiplied by the number of loaded modules, not
+ * shared across them. A session with a loader and five providers runs SIX
+ * pools. That is defensible natively, where a pool worker is an OS thread: a
+ * stack that is lazily committed, no code duplicated, and oversubscription
+ * costs scheduling rather than memory.
+ *
+ * ON THE WEB A POOL WORKER IS A WORKER, which is a different object entirely.
+ * It carries its own JS realm, its own parse of the ~2 MB emscripten glue, and
+ * an instance of EVERY open side module -- emscripten re-instantiates the
+ * dynamic libraries inside each new Worker, because a wasm instance belongs to
+ * one agent. So the cost is workers x modules and it is browser memory, outside
+ * the wasm heap entirely. At 4 the paint page created 46 Workers and Firefox
+ * refused partway through one of their dlopens; at 2 it does not. That is a
+ * measured number, not a guess, and it is why raising INITIAL_MEMORY never
+ * touched it.
+ *
+ * TWO, NOT hardware_concurrency(), for the same reason: the count that matters
+ * is per image and the machine's core count says nothing about how many Workers
+ * a tab can afford. The pool is not where this runtime gets its parallelism
+ * anyway -- the frame edge and the pointer edge are detached script threads, and
+ * a pool worker serves stream and signal work that is latency-bound rather than
+ * CPU-bound. Native keeps 4 so nothing about that path has to be re-argued.
+ */
+#if defined(__EMSCRIPTEN__)
+#define DEFAULT_THREAD_POOL_THREADS  2
+#else
 #define DEFAULT_THREAD_POOL_THREADS  4
-// can maybe be ::std::thread::hardware_concurrency()
+#endif
 // default hash size/type
 #define HASH_TYPE uint64_t
 #define BASE_SOURCE_STRING "ETCS_Kernel_v1.0"

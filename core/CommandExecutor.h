@@ -1918,7 +1918,26 @@ inline ExecuteResult execute_command(const Command& cmd,
             // shared root and the others got nothing. Each detached thread
             // now constructs its OWN fresh Root, and binds "root" to THAT
             // Root's RID.
-            ::std::thread child_thread([script_path, child_names, exec,
+            /*
+ * THE ONE PLACE A FAILED DETACH CAN STILL BE ANSWERED TO THE CALLER.
+ *
+ * ::std::thread throws when the platform refuses, and this was unguarded -- so
+ * a detach that could not get a thread unwound out of the executor instead of
+ * failing the statement. The launching script then has no result to read and
+ * carries on as though the job were running, which for a frame pump means a
+ * black page and a runtime that is otherwise working perfectly.
+ *
+ * WHAT THIS CANNOT CATCH, said here so the next reader does not trust it too
+ * far: under emscripten the thread is a Worker, and a Worker that dies while
+ * re-instantiating the open dynamic libraries does so ASYNCHRONOUSLY -- this
+ * constructor has already returned by then. That failure surfaces in the page
+ * as `worker sent an error!` and cannot be reached from C++ at all. What is
+ * caught here is the synchronous refusal: no thread was created.
+ */
+            ::std::thread child_thread;
+            try
+            {
+            child_thread = ::std::thread([script_path, child_names, exec,
                                       child_entity, child_sig,
                                       source = ::std::move(source)]() mutable
             {
@@ -1956,7 +1975,25 @@ inline ExecuteResult execute_command(const Command& cmd,
                 run_script(in, script_path, child_ctx);
                 exec->finished.store(true, ::std::memory_order_release);
             });
- 
+            }
+            catch (const ::std::exception& e)
+            {
+                // Marked finished so nothing waits on a job that never began --
+                // wait_for_environment_drain counts these, and a registry entry
+                // with no thread behind it would hold the runtime open forever.
+                exec->finished.store(true, ::std::memory_order_release);
+                return {ExecuteStatus::Error,
+                        "detach: no thread for '" + script_path + "' -- "
+                        + e.what() + ". Nothing was launched, so whatever this "
+                        "script was going to do is not happening: a frame pump "
+                        "detached this way is the difference between a drawn page "
+                        "and a black one. Under emscripten a thread is a Worker "
+                        "and each one re-instantiates every open dynamic library, "
+                        "so this is usually browser memory rather than the wasm "
+                        "heap -- see ThreadPool::start_workers on which numbers "
+                        "move it."};
+            }
+
             DetachedRegistry::getInstance().set_thread(exec, ::std::move(child_thread));
 #endif
             return {ExecuteStatus::Ok, ""};
