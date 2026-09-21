@@ -60,6 +60,7 @@ inline void etcs_web_trace(const char*) {}
 #include <deque>
 #include <mutex>
 #include <cstring>
+#include "../core/ThreadPool.h"
 namespace {
 std::mutex g_etcs_web_line_mu;
 std::deque<std::string> g_etcs_web_lines;
@@ -165,6 +166,124 @@ int etcs_web_call(const char* name, const char* work, const char* args)
         return 0;
     }
     return 1;
+}
+
+/*
+ * THE SAME CALL, WITH AN ANSWER -- ANSWERED OFF THE ONE THREAD THAT CANNOT
+ * AFFORD TO WAIT.
+ *
+ *     etcs_web_call_async(7, "game", "Request", "game/white/local/move/e2e4")
+ *     // later, from C++: window.__etcs_call_done(7, 1, "<fen> ...")
+ *
+ * is the async spelling of `game.Request("game/white/local/move/e2e4")`: it
+ * exists for the same reason `etcs_web_call` was not enough for chess -- a
+ * move's whole point is the FEN it produces, and a fire-and-forget verb has
+ * nowhere for that answer to go. An earlier version of this function
+ * (`etcs_web_call_result`, same signature idea, a result buffer instead of a
+ * callback) got the shape right and the thread wrong: it ran the resolve-
+ * and-call sequence below INLINE, on whatever thread's `Module.ccall`
+ * reached it, which for a DOM click handler is the browser's one real main
+ * thread. That is fine for a verb with no wait behind it, and fatal for one
+ * that has: ChessGame's `Request` blocks on `ChessOpEvent` until its
+ * EventStream's ordering thread answers, exactly like HttpServer's own
+ * `routeRequest` already does for every native request -- but HttpServer
+ * only ever calls that from a ThreadPool worker (see ConnectionManager.h's
+ * `enqueue`-then-`call` pattern), never from the one thread a browser page
+ * cannot let block: the thread pumping window messages, which every pthread
+ * worker this runtime depends on needs pumped to make progress at all.
+ * Empirically, on this build, routing one `move` through the blocking
+ * version froze the tab and then killed it -- not a hang to tune the
+ * timeout on, a real deadlock: nothing left running that could ever
+ * satisfy the wait.
+ *
+ * The fix is not to avoid the block -- `ChessOpEvent`'s wait is correct and
+ * necessary -- it is to put it back on a thread built to survive it. This
+ * function only ENQUEUES: `ETCS::ThreadPool::getInstance().enqueue(...)`
+ * returns as soon as the task is queued, the same non-blocking push every
+ * other ThreadPool caller in this codebase already relies on, so it is as
+ * safe to call from the real main thread as `etcs_web_call` itself. The
+ * resolve-act-call sequence -- unchanged from `etcs_web_call_result`, still
+ * the same `Entity::call` every native caller uses -- now runs on the pool
+ * worker that task lands on, where blocking is exactly what that thread is
+ * for. When it returns (answer in hand, or not: name unresolved, threw), the
+ * worker reaches back into the page the same way `etcs_web_shell_write`
+ * already does from off-main-thread output: `MAIN_THREAD_EM_ASM`, which
+ * proxies to the real browser main thread regardless of which thread calls
+ * it, and invokes `window.__etcs_call_done(handle, ok, text)`.
+ *
+ * `handle` is the caller's own correlation id -- JS picks it (an
+ * incrementing counter is enough) and this side only echoes it back, which
+ * is what lets the JS wrapper resolve the right pending Promise when several
+ * calls are in flight. `ok` is 0/1, matching `etcs_web_call`'s own return
+ * convention (0: name never resolved, or the work function threw); `text`
+ * is `restAsString()` when `ok`, empty otherwise -- there is no capacity
+ * argument here because there is no caller-owned buffer to bound: the
+ * string crosses back as an ordinary `UTF8ToString` argument, sized by
+ * itself, not by a guess made before the answer existed.
+ */
+EMSCRIPTEN_KEEPALIVE
+void etcs_web_call_async(int handle, const char* name, const char* work, const char* args)
+{
+    const std::string n = name ? name : "";
+    const std::string w = work ? work : "";
+    const std::string a = args ? args : "";
+
+    ETCS::ThreadPool::getInstance().enqueue(
+        ETCS::Priority::High, ETCS::RootSignalContext(),
+        [handle, n, w, a]()
+        {
+            bool ok = false;
+            std::string text;
+
+            if (!n.empty() && !w.empty() && ETCS::EventNode::alive())
+            {
+                auto bound = ETCS::live_global(n);
+                if (!bound)
+                {
+                    ETCS_LOG("ETCS", "etcs_web_call_async: '" << n << "' is not a "
+                             "live global name. A boot script's own names become "
+                             "the globals; anything else has to be spawned before "
+                             "the page can reach it.");
+                }
+                else if (ETCS::Entity* target = ETCS::resolve_bound_entity(*bound))
+                {
+                    ETCS::Buffer act;
+                    act.write((bound->tag + "." + w).c_str());
+                    ETCS::Buffer payload;
+                    if (!a.empty()) payload.write(a.c_str());
+
+                    try
+                    {
+                        target->call(act, payload, ETCS::RootSignalContext());
+                        text = payload.restAsString();
+                        ok = true;
+                    }
+                    catch (const std::exception& ex)
+                    {
+                        ETCS_LOG("ETCS", "etcs_web_call_async: " << n << "." << w
+                                 << " threw: " << ex.what());
+                    }
+                    catch (...)
+                    {
+                        ETCS_LOG("ETCS", "etcs_web_call_async: " << n << "." << w
+                                 << " threw an unknown exception.");
+                    }
+                }
+                else
+                {
+                    ETCS_LOG("ETCS", "etcs_web_call_async: '" << n << "' (RID:"
+                             << bound->rid << ") no longer resolves.");
+                }
+            }
+
+            MAIN_THREAD_EM_ASM({
+                var handle = $0;
+                var ok = $1;
+                var text = UTF8ToString($2);
+                if (typeof window.__etcs_call_done === 'function')
+                    window.__etcs_call_done(handle, ok, text);
+            }, handle, ok ? 1 : 0, text.c_str());
+        });
 }
 
 /*

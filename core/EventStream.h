@@ -452,6 +452,40 @@ public:
          * undefined, so the background loop never drains and main spins
          * forever on Load/Resolve/ChangeModule. Rings stay live; callers
          * use emscripten_poll() while waiting.
+         *
+         * start() ALWAYS lands here first under emscripten, unconditionally --
+         * on purpose, after two failed attempts at having it detect "is it
+         * actually safe to spawn a real thread yet" for itself. Both were
+         * shared cross-module state read from inside a dlopen'd side module,
+         * and both were wrong in exactly that way: g_etcs_runtime_threads_started
+         * (ETCS_API.h) is a plain `inline` global, and this tree links the
+         * loader and every module.wasm SEPARATELY under emscripten's dynamic
+         * linking (-sMAIN_MODULE / -sSIDE_MODULE) -- there is no final link
+         * step that ever merges an inline global's per-TU definitions into
+         * one the way a single native binary's linker would, so the loader's
+         * own `store(true, ...)` in etcs_boot_runtime_threads never touches a
+         * module's own copy, which stays false forever (confirmed by
+         * instrumenting both: different addresses). Swapping in
+         * ThreadPool::getInstance().alive() failed the OTHER direction: that
+         * flag means the singleton object has been constructed, not that its
+         * workers have started (ThreadPool's own constructor sets it before
+         * an emscripten-deferred return, by design -- see its own comment on
+         * why liveness must survive destruction), so it reads true almost
+         * immediately and this branch started spawning threads mid-dlopen
+         * again, the exact hazard the comment above describes -- reproduced
+         * as an immediate crash, not a subtle one.
+         *
+         * So this function stays honest about what it can know: NOTHING
+         * inside start() distinguishes "during preload" from "long after
+         * boot" reliably, because there is no cross-module signal here that
+         * survives being loaded as a separate side module. What DOES know
+         * the difference is whoever calls start() a second time on purpose,
+         * well after boot, for a stream preload could never have reached in
+         * the first place -- a lazily-created entity's own stream (see
+         * ChessNode::stream(), ChessNode.h, which calls
+         * arm_emscripten_ordering_thread() itself immediately after start()
+         * for exactly this reason, with the comment there covering the
+         * timing argument this one used to). Nothing here needs to guess.
          */
         sync_emscripten_ = true;
         pending_start_ = false;
