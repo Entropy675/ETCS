@@ -43,6 +43,16 @@
 #  define ETCS_MODULE_STATIC_REACH_LOADER 1
 #endif
 
+/*
+ * THE MANIFEST CHECK IS DEFERRED, NOT SKIPPED, under emscripten -- see the
+ * note on Name##_check_loader_manifest_ in ETCS_MODULE_EXPORT_MAIN for what
+ * the deferral is about (re-entering the dynamic linker, not visibility) and
+ * where it lands instead. It rode this macro as a SKIP until
+ * -fvisibility=hidden made the comparison meaningful in the first place: with
+ * shared visibility a module's getManifest() and the loader's could be the
+ * same map, and the check compared a map with itself.
+ */
+
 #include <vector>
 namespace ETCS {
 inline ::std::vector<void(*)()>& etcs_deferred_rid_registrars()
@@ -217,7 +227,30 @@ inline size_t etcs_flush_deferred_rid_registrars()
 // loader and module alike.
 #include <emscripten/emscripten.h>
 #include <emscripten/threading.h>
+// For the one message that has to outlive the process: emscripten_console_error
+// goes straight to the browser's console from any thread, where std::cerr and
+// ETCS_LOG go to the in-page terminal -- which is never rendered if the thing
+// being reported is an abort during module load (ETCS_MODULE_EXPORT_MAIN's
+// manifest check).
+#include <emscripten/console.h>
 #endif
+
+/*
+ * The last thing a dying module can say, somewhere a person will see it.
+ *
+ * abort() in wasm reaches the page as a bare "unreachable" with no text: the
+ * terminal that ETCS_LOG and std::cerr feed is an in-page widget the shell
+ * renders, and a module that aborts during load kills the runtime before that
+ * widget has anything to show. So the fatal path says it twice -- once through
+ * the normal channels for the native build and for a log capture, once
+ * straight to the browser console, which survives.
+ */
+#if defined(__EMSCRIPTEN__)
+#  define ETCS_WEB_CONSOLE_ERROR(msg) emscripten_console_error(msg)
+#else
+#  define ETCS_WEB_CONSOLE_ERROR(msg) do { (void)(msg); } while (0)
+#endif
+
 
 /*
  * A WAIT, AND ON THE BROWSER'S MAIN THREAD A REFUSAL.
@@ -1058,11 +1091,8 @@ namespace ETCS
         ETCS::EventNode::getInstance().RegisterTagBitIndex(ordered_tags); \
         return true; \
     }(); \
-    /* This module's own half of the loader/module manifest check -- runs \
-     * at static-init time, i.e. during dlopen(), before dlopen() itself \
-     * returns to the loader and so before RegisterDynamicLoader (the \
-     * loader's first call INTO this module) is ever reached. Reaches the \
-     * loader's manifest via dlsym(RTLD_DEFAULT, ...) against \
+    /* This module's own half of the loader/module manifest check. Reaches \
+     * the loader's manifest via dlsym(RTLD_DEFAULT, ...) against \
      * ETCS_GetLoaderManifest (DynamicLoader.h, loader build only, exported \
      * with default visibility and -rdynamic specifically so this lookup \
      * works) rather than waiting for the loader to hand it over -- neither \
@@ -1074,21 +1104,24 @@ namespace ETCS
      * Depends on ETCS_MODULE_EXPORT_MAIN being invoked after every header \
      * whose HEADER:/ONTOLOGY: hash should be checked has already been \
      * included in this translation unit -- true of every module as \
-     * written today (this macro goes last), but now load-bearing rather \
-     * than just eventually-true, since this runs mid-static-init instead \
-     * of at the loader's first runtime call into Name(). */ \
-    static const bool Name##_loader_manifest_checked_ = []() { \
-        if (!ETCS_MODULE_STATIC_REACH_LOADER) return true; \
+     * written today (this macro goes last), and load-bearing either way, \
+     * since the map is read once rather than watched. */ \
+    static void Name##_check_loader_manifest_() { \
         void* getterAddr = ETCS::etcs_find_loader_manifest_getter(); \
-        if (!getterAddr) return true; \
+        if (!getterAddr) return; \
         using LoaderManifestGetter = void* (*)(); \
         void* loaderManifestPtr = reinterpret_cast<LoaderManifestGetter>(getterAddr)(); \
-        if (!loaderManifestPtr) return true; \
+        if (!loaderManifestPtr) return; \
         auto* loaderManifest = static_cast<ETCS::Manifest*>(loaderManifestPtr); \
         if (ETCS::compareManifests(ETCS::Entity::getManifest(), loaderManifest, #Name)) { \
             ::std::cerr << "FATAL: module '" #Name "' and the loader disagree on " \
                          "CORE:/HEADER:/ONTOLOGY: hashes -- built for different epochs. " \
                          "Refusing to run." << ::std::endl; \
+            ETCS_WEB_CONSOLE_ERROR("FATAL: module '" #Name "' and the loader disagree on " \
+                "CORE:/HEADER:/ONTOLOGY: hashes -- built for different epochs. Refusing to " \
+                "run. (Rebuild both: `ace wasm make all && ace wasm make loader etcs`, then " \
+                "redeploy every .wasm together -- a page serving one stale module is exactly " \
+                "this.)"); \
             /* TODO(recovery): re-fetch whichever of {this module, the \
              * loader} is older from anticurrententropy.com and retry once \
              * before aborting. A SECURITY boundary as much as a \
@@ -1099,13 +1132,67 @@ namespace ETCS
              * infrastructure and the release-serving protocol -- so this \
              * goes straight to abort() rather than trusting an \
              * unverifiable replacement, or running as one that already \
-             * disagrees with the loader. */ \
+             * disagrees with the loader. \
+             * \
+             * THE SECURITY HALF IS ALREADY ANSWERED IN THE BROWSER, and \
+             * by something outside this check: the page cannot dlopen an \
+             * arbitrary file. The set of modules is modules.json, fetched \
+             * from the origin, so the question "may these bytes run here" \
+             * is the TLS certificate's and the runtime's dynamic \
+             * expansion is bounded by that list. What is left for this \
+             * check under wasm is the determinism half -- were these \
+             * bytes built together -- which the origin cannot answer, and \
+             * which a stale .wasm left beside a rebuilt loader gets \
+             * wrong. Natively there is no such list and dlopen takes a \
+             * path, so both halves are still this check's. */ \
             ::std::abort(); \
         } \
+    } \
+    /* WHEN it runs is the platform's answer, not this check's. \
+     * \
+     * Natively: static-init time, i.e. during dlopen(), before dlopen() \
+     * returns to the loader and so before RegisterDynamicLoader is reached. \
+     * \
+     * Under emscripten: queued, and flushed by RegisterDynamicLoader with \
+     * the RIDList registrars (ETCS_MODULE_STATIC_REACH_LOADER). Not because \
+     * of what it reads -- it only calls a main-module export that has been \
+     * there since before any side module existed -- but because of WHERE it \
+     * would run from: a side module's static init happens inside \
+     * loadDynamicLibrary, and dlsym() from there re-enters the dynamic \
+     * linker while the load that triggered it is still in flight. Measured: \
+     * the page stops after "before preload_web_modules" with nothing \
+     * logged, no abort and no error -- the first side module never \
+     * finishes loading. Deferred, the check still lands before the loader \
+     * has called a single one of this module's tags, which is all it has \
+     * to beat; it goes to the FRONT of the queue so a module that \
+     * disagrees aborts before publishing itself into any registry. */ \
+    static const bool Name##_loader_manifest_checked_ = []() { \
+        if (!ETCS_MODULE_STATIC_REACH_LOADER) { \
+            auto& q = ETCS::etcs_deferred_rid_registrars(); \
+            q.insert(q.begin(), &Name##_check_loader_manifest_); \
+            return true; \
+        } \
+        Name##_check_loader_manifest_(); \
         return true; \
     }(); \
+    /* THE ROOT OF THIS MODULE'S SIDE OF THE CHAIN: the module's name, then \
+     * every tag it declares and that tag's composed hash, in the order the \
+     * Tags string lists them -- which is the same order the tag-bit index \
+     * uses, so the two readings of "this module's tags" cannot drift. \
+     * \
+     * Lazy, and through the getter table rather than by symbol: this macro \
+     * expands ABOVE every ETCS_TAG_BLOCK in the .cc (it has to -- they read \
+     * its Tags string at compile time), so the symbols it composes over do \
+     * not exist yet at this point in the translation unit. */ \
     extern "C" ETCS_API HASH_TYPE Name##_GetHash() { \
-        return ETCS::GenerateEnvironmentSignature(#Name); \
+        static const HASH_TYPE composed = []() { \
+            ETCS::RegionNode node(#Name); \
+            ::std::stringstream ss(Tags); \
+            ::std::string tag; \
+            while (ss >> tag) node.child(tag.c_str(), ETCS::etcs_tag_node_hash(tag)); \
+            return node.finish(); \
+        }(); \
+        return composed; \
     } \
     extern "C" ETCS_API ETCS::Manifest* Name(ETCS::BBuffer& buff) { \
         buff.writeString(Tags); \
@@ -1174,8 +1261,12 @@ namespace ETCS
  */
 #define ETCS_MODULE_EXPORT_WORK(Type, ActionName) \
     extern "C" ETCS_API ETCS::WorkFunc Type##_##ActionName##_Work() { return &_work_##Type##_##ActionName; } \
+    /* THE LEAF: the digest of this action's own source region, recorded at \
+     * build time by `ace hash regions` -- see ETCS::etcs_region_hash \
+     * (Entity.h) for why the region is source rather than machine code, and \
+     * for what 0 means. */ \
     extern "C" ETCS_API HASH_TYPE Type##_##ActionName##_GetHash() { \
-        return ETCS::GenerateEnvironmentSignature(#Type "." #ActionName); \
+        return ETCS::etcs_region_hash(#Type "." #ActionName); \
     }
 /**
  * ETCS_MODULE_EXPORT_STREAM
@@ -1183,8 +1274,10 @@ namespace ETCS
  */
 #define ETCS_MODULE_EXPORT_STREAM(Type, ActionName) \
     extern "C" ETCS_API ETCS::StreamFunc Type##_##ActionName##_Stream() { return &_stream_##Type##_##ActionName; } \
+    /* Same leaf, same region rule -- a stream's body is scanned exactly as a \
+     * work function's is (DEFINE_STREAM_FUNC_PRODUCE / _CONSUME). */ \
     extern "C" ETCS_API HASH_TYPE Type##_##ActionName##_GetHash() { \
-        return ETCS::GenerateEnvironmentSignature(#Type "." #ActionName); \
+        return ETCS::etcs_region_hash(#Type "." #ActionName); \
     }
 /**
  * ETCS_TAG_DECLARE
@@ -1290,9 +1383,25 @@ namespace ETCS
     static_assert(sizeof(#__VA_ARGS__) <= MAX_BOUNDARY_BUFFER_SIZE, "Action list for " #TagName " exceeds MAX_BOUNDARY_BUFFER_SIZE!"); \
     extern "C" ETCS_API ETCS::MakeFunc TagName##_Make() { return &_make_##TagName; } \
     extern "C" ETCS_API ETCS::MakeChildFunc TagName##_MakeChild() { return &_make_child_##TagName; } \
+    /* AN INTERIOR NODE: this tag's name, then every action it declares and \
+     * that action's region digest, in declaration order (ETCS::RegionNode). \
+     * Computed on first call rather than at static init -- the leaf digests \
+     * arrive from module_hashes.h as inline variables, whose initialisation \
+     * is unordered against this translation unit's own statics, so composing \
+     * eagerly can compose over an empty table. By the time anything asks, \
+     * dlopen is done and the table is whole. */ \
     extern "C" ETCS_API HASH_TYPE TagName##_GetHash() { \
-        return ETCS::GenerateEnvironmentSignature(#TagName); \
+        static const HASH_TYPE composed = []() { \
+            ETCS::RegionNode node(#TagName); \
+            FOR_EACH_FIXED(ETCS_COMPOSE_ACTION_REGION, TagName, __VA_ARGS__) \
+            return node.finish(); \
+        }(); \
+        return composed; \
     } \
+    /* The module's own hash composes over its tags but is written above them \
+     * and cannot name them; this is how it finds this one (etcs_register_tag_node). */ \
+    static const bool TagName##_node_registered_ = \
+        ETCS::etcs_register_tag_node(#TagName, &TagName##_GetHash); \
     extern "C" ETCS_API ETCS::Manifest* TagName##_List(ETCS::BBuffer& buff) { \
         FOR_EACH_FIXED(ETCS_WRITE_WORK_TOKEN, TagName, __VA_ARGS__) \
         return &ETCS::Entity::getManifest(); \
@@ -1314,6 +1423,11 @@ namespace ETCS
  */
 #define ETCS_WRITE_WORK_TOKEN(TagName, Name)   buff.write(#Name "_Work ");
 #define ETCS_WRITE_STREAM_TOKEN(TagName, Name) buff.write(#Name "_Stream ");
+/* One child of a tag node: the action's name and the digest of its region.
+ * The same FOR_EACH the token writers use, so the tag hashes over exactly the
+ * actions it declares, in the order it declares them. */
+#define ETCS_COMPOSE_ACTION_REGION(TagName, Name) \
+    node.child(#Name, ETCS::etcs_region_digest(#TagName "." #Name));
 /**
  * ETCS_TAG_BLOCK_HYBRID
  */
@@ -1331,9 +1445,19 @@ namespace ETCS
     \
     extern "C" ETCS_API ETCS::MakeFunc TagName##_Make() { return &_make_##TagName; } \
     extern "C" ETCS_API ETCS::MakeChildFunc TagName##_MakeChild() { return &_make_child_##TagName; } \
+    /* The same interior node as _BASIC's, over both lists in the order they \
+     * are declared: work actions, then stream actions. */ \
     extern "C" ETCS_API HASH_TYPE TagName##_GetHash() { \
-        return ETCS::GenerateEnvironmentSignature(#TagName); \
+        static const HASH_TYPE composed = []() { \
+            ETCS::RegionNode node(#TagName); \
+            FOR_EACH_FIXED(ETCS_COMPOSE_ACTION_REGION, TagName, BRACKET_UNWRAP WorkActions) \
+            FOR_EACH_FIXED(ETCS_COMPOSE_ACTION_REGION, TagName, BRACKET_UNWRAP StreamActions) \
+            return node.finish(); \
+        }(); \
+        return composed; \
     } \
+    static const bool TagName##_node_registered_ = \
+        ETCS::etcs_register_tag_node(#TagName, &TagName##_GetHash); \
     \
     extern "C" ETCS_API ETCS::Manifest* TagName##_List(ETCS::BBuffer& buff) { \
         /* Use FOR_EACH to write each name without commas */ \

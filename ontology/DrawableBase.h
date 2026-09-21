@@ -67,7 +67,7 @@ ETCS_SUPERTYPE_BASE(Drawable), public SurfaceBase<Derived>
      */
     virtual void DrawIntoConcrete(Surface_* dst) = 0;
 
-    void DrawInto(Surface_* dst)
+    void DrawInto(Surface_* dst) override
     {
         if (m_hidden) return;
         static_cast<Derived*>(this)->DrawIntoConcrete(dst);

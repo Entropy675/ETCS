@@ -351,7 +351,11 @@ private:
     // io_uring_get_sqe bumps the SQ tail non-atomically and liburing gives no
     // thread-safety without SQPOLL. Every pool worker calls submit().
     ::std::mutex       submit_mutex_;
-    IOSubmissionPool sub_pool_;
+    // Used only on the io_uring paths, which are compiled out everywhere
+    // io_uring is not (the browser included) -- so it is a live member of a
+    // Linux build and a dead one of a wasm build, and only the second gets to
+    // say so.
+    [[maybe_unused]] IOSubmissionPool sub_pool_;
 
     void cleanup_io()
     {

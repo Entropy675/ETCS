@@ -1704,9 +1704,22 @@ bool ETCS::EventNode::LoaderStream::attachModule(
  * shutdown rather than fetching-and-trusting something unverifiable, or
  * silently continuing on a build that already can't be trusted.
  */
-            ::std::cerr << "FATAL: '" << module_name << "' -- " << mex.what()
-                      << " -- loader and module were not built for the same "
-                         "epoch. Shutting down." << ::std::endl;
+            /*
+ * Said twice, and the second one is the only one a browser shows: abort()
+ * in wasm reaches the page as a bare "unreachable", and the terminal that
+ * std::cerr and ETCS_LOG feed is an in-page widget that a failure during
+ * module load kills before it renders. This is the path that fires first
+ * under emscripten -- the module's own half is deferred to
+ * RegisterDynamicLoader, which a mismatch means this function never reaches
+ * (ETCS_MODULE_EXPORT_MAIN, ETCS_API.h).
+ */
+            const ::std::string fatal =
+                "FATAL: '" + module_name + "' -- " + mex.what()
+                + " -- loader and module were not built for the same epoch. "
+                  "Shutting down. (Rebuild and redeploy both halves together: "
+                  "`ace wasm make all && ace wasm make loader etcs`.)";
+            ::std::cerr << fatal << ::std::endl;
+            ETCS_WEB_CONSOLE_ERROR(fatal.c_str());
             ::std::abort();
         }
         catch (const ::std::exception& ex)

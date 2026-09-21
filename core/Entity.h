@@ -25,6 +25,8 @@
 #include <mutex>   // resolvePairModuleMask's cache
 #include <thread>  // the loader stream pair waits out its producer body
 #include <chrono>
+#include <string>
+#include <unordered_map>   // the region-digest table below
 namespace ETCS
 {
 inline ETCS::Buffer source()
@@ -409,9 +411,17 @@ private:
  * reclaim implies nothing will ever call delete on it. What this buys is
  * that the read no longer travels through a member whose value the
  * compiler is entitled to treat as garbage.
+ *
+ * STAGED, NOT WIRED: nothing in the tree writes or reads either of these
+ * today -- ~Entity() does not capture into them and operator delete still
+ * reads parent_/owning_arena_ directly, so the protection described above is
+ * a design that is present as a place to put it and nothing more.
+ * [[maybe_unused]] rather than deleted, because the hazard is real and the
+ * two slots are where the fix goes; it also stops every wasm build printing
+ * them as dead fields.
  */
-    Entity*      delete_parent_ = nullptr;
-    MemoryArena* delete_arena_  = nullptr;
+    [[maybe_unused]] Entity*      delete_parent_ = nullptr;
+    [[maybe_unused]] MemoryArena* delete_arena_  = nullptr;
     /*
  * Set only when this entity was spawned via a parent's addTag<T>(...).
  * nullptr otherwise. On destruction, if set, this entity removes its
@@ -1675,8 +1685,18 @@ public:
               SignalContext        ctx = {})
     {
         if (!producer_entity) return;
-        auto [tag_type, action]     = parseConjugateActionKey(conjugateAction);
+        /*
+     * NAMED LOCALS, not the structured bindings themselves. A lambda below
+     * captures tag_type and action, and capturing a structured binding is a
+     * C++20 extension -- this tree builds as C++17, so clang takes it and
+     * warns, on every module, every build. The binding is still where the
+     * two names come from; these are ordinary variables copied out of it, so
+     * the capture is an ordinary capture.
+     */
+        auto [tag_type_b, action_b]     = parseConjugateActionKey(conjugateAction);
         auto [tag_type_r, action_r] = parseConjugateActionKey(conjugateActionRcv);
+        const ETCS::Buffer tag_type = tag_type_b;
+        const ETCS::Buffer action   = action_b;
         if (!producer_entity->hasTag(tag_type) || !hasTag(tag_type_r))
         {
             ETCS_LOG("[CALL]", "Stream call failed -- producer RID:"
@@ -2863,6 +2883,181 @@ inline HASH_TYPE GenerateEnvironmentSignature(const ETCS::Buffer& uniqueName)
     HASH_TYPE result;
     ::std::memcpy(&result, digest, sizeof(HASH_TYPE));
     return result;
+}
+
+/*
+ * ═══ REGION HASHES ═══════════════════════════════════════════════════════
+ *
+ * WHAT A NAME'S OWN BYTES CAME TO. GenerateEnvironmentSignature above answers
+ * a different question and answers it well: "which build is this", a name
+ * salted with the whole manifest, so every export of one build moves together
+ * and none of them says anything about itself. That is an epoch stamp. It is
+ * not what `Tag_Action_GetHash` should mean, because the loader asks that
+ * question PER ACTION (Module::discoverActions) and stores the answer per
+ * action -- and every answer it stored differed only in the name it was given.
+ *
+ * So the leaves are now the SOURCE REGION each name corresponds to: the span
+ * of source from `DEFINE_WORK_FUNC(Tag, Action)` through the closing brace of
+ * the body under it, SHA-256'd at build time by `ace hash regions` and
+ * registered here by the generated module_hashes.h. A tag composes over its
+ * actions, a module over its tags, in declaration order -- so a changed body
+ * moves exactly one leaf, its tag and its module, and nothing else.
+ *
+ * WHY SOURCE AND NOT MACHINE CODE. The obvious reading of "hash the function"
+ * is the bytes it compiled to, and that reading cannot cross this project's
+ * own substrates: a wasm function pointer is a table index, there is no code
+ * address to hash from and no symbol size to hash to. Source bytes are the
+ * one thing a native .so and a .wasm built from the same commit agree on, and
+ * a hash chain whose leaves disagree per platform is a chain that can only
+ * ever compare a build against itself.
+ *
+ * WHAT IT DOES NOT CLAIM. Raw bytes, comments and whitespace included -- the
+ * same bargain the file hashes above already make, and for the same reason:
+ * a normaliser is a second parser to disagree with the compiler. A reformat
+ * therefore reads as a change. It is a content hash of the region, not a
+ * semantic hash of the behaviour, and nothing here pretends otherwise.
+ */
+inline ::std::unordered_map<::std::string, ::std::string>& etcs_region_digests()
+{
+    static ::std::unordered_map<::std::string, ::std::string> table;
+    return table;
+}
+
+// Called from the generated module_hashes.h, once per work/stream function
+// found in this module's sources. Full hex digest, not the truncation: the
+// ABI hands out 64 bits (HASH_TYPE) but a DAG built over these wants the
+// whole thing, and throwing it away here would be unrecoverable later.
+inline bool etcs_register_region_digest(const char* key, const char* digest_hex)
+{
+    etcs_region_digests()[key] = digest_hex;
+    return true;
+}
+
+inline const ::std::string& etcs_region_digest(const char* key)
+{
+    static const ::std::string none;
+    auto it = etcs_region_digests().find(key);
+    return (it == etcs_region_digests().end()) ? none : it->second;
+}
+
+/*
+ * ZERO MEANS "NO REGION WAS RECORDED FOR THIS NAME", and it is deliberately
+ * not a fallback to the old name hash. A name hash returned where a content
+ * hash was expected is indistinguishable from a content hash at every caller
+ * -- the DAG would accept it, compare it, and be wrong about what it proved.
+ * A hole says it is a hole. It happens when the module was built without
+ * `ace hash regions` (no ace on PATH at build time), or when an action is
+ * declared in a tag block with no DEFINE_WORK_FUNC under that exact name.
+ */
+inline HASH_TYPE etcs_region_hash(const char* key)
+{
+    const ::std::string& hex = etcs_region_digest(key);
+    if (hex.size() < 16)
+    {
+        ETCS_LOG("RegionHash", "no source region recorded for '" << key
+                 << "' -- its hash is 0. Built without `ace hash regions`, or the "
+                    "tag block names an action no DEFINE_WORK_FUNC defines.");
+        return 0;
+    }
+    HASH_TYPE v = 0;
+    for (int i = 0; i < 16; ++i)
+    {
+        const char c = hex[static_cast<size_t>(i)];
+        const HASH_TYPE nib = (c >= '0' && c <= '9') ? HASH_TYPE(c - '0')
+                            : (c >= 'a' && c <= 'f') ? HASH_TYPE(c - 'a' + 10)
+                            : (c >= 'A' && c <= 'F') ? HASH_TYPE(c - 'A' + 10)
+                            : HASH_TYPE(0);
+        v = (v << 4) | nib;
+    }
+    return v;
+}
+
+/*
+ * An interior node: its own name, then each child's name and digest, in the
+ * order the declaration gives them. Order is part of the hash because the
+ * declaration order IS the contract -- a tag block that lists the same
+ * actions in another order is a different surface, and discoverActions walks
+ * it in that order.
+ *
+ * 0x1F between fields (ASCII unit separator, which cannot occur in a C++
+ * identifier or a hex digest) so that no two different child lists can
+ * flatten to the same byte string.
+ */
+class RegionNode
+{
+public:
+    explicit RegionNode(const char* name)
+    {
+        picohash_init_sha256(&m_ctx);
+        field(name);
+    }
+
+    void child(const char* name, const ::std::string& digest)
+    {
+        field(name);
+        // A missing child is still a child: it contributes its name and a
+        // mark, so a node with a hole is not the same as a node without it.
+        field(digest.empty() ? "-" : digest.c_str());
+    }
+
+    void child(const char* name, HASH_TYPE h)
+    {
+        field(name);
+        char hex[17];
+        for (int i = 15; i >= 0; --i) { hex[i] = "0123456789abcdef"[h & 0xF]; h >>= 4; }
+        hex[16] = '\0';
+        field(hex);
+    }
+
+    HASH_TYPE finish()
+    {
+        unsigned char digest[PICOHASH_SHA256_DIGEST_LENGTH];
+        picohash_final(&m_ctx, digest);
+        HASH_TYPE result;
+        ::std::memcpy(&result, digest, sizeof(HASH_TYPE));
+        return result;
+    }
+
+private:
+    void field(const char* s)
+    {
+        picohash_update(&m_ctx, s, ::std::strlen(s));
+        picohash_update(&m_ctx, "\x1f", 1);
+    }
+    picohash_ctx_t m_ctx;
+};
+
+/*
+ * THE TAGS A MODULE IS MADE OF, BY THEIR GETTERS AND NOT THEIR VALUES.
+ *
+ * A module's hash composes over its tags', and ETCS_MODULE_EXPORT_MAIN is
+ * written before any tag block in the same .cc -- it cannot call symbols that
+ * do not exist yet, so it looks them up. What is registered is the FUNCTION,
+ * not the number, for two reasons that are really one: each tag's hash is a
+ * function-local static computed on first call, so registering a value would
+ * mean computing it during static initialisation, and the leaf digests it
+ * composes over are registered by module_hashes.h as INLINE variables --
+ * whose dynamic initialisation is explicitly unordered against everything
+ * else ([basic.start.dynamic]). A value captured at static-init could
+ * therefore be composed over an empty table. A getter cannot: whenever it is
+ * finally called, the load is long over and every table is full.
+ */
+inline ::std::unordered_map<::std::string, HASH_TYPE(*)()>& etcs_tag_node_getters()
+{
+    static ::std::unordered_map<::std::string, HASH_TYPE(*)()> table;
+    return table;
+}
+
+inline bool etcs_register_tag_node(const char* tag, HASH_TYPE(*getter)())
+{
+    etcs_tag_node_getters()[tag] = getter;
+    return true;
+}
+
+inline HASH_TYPE etcs_tag_node_hash(const ::std::string& tag)
+{
+    auto it = etcs_tag_node_getters().find(tag);
+    return (it == etcs_tag_node_getters().end() || !it->second) ? HASH_TYPE(0) : it->second();
 }
  
 /*

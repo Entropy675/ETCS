@@ -18,7 +18,17 @@
 ETCS_SUPERTYPE_BASE(Thread), public ThreadedBase<Derived>
 {
     ETCS_MAKE_INSTANCE(Thread)
-    ETCS_DISPATCH_METHOD(ETCS::Buffer, Script);
+    /*
+ * SPELLED OUT RATHER THAN ETCS_DISPATCH_METHOD(ETCS::Buffer, Script), and
+ * only because of the `override`. The macro's wrapper cannot carry one: most
+ * families use it to INTRODUCE a method, and a blanket override there would
+ * stop those compiling. Thread_ already declares Script as part of the family
+ * interface (Thread.h), so here the wrapper genuinely overrides -- which
+ * clang reported, correctly, on every module that includes this. Identical to
+ * what the macro expands to otherwise.
+ */
+    virtual ETCS::Buffer ScriptConcrete() = 0;
+    ETCS::Buffer Script() override { return static_cast<Derived*>(this)->ScriptConcrete(); }
     // Overrides the wire's refusing default (ThreadedBase) and hands the work
     // to the leaf, which is the only thing that knows how to make one of itself.
     uint64_t Detach(const ETCS::Buffer& script) override

@@ -173,7 +173,11 @@ enum class PageOrigin : uint8_t { ExplicitHuge, TransparentHuge, Plain };
 // to nullptr) — only MemoryArena's own slab-minting path passes a real
 // pointer, to determine once, at first mint, whether address arithmetic
 // is trustworthy for its own child-page pool.
-inline void* allocatePage(long long size, bool tryHuge, PageOrigin* origin_out = nullptr)
+// tryHuge is read only on the __linux__ branch below: no other platform has
+// an explicit huge-page request to make, and a wasm build would otherwise
+// report the parameter dead in every module that includes this.
+inline void* allocatePage(long long size, [[maybe_unused]] bool tryHuge,
+                          PageOrigin* origin_out = nullptr)
 {
     auto report = [&](PageOrigin o) { if (origin_out) *origin_out = o; };
 #if defined(_WIN32) || defined(_WIN64)
