@@ -2,6 +2,7 @@
 #define BASE_PRESENTABLE_H__
 #include "Presentable.h"
 #include "StepClock.h"
+#include "AnimatedBase.h"
 
 /*
  * THE RATE IS COUNTED HERE, ON THE WAY BACK OUT OF EVERY PRESENT.
@@ -28,11 +29,78 @@
  * into "the slowest frame we are willing to believe in", and one of those has
  * almost no effect.
  */
-ETCS_SUPERTYPE_BASE(Presentable)
+/*
+ * AND THE FRAME EDGE IS A STEP, NOT A THREAD -- which is why this base also
+ * claims Animated.
+ *
+ * Presenting on a clock used to be a standing producer/consumer PAIR: one body
+ * paced and wrote a token, another read it and did the walk. Both were loops
+ * that never returned, so each held a thread for the session -- and the
+ * producer's thread came out of the ThreadPool (ETCS_MODULE_EXPORT_STREAM
+ * enqueues it), which is how a pool acquired a MINIMUM size. An image with two
+ * standing producers and one worker deadlocks: the second body is queued behind
+ * one that never finishes. That is not a tuning problem, it is a floor derived
+ * from whatever the script happens to open.
+ *
+ * A LOOP HOLDS A STACK BETWEEN ITERATIONS; A STEP HOLDS NOTHING. That is the
+ * whole difference, and it is why this needs no scheduler, no work-stealing and
+ * no way to suspend a body mid-flight -- there is no stack to move, so any
+ * thread may run the next step. The ring between the two halves goes with them:
+ * it existed to cross a thread boundary that no longer exists, and
+ * ConsumeFrames' own comment already said the walk belongs on the presenting
+ * thread anyway.
+ *
+ * ONE DEFINITION FOR EVERY BACKEND, here rather than per surface, for the same
+ * reason the rate is: the next backend is a WebGPU path that has not been
+ * written, and this is the arrangement it cannot get wrong. All a backend owes
+ * is whether it is ready (below).
+ */
+ETCS_SUPERTYPE_BASE(Presentable), public AnimatedBase<Derived>
 {
     ETCS_MAKE_INSTANCE(Presentable)
 
     virtual void PresentConcrete() = 0;
+
+    /*
+     * Can this thing present RIGHT NOW -- created, not retired, sized. The one
+     * thing the family cannot answer for a backend, and the reason it is a
+     * question rather than a flag is that every backend already knows: it is
+     * the condition the old producer spun in a cooperative-pause loop waiting
+     * for, before it could start. Asked once per visit now, which is what a
+     * settled or not-yet-created surface costs instead of a parked thread.
+     */
+    virtual bool CanPresentConcrete() = 0;
+
+    bool AnimatingConcrete() override
+    { return static_cast<Derived*>(this)->CanPresentConcrete(); }
+
+    /*
+     * PACED HERE, so the interval is one number in one place instead of a
+     * `sleep_for` inside a body. dt is measured (AnimatedBase), so a driver
+     * ticking faster than the interval simply does not present on every visit
+     * and one ticking slower is not corrected -- which is the honest behaviour:
+     * the frame rate is whatever the driver and the work permit, and Fps()
+     * reports what actually happened rather than what was asked for.
+     *
+     * ZERO IS UNPACED, kept from the old producer's config: present on every
+     * visit and let the driver set the rate. That is still the only honest way
+     * to ask how fast the pipeline can go.
+     */
+    void AdvanceConcrete(double dt_ms) override
+    {
+        if (m_interval_ms > 0.0)
+        {
+            m_owed_ms += dt_ms;
+            if (m_owed_ms < m_interval_ms) return;
+            m_owed_ms = 0.0;
+        }
+        static_cast<Derived*>(this)->RecomposeBound();
+        Present();
+    }
+
+    // The pacing a script asked for, in ms. Zero means unpaced -- see above.
+    void SetFrameInterval(double ms) { m_interval_ms = (ms < 0.0) ? 0.0 : ms; }
+    double FrameInterval() const { return m_interval_ms; }
 
     void Present() override final
     {
@@ -53,6 +121,12 @@ private:
     // number being shown is not a frame rate any more, it is a stall.
     StepClock m_present_clock{ 250.0 };
     float     m_fps = 0.0f;
+
+    // ~60Hz by default, which is where the old producer's constant lived. A
+    // placeholder for asking the swapchain about its present mode, same as it
+    // always was -- moved, not invented.
+    double    m_interval_ms = 16.0;
+    double    m_owed_ms     = 0.0;
 };
 
 #endif

@@ -73,4 +73,37 @@ private:
     StepClock m_clock{};
 };
 
+
+/*
+ * ADVANCE EVERYTHING THAT CLAIMS Animated, ONCE.
+ *
+ * The family's driver, and it lives here rather than in core because core is
+ * deliberately ignorant of every family by name (Entity.h says so at
+ * ETCS_MAKE_INSTANCE). collect_family is the generic half; naming Animated is
+ * this file's business.
+ *
+ * A SESSION NEEDS EXACTLY ONE CALLER. A frame edge, a page's timer, a test
+ * stepping by hand -- any of them, and it advances every Animated leaf in every
+ * loaded image. See ontology/Animated.h on why the driver is not named by the
+ * family, and the header above on why a second driver would still be correct
+ * rather than merely tolerated.
+ *
+ * NO LIST IS KEPT ACROSS CALLS, on purpose. A leaf that appeared since the last
+ * tick is advanced on this one and a leaf that died is skipped, because
+ * collect_family re-reads the claim instead of a cache -- which is the whole
+ * reason a driver can know nothing about what it drives. The cost is one family
+ * walk per tick, against visits that are doing real work.
+ *
+ * Returns how many were advanced, so a caller can say the edge is alive once
+ * without saying it every frame.
+ */
+inline size_t etcs_advance_animated()
+{
+    static thread_local ::std::vector<Animated_*> live;
+    live.clear();
+    ETCS::collect_family<Animated_>("Animated", live);
+    for (Animated_* a : live) if (a) a->Advance();
+    return live.size();
+}
+
 #endif
