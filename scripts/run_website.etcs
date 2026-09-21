@@ -13,13 +13,23 @@
 # Adding landing here, before either lobby is detached, is what makes that
 # deterministic rather than a function of which script ran first.
 #
-# The lobbies are detached AFTER Start. Each one spawns `web` by that same name,
-# and spawn_entity retargets a pending name already bound to a live entity of
-# the same module and tag -- PersistentNames is process-scope, not per-script --
-# so they find THIS server instead of minting a second one and failing to bind
-# 8080. Their own Start calls are no-ops: StartConcrete returns false when a
-# manager already exists. Their duplicate FileHtmlPage children are harmless
-# for the same first-match reason, just redundant.
+# The lobbies are detached AFTER Start, and what makes them find THIS server
+# rather than minting a second one that cannot bind 8080 is the verb their own
+# web scripts use: `ensure NetworkProvider::HttpServer web`
+# (NetworkProvider/scripts/chess_web.etcs). ensure takes the name if it already
+# resolves and spawns only if it does not.
+#
+# THIS PARAGRAPH USED TO SAY SOMETHING ELSE -- that a `spawn` of the same name
+# was silently retargeted onto the live entity, PersistentNames being
+# process-scope. That mechanism is gone, and spawn_entity says so in as many
+# words (core/CommandExecutor.h): spawn ALWAYS creates, and refuses outright
+# when the name already resolves. Left standing, the old note reads as licence
+# to write `spawn` in a subscript, which is now the one spelling that fails in
+# exactly the session the subscript was written for.
+#
+# Their own Start calls are no-ops: StartConcrete returns false when a manager
+# already exists. Their duplicate FileHtmlPage children are harmless for the
+# same first-match reason, just redundant.
 
 spawn NetworkProvider::HttpServer web
 web.SetPort(8080)
