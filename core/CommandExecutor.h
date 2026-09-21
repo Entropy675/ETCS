@@ -642,14 +642,42 @@ inline ::std::string peek_import_directive(const ::std::string& script_path)
     return rest.substr(s, e - s + 1);
 }
 
-// Cached for the process's lifetime -- ACE_ROOT-relative directives would
-// otherwise spawn a subprocess on every single run/detach resolution.
+/*
+ * WHERE THE TREE IS -- TOLD, THEN ASKED, AND ONLY THEN GUESSED.
+ *
+ * ETCS_ACE_ROOT is baked in at build time by the thing that actually knows:
+ * ACE generates every Makefile in the tree and is already standing in it
+ * (dev_tools/ace/ace_manifest.py, ACE_ROOT_DEFINE). That is the answer, and it
+ * costs nothing to read.
+ *
+ * THIS USED TO BE A popen("ace root") AND THAT WAS THE WRONG SHAPE. A running
+ * server would spawn a python CLI to ask the build system a question the build
+ * system had already answered at compile time -- and it answered NOTHING
+ * wherever `ace` was not on that process's PATH, which is every environment a
+ * server actually runs in: a unit file, a stripped shell, a container. The
+ * failure was silent, because an unresolvable root leaves the token verbatim
+ * and the path it lands in fails to open for what reads as an unrelated reason.
+ *
+ * The env var sits between them for the one case a build-time constant cannot
+ * cover: a tree that was MOVED after it was built, where the compiled-in path
+ * is confidently wrong. Overriding is deliberate, and stating it is the only
+ * way to do it. The subprocess stays last, for a binary built before this
+ * define existed; when it goes, this reduces to two reads.
+ *
+ * Cached for the process's lifetime -- every run/detach resolution asks.
+ */
 inline ::std::string get_ace_root()
 {
     static ::std::string cached;
     static ::std::once_flag once;
     ::std::call_once(once, []()
     {
+        if (const char* env = ::std::getenv("ACE_ROOT"); env && *env)
+        { cached = env; return; }
+#ifdef ETCS_ACE_ROOT
+        cached = ETCS_ACE_ROOT;
+        if (!cached.empty()) return;
+#endif
         FILE* pipe = popen("ace root 2>/dev/null", "r");
         if (!pipe) return;
         char buf[4096];
