@@ -3951,6 +3951,92 @@ inline size_t collect_in_family(const char* family, RID rid, ::std::vector<Base*
 }
 
 /*
+ * THE WHOLE FAMILY, WITH NOTHING NAMED -- "everyone who claims this".
+ *
+ * The two above are keyed on a RID: the caller knows which entity it wants and
+ * the family is how it reaches it. This is the other direction, and it is what
+ * a DRIVER needs. Something that steps every Animated, flushes every Database,
+ * or polls every Device does not have a list to iterate and must not be given
+ * one: a registry the driver maintains by hand is a second statement of "who
+ * claims this family", kept in agreement with the first by remembering to.
+ * Claiming the family IS the registration, so the walk reads the claim.
+ *
+ * SNAPSHOT THE RIDS, THEN RESOLVE THEM, and that ordering is the whole safety
+ * argument. Holding iterators into a live list across a visit that can spawn or
+ * retire entities is the ordinary way to crash; holding RIDs cannot, because a
+ * RID that died in between resolves to null and is skipped. The cost is a
+ * second lookup per member, which is a hash probe against a visit that is doing
+ * real work.
+ *
+ * ONE LIST AT MOST ONCE, BY IDENTITY. A module's own list is reachable twice --
+ * directly as this image's ridMap row, and again as the loader's mirror row for
+ * this module -- and under a collapsed build (emscripten) the caller's node and
+ * the loader's are THE SAME object, so the own-map read and the loader's are
+ * also the same list. Deduplicating on the list's address covers every one of
+ * those without the shape of the build appearing in the code; deduplicating on
+ * the module NAME would not, since the first pair shares one.
+ *
+ * Appends and returns how many this call added, like collect_in_family, so a
+ * caller can accumulate several families into one visit list. A qualified
+ * "Provider:Family" narrows to one module's members.
+ */
+template <typename Base>
+inline size_t collect_family(const char* family, ::std::vector<Base*>& out)
+{
+    const ::std::string name(family);
+    const auto          colon = name.rfind(':');
+    const bool          qualified = (colon != ::std::string::npos);
+    const ::std::string wanted_module = qualified ? name.substr(0, colon) : ::std::string();
+    const ETCS::Buffer  bare = etcs_bare_family_key(ETCS::Buffer(family));
+
+    ETCS::EventNode* mine_node = &ETCS::EventNode::getInstance();
+    ETCS::EventNode* owner     = etcs_loader_event_node();
+
+    size_t added = 0;
+    // Small and linear on purpose: the count here is the number of IMAGES
+    // publishing one family, not the number of members.
+    ::std::vector<const void*> seen;
+    ::std::vector<RID>         rids;
+
+    auto take = [&](const ETCS::RIDListHandle& h)
+    {
+        for (const void* s : seen) if (s == h.self) return;
+        seen.push_back(h.self);
+        rids.clear();
+        h.invoke_collect_rids(rids);
+        for (RID rid : rids)
+            if (void* p = h.invoke_get_iface(rid))
+            { out.push_back(static_cast<Base*>(p)); ++added; }
+    };
+
+    if (!qualified)
+    {
+        auto it = mine_node->ridMap.find(bare);
+        if (it != mine_node->ridMap.end()) take(it->second);
+    }
+
+    if (!owner) return added;
+
+    auto mirror = owner->ridMirror.find(bare);
+    // Same candidacy rule as resolve_in_family: a named module also matches the
+    // own map when nothing mirrored the name, which is the collapsed build.
+    if (!qualified || wanted_module == (owner->scope ? owner->scope : "")
+        || mirror == owner->ridMirror.end())
+    {
+        auto it = owner->ridMap.find(bare);
+        if (it != owner->ridMap.end()) take(it->second);
+    }
+
+    if (mirror == owner->ridMirror.end()) return added;
+    for (auto& row : mirror->second)
+    {
+        if (qualified && row.module.toString() != wanted_module) continue;
+        take(row.handle);
+    }
+    return added;
+}
+
+/*
  * SEARCH BY THE ORDER KEY -- the other half of the pair, and deliberately not
  * the same function.
  *

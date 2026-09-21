@@ -4,6 +4,10 @@
 
 #include "../core_defs.h"
 #include "Surface.h"
+// For the one question below that is not about drawing: whether this node has a
+// step left to take is the Animated family's to answer, and a Drawable that is
+// also Animated should not have to say so twice. See NeedsFrame.
+#include "Animated.h"
 #include <algorithm>
 #include <cstdint>
 #include <utility>
@@ -135,31 +139,42 @@ public:
     }
 
     /*
- * Is this node's appearance changing on its own, without anyone marking it?
+ * Will this subtree need composing again even if nobody marks it?
  *
- * CONCRETE AND FALSE BY DEFAULT, deliberately not dispatched -- the same
- * treatment Drawable2D_ gives ToParent/ToLocal/Pick, and for the same
- * reason: a dispatched method is one every leaf must write, and almost no
- * leaf animates itself. A polygon, an image layer, a window's root
- * rectangle all change only when something changes them, and inheriting
- * "no" is the right answer for every one of them.
+ * IT WAS CALLED Animating, AND THAT WAS THE PROBLEM. Two different questions
+ * had one name: "do I have a step left to take", which is causal and belongs
+ * to Animated_ (ontology/Animated.h), and "does this subtree still need
+ * frames", which is a scheduling fact about a TREE and belongs here. While
+ * both were spelled Animating a leaf could not honestly claim both families --
+ * the two declarations collide -- and every self-stepping node was pushed into
+ * answering the tree question on behalf of the causal one.
  *
- * IT EXISTS BECAUSE A DIRTY FLAG CANNOT ANSWER IT. The flag means "changed
- * since you last looked", it is consumed by whoever looks, and its writers
- * mark it BETWEEN walks -- which is exactly what a self-animating node does
- * not do. Such a node changes DURING the walk that draws it, so the mark it
- * leaves is consumed by that same frame's upload and there is nothing left
- * to schedule the next frame with. A tree containing one would either
- * freeze after a single frame or have to be walked unconditionally forever,
- * and both of those are wrong.
+ * SO THE DEFAULT IS THE ONE PLACE THE TWO MEET. A node that claims Animated
+ * needs a frame while it is still advancing, and that is derived here rather
+ * than restated by each leaf: claiming the family is the whole of what a
+ * self-stepping leaf has to do. Asked by family name rather than by a cast,
+ * like every other cross-family hop in this tree, so a Drawable that is not
+ * Animated pays one null-returning lookup and says no.
  *
- * So a compositor's gate is "am I dirty, OR is anything under me still
- * moving", and a compositor answers this for its own parent by asking its
- * children -- the recursion is the point. A settled tree answers no all the
- * way down and costs one query per node; a tree with one moving camera in it
- * keeps exactly the path to that camera awake.
+ * IT EXISTS BECAUSE A DIRTY FLAG CANNOT ALWAYS ANSWER IT. The flag means
+ * "changed since you last looked" and is consumed by whoever looks. That is
+ * enough for a stepper driven BEFORE the compose walk -- its mark is left in
+ * front of the walk and the ordinary gate carries it -- and not enough for a
+ * COMPOSITOR, which has to answer for its children before it has walked them.
+ * A settled tree answers no all the way down and costs one query per node; a
+ * tree with one moving camera in it keeps exactly the path to that camera
+ * awake.
+ *
+ * CONCRETE, NOT DISPATCHED -- the same treatment Drawable2D_ gives
+ * ToParent/ToLocal/Pick, and for the same reason: a dispatched method is one
+ * every leaf must write, and almost no leaf overrides this. A polygon, an
+ * image layer, a window's root rectangle all inherit exactly the right answer.
  */
-    virtual bool Animating() { return false; }
+    virtual bool NeedsFrame()
+    {
+        void* p = getInterfacePointer(ETCS::Buffer("Animated"));
+        return p && static_cast<Animated_*>(p)->Animating();
+    }
 
     /*
      * PRESENT BUT NOT DRAWN -- answered by DrawableBase, which owns the flag and
@@ -186,8 +201,8 @@ public:
  * NO FAMILY IS SKIPPED. A camera's copy used to skip Drawable3D children on
  * the grounds that scenery is reached through the bound scene -- true of
  * DRAWING, where painting a 3D child flat would be wrong, and not true of this
- * question. Asking a 3D child whether it is moving is a fair question with a
- * real answer (Scene3D::Animating is InMotion), this is a boolean OR so
+ * question. Asking a 3D child whether it still needs frames is a fair question
+ * with a real answer (Scene3D::NeedsFrame is InMotion), this is a boolean OR so
  * agreeing with sceneInMotion costs nothing, and skipping would miss a moving
  * 3D child that is not the bound scene.
  *
@@ -195,12 +210,12 @@ public:
  * sibling family reaching in through getInterfacePointer rather than a
  * subclass.
  */
-    bool anyChildAnimating()
+    bool anyChildNeedsFrame()
     {
         ::std::vector<Drawable_*> ordered;
         collectDrawableChildren(ordered);
         for (Drawable_* child : ordered)
-            if (child->Animating()) return true;
+            if (child->NeedsFrame()) return true;
         return false;
     }
 

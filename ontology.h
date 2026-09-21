@@ -99,6 +99,17 @@
 // lands on. See ontology/Thread.h.
 #include "ontology/ThreadBase.h"
 #include "ontology/EphemeralBase.h"
+// Not a family: "how long since the last time I asked, with a ceiling", which
+// this tree had written four times. Here rather than only inside AnimatedBase
+// because a leaf whose steps are caused by something other than a driver needs
+// the measurement without the claim -- see ontology/StepClock.h.
+#include "ontology/StepClock.h"
+// Animated is the causal counterpart to Threaded: a body that must be stepped
+// by somebody else, rather than one that runs itself. It refines nothing, so it
+// sits here rather than in any lineage -- an entity claims it to say "I am not
+// finished, come back", and nothing else about the entity has to be true. Note
+// that the family deliberately does NOT say who steps it; see ontology/Animated.h.
+#include "ontology/AnimatedBase.h"
 #include "ontology/ParserBase.h"
 #include "ontology/WrapperBase.h"
 // Matrix refines Wrapper: one step, and a forward link, in a transform chain.
