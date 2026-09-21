@@ -5,12 +5,55 @@ spawn NetworkProvider::HttpServer web
 web.SetPort(8443)
 web.EnableTLS(/tmp/etcs-cert.pem /tmp/etcs-key.pem)
 
+# Cross-origin isolation, site-wide -- SharedArrayBuffer, and therefore threads,
+# for the -pthread wasm build at /paint. See run_website.etcs for why this is
+# safe for the pages that came first and what it does change.
+web.AddHeader(Cross-Origin-Opener-Policy same-origin)
+web.AddHeader(Cross-Origin-Embedder-Policy require-corp)
+
 web.spawn(NetworkProvider::StaticHtmlPage landing)
-landing.SetHtmlFromFile(./www/index.html)
+landing.SetHtmlFromFile(ACE_ROOT/scripts/www/index.html)
 
 web.spawn(NetworkProvider::FileHtmlPage tree)
-tree.LoadFromDisk(./www)
+tree.LoadFromDisk(ACE_ROOT/scripts/www)
 tree.SetDefaultExtension(.html)
+tree.ListPaths()
+
+# /paint -- the same second site, mounted the same way. See run_website.etcs for
+# the whole argument; this file is the TLS spelling of it and nothing about the
+# mounts differs.
+#
+# SetDefaultExtension above is THIS node's, not the subtree's: the paint page
+# fetches exact names (modules.json, etcs.js, *.wasm, shell), so the prefix needs
+# no extension guessing and inherits none.
+tree.MountTree(paint ACE_ROOT/modules/PaintProvider/scripts/www)
+
+# ── /wasm ────────────────────────────────────────────────────────────────────
+#
+# THE ONE COPY OF THE BROWSER RUNTIME, mounted once and shared by every page
+# that needs it. `ace wasm make ...` writes here (bin/wasm/, see ETCS's Makefile
+# WASM_DIR and loaders/Makefile ARTIFACT_DIR) and nothing else does, so what is
+# served is what was last built.
+#
+# WHY NOT bin/. It holds the native runtime, the .so modules, run_all_tests.sh
+# and the shader assets; mounting it to reach etcs.wasm publishes all of them.
+#
+# WHY NOT BESIDE EACH PAGE. That was the arrangement until now -- copy the
+# artifacts into the page's own www/ after every build -- and it fails in the
+# worst available way: the page still answers 200, with LAST epoch's binary, and
+# the loader refuses it on a manifest hash it cannot explain. These move
+# together, in epochs; one directory is the shape that says so, and N copies is
+# N chances to have missed one.
+tree.MountTree(wasm ACE_ROOT/bin/wasm)
+
+tree.MountFile(paint/paint_routed_pointer.etcs ACE_ROOT/modules/PaintProvider/scripts/paint_routed_pointer.etcs)
+tree.MountFile(paint/PaintProvider/scripts/paint_toolbar.etcs ACE_ROOT/modules/PaintProvider/scripts/paint_toolbar.etcs)
+tree.MountFile(paint/PaintProvider/scripts/paint_wheel.etcs ACE_ROOT/modules/PaintProvider/scripts/paint_wheel.etcs)
+tree.MountFile(paint/PaintProvider/scripts/paint_menu.etcs ACE_ROOT/modules/PaintProvider/scripts/paint_menu.etcs)
+tree.MountFile(paint/PaintProvider/scripts/paint_layers.etcs ACE_ROOT/modules/PaintProvider/scripts/paint_layers.etcs)
+tree.MountFile(paint/PaintProvider/scripts/paint_import.etcs ACE_ROOT/modules/PaintProvider/scripts/paint_import.etcs)
+tree.MountFile(paint/RenderProvider/scripts/render_frames.etcs ACE_ROOT/modules/RenderProvider/scripts/render_frames.etcs)
+tree.MountFile(paint/shell ACE_ROOT/modules/ShellProvider/scripts/www/index.html)
 tree.ListPaths()
 
 spawn NetworkProvider::TarpitNode tarpit

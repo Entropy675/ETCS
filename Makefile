@@ -23,6 +23,28 @@ endif
 # is every suffix a module target may leave in modules/<name>/.
 MODULE_EXTS := $(LIB_EXT) wasm
 
+# WEB ARTIFACTS GET THEIR OWN DIRECTORY, because a served directory should hold
+# nothing but what is meant to be served. bin/ has the native runtime, the .so
+# modules, run_all_tests.sh and the shader assets in it; mounting bin/ to reach
+# etcs.wasm exposes every one of them.
+#
+# It also makes ONE place to point a page at. The alternative -- what every page
+# did before -- was copying the web artifacts into its own www/ after each
+# build: a step to forget, and a stale binary against a fresh loader when you
+# do, which surfaces as a manifest-epoch refusal rather than as the missed copy
+# it was. These are shared and they move in epochs; a directory is the right
+# shape for that and a per-page copy is not.
+#
+# Same split ACE already generates for the loader side (ARTIFACT_DIR in
+# loaders/Makefile); this is the module half of it, spelled here because this
+# file is what moves a module's artifact.
+WASM_DIR := $(TARGET_DIR)/wasm
+
+# The copy loops below pick their destination PER EXTENSION rather than per
+# build mode, with a one-line case on $$ext -- they already iterate
+# MODULE_EXTS, so this costs nothing, and a tree that somehow holds both a .so
+# and a .wasm still files each where it belongs instead of one winning.
+
 # Registration/Hash files
 ONTOLOGY_HASH_FILE := ./ontology_hashes.h
 LIBS_HASH_FILE     := ./libs_hashes.h
@@ -117,10 +139,12 @@ module_%: $(HASH_PREREQ)
 	$(MAKE) -C $(MODULES_DIR)/$*
 	@mkdir -p $(TARGET_DIR)
 	@for ext in $(MODULE_EXTS); do \
+		case "$$ext" in wasm) dest=$(WASM_DIR);; *) dest=$(TARGET_DIR);; esac; \
 		for f in $(MODULES_DIR)/$*/*.$$ext; do \
 			if [ -f "$$f" ]; then \
-				mv -f "$$f" $(TARGET_DIR)/; \
-				echo "✓ Moved: $$f -> $(TARGET_DIR)/"; \
+				mkdir -p "$$dest"; \
+				mv -f "$$f" "$$dest"/; \
+				echo "✓ Moved: $$f -> $$dest/"; \
 			fi; \
 		done; \
 	done
@@ -130,7 +154,7 @@ clean_module_%:
 		echo "[-] Error: Module '$*' not found in $(MODULES_DIR)/"; exit 1; \
 	fi
 	$(MAKE) -C $(MODULES_DIR)/$* clean
-	@rm -f $(TARGET_DIR)/$*.$(LIB_EXT) $(TARGET_DIR)/$*.wasm
+	@rm -f $(TARGET_DIR)/$*.$(LIB_EXT) $(WASM_DIR)/$*.wasm
 
 # ====================================================================
 # HASH GENERATION
@@ -196,10 +220,12 @@ copy_modules:
 	@echo "\n--- Moving Modules to $(TARGET_DIR)/ ---"
 	@for dir in $(MODULE_SUBDIRS); do \
 		for ext in $(MODULE_EXTS); do \
+			case "$$ext" in wasm) dest=$(WASM_DIR);; *) dest=$(TARGET_DIR);; esac; \
 			for f in $$dir/*.$$ext; do \
 				if [ -f "$$f" ]; then \
-					mv -f "$$f" $(TARGET_DIR)/; \
-					echo "✓ Moved module: $$f -> $(TARGET_DIR)/"; \
+					mkdir -p "$$dest"; \
+					mv -f "$$f" "$$dest"/; \
+					echo "✓ Moved module: $$f -> $$dest/"; \
 				fi; \
 			done; \
 		done; \
@@ -218,7 +244,7 @@ clean:
 	done
 	@rm -f $(ONTOLOGY_HASH_FILE) $(LIBS_HASH_FILE) $(CORE_HASH_FILE)
 	@rm -f $(TARGET_DIR)/Run_*
-	@rm -f $(TARGET_DIR)/*.$(LIB_EXT) $(TARGET_DIR)/*.wasm
+	@rm -f $(TARGET_DIR)/*.$(LIB_EXT) $(WASM_DIR)/*.wasm
 	@echo "--- Cleanup Complete ---\n"
 
 clean_loaders:
@@ -232,5 +258,5 @@ clean_modules:
 	@for dir in $(MODULE_SUBDIRS); do \
 		if [ -d "$$dir" ]; then $(MAKE) -C "$$dir" clean; fi; \
 	done
-	@rm -f $(TARGET_DIR)/*.$(LIB_EXT) $(TARGET_DIR)/*.wasm
+	@rm -f $(TARGET_DIR)/*.$(LIB_EXT) $(WASM_DIR)/*.wasm
 	@echo "--- Module Cleanup Complete ---\n"
