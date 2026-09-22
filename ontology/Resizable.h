@@ -116,9 +116,26 @@ public:
         if (how == ResizeDelivery::Pushed)
         {
             ::std::lock_guard<::std::mutex> lock(source->m_pushMutex);
-            for (ETCS::RID r : source->m_pushFollowers) if (r == getRID()) return;
-            source->m_pushFollowers.push_back(getRID());
+            bool known = false;
+            for (ETCS::RID r : source->m_pushFollowers) if (r == getRID()) known = true;
+            if (!known) source->m_pushFollowers.push_back(getRID());
         }
+
+        /*
+         * AND BE THAT SIZE NOW.
+         *
+         * The polled path has this already and says so above: a new observer
+         * starts dirty, so its first poll fires and that poll IS the initial
+         * layout. A pushed follower has no poll of its own, so without this it
+         * holds whatever size it was declared at until the source next moves --
+         * and if the source is already at its final size, that is forever.
+         *
+         * Not a special case: it is the same guarantee, taken at the one moment
+         * a pushed follower is on a thread of its own. The source being where
+         * it started makes this a no-op through the observer bit, not a
+         * duplicate solve.
+         */
+        PollResize();
     }
 
     /*
@@ -180,12 +197,34 @@ public:
             m_settle = -1;
             wake = m_pushFollowers;
         }
-        for (ETCS::RID r : wake)
-        {
-            ETCS::Held<Resizable_> f = ETCS::resolve_held<Resizable_>("Resizable", r);
-            if (f) f->PollResize();
-        }
+        wakePushFollowers(wake);
         return true;
+    }
+
+    /*
+     * WAKE THEM NOW, for a source with no pump behind it.
+     *
+     * The countdown above rides a poll pass, which is the right clock when a
+     * burst of resizes is arriving from a window manager. A browser delivers
+     * no such burst: the size is STATED, once, by whoever owns the box
+     * (Window::ResizeTo under emscripten, driven by the page's own debounced
+     * observer). There the deferral has nothing to defer and the only thing a
+     * countdown can do is delay -- or, if the pass that would count it down is
+     * on the far side of a stream this thread is not driving, drop it.
+     *
+     * So the stated path calls this and the observed path calls settleResize.
+     * Same wake, same followers, different question about whether more is
+     * coming.
+     */
+    void deliverResizeNow()
+    {
+        ::std::vector<ETCS::RID> wake;
+        {
+            ::std::lock_guard<::std::mutex> lock(m_pushMutex);
+            m_settle = -1;
+            wake = m_pushFollowers;
+        }
+        wakePushFollowers(wake);
     }
 
 protected:
@@ -215,6 +254,32 @@ private:
     // Followers that asked to be woken rather than to ask. Resizable's own
     // policy, deliberately not on the Observable edge: the edge says a change
     // happened, this says who wants to be told about it without asking.
+    /*
+     * Each follower read back by RID, because a follower can outlive the
+     * registration and a raw pointer here would be the one dangling reference
+     * this design is arranged to avoid (FollowResize).
+     *
+     * A NAME THAT DOES NOT RESOLVE IS REPORTED. It used to be skipped in
+     * silence, which is the worst way to find out: the scene stops following
+     * and every other edge still works, so nothing points at the resize. Under
+     * dynamic linking it is also the failure with the most interesting cause --
+     * a follower registered from another module's image.
+     */
+    void wakePushFollowers(const ::std::vector<ETCS::RID>& wake)
+    {
+        for (ETCS::RID r : wake)
+        {
+            ETCS::Held<Resizable_> f = ETCS::resolve_held<Resizable_>("Resizable", r);
+            if (!f)
+            {
+                ETCS_LOG("Resizable", "push follower RID:" << r
+                         << " does not resolve from here -- it will not follow.");
+                continue;
+            }
+            f->PollResize();
+        }
+    }
+
     mutable ::std::mutex     m_pushMutex;
     ::std::vector<ETCS::RID> m_pushFollowers;
     int                    m_settle = -1;   // pump passes left; -1 = idle
