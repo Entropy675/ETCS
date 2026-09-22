@@ -8,13 +8,12 @@
  * THE RATE IS COUNTED HERE, ON THE WAY BACK OUT OF EVERY PRESENT.
  *
  * Present is written out rather than left to ETCS_DISPATCH_METHOD for exactly
- * one reason: the macro's forwarder has nowhere to put an "and then". Each
- * backend used to note its own present at the end of its own PresentConcrete,
- * in two copies of the same six lines, which means the rate was correct only
- * for as long as every backend remembered -- and the next one to be written is
- * a WebGPU path that has not been written yet. Counting on the way out of the
- * family's own forwarder is the one arrangement a new backend cannot get wrong,
- * because there is nothing for it to do.
+ * one reason: the macro's forwarder has nowhere to put an "and then". A count
+ * kept per backend, at the end of each PresentConcrete, is correct only for as
+ * long as every backend remembers -- and the next one to be written is a WebGPU
+ * path that has not been written yet. Counting on the way out of the family's
+ * own forwarder is the one arrangement a new backend cannot get wrong, because
+ * there is nothing for it to do.
  *
  * AVERAGED, NOT INSTANTANEOUS. A frame rate read off a single interval is a
  * number that swings by a third whenever the compositor hesitates, which reads
@@ -33,22 +32,23 @@
  * AND THE FRAME EDGE IS A STEP, NOT A THREAD -- which is why this base also
  * claims Animated.
  *
- * Presenting on a clock used to be a standing producer/consumer PAIR: one body
- * paced and wrote a token, another read it and did the walk. Both were loops
- * that never returned, so each held a thread for the session -- and the
- * producer's thread came out of the ThreadPool (ETCS_MODULE_EXPORT_STREAM
- * enqueues it), which is how a pool acquired a MINIMUM size. An image with two
- * standing producers and one worker deadlocks: the second body is queued behind
- * one that never finishes. That is not a tuning problem, it is a floor derived
- * from whatever the script happens to open.
+ * The obvious shape is a standing producer/consumer PAIR: one body paces and
+ * writes a token, another reads it and does the walk, with a ring between them
+ * to cross the thread boundary. Both are loops that never return, so each holds
+ * a thread for the session -- and a produce body's thread comes out of the
+ * ThreadPool (ETCS_MODULE_EXPORT_STREAM enqueues it), which is how a pool
+ * acquires a MINIMUM size: an image with two standing producers and one worker
+ * deadlocks, the second body queued behind one that never finishes. That is not
+ * a tuning problem, it is a floor derived from whatever the script happens to
+ * open. Nor is the split worth having the other way round -- pacing on one side
+ * and the Vulkan submit on the other still leaves one loop holding a worker,
+ * and the walk belongs on the presenting thread anyway.
  *
  * A LOOP HOLDS A STACK BETWEEN ITERATIONS; A STEP HOLDS NOTHING. That is the
  * whole difference, and it is why this needs no scheduler, no work-stealing and
  * no way to suspend a body mid-flight -- there is no stack to move, so any
- * thread may run the next step. The ring between the two halves goes with them:
- * it existed to cross a thread boundary that no longer exists, and
- * ConsumeFrames' own comment already said the walk belongs on the presenting
- * thread anyway.
+ * thread may run the next step, and there is no thread boundary for a ring to
+ * cross.
  *
  * ONE DEFINITION FOR EVERY BACKEND, here rather than per surface, for the same
  * reason the rate is: the next backend is a WebGPU path that has not been
@@ -63,11 +63,10 @@ ETCS_SUPERTYPE_BASE(Presentable), public AnimatedBase<Derived>
 
     /*
      * Can this thing present RIGHT NOW -- created, not retired, sized. The one
-     * thing the family cannot answer for a backend, and the reason it is a
-     * question rather than a flag is that every backend already knows: it is
-     * the condition the old producer spun in a cooperative-pause loop waiting
-     * for, before it could start. Asked once per visit now, which is what a
-     * settled or not-yet-created surface costs instead of a parked thread.
+     * thing the family cannot answer for a backend, and a question rather than
+     * a flag because every backend already knows. Asked once per visit, which
+     * is all a settled or not-yet-created surface costs -- against a thread
+     * parked in a wait loop until it could start.
      */
     virtual bool CanPresentConcrete() = 0;
 
@@ -82,9 +81,8 @@ ETCS_SUPERTYPE_BASE(Presentable), public AnimatedBase<Derived>
      * the frame rate is whatever the driver and the work permit, and Fps()
      * reports what actually happened rather than what was asked for.
      *
-     * ZERO IS UNPACED, kept from the old producer's config: present on every
-     * visit and let the driver set the rate. That is still the only honest way
-     * to ask how fast the pipeline can go.
+     * ZERO IS UNPACED: present on every visit and let the driver set the rate,
+     * which is the only honest way to ask how fast the pipeline can go.
      */
     void AdvanceConcrete(double dt_ms) override
     {
@@ -122,9 +120,8 @@ private:
     StepClock m_present_clock{ 250.0 };
     float     m_fps = 0.0f;
 
-    // ~60Hz by default, which is where the old producer's constant lived. A
-    // placeholder for asking the swapchain about its present mode, same as it
-    // always was -- moved, not invented.
+    // ~60Hz by default: a placeholder for asking the swapchain about its
+    // present mode.
     double    m_interval_ms = 16.0;
     double    m_owed_ms     = 0.0;
 };

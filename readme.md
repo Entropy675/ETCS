@@ -46,6 +46,34 @@ ace abi
 ace ontology
 ```
 
+### Building for the browser
+
+The same modules build to wasm with the emscripten toolchain on PATH (`source <emsdk>/emsdk_env.sh`):
+
+```
+ace wasm make module WindowProvider
+ace wasm make module RenderProvider
+ace wasm make module PaintProvider
+ace wasm make module ShellProvider
+ace wasm make loader etcs
+```
+
+Every web artifact -- `etcs.js`, `etcs.wasm` and one `<Provider>.wasm` per module -- lands in **`bin/wasm/`** (`WASM_DIR` in the Makefile, `ARTIFACT_DIR` in the generated `loaders/Makefile`). Native artifacts stay in `bin/`. The two are kept apart so that a script can serve the web directory whole without also publishing the native runtime, the `.so` modules and everything else in `bin/`.
+
+`bin/wasm/` is the one copy of the browser runtime. The serve scripts mount it at the URL prefix `/wasm/` (`FileHtmlPage::MountTree`), and every web page resolves its modules and glue from `/wasm/` first, so there is no step that copies artifacts beside a page and nothing that can go stale beside one. These binaries move together in epochs -- one loader and one `.wasm` per provider, built together and refusing each other across a rebuild (the manifest check) -- which is what a single directory says and a per-page copy does not.
+
+To serve a page locally:
+
+```
+etcs modules/PaintProvider/scripts/serve_paint.etcs      # https://localhost:8443/
+etcs modules/WindowProvider/scripts/serve_web.etcs       # https://localhost:8443/
+etcs scripts/run_tls_website.etcs                        # the whole site, paint at /paint/
+```
+
+A `-pthread` build needs cross-origin isolation for `SharedArrayBuffer`, so every serve script sets `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp`; a plain static server without those headers loads the page and then every Worker dies on `wasmMemory is undefined`.
+
+On the web, every thread is a Worker and every Worker re-instantiates all open side modules, so thread count is the dominant boot cost. Web builds therefore share ONE thread pool across the loader and every module (`ETCS_SHARED_THREAD_POOL`, default on for wasm, off for native -- `core/ETCS_API.h` for why the two want opposite defaults) with the native worker count of 4. Measured on the paint page: 16 Workers and a first frame at 8.8s, against 34 and 12.1s with a pool per module.
+
 
 TODO:
 - Import merkle hash chain from the completed version in other instance of project

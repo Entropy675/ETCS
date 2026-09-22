@@ -33,8 +33,7 @@
  * argument rather than a constant. What a quarter second means to a fade and
  * what a second means to an entropy accounting are different claims about how
  * much unobserved time is credible, and two clocks in one class disagreeing on
- * it is fine -- what is not fine is the two disagreeing silently, which is
- * what four hand-written copies had arranged.
+ * it is fine -- what is not fine is the two disagreeing silently.
  *
  * MILLISECONDS, ALWAYS, and a seconds reading is the caller's own multiply.
  * One unit in the type means no call site has to be read twice to find out

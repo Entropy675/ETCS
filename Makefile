@@ -24,20 +24,22 @@ endif
 MODULE_EXTS := $(LIB_EXT) wasm
 
 # WEB ARTIFACTS GET THEIR OWN DIRECTORY, because a served directory should hold
-# nothing but what is meant to be served. bin/ has the native runtime, the .so
-# modules, run_all_tests.sh and the shader assets in it; mounting bin/ to reach
-# etcs.wasm exposes every one of them.
+# nothing but what is meant to be served: bin/ has the native runtime, the .so
+# modules, run_all_tests.sh and the shader assets in it, and mounting it to
+# reach etcs.wasm publishes every one of them.
 #
-# It also makes ONE place to point a page at. The alternative -- what every page
-# did before -- was copying the web artifacts into its own www/ after each
-# build: a step to forget, and a stale binary against a fresh loader when you
-# do, which surfaces as a manifest-epoch refusal rather than as the missed copy
-# it was. These are shared and they move in epochs; a directory is the right
-# shape for that and a per-page copy is not.
+# It is also THE ONE COPY. The alternative is a copy of the artifacts beside
+# each page that uses them, and that fails in the worst available way: forget
+# the copy after a build and the page still answers 200 -- with last epoch's
+# binary, which the loader then refuses on a manifest hash that reads like a
+# build problem. These move together in epochs, one loader and one .wasm per
+# provider; one directory says so, N copies are N chances to be one behind.
+# Every serve script mounts this directory at /wasm/, and every page resolves
+# its modules from there first.
 #
-# Same split ACE already generates for the loader side (ARTIFACT_DIR in
-# loaders/Makefile); this is the module half of it, spelled here because this
-# file is what moves a module's artifact.
+# The loader side of the same split is ARTIFACT_DIR in the ACE-generated
+# loaders/Makefile; this is the module half, here because this file is what
+# moves a module's artifact.
 WASM_DIR := $(TARGET_DIR)/wasm
 
 # The copy loops below pick their destination PER EXTENSION rather than per
@@ -110,12 +112,10 @@ loaders: clean_loaders $(HASH_PREREQ)
 	$(MAKE) -C $(LOADERS_DIR)
 	$(MAKE) copy_loaders
 
-# ONE RECIPE PER MODULE, NOT ONE LOOP OVER ALL OF THEM.
-#
-# This was a shell `for` loop, and a loop inside a recipe is ONE command to make:
-# -j could not touch it, so every module compiled in series no matter what the
-# build was told. The per-directory rule it needed already existed and was simply
-# never used ($(MODULE_SUBDIRS), under BUILD RULES below).
+# ONE RECIPE PER MODULE, NOT ONE LOOP OVER ALL OF THEM: a shell loop inside a
+# recipe is ONE command to make, so -j cannot touch it and every module compiles
+# in series whatever the build was told. $(MODULE_SUBDIRS) under BUILD RULES is
+# the per-directory rule that lets them run in parallel.
 #
 # STILL A SUB-MAKE, and that part is deliberate rather than leftover. Listing the
 # modules as prerequisites of this target would let -j run them CONCURRENTLY WITH

@@ -441,30 +441,22 @@ public:
         for (size_t i = 0; i < threads; ++i)
         {
             /*
- * A THREAD THAT WAS NOT CREATED IS REPORTED HERE, and this is the controlled
- * point the alternative lacks.
- *
- * ::std::thread's constructor throws when the platform refuses, and this loop
- * used to let that escape into whatever was arming the pool -- which, on the
- * web, is a deferred boot step running under the module's static init, where an
- * escaping exception is a bare `unreachable` with no thread, no count and no
- * name attached to it. What the operator needs to know is a NUMBER, and the
- * number is only available right here.
+ * A THREAD THAT WAS NOT CREATED IS REPORTED HERE, because this is the only
+ * point that knows the number. ::std::thread's constructor throws when the
+ * platform refuses; let that escape and, on the web, it surfaces inside a
+ * module's static init as a bare `unreachable` with no thread, no count and no
+ * name attached.
  *
  * IT CARRIES ON WITH WHAT IT GOT rather than unwinding. A pool of six where
- * eight were asked for still runs every task that is queued, just with less
- * overlap; a pool that threw during arming leaves workers_started_ true and no
- * workers at all, so every later enqueue waits on a condition variable nobody
- * is going to signal. Degrading is the difference between a slower runtime and
- * one that has silently stopped.
+ * eight were asked for still runs every queued task, with less overlap; a pool
+ * that threw during arming leaves workers_started_ true and no workers at all,
+ * so every later enqueue waits on a condition variable nobody will signal.
+ * Degrading is the difference between a slower runtime and one that has
+ * silently stopped.
  *
- * WHY IT IS USUALLY MEMORY, and worth saying in the message because the browser
- * will not: under emscripten every one of these is a Worker, and a Worker
- * created after the dynamic libraries are open re-instantiates all of them for
- * itself. So the cost is workers x modules, the pool size is PER IMAGE
- * (DEFAULT_THREAD_POOL_THREADS, ETCS_API.h) and a session with six images pays
- * it six times over. That is the arithmetic to reach for, not the heap size --
- * this allocation does not come out of the wasm heap at all.
+ * The message names memory because the browser will not: a Worker is every open
+ * side module instantiated again, browser memory outside the wasm heap
+ * (ETCS_SHARED_THREAD_POOL, ETCS_API.h, for the arithmetic).
  */
             try
             {
@@ -526,8 +518,7 @@ public:
 
         // Said every time, not only on failure: the count is the one number that
         // makes the paragraph above actionable, and nothing else in the boot log
-        // reports it. Six images asking for four each is twenty-four workers
-        // that no single line of output previously mentioned.
+        // reports it.
         ETCS_LOG("ThreadPool", "workers started: " << workers_.size() << " of "
                  << threads << " requested.");
 
@@ -589,17 +580,12 @@ public:
  *
  * The function-local static below is a PER-DSO singleton -- the same
  * -fvisibility=hidden isolation MemoryArena::getInstance() and
- * EventNode::getInstance() already document. Natively that was invisible: six
- * images meant six pools, each with its workers, its watchdog and its io
- * thread, on a machine with threads to spare.
+ * EventNode::getInstance() document -- so without this, six images are six
+ * pools, each with its workers, its watchdog and its io thread. Why that is
+ * fine natively and the dominant cost of a web boot is ETCS_SHARED_THREAD_POOL's
+ * business (ETCS_API.h); this is the mechanism.
  *
- * On the web it is the dominant cost of a boot. Every thread is a Worker and
- * every Worker re-instantiates all seven open side modules, so the per-image
- * pools are not an implementation detail, they are megabytes of wasm compiled
- * per image for no reason -- measured against the paint page, 34 Workers, of
- * which 32 were created inside one 500ms window, and a first frame at 10.5s.
- *
- * So the loader installs ITS pool into every module as the module registers
+ * The loader installs ITS pool into every module as the module registers
  * (Module::registerLoader), and from that point every image's getInstance()
  * answers with the one object. Nothing else changes: a work function still
  * says getThreadPool(), a produce trampoline still enqueues onto

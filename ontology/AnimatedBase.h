@@ -7,14 +7,12 @@
  * THE CLOCK LIVES HERE, and that is the whole reason this base exists.
  *
  * Every animated thing has to answer "how much has happened since last time",
- * and every one that answered it for itself answered it slightly differently:
- * this tree had the same measured-interval-with-a-ceiling written twice inside
- * one class (Scene3D's AdvanceForObserver and commitEntropy, with different
- * ceilings and a comment claiming they matched) and a frame-counted version in
- * another module. The measurement is StepClock now, beside this file, because
- * it is not the family: a leaf whose steps are caused by something other than a
- * driver needs the same clock without the same claim. What this base owns is
- * the DECISION to keep one, and the order it asks its two questions in.
+ * and a leaf that answers it for itself answers it slightly differently from the
+ * next (StepClock.h on the copies this replaces). The measurement is StepClock,
+ * beside this file, because it is not the family: a leaf whose steps are caused
+ * by something other than a driver needs the same clock without the same claim.
+ * What this base owns is the DECISION to keep one, and the order it asks its
+ * two questions in.
  *
  * MEASURED, NOT COUNTED, and the difference is not stylistic.
  *

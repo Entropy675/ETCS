@@ -211,35 +211,6 @@ inline size_t etcs_flush_deferred_rid_registrars()
 #define MAX_LMAX_BUFFER_SIZE   (ETCS_SLOT_SIZE - ETCS_BUFFER_METADATA_SIZE - ETCS_SEQUENTIAL_FRAME_SIZE)
 // you get 16 bytes, fit a ptr & action type
 /*
- * HOW MANY WORKERS ONE IMAGE'S POOL KEEPS, and it is not one number because a
- * worker is not one thing.
- *
- * PER IMAGE is the part that surprises, and it is the whole of the arithmetic:
- * every DSO gets its own ThreadPool -- the per-DSO grain this core is built on
- * -- so the figure below is multiplied by the number of loaded modules, not
- * shared across them. A session with a loader and five providers runs SIX
- * pools. That is defensible natively, where a pool worker is an OS thread: a
- * stack that is lazily committed, no code duplicated, and oversubscription
- * costs scheduling rather than memory.
- *
- * ON THE WEB A POOL WORKER IS A WORKER, which is a different object entirely.
- * It carries its own JS realm, its own parse of the ~2 MB emscripten glue, and
- * an instance of EVERY open side module -- emscripten re-instantiates the
- * dynamic libraries inside each new Worker, because a wasm instance belongs to
- * one agent. So the cost is workers x modules and it is browser memory, outside
- * the wasm heap entirely. At 4 the paint page created 46 Workers and Firefox
- * refused partway through one of their dlopens; at 2 it does not. That is a
- * measured number, not a guess, and it is why raising INITIAL_MEMORY never
- * touched it.
- *
- * TWO, NOT hardware_concurrency(), for the same reason: the count that matters
- * is per image and the machine's core count says nothing about how many Workers
- * a tab can afford. The pool is not where this runtime gets its parallelism
- * anyway -- the frame edge and the pointer edge are detached script threads, and
- * a pool worker serves stream and signal work that is latency-bound rather than
- * CPU-bound. Native keeps 4 so nothing about that path has to be re-argued.
- */
-/*
  * ETCS_SHARED_THREAD_POOL -- one pool for the whole runtime, or one per image.
  *
  * ThreadPool::getInstance()'s function-local static is a PER-DSO singleton (the
@@ -253,10 +224,13 @@ inline size_t etcs_flush_deferred_rid_registrars()
  * reader should be able to see which one they are getting without knowing which
  * #ifdef branch they are in.
  *
- *   web, default ON.  A thread is a Worker and a Worker re-instantiates every
- *     open side module, so per-image pools are megabytes of wasm compiled again
- *     per image. Measured on the paint page before this existed: 34 Workers, 32
- *     of them created inside one 500ms window, first presented frame at 10.5s.
+ *   web, default ON.  A thread is a Worker, with its own JS realm, its own
+ *     parse of the ~2 MB glue and an instance of EVERY open side module (a wasm
+ *     instance belongs to one agent), so the cost is workers x modules and it
+ *     is browser memory outside the wasm heap. Per-image pools multiply it by
+ *     the number of images. Measured on the paint page: one shared pool of 4 is
+ *     16 Workers and a first frame at 8.8s; a pool of 2 per image is 34 and
+ *     12.1s; a pool of 4 per image is 46 and 14.4s.
  *
  *   native, default OFF.  Threads are cheap, the machine has cores, and there
  *     is a real hazard: a module's own pool is constructed during its static
@@ -277,23 +251,22 @@ inline size_t etcs_flush_deferred_rid_registrars()
 #endif
 
 /*
- * TWO IS A PER-IMAGE NUMBER, AND IT STOPS BEING RIGHT THE MOMENT THE POOL IS
- * SHARED. The web count was lowered to 2 because the cost was paid SIX TIMES --
- * six images, six pools, and every worker a Worker re-instantiating all seven
- * side modules. With ETCS_SHARED_THREAD_POOL there is one pool for the runtime,
- * so the arithmetic that justified 2 no longer holds and the reason to keep it
- * would be nothing but the number's own history.
+ * HOW MANY WORKERS A POOL KEEPS. 4 wherever the pool is shared; 2 only for a
+ * web build that has opted back into a pool per image, where the count is
+ * multiplied by the number of images and every worker is a Worker (see
+ * ETCS_SHARED_THREAD_POOL above for the arithmetic).
  *
- * 4 SHARED IS FEWER THREADS THAN 2 PER IMAGE, by a lot: measured on the paint
- * page, per-image pools gave 34 Workers and one shared pool gives 14. Taking
- * the native count back is spending four of the twenty that were saved.
+ * Not hardware_concurrency(): the pool is not where this runtime gets its
+ * parallelism -- the frame edge and the pointer edge are detached script
+ * threads -- and on the web the core count says nothing about how many Workers
+ * a tab can afford.
  *
- * AND THE FLOOR IS REAL, not headroom for its own sake. A standing produce body
- * occupies a worker for as long as its edge is open (DEFINE_STREAM_FUNC_PRODUCE
- * enqueues the body), and WindowProvider alone opens two -- ProduceEvents and
- * ProducePointer. At 2 shared workers those two ARE the pool: every other
- * stream edge in the session queues behind them and never runs, which is the
- * silent-dead-edge failure etcs_boot_runtime_threads' own comment describes.
+ * 4 IS A FLOOR, NOT HEADROOM. A standing produce body occupies a worker for as
+ * long as its edge is open (DEFINE_STREAM_FUNC_PRODUCE enqueues the body), and
+ * WindowProvider alone opens two -- ProduceEvents and ProducePointer. At 2
+ * shared workers those two ARE the pool: every other stream edge in the session
+ * queues behind them and never runs, silently (etcs_boot_runtime_threads on that
+ * failure). Measured: 3 shared is 9.2s to first frame, 4 is 8.8s, 6 is 9.2s.
  */
 #if defined(__EMSCRIPTEN__) && !ETCS_SHARED_THREAD_POOL
 #define DEFAULT_THREAD_POOL_THREADS  2
@@ -1209,7 +1182,7 @@ namespace ETCS
             ETCS_WEB_CONSOLE_ERROR("FATAL: module '" #Name "' and the loader disagree on " \
                 "CORE:/HEADER:/ONTOLOGY: hashes -- built for different epochs. Refusing to " \
                 "run. (Rebuild both: `ace wasm make all && ace wasm make loader etcs`, then " \
-                "redeploy every .wasm together -- a page serving one stale module is exactly " \
+                "rebuild every .wasm together -- a page serving one stale module is exactly " \
                 "this.)"); \
             /* TODO(recovery): re-fetch whichever of {this module, the \
              * loader} is older from anticurrententropy.com and retry once \

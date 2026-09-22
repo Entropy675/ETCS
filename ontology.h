@@ -95,13 +95,10 @@
 #include "ontology/ObservableBase.h"
 // Thread refines Threaded: an entity that IS a control thread, owning signal
 // authority and a closure, rather than one that merely has a body to stop.
-// ShellProvider's Shell claims it -- this line used to say nothing did, which
-// stopped being true when Shell took it and was the one place a reader would
-// have gone to check. See ontology/Thread.h.
-//
-// Still the surface the CommandExecutor migration lands on: DetachedRegistry is
-// the thing Thread.h maps field by field, and Shell claiming the family is the
-// first half of that, not the end of it.
+// ShellProvider's Shell claims it. Still the surface the CommandExecutor
+// migration lands on: DetachedRegistry is what Thread.h maps field by field,
+// and Shell claiming the family is the first half of that, not the end of it.
+// See ontology/Thread.h.
 #include "ontology/ThreadBase.h"
 #include "ontology/EphemeralBase.h"
 // Not a family: "how long since the last time I asked, with a ceiling", which

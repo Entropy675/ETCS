@@ -28,22 +28,9 @@ tree.ListPaths()
 # no extension guessing and inherits none.
 tree.MountTree(paint ACE_ROOT/modules/PaintProvider/scripts/www)
 
-# ── /wasm ────────────────────────────────────────────────────────────────────
-#
-# THE ONE COPY OF THE BROWSER RUNTIME, mounted once and shared by every page
-# that needs it. `ace wasm make ...` writes here (bin/wasm/, see ETCS's Makefile
-# WASM_DIR and loaders/Makefile ARTIFACT_DIR) and nothing else does, so what is
-# served is what was last built.
-#
-# WHY NOT bin/. It holds the native runtime, the .so modules, run_all_tests.sh
-# and the shader assets; mounting it to reach etcs.wasm publishes all of them.
-#
-# WHY NOT BESIDE EACH PAGE. That was the arrangement until now -- copy the
-# artifacts into the page's own www/ after every build -- and it fails in the
-# worst available way: the page still answers 200, with LAST epoch's binary, and
-# the loader refuses it on a manifest hash it cannot explain. These move
-# together, in epochs; one directory is the shape that says so, and N copies is
-# N chances to have missed one.
+# The one copy of the browser runtime, mounted whole: `ace wasm make` writes
+# bin/wasm/ and nothing else does (Makefile, WASM_DIR, on why it is its own
+# directory rather than bin/ and why a page never holds a copy).
 tree.MountTree(wasm ACE_ROOT/bin/wasm)
 
 tree.MountFile(paint/paint_routed_pointer.etcs ACE_ROOT/modules/PaintProvider/scripts/paint_routed_pointer.etcs)

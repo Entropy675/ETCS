@@ -1716,7 +1716,7 @@ bool ETCS::EventNode::LoaderStream::attachModule(
             const ::std::string fatal =
                 "FATAL: '" + module_name + "' -- " + mex.what()
                 + " -- loader and module were not built for the same epoch. "
-                  "Shutting down. (Rebuild and redeploy both halves together: "
+                  "Shutting down. (Rebuild both halves together: "
                   "`ace wasm make all && ace wasm make loader etcs`.)";
             ::std::cerr << fatal << ::std::endl;
             ETCS_WEB_CONSOLE_ERROR(fatal.c_str());
@@ -2586,9 +2586,9 @@ inline void etcs_boot_runtime_threads()
  * Each module's node, through its own trampoline (EventNode::arm_runtime):
  * this starts the module's ordering thread AND its ThreadPool workers, both
  * of which are that image's own objects. ETCS::emscripten_deferred_module_nodes
- * is the list registerLoader filled -- the ETCS:: one, spelled out because a
- * second, global-scope definition of the same name once shadowed it here and
- * drained an always-empty list.
+ * is the list registerLoader filled -- ETCS:: spelled out, because an
+ * unqualified name here can bind a global-scope definition and drain an empty
+ * list.
  */
     for (ETCS::EventNode* mod_node : ETCS::emscripten_deferred_module_nodes())
     {
@@ -2691,44 +2691,28 @@ void* ETCS_GetLoaderManifest()
 /*
  * RegisterDynamicLoader - the module-side entry point the loader calls
  * immediately after dlopen, handing this module a pointer to the loader's
- * own EventNode. Wrapped in try/catch specifically because this runs
- * across the dlopen boundary (extern "C") - an uncaught exception trying
- * to unwind through that boundary is exactly what "terminate called
- * without an active exception" looks like when the unwinder can't resolve
- * a handler on the other side (see this session's own notes on
- * -fvisibility=hidden hiding RTTI across it).
+ * own EventNode. Wrapped in try/catch because this runs across the dlopen
+ * boundary (extern "C"): an exception unwinding through it, with
+ * -fvisibility=hidden hiding the RTTI a handler on the far side would need,
+ * is what "terminate called without an active exception" looks like.
  *
- * Both catch blocks below CRASH deliberately, rather than logging and
- * returning nullptr the way an earlier version of this did. That earlier
- * behavior let Module::registerLoader detect the null EventNode* and fail
- * the load "gracefully" - but graceful failure here is the wrong instinct:
- * ETCS scripts are meant to execute deterministically, and a module that
- * fails to load for a structural reason (the OS not having finished
- * tearing down a just-unloaded instance of this exact library, or a
- * genuine allocation failure) leaves that guarantee violated the moment
- * execution is allowed to continue past it. Silently returning nullptr
- * converts a hard invariant violation into a soft "module not available"
- * that some later, unrelated line might behave differently around,
- * exactly the kind of thing determinism can't tolerate. Better to stop
- * the whole process here, loudly, with a message that names the actual
- * condition - which also surfaces what amounts to a third invariant this
- * session settled on: a root-hosted Module cannot be created and destroyed
- * repeatedly in a tight cycle; doing so risks racing the OS's own
- * asynchronous post-dlclose teardown, and the crash here is what makes
- * that impossible to do silently rather than merely slow.
+ * Both catch blocks CRASH deliberately. Logging and returning nullptr would let
+ * Module::registerLoader fail the load "gracefully", and graceful failure here
+ * is the wrong instinct: a module that fails to load for a structural reason
+ * (the OS not having finished tearing down a just-unloaded instance of this
+ * exact library, or a genuine allocation failure) has violated the guarantee
+ * that ETCS scripts execute deterministically, and returning nullptr converts
+ * that into a soft "module not available" some later, unrelated line behaves
+ * differently around. Stopping loudly, naming the condition, is also what
+ * enforces the invariant that a root-hosted Module is not created and destroyed
+ * in a tight cycle -- that races the OS's asynchronous post-dlclose teardown,
+ * and the crash makes it impossible to do silently rather than merely slow.
  *
- * The manifest check is no longer done here. It used to run as this
- * function's first statement, fed a loader manifest pointer passed in as a
- * second argument -- moved to a static-init lambda in ETCS_MODULE
- * (ETCS_API.h) instead, which dlsym(RTLD_DEFAULT)s ETCS_GetLoaderManifest
- * back on its own the instant dlopen() maps this library. That runs before
- * this function is ever called (dlopen's static-init completes before
- * dlopen() itself returns to the loader), so by the time control reaches
- * here the module has already independently verified the loader, and
- * Module::registerLoader has already independently verified the module
- * (its own discoverTags()/validateManifest() call, before it ever gets to
- * calling this function) -- neither side waited on the other's result, only
- * on dlopen() being the one thing both must have already happened by.
+ * No manifest check here: it runs in ETCS_MODULE's static-init lambda
+ * (ETCS_API.h), which dlsym(RTLD_DEFAULT)s ETCS_GetLoaderManifest the instant
+ * dlopen maps this library, so by the time control reaches this function each
+ * side has already verified the other independently (the loader's half is
+ * Module::registerLoader's validateManifest, before it calls this).
  */
 extern "C" ETCS_API ETCS::EventNode* RegisterDynamicLoader(void* ptr)
 {
@@ -2739,11 +2723,11 @@ extern "C" ETCS_API ETCS::EventNode* RegisterDynamicLoader(void* ptr)
         dynamicLoader.node = static_cast<ETCS::EventNode*>(ptr);
         ETCS_LOG("DynamicLoader", "Passed EventNode! " << ptr);
         /*
- * No signal wiring here. Re-registering ::std::signal() per module used to
- * silently steal OS signal disposition from the loader (process-global,
- * last dlopen wins). The loader instead hands this module its real root
- * SignalContext* via RegisterRootSignalContext() below, called from
- * Module::registerLoader() immediately after this function returns.
+ * No signal wiring here: re-registering ::std::signal() per module would
+ * silently steal OS signal disposition from the loader (process-global, last
+ * dlopen wins). The loader hands this module its real root SignalContext* via
+ * RegisterRootSignalContext() below, called from Module::registerLoader()
+ * immediately after this function returns.
  */
         ETCS::MemoryArena::getInstance(); // this may actaully be the real cleanup order
         ETCS_LOG("DynamicLoader", "Passed MemoryArena! ");

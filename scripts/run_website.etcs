@@ -16,16 +16,11 @@
 # The lobbies are detached AFTER Start, and what makes them find THIS server
 # rather than minting a second one that cannot bind 8080 is the verb their own
 # web scripts use: `ensure NetworkProvider::HttpServer web`
-# (NetworkProvider/scripts/chess_web.etcs). ensure takes the name if it already
-# resolves and spawns only if it does not.
-#
-# THIS PARAGRAPH USED TO SAY SOMETHING ELSE -- that a `spawn` of the same name
-# was silently retargeted onto the live entity, PersistentNames being
-# process-scope. That mechanism is gone, and spawn_entity says so in as many
-# words (core/CommandExecutor.h): spawn ALWAYS creates, and refuses outright
-# when the name already resolves. Left standing, the old note reads as licence
-# to write `spawn` in a subscript, which is now the one spelling that fails in
-# exactly the session the subscript was written for.
+# (NetworkProvider/scripts/chess_web.etcs). `ensure` takes the name if it
+# already resolves and spawns only if it does not; `spawn` ALWAYS creates and
+# refuses a name that already resolves (spawn_entity, core/CommandExecutor.h),
+# so a subscript that spells it `spawn` fails in exactly the session it was
+# written for.
 #
 # Their own Start calls are no-ops: StartConcrete returns false when a manager
 # already exists. Their duplicate FileHtmlPage children are harmless for the
@@ -67,16 +62,13 @@ tree.ListPaths()
 # explain. Every url inside the page is relative, so it does not learn it was
 # mounted; its one absolute link, href="/", now goes where it reads like it goes.
 #
-# The tree comes from PaintProvider's own www/, not a copy: that directory holds
-# the built wasm (.gitignore'd there, produced by `ace wasm make`), so a copy
-# here would be 9 MB of build output in this repo's history AND a second thing
-# to re-copy after every wasm build.
+# Mounted from PaintProvider's own www/ rather than copied into this repo: the
+# page is that module's, and a copy here is a second thing to keep current.
 tree.MountTree(paint ACE_ROOT/modules/PaintProvider/scripts/www)
 
-# The one copy of the browser runtime, shared by every page that needs it.
-# `ace wasm make ...` writes bin/wasm/ and nothing else does. See
-# run_tls_website.etcs for why this is a mount rather than a per-page copy, and
-# why it is not bin/ itself.
+# The one copy of the browser runtime: `ace wasm make` writes bin/wasm/ and
+# nothing else does (Makefile, WASM_DIR, on why it is its own directory and why
+# a page never holds a copy).
 tree.MountTree(wasm ACE_ROOT/bin/wasm)
 
 # The scripts the page stages into the browser FS, each at the path it is
@@ -107,8 +99,7 @@ tree.ListPaths()
 # bot-scan-shaped paths (.env, wp-admin, .php, ...) and answers them with a
 # deliberately slow 404 instead of routing them anywhere real -- see
 # TarpitNode.h for why it lives here as its own entity rather than a flag on
-# HttpServer or ConnectionManager. The new syntax spawns it at the root level,
-# completely eliminating the old context-switching parsing ambiguity.
+# HttpServer or ConnectionManager.
 spawn NetworkProvider::TarpitNode tarpit
 tarpit.LoadDefaultTarpitPatterns()
 
