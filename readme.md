@@ -2,7 +2,7 @@ ETCS (Entity Tag Component System) is a C++ substrate for defining types, ABI co
 
 See https://anticurrententropy.com/whitepaper.html for details.
 
-Currently building on linux, targeting ARM and x64
+Currently building on linux, targeting ARM and x64, + emscripten WASM (see build instructions below)
 
 Tools & Modules
 - https://github.com/Entropy675/ACE-Build-Tools 
