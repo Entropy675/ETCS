@@ -239,11 +239,68 @@ inline size_t etcs_flush_deferred_rid_registrars()
  * a pool worker serves stream and signal work that is latency-bound rather than
  * CPU-bound. Native keeps 4 so nothing about that path has to be re-argued.
  */
-#if defined(__EMSCRIPTEN__)
+/*
+ * ETCS_SHARED_THREAD_POOL -- one pool for the whole runtime, or one per image.
+ *
+ * ThreadPool::getInstance()'s function-local static is a PER-DSO singleton (the
+ * -fvisibility=hidden isolation MemoryArena and EventNode already document), so
+ * by default six loaded providers mean six pools: six sets of workers, six
+ * watchdogs, six io threads. With this on, the loader hands modules ITS pool as
+ * they register and every image's getInstance() answers with that one object.
+ *
+ * A BUILD OPTION AND NOT A PLATFORM TEST, because the two substrates want
+ * opposite defaults for reasons that are about cost, not correctness -- and a
+ * reader should be able to see which one they are getting without knowing which
+ * #ifdef branch they are in.
+ *
+ *   web, default ON.  A thread is a Worker and a Worker re-instantiates every
+ *     open side module, so per-image pools are megabytes of wasm compiled again
+ *     per image. Measured on the paint page before this existed: 34 Workers, 32
+ *     of them created inside one 500ms window, first presented frame at 10.5s.
+ *
+ *   native, default OFF.  Threads are cheap, the machine has cores, and there
+ *     is a real hazard: a module's own pool is constructed during its static
+ *     init (_core_init) and native pools start their workers in the
+ *     constructor, so adopting afterwards would orphan a pool that already has
+ *     threads running. Turning this on natively is only sound if nothing in a
+ *     module reaches getThreadPool() before RegisterDynamicLoader -- which is
+ *     true today, but is a property of the modules rather than of this header.
+ *
+ * Override either way with -DETCS_SHARED_THREAD_POOL=1 / =0.
+ */
+#ifndef ETCS_SHARED_THREAD_POOL
+#  if defined(__EMSCRIPTEN__)
+#    define ETCS_SHARED_THREAD_POOL 1
+#  else
+#    define ETCS_SHARED_THREAD_POOL 0
+#  endif
+#endif
+
+/*
+ * TWO IS A PER-IMAGE NUMBER, AND IT STOPS BEING RIGHT THE MOMENT THE POOL IS
+ * SHARED. The web count was lowered to 2 because the cost was paid SIX TIMES --
+ * six images, six pools, and every worker a Worker re-instantiating all seven
+ * side modules. With ETCS_SHARED_THREAD_POOL there is one pool for the runtime,
+ * so the arithmetic that justified 2 no longer holds and the reason to keep it
+ * would be nothing but the number's own history.
+ *
+ * 4 SHARED IS FEWER THREADS THAN 2 PER IMAGE, by a lot: measured on the paint
+ * page, per-image pools gave 34 Workers and one shared pool gives 14. Taking
+ * the native count back is spending four of the twenty that were saved.
+ *
+ * AND THE FLOOR IS REAL, not headroom for its own sake. A standing produce body
+ * occupies a worker for as long as its edge is open (DEFINE_STREAM_FUNC_PRODUCE
+ * enqueues the body), and WindowProvider alone opens two -- ProduceEvents and
+ * ProducePointer. At 2 shared workers those two ARE the pool: every other
+ * stream edge in the session queues behind them and never runs, which is the
+ * silent-dead-edge failure etcs_boot_runtime_threads' own comment describes.
+ */
+#if defined(__EMSCRIPTEN__) && !ETCS_SHARED_THREAD_POOL
 #define DEFAULT_THREAD_POOL_THREADS  2
 #else
 #define DEFAULT_THREAD_POOL_THREADS  4
 #endif
+
 // default hash size/type
 #define HASH_TYPE uint64_t
 #define BASE_SOURCE_STRING "ETCS_Kernel_v1.0"

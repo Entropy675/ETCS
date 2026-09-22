@@ -599,6 +599,20 @@ public:
  */
     void (*arm_runtime)()         = nullptr;
 
+    /*
+ * WHOSE ThreadPool THIS IMAGE USES, as a trampoline for the same reason every
+ * pointer above it is one: a module asking ThreadPool::getInstance() gets its
+ * OWN per-DSO singleton, so the only way to reach the loader's is to call back
+ * through the loader's node. Answered by the image that constructed this node.
+ *
+ * Read once, by a module, from inside RegisterDynamicLoader -- see
+ * ThreadPool::adopt_shared for what it is for and why one pool for the whole
+ * runtime is worth this pointer.
+ *
+ * ABOVE the fork, for the same layout reason as the four above it.
+ */
+    ETCS::ThreadPool* (*get_pool)() = nullptr;
+
     ::std::unordered_map<ETCS::Buffer, RIDListHandle> ridMap;
 
     /*
@@ -1188,6 +1202,14 @@ public:
             ETCS::ThreadPool::getInstance().arm_emscripten_workers();
         };
 #endif
+        /*
+     * OUTSIDE the emscripten fork above, unconditionally: this is a pointer,
+     * it costs nothing when nobody reads it, and whether anybody DOES read it
+     * is ETCS_SHARED_THREAD_POOL's business -- a build option that lives in
+     * ETCS_API.h. Gating it here as well would mean this header had to see that
+     * macro, and EventNode.h is reached from places core_defs.h is not.
+     */
+        get_pool       = []() { return &ETCS::ThreadPool::getInstance(); };
         stream.owner = this; // wire back-pointer now that EventNode is complete --
                               // both LoaderStream and ModuleProxy have this member.
         s_alive.store(true, ::std::memory_order_release);

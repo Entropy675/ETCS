@@ -568,14 +568,58 @@ public:
     inline static ::std::atomic<bool> s_alive{false};
     static bool alive() { return s_alive.load(::std::memory_order_acquire); }
 
+    // Whose pool this image should use, or null for "its own". A raw pointer
+    // and not an atomic: it is written once, on the main thread, while the
+    // module that will read it is still inside its own registration and has no
+    // threads of its own yet (Module::registerLoader).
+    static ThreadPool*& shared_slot()
+    {
+        static ThreadPool* slot = nullptr;
+        return slot;
+    }
+
     ~ThreadPool()
     {
         s_alive.store(false, ::std::memory_order_release);
         ETCS_LOG("ThreadPool", "dtor called, trigger_shutdown_drain...");
         trigger_shutdown_drain();
     }
+    /*
+ * ONE POOL FOR THE WHOLE RUNTIME, when a loader has said which one.
+ *
+ * The function-local static below is a PER-DSO singleton -- the same
+ * -fvisibility=hidden isolation MemoryArena::getInstance() and
+ * EventNode::getInstance() already document. Natively that was invisible: six
+ * images meant six pools, each with its workers, its watchdog and its io
+ * thread, on a machine with threads to spare.
+ *
+ * On the web it is the dominant cost of a boot. Every thread is a Worker and
+ * every Worker re-instantiates all seven open side modules, so the per-image
+ * pools are not an implementation detail, they are megabytes of wasm compiled
+ * per image for no reason -- measured against the paint page, 34 Workers, of
+ * which 32 were created inside one 500ms window, and a first frame at 10.5s.
+ *
+ * So the loader installs ITS pool into every module as the module registers
+ * (Module::registerLoader), and from that point every image's getInstance()
+ * answers with the one object. Nothing else changes: a work function still
+ * says getThreadPool(), a produce trampoline still enqueues onto
+ * self->getThreadPool(), and neither has to learn that the pool is shared.
+ *
+ * SHARED, NOT OWNED. The pointer is adopted, never deleted here: it belongs to
+ * whichever image constructed it -- the loader -- and that image outlives every
+ * module by construction (the loader is what dlclose'd them). A module's own
+ * local static is simply never constructed once adopt_shared has run, so there
+ * is no second pool to shut down and no ordering between the two to get wrong.
+ */
+    static void adopt_shared(ThreadPool* pool)
+    {
+        if (pool) shared_slot() = pool;
+    }
+    static bool is_shared() { return shared_slot() != nullptr; }
+
     static ThreadPool& getInstance()
     {
+        if (ThreadPool* p = shared_slot()) return *p;
         static ThreadPool instance;
         return instance;
     }

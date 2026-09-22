@@ -2639,16 +2639,27 @@ inline const bool _core_init = []() {
  */
     ETCS::MemoryArena::getInstance();
     dynamicLoader.node = &ETCS::EventNode::getInstance();
-#if defined(__EMSCRIPTEN__)
+    /*
+ * THE POOL IS NOT TOUCHED HERE WHEN IT IS SHARED, and that is what keeps the
+ * adoption in RegisterDynamicLoader from orphaning anything: this runs during
+ * a module's static init, BEFORE the loader has had a chance to hand its pool
+ * over, so constructing one here would leave a second pool that adoption then
+ * makes unreachable. Skipping it means the first getInstance() in this image
+ * happens after adoption and answers with the loader's.
+ *
+ * Unconditional when pools are per-image, where the eager construction is the
+ * point -- it is what makes the pool exist before anything enqueues onto it.
+ */
+#if !ETCS_SHARED_THREAD_POOL
+#  if defined(__EMSCRIPTEN__)
     // May construct pool / call start(); both defer std::thread until boot.
     (void)ETCS::ThreadPool::getInstance();
-    ETCS::EventNode::getInstance().stream.start(
-        ETCS::MemoryArena::getInstance(), 1);
-#else
+#  else
     ETCS::ThreadPool::getInstance();
+#  endif
+#endif
     ETCS::EventNode::getInstance().stream.start(
         ETCS::MemoryArena::getInstance(), 1);
-#endif
     return true;
 }();
 
@@ -2736,6 +2747,28 @@ extern "C" ETCS_API ETCS::EventNode* RegisterDynamicLoader(void* ptr)
  */
         ETCS::MemoryArena::getInstance(); // this may actaully be the real cleanup order
         ETCS_LOG("DynamicLoader", "Passed MemoryArena! ");
+#if ETCS_SHARED_THREAD_POOL
+        /*
+ * ADOPT THE LOADER'S POOL, before this image's own getInstance() is asked for
+ * anything. See ThreadPool::adopt_shared: one pool for the whole runtime,
+ * because on the web a pool is Workers and a Worker is every open side module
+ * instantiated again.
+ *
+ * UNDER ETCS_SHARED_THREAD_POOL, which is on for web builds and off for native
+ * ones -- see that macro (core/ETCS_API.h) for why the two substrates want
+ * opposite defaults, and for what has to stay true of a module for the native
+ * setting to be safe to flip.
+ */
+        if (dynamicLoader.node && dynamicLoader.node->get_pool)
+        {
+            ETCS::ThreadPool::adopt_shared(dynamicLoader.node->get_pool());
+            ETCS_LOG("DynamicLoader", "adopted the loader's ThreadPool -- one pool "
+                     "for the runtime, so this image arms no Workers of its own");
+        }
+        else
+            ETCS_LOG("DynamicLoader", "loader node offers no pool trampoline -- "
+                     "this image will use its own ThreadPool (older loader)");
+#endif
         ETCS::ThreadPool::getInstance();
         ETCS_LOG("DynamicLoader", "Passed ThreadPool! ");
 #if defined(__EMSCRIPTEN__)
