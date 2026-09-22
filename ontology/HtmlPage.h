@@ -35,12 +35,25 @@ public:
     // already holds (a ::std::string's bytes, an NBuffer's buf), valid only as
     // long as that page is alive and unmodified. Callers build a response
     // from it immediately and must never store it, as the data can go stale.
+    //
+    // A REDIRECT IS AN ANSWER, not a miss: `redirect` non-empty (with matched
+    // true and no data) tells the server to send the client to that path
+    // instead. It exists for one reason -- a directory asked for without its
+    // trailing slash. The page under /paint fetches "modules.json" relative to
+    // its own URL, and from "/paint" the browser resolves that to
+    // "/modules.json" while from "/paint/" it resolves to "/paint/modules.json";
+    // serving the same index.html at both spellings makes the first one a page
+    // whose every relative fetch 404s. Answering "/paint" with the bytes and
+    // no redirect is what every web server stopped doing for this reason.
+    // Carried here rather than as a FileHtmlPage detail because the SERVER
+    // writes the status line, and it holds a bare HtmlPage_*.
     struct ResolvedAsset
     {
         bool        matched   = false;
         const char* data      = nullptr;
         size_t      length    = 0;
         ::std::string mime_type = "application/octet-stream";
+        ::std::string redirect;     // absolute path; empty for content
     };
 
     // The routing surface, and the reason it belongs to the family rather

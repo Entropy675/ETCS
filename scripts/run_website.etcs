@@ -61,6 +61,11 @@ tree.ListPaths()
 # winner would be attach order, the same fragility the "/" note above has to
 # explain. Every url inside the page is relative, so it does not learn it was
 # mounted; its one absolute link, href="/", now goes where it reads like it goes.
+# Relative is also why the address is /paint/ WITH the slash: from /paint the
+# browser resolves "modules.json" to /modules.json. The server answers the bare
+# spelling with a 301 to the slashed one rather than with the page
+# (FileHtmlPage::ResolveConcrete), so either address works and the page's
+# fetches always land under the prefix.
 #
 # Mounted from PaintProvider's own www/ rather than copied into this repo: the
 # page is that module's, and a copy here is a second thing to keep current.
