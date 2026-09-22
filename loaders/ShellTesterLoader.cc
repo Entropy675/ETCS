@@ -727,13 +727,26 @@ int main()
 
             cold->call("Shell.Run", "st_cold.etcs", ctx);
 
+            /*
+ * ASKED THROUGH etcs_ridmap_named, NOT BY POKING ridMap WITH A COMPOSED KEY.
+ *
+ * This used to do ridMap.find("ChessProvider:ChessGame"), which was reading the
+ * loader's map for a row keyed by the origin-affixed name. That key no longer
+ * exists -- a module's lists are mirrored under the BARE name with the provider
+ * on the row (EventNode::ridMirror) -- so both checks failed for the wrong
+ * reason: the modules loaded fine, the test was looking in the old place.
+ *
+ * The accessor is also the better question regardless of spelling. What this
+ * step means to assert is "that provider's list for that type is reachable from
+ * here", and a raw find() on a hand-built key asserts the storage layout
+ * instead, which is why it broke the moment the layout changed.
+ */
             ETCS::Held<ETCS::Entity> probe;
-            bool loaded = ETCS::EventNode::getInstance().ridMap.find(
-                              ETCS::Buffer("ChessProvider:ChessGame"))
-                          != ETCS::EventNode::getInstance().ridMap.end();
-            const bool loaded2 = ETCS::EventNode::getInstance().ridMap.find(
-                                     ETCS::Buffer("LayoutProvider:Layout"))
-                                 != ETCS::EventNode::getInstance().ridMap.end();
+            ETCS::EventNode* ldr = &ETCS::EventNode::getInstance();
+            const bool loaded  = ETCS::etcs_ridmap_named(
+                                     ldr, ETCS::Buffer("ChessProvider:ChessGame")) != nullptr;
+            const bool loaded2 = ETCS::etcs_ridmap_named(
+                                     ldr, ETCS::Buffer("LayoutProvider:Layout")) != nullptr;
             check(loaded,
                   "a module-hosted Shell.Run triggered a first-request module load");
             // The migration, not just the first bind: one Root moved between two

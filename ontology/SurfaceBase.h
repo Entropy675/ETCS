@@ -2,7 +2,7 @@
 #define BASE_SURFACE_H__
 #include "Surface.h"
 #include "ResizableBase.h"
-#include "OrderableBase.h"
+#include "LayerBase.h"
 
 // Composes Resizable at the FAMILY level, not per-concrete-class (contrast
 // GLFWWindow, which multiply-inherits WindowBase/InputSourceBase/
@@ -28,33 +28,37 @@
 // above the real invocation below, or `ace ontology` mislabels this
 // entire family (confirmed by triggering it while writing this file).
 //
-// Orderable is composed here for the same reason and by the same argument
-// as Resizable: every surface stands somewhere relative to other surfaces.
-// A layer stack IS an ordering, and a surface that could not answer "what
-// is above me" would have to have that answer stored somewhere else, by
-// something else, about it -- which is the arrangement this ontology exists
-// to avoid. Not optional per backend, so not left to the concrete type.
+// LAYER IS COMPOSED HERE, AND IT IS WHERE ORDERABILITY NOW COMES FROM.
 //
-// IT IS ALSO A UNIQUENESS TRAIT, mechanically. OrderableBase<Derived> is
-// composed non-virtually, so if a second base anywhere in a leaf's lineage
-// also claimed Orderable, the leaf would hold two OrderableBase subobjects
-// and every comparison through them would be ambiguous -- a compile error,
-// not a silent double answer. Exactly one place in a lineage may claim the
-// causality for orderability, and claiming it here excludes every base
-// downstream from claiming it again. That is why it belongs at the TOP of
-// this lineage rather than partway down it: Drawable, Drawable2D and
-// Drawable3D all inherit the single claim made here.
+// This file used to compose OrderableBase directly, on the argument that
+// every surface stands somewhere relative to other surfaces -- that a layer
+// stack IS an ordering, and a surface that could not answer "what is above
+// me" would need that answer stored somewhere else, by something else, about
+// it. The argument was right and was being made one level too low: it is not
+// a fact about surfaces, it is the definition of a LAYER (ontology/Layer.h),
+// which is an order that has a frame of reference. So the claim moved up and
+// Surface refines Layer instead.
 //
-// The requirement rides along: a concrete surface must declare
-// bool operator<(const T&) const, checked at compile time
-// (OrderableBase.h). Every other comparison is derived from that one.
+// Nothing downstream changed. The single-claim rule that used to live here
+// lives in LayerBase.h now, one link higher: OrderableBase is composed
+// non-virtually, exactly one place in a lineage may claim the causality for
+// orderability, and claiming it there excludes every base downstream --
+// Surface, Drawable, Drawable2D and Drawable3D all inherit that one claim as
+// they always did. The requirement rides along unchanged: a concrete surface
+// must declare bool operator<(const T&) const, checked at compile time
+// (OrderableBase.h).
 //
-// A concrete surface therefore gets THREE interface pointers registered
-// automatically -- "Surface", "Resizable", "Orderable" (one
+// What it buys is the leaf that is a layer WITHOUT being a surface -- a paint
+// layer, a locale node with no appearance of its own -- which could not exist
+// while the two claims were the same claim, and which is the case the family
+// was raised for.
+//
+// A concrete surface therefore gets FOUR interface pointers registered
+// automatically -- "Surface", "Resizable", "Layer", "Orderable" (one
 // ETCS_MAKE_INSTANCE call here, one inherited from each composed base's own
 // ctor) -- foreign code can reach any of them generically via
 // getInterfacePointer.
-ETCS_SUPERTYPE_BASE(Surface), public ResizableBase<Derived>, public OrderableBase<Derived>
+ETCS_SUPERTYPE_BASE(Surface), public ResizableBase<Derived>, public LayerBase<Derived>
 {
     ETCS_MAKE_INSTANCE(Surface)
     ETCS_DISPATCH_METHOD(void, Clear,    (float, r), (float, g), (float, b), (float, a));

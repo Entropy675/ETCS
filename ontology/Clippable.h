@@ -112,6 +112,23 @@ public:
         x = top.x; y = top.y; w = top.w; h = top.h;
     }
 
+    // Narrow a rectangle to the region in effect, in place. w or h comes back
+    // zero when nothing survives, which is the caller's cue to draw nothing.
+    //
+    // A COMPANION TO CurrentClip, not a second way to do the same thing. A
+    // backend that reads the clip at draw time never wants the region for its
+    // own sake -- it wants the rectangle it was handed, narrowed. Offering only
+    // the region leaves every such backend to write the intersection itself,
+    // and the reason the arithmetic lives down in intersect is precisely that a
+    // backend writing its own is a backend that can invert the empty case.
+    void clipToCurrent(int32_t& x, int32_t& y, uint32_t& w, uint32_t& h) const
+    {
+        int32_t cx, cy; uint32_t cw, ch;
+        CurrentClip(cx, cy, cw, ch);
+        const ClipRect r = intersect(ClipRect{cx, cy, cw, ch}, ClipRect{x, y, w, h});
+        x = r.x; y = r.y; w = r.w; h = r.h;
+    }
+
 protected:
     struct ClipRect { int32_t x; int32_t y; uint32_t w; uint32_t h; };
 
@@ -126,15 +143,15 @@ protected:
         const int64_t bx0 = b.x, by0 = b.y;
         const int64_t bx1 = bx0 + static_cast<int64_t>(b.w), by1 = by0 + static_cast<int64_t>(b.h);
 
-        const int64_t x0 = std::max(ax0, bx0), y0 = std::max(ay0, by0);
-        const int64_t x1 = std::min(ax1, bx1), y1 = std::min(ay1, by1);
+        const int64_t x0 = ::std::max(ax0, bx0), y0 = ::std::max(ay0, by0);
+        const int64_t x1 = ::std::min(ax1, bx1), y1 = ::std::min(ay1, by1);
         if (x1 <= x0 || y1 <= y0)
             return ClipRect{ static_cast<int32_t>(x0), static_cast<int32_t>(y0), 0, 0 };
         return ClipRect{ static_cast<int32_t>(x0), static_cast<int32_t>(y0),
                          static_cast<uint32_t>(x1 - x0), static_cast<uint32_t>(y1 - y0) };
     }
 
-    std::vector<ClipRect> m_clipStack;
+    ::std::vector<ClipRect> m_clipStack;
 };
 
 #endif

@@ -5,7 +5,7 @@
 ETCS_SUPERTYPE_BASE(HtmlPage)
 {
     ETCS_MAKE_INSTANCE(HtmlPage)
-    ETCS_DISPATCH_METHOD_CONST(HtmlPage_::ResolvedAsset, Resolve, (const std::string&, request_path));
+    ETCS_DISPATCH_METHOD_CONST(HtmlPage_::ResolvedAsset, Resolve, (const ::std::string&, request_path));
     ETCS_DISPATCH_METHOD_CONST(bool, IsFileBacked);
 };
 

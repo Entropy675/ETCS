@@ -512,8 +512,38 @@ document.
 
 ## ABI integrity
 
-Every module load checks an environment-signature hash against what each exported symbol was
-built with. A mismatch refuses the load rather than risk a silently incompatible call. Unchanged.
+Two different questions, answered by two different hashes, and they used to be one.
+
+**Which build is this** — the epoch check. Every contract header (`CORE:`, `ONTOLOGY:`) is
+SHA-256'd at build time into the module's manifest, and at load the module and the loader each
+compare their own copy against the other's: the loader in `Module::validateManifest`, the module
+in its own `ETCS_MODULE_EXPORT_MAIN` block. Either side disagreeing refuses the load rather than
+risk a silently incompatible call. Under emscripten the module's half is deferred to
+`RegisterDynamicLoader` rather than run at static-init — `dlsym` from inside a side module's
+static initialiser re-enters the dynamic linker while the load that triggered it is still in
+flight, and the page stops with nothing logged — but it still lands before the loader has called
+any of that module's tags.
+
+**What is this function** — the region hash, which is what `<Tag>_<Action>_GetHash` now returns.
+The leaf is the SHA-256 of the action's own source region: the span from `DEFINE_WORK_FUNC(Tag,
+Action)` through the closing brace of the body written under it, computed by `ace hash regions`
+and registered into the module's table by the generated `module_hashes.h`. A tag hashes its own
+name and each action it declares, in declaration order, over those digests; a module hashes its
+name and each tag in the order its Tags string lists them. So an edit to one body moves exactly
+one leaf, its tag and its module, and leaves every sibling alone — which is the property a hash
+chain over the runtime needs.
+
+The region is SOURCE, not machine code, because a wasm function pointer is a table index: there
+is no code address to hash from and no symbol size to hash to, and a chain whose leaves disagree
+per platform can only ever compare a build against itself. It is raw bytes, comments included —
+the same bargain the header digests make — so a reformat reads as a change. Zero means no region
+was recorded for that name (built without `ace` on PATH, or a tag block naming an action no
+`DEFINE_WORK_FUNC` defines); it is deliberately not a fallback to hashing the name, because a
+name hash returned where a content hash is expected is indistinguishable from one at every
+caller.
+
+`GenerateEnvironmentSignature` — name plus the whole manifest — still exists and still answers
+the first question. It is no longer what any `_GetHash` export returns.
 
 ## Shutdown
 

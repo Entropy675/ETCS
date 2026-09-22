@@ -11,8 +11,5 @@ loaders/etcs
 loaders/*.o
 logs/
 bin/
-bin/Run_*Loader
-bin/etcs
-bin/*.so
 *_hashes.h
 *db

@@ -36,6 +36,10 @@
 // Lower suspicion graphical/window ontology types (mostly RenderProvider/WindowProvider):
 #include "ontology/ResizableBase.h"
 #include "ontology/ClippableBase.h"
+// Layer before Surface, because Surface refines it: an order with a frame of
+// reference, which is where orderability is claimed for this whole lineage.
+// Reachable on its own for the leaf that is a layer without being a surface.
+#include "ontology/LayerBase.h"
 #include "ontology/SurfaceBase.h"
 #include "ontology/PresentableBase.h"
 
@@ -52,6 +56,12 @@
 // including why the lineage sits in those two interfaces instead.
 #include "ontology/PixelsBase.h"
 #include "ontology/RenderableBase.h"
+
+// Not a family: the resample every implementor of Surface_::Blit owes, and
+// every caller that projects Pixels_ into Pixels_ without being a surface.
+// Here because it is Pixels_ arithmetic with no backend in it -- see the
+// header, and Surface_::Blit's contract on what w/h mean.
+#include "ontology/ScaledComposite.h"
 
 // The Drawable lineage: Surface refined into a node that occupies space in
 // a parent and nests. DrawableBase composes SurfaceBase, the two leaf bases
@@ -85,10 +95,23 @@
 #include "ontology/ObservableBase.h"
 // Thread refines Threaded: an entity that IS a control thread, owning signal
 // authority and a closure, rather than one that merely has a body to stop.
-// Nothing claims it yet -- it is the surface the CommandExecutor migration
-// lands on. See ontology/Thread.h.
+// ShellProvider's Shell claims it. Still the surface the CommandExecutor
+// migration lands on: DetachedRegistry is what Thread.h maps field by field,
+// and Shell claiming the family is the first half of that, not the end of it.
+// See ontology/Thread.h.
 #include "ontology/ThreadBase.h"
 #include "ontology/EphemeralBase.h"
+// Not a family: "how long since the last time I asked, with a ceiling", which
+// this tree had written four times. Here rather than only inside AnimatedBase
+// because a leaf whose steps are caused by something other than a driver needs
+// the measurement without the claim -- see ontology/StepClock.h.
+#include "ontology/StepClock.h"
+// Animated is the causal counterpart to Threaded: a body that must be stepped
+// by somebody else, rather than one that runs itself. It refines nothing, so it
+// sits here rather than in any lineage -- an entity claims it to say "I am not
+// finished, come back", and nothing else about the entity has to be true. Note
+// that the family deliberately does NOT say who steps it; see ontology/Animated.h.
+#include "ontology/AnimatedBase.h"
 #include "ontology/ParserBase.h"
 #include "ontology/WrapperBase.h"
 // Matrix refines Wrapper: one step, and a forward link, in a transform chain.

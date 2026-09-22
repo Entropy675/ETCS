@@ -17,6 +17,9 @@
 // `etcs` must pass -DETCS_REPL_SHELL. A target without it is the
 // daemon/environment binary.
 #undef ETCS_PRODUCTION_BUILD
+#if defined(__EMSCRIPTEN__)
+#include <emscripten.h>
+#endif
 #include "../ETCS.h"
 #include <fstream>
 #include <iostream>
@@ -28,10 +31,444 @@
 // ANSI codes when stdout is a terminal, empty strings when it is a pipe or a
 // file, in either binary. No fallback needed here.
 
+
+#if defined(__EMSCRIPTEN__)
+// Force a line to the page terminal even when main is spinning (no stop-script needed).
+inline void etcs_web_trace(const char* msg)
+{
+    EM_ASM({
+        var s = UTF8ToString($0);
+        if (typeof Module !== 'undefined' && Module.print)
+            Module.print(s + (s.endsWith('\n') ? "" : '\n'));
+        else
+            console.log(s);
+    }, msg);
+    ::std::fflush(stdout);
+    ::std::fflush(stderr);
+}
+#else
+inline void etcs_web_trace(const char*) {}
+#endif
+
+#if defined(__EMSCRIPTEN__)
+/*
+ * Browser line queue on MAIN so Module.ccall hits real symbols (not side-module
+ * stubs). Polling + emscripten_sleep live in CommandExecutor's ReplLineSource
+ * as *direct* calls from the main module -- ASYNCIFY cannot unwind through
+ * WorkBundle's indirect Shell.ReadLine path (unreachable on rewind).
+ */
+#include <deque>
+#include <mutex>
+#include <cstring>
+#include "../core/ThreadPool.h"
+namespace {
+std::mutex g_etcs_web_line_mu;
+std::deque<std::string> g_etcs_web_lines;
+}
+extern "C" {
+
+EMSCRIPTEN_KEEPALIVE
+void etcs_web_shell_push_line(const char* line)
+{
+    if (!line) return;
+    std::lock_guard<std::mutex> lock(g_etcs_web_line_mu);
+    g_etcs_web_lines.emplace_back(line);
+}
+
+EMSCRIPTEN_KEEPALIVE
+int etcs_web_shell_try_pop_line(char* out, int cap)
+{
+    if (!out || cap < 2) return 0;
+    std::lock_guard<std::mutex> lock(g_etcs_web_line_mu);
+    if (g_etcs_web_lines.empty()) return 0;
+    std::string line = std::move(g_etcs_web_lines.front());
+    g_etcs_web_lines.pop_front();
+    if ((int)line.size() >= cap) line.resize((size_t)cap - 1);
+    std::memcpy(out, line.data(), line.size());
+    out[line.size()] = '\0';
+    return 1;
+}
+
+/*
+ * ONE SCRIPT LINE, CALLED FROM THE PAGE.
+ *
+ *     etcs_web_call("input", "Pointer", "412, 22")
+ *
+ * is the JS spelling of
+ *
+ *     input.Pointer(412, 22)
+ *
+ * and it goes through the same dispatch the executor uses for an ordinary action
+ * -- resolve the name, build "<Tag>.<Work>", hand the argument text to the work
+ * function to parse. Nothing here knows what any particular work function means,
+ * which is the point: every verb a module exports is reachable from the page the
+ * moment the module is loaded, with no per-verb glue to write and nothing to keep
+ * in step.
+ *
+ * BY GLOBAL NAME, NOT BY RID, and that is not only convenience. A RID is a full
+ * 64-bit hash; a JS number carries 53 bits, so a RID that crossed this boundary
+ * as a number would arrive silently wrong for most values. Names are what the
+ * script already introduced -- a boot script runs as root, so its names ARE the
+ * globals (run_root_script sets is_root) -- and they are what a reader of the
+ * page and a reader of the script can match up by eye.
+ *
+ * Returns 1 if the call was dispatched, 0 if the name does not resolve. It does
+ * NOT report what the work function decided: a work function's answer is its own
+ * business (it logs), and a bool here would suggest this layer knew.
+ *
+ * ON THE CALLING THREAD, which for a DOM handler is the main thread, and that
+ * bounds what this is good for: discrete events -- a click, a key, a button --
+ * not a stream. A call per pointer move would put the page's event loop behind
+ * the module's stream for every sample; that traffic belongs on an edge
+ * (ProducePointer -> ConsumePointer), which is why the window has one.
+ */
+EMSCRIPTEN_KEEPALIVE
+int etcs_web_call(const char* name, const char* work, const char* args)
+{
+    if (!name || !*name || !work || !*work) return 0;
+    if (!ETCS::EventNode::alive()) return 0;
+
+    auto bound = ETCS::live_global(name);
+    if (!bound)
+    {
+        ETCS_LOG("ETCS", "etcs_web_call: '" << name << "' is not a live global name. "
+                 "A boot script's own names become the globals; anything else has to "
+                 "be spawned before the page can reach it.");
+        return 0;
+    }
+    ETCS::Entity* target = ETCS::resolve_bound_entity(*bound);
+    if (!target)
+    {
+        ETCS_LOG("ETCS", "etcs_web_call: '" << name << "' (RID:" << bound->rid
+                 << ") no longer resolves.");
+        return 0;
+    }
+
+    ETCS::Buffer act;
+    act.write((bound->tag + "." + work).c_str());
+    ETCS::Buffer payload;
+    if (args && *args) payload.write(args);
+
+    try
+    {
+        target->call(act, payload, ETCS::RootSignalContext());
+    }
+    catch (const std::exception& ex)
+    {
+        ETCS_LOG("ETCS", "etcs_web_call: " << name << "." << work << " threw: "
+                 << ex.what());
+        return 0;
+    }
+    catch (...)
+    {
+        ETCS_LOG("ETCS", "etcs_web_call: " << name << "." << work
+                 << " threw an unknown exception.");
+        return 0;
+    }
+    return 1;
+}
+
+/*
+ * THE SAME CALL, WITH AN ANSWER -- ANSWERED OFF THE ONE THREAD THAT CANNOT
+ * AFFORD TO WAIT.
+ *
+ *     etcs_web_call_async(7, "game", "Request", "game/white/local/move/e2e4")
+ *     // later, from C++: window.__etcs_call_done(7, 1, "<fen> ...")
+ *
+ * is the async spelling of `game.Request("game/white/local/move/e2e4")`: it
+ * exists for the same reason `etcs_web_call` was not enough for chess -- a
+ * move's whole point is the FEN it produces, and a fire-and-forget verb has
+ * nowhere for that answer to go. An earlier version of this function
+ * (`etcs_web_call_result`, same signature idea, a result buffer instead of a
+ * callback) got the shape right and the thread wrong: it ran the resolve-
+ * and-call sequence below INLINE, on whatever thread's `Module.ccall`
+ * reached it, which for a DOM click handler is the browser's one real main
+ * thread. That is fine for a verb with no wait behind it, and fatal for one
+ * that has: ChessGame's `Request` blocks on `ChessOpEvent` until its
+ * EventStream's ordering thread answers, exactly like HttpServer's own
+ * `routeRequest` already does for every native request -- but HttpServer
+ * only ever calls that from a ThreadPool worker (see ConnectionManager.h's
+ * `enqueue`-then-`call` pattern), never from the one thread a browser page
+ * cannot let block: the thread pumping window messages, which every pthread
+ * worker this runtime depends on needs pumped to make progress at all.
+ * Empirically, on this build, routing one `move` through the blocking
+ * version froze the tab and then killed it -- not a hang to tune the
+ * timeout on, a real deadlock: nothing left running that could ever
+ * satisfy the wait.
+ *
+ * The fix is not to avoid the block -- `ChessOpEvent`'s wait is correct and
+ * necessary -- it is to put it back on a thread built to survive it. This
+ * function only ENQUEUES: `ETCS::ThreadPool::getInstance().enqueue(...)`
+ * returns as soon as the task is queued, the same non-blocking push every
+ * other ThreadPool caller in this codebase already relies on, so it is as
+ * safe to call from the real main thread as `etcs_web_call` itself. The
+ * resolve-act-call sequence -- unchanged from `etcs_web_call_result`, still
+ * the same `Entity::call` every native caller uses -- now runs on the pool
+ * worker that task lands on, where blocking is exactly what that thread is
+ * for. When it returns (answer in hand, or not: name unresolved, threw), the
+ * worker reaches back into the page the same way `etcs_web_shell_write`
+ * already does from off-main-thread output: `MAIN_THREAD_EM_ASM`, which
+ * proxies to the real browser main thread regardless of which thread calls
+ * it, and invokes `window.__etcs_call_done(handle, ok, text)`.
+ *
+ * `handle` is the caller's own correlation id -- JS picks it (an
+ * incrementing counter is enough) and this side only echoes it back, which
+ * is what lets the JS wrapper resolve the right pending Promise when several
+ * calls are in flight. `ok` is 0/1, matching `etcs_web_call`'s own return
+ * convention (0: name never resolved, or the work function threw); `text`
+ * is `restAsString()` when `ok`, empty otherwise -- there is no capacity
+ * argument here because there is no caller-owned buffer to bound: the
+ * string crosses back as an ordinary `UTF8ToString` argument, sized by
+ * itself, not by a guess made before the answer existed.
+ */
+EMSCRIPTEN_KEEPALIVE
+void etcs_web_call_async(int handle, const char* name, const char* work, const char* args)
+{
+    const std::string n = name ? name : "";
+    const std::string w = work ? work : "";
+    const std::string a = args ? args : "";
+
+    ETCS::ThreadPool::getInstance().enqueue(
+        ETCS::Priority::High, ETCS::RootSignalContext(),
+        [handle, n, w, a]()
+        {
+            bool ok = false;
+            std::string text;
+
+            if (!n.empty() && !w.empty() && ETCS::EventNode::alive())
+            {
+                auto bound = ETCS::live_global(n);
+                if (!bound)
+                {
+                    ETCS_LOG("ETCS", "etcs_web_call_async: '" << n << "' is not a "
+                             "live global name. A boot script's own names become "
+                             "the globals; anything else has to be spawned before "
+                             "the page can reach it.");
+                }
+                else if (ETCS::Entity* target = ETCS::resolve_bound_entity(*bound))
+                {
+                    ETCS::Buffer act;
+                    act.write((bound->tag + "." + w).c_str());
+                    ETCS::Buffer payload;
+                    if (!a.empty()) payload.write(a.c_str());
+
+                    try
+                    {
+                        target->call(act, payload, ETCS::RootSignalContext());
+                        text = payload.restAsString();
+                        ok = true;
+                    }
+                    catch (const std::exception& ex)
+                    {
+                        ETCS_LOG("ETCS", "etcs_web_call_async: " << n << "." << w
+                                 << " threw: " << ex.what());
+                    }
+                    catch (...)
+                    {
+                        ETCS_LOG("ETCS", "etcs_web_call_async: " << n << "." << w
+                                 << " threw an unknown exception.");
+                    }
+                }
+                else
+                {
+                    ETCS_LOG("ETCS", "etcs_web_call_async: '" << n << "' (RID:"
+                             << bound->rid << ") no longer resolves.");
+                }
+            }
+
+            MAIN_THREAD_EM_ASM({
+                var handle = $0;
+                var ok = $1;
+                var text = UTF8ToString($2);
+                if (typeof window.__etcs_call_done === 'function')
+                    window.__etcs_call_done(handle, ok, text);
+            }, handle, ok ? 1 : 0, text.c_str());
+        });
+}
+
+/*
+ * ── the terminal's output, in chunks rather than in lines ────────────────
+ *
+ * A LINE OF LOG USED TO COST A CROSS-THREAD PROXY AND A REFLOW. Every
+ * ETCS_LOG reaching the browser went through MAIN_THREAD_EM_ASM, which BLOCKS
+ * the calling thread until the main thread runs the body; then the page
+ * postMessage'd it to the terminal frame, which built spans for it, appended
+ * them to a live document and read scrollHeight to follow the tail -- a forced
+ * synchronous layout, per line. Boot prints several thousand lines (the
+ * manifest handshake alone is ~900 rows per module), so the terminal was not
+ * showing the boot, it was pacing it.
+ *
+ * SO THE WRITERS ONLY ACCUMULATE. Appending to a string under a mutex is what
+ * a write costs now -- no proxy, no DOM, no layout. The page drains the buffer
+ * on its own clock (etcs_web_shell_drain) and hands the whole chunk to the
+ * terminal in one go, so a hundred lines that arrive inside one frame are one
+ * postMessage and one reflow instead of a hundred of each.
+ *
+ * AND IT STILL PUSHES IF NOBODY PULLS. A page that does not drain -- an older
+ * copy of the shell page, or one whose timer has stopped -- would otherwise
+ * accumulate silently, so a write that finds no recent pull falls back to the
+ * old proxied push. That is the only path that still pays per write, and only
+ * for as long as nothing is draining.
+ *
+ * THE LOCK IS NEVER HELD ACROSS THE PROXY. MAIN_THREAD_EM_ASM waits for the
+ * main thread, and the main thread's drain wants this same mutex: holding it
+ * over the push is a deadlock with a real path to it. The chunk is swapped out
+ * under the lock and pushed after it is released.
+ */
+namespace {
+std::mutex  g_shell_out_mu;
+std::string g_shell_out;
+double      g_shell_last_pull = 0.0;   // emscripten_get_now() of the last drain
+
+// How stale a pull has to be before a writer decides nobody is draining, and
+// how much may pile up before it pushes anyway (a hidden tab's timers are
+// throttled, not stopped, so this is a ceiling and not the usual path).
+constexpr double  SHELL_PULL_STALE_MS = 750.0;
+constexpr size_t  SHELL_HARD_CAP      = 1u << 20;
+}
+
+namespace {
+/*
+ * Append, and push only if nobody is draining. The one place that decides,
+ * shared by the stdout redirect and by etcs_web_shell_write -- two callers
+ * with the same question.
+ */
+void shell_out_append(const char* text, size_t n)
+{
+    if (!text || n == 0) return;
+    std::string chunk;
+    {
+        std::lock_guard<std::mutex> lock(g_shell_out_mu);
+        g_shell_out.append(text, n);
+        const double now = emscripten_get_now();
+        const bool nobody_pulling = (now - g_shell_last_pull) > SHELL_PULL_STALE_MS;
+        if (!nobody_pulling && g_shell_out.size() < SHELL_HARD_CAP) return;
+        chunk.swap(g_shell_out);
+    }
+    MAIN_THREAD_EM_ASM({
+        var t = UTF8ToString($0);
+        if (typeof window.etcsTermWrite === 'function')
+            window.etcsTermWrite(t);
+        else if (typeof Module !== 'undefined' && Module.print)
+            Module.print(t);
+    }, chunk.c_str());
+}
+
+/*
+ * ── std::cout, into the same buffer ──────────────────────────────────────
+ *
+ * AND THIS IS THE ONE THAT MATTERED. ETCS_LOG's default sink is std::cout and
+ * it flushes per line (Log.h says why: one line, one write, so a transcript
+ * cannot interleave mid-line). Under emscripten that flush is a write to
+ * stdout, stdout is emscripten's `out()`, and out() calls Module.print -- and
+ * from a pthread the whole path is PROXIED TO THE MAIN THREAD, which blocks
+ * the logging thread until the main thread gets a turn. Measured: the boot
+ * script's output arrived at a flat ~54 lines a second, about 18ms each --
+ * one main-thread turn per line -- and the paint page took ~60s to draw a
+ * canvas the runtime had finished building in 0.6s. The terminal was not
+ * showing the boot, it was pacing it.
+ *
+ * So cout goes here instead: an append under a mutex, no FS, no proxy, no DOM.
+ * The page drains it (etcs_web_shell_drain) and hands the terminal one chunk
+ * per tick. Nothing about WHAT is logged changes, and the per-line flush stays
+ * exactly as atomic as it was -- a flush now costs a string append.
+ *
+ * stderr is left alone: it is rare, it is what an abort has time to say, and a
+ * buffered channel is the wrong place for the last words of a dying process.
+ */
+class ShellOutBuf : public ::std::streambuf
+{
+protected:
+    int overflow(int c) override
+    {
+        if (c == traits_type::eof()) return traits_type::not_eof(c);
+        const char ch = static_cast<char>(c);
+        shell_out_append(&ch, 1);
+        return c;
+    }
+    ::std::streamsize xsputn(const char* s, ::std::streamsize n) override
+    {
+        shell_out_append(s, static_cast<size_t>(n));
+        return n;
+    }
+};
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE
+const char* etcs_web_shell_drain()
+{
+    // MAIN THREAD ONLY, and the string outlives the call because ccall's
+    // 'string' return copies it out before anything can run again here.
+    static std::string held;
+    std::lock_guard<std::mutex> lock(g_shell_out_mu);
+    held.swap(g_shell_out);
+    g_shell_out.clear();
+    g_shell_last_pull = emscripten_get_now();
+    return held.c_str();
+}
+
+/*
+ * The explicit write, through the same buffer as everything else. The fallback
+ * push inside shell_out_append is MAIN_THREAD_EM_ASM and not EM_ASM for the
+ * reason it always was: callers include the REPL thread, EM_ASM runs in the
+ * CALLING thread's JS scope, and a Worker's scope has no document, no window
+ * and no etcsTermWrite -- output would land in a Worker console nobody reads
+ * while the terminal sat empty.
+ */
+EMSCRIPTEN_KEEPALIVE
+void etcs_web_shell_write(const char* text)
+{
+    if (!text) return;
+    shell_out_append(text, ::std::strlen(text));
+}
+
+} // extern "C"
+#endif
+
 int main(int argc, char* argv[])
 {
+#if defined(__EMSCRIPTEN__)
+    /*
+     * BEFORE ANYTHING LOGS. Redirecting cout is what takes the per-line proxy
+     * off every ETCS_LOG in the process (see ShellOutBuf); doing it after
+     * shell_startup would leave the first few hundred lines on the slow path,
+     * and those are the ones somebody is watching for.
+     */
+    static ShellOutBuf etcs_web_cout_buf;
+    ::std::cout.rdbuf(&etcs_web_cout_buf);
+#endif
     shell_startup();
+#if defined(__EMSCRIPTEN__)
+    /*
+     * STATIC HERE, because main() does not outlive the session in a browser.
+     *
+     * drive_main_loop_then_exit hands the REPL to a Worker and returns, so main()
+     * returns while that thread is still running and noExitRuntime keeps the page
+     * alive around it. As ordinary locals these would take the SignalContext the
+     * REPL thread uses, and the Root its entities are parented to, down with them.
+     *
+     * Otherwise identical to WIRE_CONTEXT, ctx included -- still parented to
+     * RootSignalContext(), so signal authority is unchanged.
+     */
+    static ETCS::SignalContext ctx;
+    ctx.setParent(&ETCS::RootSignalContext());
+    static ETCS::Root root(ctx);
+    static ETCS::ExecSource loader{"(loader)", 0};
+    static ETCS::ExecutionContext env(&root, &ctx);
+#else
     WIRE_CONTEXT();
+#endif
+#if defined(__EMSCRIPTEN__)
+    // 1) Bind modules on THIS thread via attachModule (no ChangeModuleEvent).
+    //    Ordering thread is still deferred — no concurrent LoaderStream consumer.
+    etcs_web_trace("[trace] before preload_web_modules");
+    ETCS::preload_web_modules(ctx);
+    etcs_web_trace("[trace] after preload_web_modules");
+    // 2) Then arm ThreadPool workers + loader ordering thread for the rest of the run.
+    etcs_web_trace("[trace] before etcs_boot_runtime_threads");
+    etcs_boot_runtime_threads();
+    etcs_web_trace("[trace] after etcs_boot_runtime_threads");
+#endif
     // drive_main_loop_then_exit (CommandExecutor.h) is what every path through
     // main() funnels through so that, once whichever top-level loop
     // applies actually returns -- the user leaving the REPL (`exit`/
@@ -50,6 +487,7 @@ int main(int argc, char* argv[])
         // wait_for_environment_drain returns immediately (see its own comment,
         // CommandExecutor.h, on why an empty registry is correct-and-trivial,
         // not an error) -- this is a legitimate, if uninteresting, no-op.
+        etcs_web_trace("[trace] before drive_main_loop_then_exit");
         return drive_main_loop_then_exit(ctx, 0);
     }
     // ── Script file mode ──────────────────────────────────────────────────────
@@ -180,7 +618,54 @@ int main(int argc, char* argv[])
     // wait_for_environment_drain, which is exactly the gserver.etcs shape
     // this whole switch was added for: run the two `detach` lines, then
     // block on the environment they set up, no prompt involved at all.
+#if defined(__EMSCRIPTEN__)
+    /*
+     * THE SCRIPT RUNS ON A WORKER, so that the same .etcs file runs here and on
+     * the OS side without being written differently for the browser.
+     *
+     * A top-level `->` edge, or a Window.Run, holds the thread that stated it for
+     * as long as the edge lives -- which on the OS side is the point: the script
+     * thread is where a session waits. In a browser the thread reading argv[1] is
+     * the page's, and holding it stops the event loop that delivers every GLFW
+     * event the script is waiting for, so the page freezes with the window half
+     * built. Running the script off that thread makes the blocking form correct
+     * again, and a script that returns immediately is unaffected.
+     *
+     * Detached rather than joined for the same reason: joining would put the wait
+     * back on the main thread. The runtime outlives main() here (see the static
+     * context above), so the thread keeps its script's entities alive.
+     *
+     * Modules are already open and the pool is already armed at this point.
+     */
+    {
+        static std::string  s_script_path = filepath;
+        static std::ifstream s_script_file(std::move(file));
+        static ETCS::ExecutionContext s_script_ctx = script_ctx;
+        ETCS_LOG("ETCS", "[trace] handing '" << s_script_path << "' to a worker");
+        std::thread([]() {
+            ETCS_LOG("ETCS", "[trace] web script thread: entered for '" << s_script_path << "'");
+            try
+            {
+                ETCS::run_script(s_script_file, s_script_path, s_script_ctx);
+                ETCS_LOG("ETCS", "[trace] web script thread: '" << s_script_path << "' returned");
+            }
+            catch (const std::exception& ex)
+            {
+                // An exception escaping a pthread is std::terminate, and in a
+                // Worker that reaches the page with no message at all.
+                ETCS_LOG("ETCS", "web script thread: '" << s_script_path
+                         << "' threw -- " << ex.what());
+            }
+            catch (...)
+            {
+                ETCS_LOG("ETCS", "web script thread: '" << s_script_path
+                         << "' threw a non-std exception.");
+            }
+        }).detach();
+    }
+#else
     ETCS::run_script(file, filepath, script_ctx);
+#endif
     // Clear the interrupt flag so the following loop doesn't instantly exit
     g_sig_int = 0;
     // Drop into whichever top-level loop applies after script completion or

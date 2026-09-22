@@ -13,33 +13,98 @@
 # Adding landing here, before either lobby is detached, is what makes that
 # deterministic rather than a function of which script ran first.
 #
-# The lobbies are detached AFTER Start. Each one spawns `web` by that same name,
-# and spawn_entity retargets a pending name already bound to a live entity of
-# the same module and tag -- PersistentNames is process-scope, not per-script --
-# so they find THIS server instead of minting a second one and failing to bind
-# 8080. Their own Start calls are no-ops: StartConcrete returns false when a
-# manager already exists. Their duplicate FileHtmlPage children are harmless
-# for the same first-match reason, just redundant.
+# The lobbies are detached AFTER Start, and what makes them find THIS server
+# rather than minting a second one that cannot bind 8080 is the verb their own
+# web scripts use: `ensure NetworkProvider::HttpServer web`
+# (NetworkProvider/scripts/chess_web.etcs). `ensure` takes the name if it
+# already resolves and spawns only if it does not; `spawn` ALWAYS creates and
+# refuses a name that already resolves (spawn_entity, core/CommandExecutor.h),
+# so a subscript that spells it `spawn` fails in exactly the session it was
+# written for.
+#
+# Their own Start calls are no-ops: StartConcrete returns false when a manager
+# already exists. Their duplicate FileHtmlPage children are harmless for the
+# same first-match reason, just redundant.
 
 spawn NetworkProvider::HttpServer web
 web.SetPort(8080)
 
+# Cross-origin isolation, site-wide, which is what makes SharedArrayBuffer --
+# and therefore threads -- available at all. /paint is a -pthread wasm build and
+# its Workers die on `wasmMemory is undefined` without these two; the same pair
+# serve_paint.etcs already carries, moved up here because AddHeader is a property
+# of the SERVER and there is one server.
+#
+# Safe for the pages that came first, and checked rather than assumed: every
+# cross-origin url anywhere in www/ is an <a href> (github, youtube,
+# anticurrententropy.com), and COEP governs SUBRESOURCES, not navigation. The
+# one behaviour this does change is that a link opened in a new tab loses
+# window.opener -- which nothing here reads.
+web.AddHeader(Cross-Origin-Opener-Policy same-origin)
+web.AddHeader(Cross-Origin-Embedder-Policy require-corp)
+
 web.spawn(NetworkProvider::StaticHtmlPage landing)
-landing.SetHtmlFromFile(./www/static/index.html)
+landing.SetHtmlFromFile(ACE_ROOT/scripts/www/index.html)
 
 # Everything else is disk layout as url layout: /chess.html, /forum.html,
 # /whitepaper.html. One page type, no per-document entity, and adding a
 # document is copying a file rather than editing this script.
 web.spawn(NetworkProvider::FileHtmlPage tree)
-tree.LoadFromDisk(./www)
+tree.LoadFromDisk(ACE_ROOT/scripts/www)
+tree.ListPaths()
+
+# ── /paint ───────────────────────────────────────────────────────────────────
+#
+# The paint page is a SECOND SELF-CONTAINED SITE: its own index.html, its own
+# modules.json, ~9 MB of wasm. MountTree gives it a prefix of its own, which is
+# what keeps the two index.html files from landing on the same name -- flat, the
+# winner would be attach order, the same fragility the "/" note above has to
+# explain. Every url inside the page is relative, so it does not learn it was
+# mounted; its one absolute link, href="/", now goes where it reads like it goes.
+# Relative is also why the address is /paint/ WITH the slash: from /paint the
+# browser resolves "modules.json" to /modules.json. The server answers the bare
+# spelling with a 301 to the slashed one rather than with the page
+# (FileHtmlPage::ResolveConcrete), so either address works and the page's
+# fetches always land under the prefix.
+#
+# Mounted from PaintProvider's own www/ rather than copied into this repo: the
+# page is that module's, and a copy here is a second thing to keep current.
+tree.MountTree(paint ACE_ROOT/modules/PaintProvider/scripts/www)
+
+# The one copy of the browser runtime: `ace wasm make` writes bin/wasm/ and
+# nothing else does (Makefile, WASM_DIR, on why it is its own directory and why
+# a page never holds a copy).
+tree.MountTree(wasm ACE_ROOT/bin/wasm)
+
+# The scripts the page stages into the browser FS, each at the path it is
+# fetched from (www/modules.json is the source of truth for this list, and
+# serve_paint.etcs mounts the same seven at the root of its own server). A name
+# the page asks for and this does not mount is a 404 -- and the one that matters
+# is render_frames.etcs, the frame pump: losing it leaves a black canvas on a
+# runtime that is otherwise working perfectly.
+tree.MountFile(paint/paint_routed_pointer.etcs ACE_ROOT/modules/PaintProvider/scripts/paint_routed_pointer.etcs)
+tree.MountFile(paint/PaintProvider/scripts/paint_toolbar.etcs ACE_ROOT/modules/PaintProvider/scripts/paint_toolbar.etcs)
+tree.MountFile(paint/PaintProvider/scripts/paint_wheel.etcs ACE_ROOT/modules/PaintProvider/scripts/paint_wheel.etcs)
+tree.MountFile(paint/PaintProvider/scripts/paint_menu.etcs ACE_ROOT/modules/PaintProvider/scripts/paint_menu.etcs)
+tree.MountFile(paint/PaintProvider/scripts/paint_layers.etcs ACE_ROOT/modules/PaintProvider/scripts/paint_layers.etcs)
+tree.MountFile(paint/PaintProvider/scripts/paint_import.etcs ACE_ROOT/modules/PaintProvider/scripts/paint_import.etcs)
+tree.MountFile(paint/RenderProvider/scripts/render_frames.etcs ACE_ROOT/modules/RenderProvider/scripts/render_frames.etcs)
+
+# The terminal view, from ShellProvider's own page rather than a copy of it.
+# Mounted at "shell", which is what the paint page's iframe points at; the MIME
+# comes from the DISK name, so an extensionless url still serves text/html.
+tree.MountFile(paint/shell ACE_ROOT/modules/ShellProvider/scripts/www/index.html)
+
+# Printed again after the paint mounts, not only after LoadFromDisk: this is the
+# fastest way to catch a staging mistake, and every name added above is one the
+# page will ask for.
 tree.ListPaths()
 
 # The tar-pit: a self-registering, gate-level filter that catches
 # bot-scan-shaped paths (.env, wp-admin, .php, ...) and answers them with a
 # deliberately slow 404 instead of routing them anywhere real -- see
 # TarpitNode.h for why it lives here as its own entity rather than a flag on
-# HttpServer or ConnectionManager. The new syntax spawns it at the root level,
-# completely eliminating the old context-switching parsing ambiguity.
+# HttpServer or ConnectionManager.
 spawn NetworkProvider::TarpitNode tarpit
 tarpit.LoadDefaultTarpitPatterns()
 

@@ -18,6 +18,34 @@ ifeq ($(OS),Windows_NT)
 else
     LIB_EXT := so
 endif
+# Web builds produce side modules named *.wasm. Host uname is still Linux
+# under emscripten, so LIB_EXT alone cannot name the artifact -- MODULE_EXTS
+# is every suffix a module target may leave in modules/<name>/.
+MODULE_EXTS := $(LIB_EXT) wasm
+
+# WEB ARTIFACTS GET THEIR OWN DIRECTORY, because a served directory should hold
+# nothing but what is meant to be served: bin/ has the native runtime, the .so
+# modules, run_all_tests.sh and the shader assets in it, and mounting it to
+# reach etcs.wasm publishes every one of them.
+#
+# It is also THE ONE COPY. The alternative is a copy of the artifacts beside
+# each page that uses them, and that fails in the worst available way: forget
+# the copy after a build and the page still answers 200 -- with last epoch's
+# binary, which the loader then refuses on a manifest hash that reads like a
+# build problem. These move together in epochs, one loader and one .wasm per
+# provider; one directory says so, N copies are N chances to be one behind.
+# Every serve script mounts this directory at /wasm/, and every page resolves
+# its modules from there first.
+#
+# The loader side of the same split is ARTIFACT_DIR in the ACE-generated
+# loaders/Makefile; this is the module half, here because this file is what
+# moves a module's artifact.
+WASM_DIR := $(TARGET_DIR)/wasm
+
+# The copy loops below pick their destination PER EXTENSION rather than per
+# build mode, with a one-line case on $$ext -- they already iterate
+# MODULE_EXTS, so this costs nothing, and a tree that somehow holds both a .so
+# and a .wasm still files each where it belongs instead of one winning.
 
 # Registration/Hash files
 ONTOLOGY_HASH_FILE := ./ontology_hashes.h
@@ -39,6 +67,10 @@ ifeq ($(ASAN),1)
     export CXXFLAGS += -fsanitize=address -fno-omit-frame-pointer
     export LDFLAGS  += -fsanitize=address
 endif
+# emscripten: module/loader Makefiles key on ifdef EMSCRIPTEN.
+ifdef EMSCRIPTEN
+    export EMSCRIPTEN
+endif
 
 # ====================================================================
 # PHONY TARGETS
@@ -49,38 +81,72 @@ endif
 # ====================================================================
 # TOP LEVEL TARGETS
 # ====================================================================
-all: generate_hashes modules loaders
+# THE PHASES ARE ORDERED BY A RECIPE, NOT BY PREREQUISITES.
+#
+# As three prerequisites these ran CONCURRENTLY under -j, and two of them ask
+# for generate_hashes themselves -- so a parallel `all` had one process
+# rewriting ontology_hashes.h while another compiled against it. Ordering them
+# here costs nothing: the parallelism worth having is INSIDE modules and
+# loaders, and each sub-make inherits -j through MAKEFLAGS.
+#
+# generate_hashes is not listed separately because both phases below already
+# depend on it, so this now runs the pass twice instead of three times.
+all:
+	$(MAKE) modules
+	$(MAKE) loaders
 
-loaders: clean_loaders generate_hashes
+# generate_hashes IS A PREREQUISITE ONLY WHEN NOBODY ELSE HAS RUN IT.
+#
+# ace does the hash pass once before a batch and then builds the modules
+# concurrently; without this guard every one of those makes would re-run it,
+# which is both N redundant openssl sweeps and N writers on the same three
+# headers. Set in the environment by ace, so it reaches every nested make
+# without being passed along by hand.
+HASH_PREREQ := generate_hashes
+ifdef ACE_HASHES_READY
+    HASH_PREREQ :=
+endif
+
+loaders: clean_loaders $(HASH_PREREQ)
 	@echo "\n--- Building Loaders ---"
 	$(MAKE) -C $(LOADERS_DIR)
 	$(MAKE) copy_loaders
 
-modules: clean_modules generate_hashes
+# ONE RECIPE PER MODULE, NOT ONE LOOP OVER ALL OF THEM: a shell loop inside a
+# recipe is ONE command to make, so -j cannot touch it and every module compiles
+# in series whatever the build was told. $(MODULE_SUBDIRS) under BUILD RULES is
+# the per-directory rule that lets them run in parallel.
+#
+# STILL A SUB-MAKE, and that part is deliberate rather than leftover. Listing the
+# modules as prerequisites of this target would let -j run them CONCURRENTLY WITH
+# clean_modules and generate_hashes, which is a race that deletes artifacts out
+# from under a compile and reads hash headers while they are being rewritten. The
+# phases have to stay ordered; only the middle one parallelises. The sub-make
+# inherits -j through MAKEFLAGS, so nothing has to be passed on by hand.
+modules: clean_modules $(HASH_PREREQ)
 	@echo "\n--- Building Modules ---"
-	@for dir in $(MODULE_SUBDIRS); do \
-		if [ -d "$$dir" ]; then \
-			echo "\n--- Building Module: $$dir ---"; \
-			$(MAKE) -C "$$dir"; \
-		fi; \
-	done
+	$(MAKE) $(MODULE_SUBDIRS)
 	$(MAKE) copy_modules
 
 # ====================================================================
 # SINGLE MODULE TARGETS
 # ====================================================================
-module_%: generate_hashes
+module_%: $(HASH_PREREQ)
 	@echo "\n--- Building Module: $(MODULES_DIR)/$* ---"
 	@if [ ! -d "$(MODULES_DIR)/$*" ]; then \
 		echo "[-] Error: Module '$*' not found in $(MODULES_DIR)/"; exit 1; \
 	fi
 	$(MAKE) -C $(MODULES_DIR)/$*
 	@mkdir -p $(TARGET_DIR)
-	@for f in $(MODULES_DIR)/$*/*.$(LIB_EXT); do \
-		if [ -f "$$f" ]; then \
-			mv -f "$$f" $(TARGET_DIR)/; \
-			echo "✓ Moved: $$f -> $(TARGET_DIR)/"; \
-		fi; \
+	@for ext in $(MODULE_EXTS); do \
+		case "$$ext" in wasm) dest=$(WASM_DIR);; *) dest=$(TARGET_DIR);; esac; \
+		for f in $(MODULES_DIR)/$*/*.$$ext; do \
+			if [ -f "$$f" ]; then \
+				mkdir -p "$$dest"; \
+				mv -f "$$f" "$$dest"/; \
+				echo "✓ Moved: $$f -> $$dest/"; \
+			fi; \
+		done; \
 	done
 
 clean_module_%:
@@ -88,7 +154,7 @@ clean_module_%:
 		echo "[-] Error: Module '$*' not found in $(MODULES_DIR)/"; exit 1; \
 	fi
 	$(MAKE) -C $(MODULES_DIR)/$* clean
-	@rm -f $(TARGET_DIR)/$*.$(LIB_EXT)
+	@rm -f $(TARGET_DIR)/$*.$(LIB_EXT) $(WASM_DIR)/$*.wasm
 
 # ====================================================================
 # HASH GENERATION
@@ -153,11 +219,15 @@ copy_modules:
 	@mkdir -p $(TARGET_DIR)
 	@echo "\n--- Moving Modules to $(TARGET_DIR)/ ---"
 	@for dir in $(MODULE_SUBDIRS); do \
-		for f in $$dir/*.$(LIB_EXT); do \
-			if [ -f "$$f" ]; then \
-				mv -f "$$f" $(TARGET_DIR)/; \
-				echo "✓ Moved module: $$f -> $(TARGET_DIR)/"; \
-			fi; \
+		for ext in $(MODULE_EXTS); do \
+			case "$$ext" in wasm) dest=$(WASM_DIR);; *) dest=$(TARGET_DIR);; esac; \
+			for f in $$dir/*.$$ext; do \
+				if [ -f "$$f" ]; then \
+					mkdir -p "$$dest"; \
+					mv -f "$$f" "$$dest"/; \
+					echo "✓ Moved module: $$f -> $$dest/"; \
+				fi; \
+			done; \
 		done; \
 	done
 
@@ -174,7 +244,7 @@ clean:
 	done
 	@rm -f $(ONTOLOGY_HASH_FILE) $(LIBS_HASH_FILE) $(CORE_HASH_FILE)
 	@rm -f $(TARGET_DIR)/Run_*
-	@rm -f $(TARGET_DIR)/*.$(LIB_EXT)
+	@rm -f $(TARGET_DIR)/*.$(LIB_EXT) $(WASM_DIR)/*.wasm
 	@echo "--- Cleanup Complete ---\n"
 
 clean_loaders:
@@ -188,5 +258,5 @@ clean_modules:
 	@for dir in $(MODULE_SUBDIRS); do \
 		if [ -d "$$dir" ]; then $(MAKE) -C "$$dir" clean; fi; \
 	done
-	@rm -f $(TARGET_DIR)/*.$(LIB_EXT)
+	@rm -f $(TARGET_DIR)/*.$(LIB_EXT) $(WASM_DIR)/*.wasm
 	@echo "--- Module Cleanup Complete ---\n"

@@ -94,6 +94,19 @@
     </div>
   </a>
 
+  <!-- Relative, not absolute like the two above: this one is the same runtime
+       compiled to wasm and served from whichever host is serving this page, so
+       hardcoding anticurrententropy.com would send a local run off-machine. -->
+  <a class="card" href="/paint/">
+    <span class="path">/paint/</span>
+    <span class="name">PAINT</span>
+    <div class="what">The runtime itself, in the tab, drawing.</div>
+    <div class="why">
+      Five providers compiled to wasm, a canvas, a palette and a live shell.
+      Nothing on the server draws anything.
+    </div>
+  </a>
+
   <h2>What it is</h2>
 
   <a class="card" href="https://anticurrententropy.com/whitepaper.html">
@@ -116,7 +129,7 @@
 </main>
 
 <footer>
-  Anticurrent Entropy Inc. · the two demos above are the smallest
+  Anticurrent Entropy Inc. · the demos above are the smallest
   complete instances of the thing, not mockups of it.
 </footer>
 

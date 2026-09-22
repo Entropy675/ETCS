@@ -190,6 +190,43 @@ Which of these two paths is correct is a judgment call for the leaf's
 author, made explicit by the compiler error rather than silently defaulted
 by the language.
 
+### A worked case: `Animating`, and a third resolution
+
+The first real collision in this tree produced neither of the two
+resolutions above, and is worth recording because the reason is general.
+
+`Drawable_` carried `virtual bool Animating()`, meaning *does this subtree
+still need composing*. When `Animated_` was folded in as an orthogonal
+family, its own `Animating()` meant *do I have a step left to take*. Same
+name, same signature, unrelated families — textbook incidental exclusivity,
+and a leaf that was both could not be written, because `AnimatedBase`
+declares its half `final`.
+
+Neither legitimate resolution fitted. An explicit merge would have combined
+two answers that are not two answers to one question: a compositor's "my
+children are still moving" and a stepper's "I am mid-fade" are different
+facts, and a leaf combining them would be stating a policy nobody asked for.
+Composition was worse — the two really are properties of one entity; a
+fading panel genuinely is both a thing being advanced and a thing that will
+need drawing.
+
+The collision was a **symptom of one name covering two concepts**, so the
+fix was to name the second one: `Drawable_::Animating` became
+`Drawable_::NeedsFrame`. That is the act §4's naming subsection describes,
+applied after the fact rather than before it — and it left something the
+merge would have hidden. With two names, the tree question can be *defined
+in terms of* the causal one: `NeedsFrame` defaults to "am I Animated, and if
+so am I still animating", asked by family name. A self-stepping leaf now
+claims `Animated` and writes nothing else, and the two families meet at one
+line instead of once per leaf.
+
+So there is a third resolution, and it is the one to reach for first:
+**rename, and then derive one from the other.** It is available exactly when
+the collision was never a real conflict — when two families picked the same
+word for two things. The compiler cannot tell that case from a genuine
+one; only the author can, and the tell is that neither of the two sanctioned
+resolutions produces a sentence you would want to write down.
+
 ---
 
 ## 6. Summary of the constraint model
@@ -199,7 +236,7 @@ by the language.
 | Lineage (`X → Y`) | Authored, up front | N/A — cumulative, not exclusive | N/A |
 | Siblings (`Y`, `Z` under `X`) | Authored, up front | Same constraint, different specialization | None — genuinely exclusive |
 | Orthogonal families (`Ephemeral_` + `ConnectionState_`) | Authored, at fold-in | N/A — independent axes | N/A — always combinable |
-| Incidental name collision (`C`, `D`) | Lazily, at first attempted combination | Coincidental name/signature overlap | Explicit merge, or composition via `addTag` |
+| Incidental name collision (`C`, `D`) | Lazily, at first attempted combination | Coincidental name/signature overlap | Explicit merge, composition via `addTag`, or rename-and-derive (§5) |
 
 The overall effect is an ontology whose full constraint surface is not
 entirely legible from any single interface file in isolation: two families

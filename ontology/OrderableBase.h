@@ -9,10 +9,10 @@
 // comparison, and catching that here beats catching it inside a sort.
 namespace ETCS { namespace detail {
 template <typename T, typename = void>
-struct has_less : std::false_type {};
+struct has_less : ::std::false_type {};
 template <typename T>
-struct has_less<T, std::void_t<decltype(std::declval<const T&>() < std::declval<const T&>())>>
-    : std::true_type {};
+struct has_less<T, ::std::void_t<decltype(::std::declval<const T&>() < ::std::declval<const T&>())>>
+    : ::std::true_type {};
 } }
 
 // Requires operator< on the leaf, derives the other five from it, and

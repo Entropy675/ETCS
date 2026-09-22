@@ -27,7 +27,7 @@ void* etcs_true_type(Entity* e);
 // compiles, produces a deterministic order, and looks exactly like it
 // worked; you would only catch it by noticing the order happened to match
 // allocation order. (It is also formally unspecified for unrelated
-// pointers; only std::less over pointers is a guaranteed total order.)
+// pointers; only ::std::less over pointers is a guaranteed total order.)
 //
 // So the relation is read one level in, off the pointee, where a type CAN
 // declare it. A list whose pointee declares nothing keeps today's behaviour
@@ -35,12 +35,12 @@ void* etcs_true_type(Entity* e);
 // its storage and its rebuild all live behind `if constexpr`.
 namespace detail {
 template <typename P, typename = void>
-struct has_ordered_pointee : std::false_type {};
+struct has_ordered_pointee : ::std::false_type {};
 template <typename P>
-struct has_ordered_pointee<P, std::void_t<decltype(
-        std::declval<const std::remove_pointer_t<P>&>()
-      < std::declval<const std::remove_pointer_t<P>&>())>>
-    : std::true_type {};
+struct has_ordered_pointee<P, ::std::void_t<decltype(
+        ::std::declval<const ::std::remove_pointer_t<P>&>()
+      < ::std::declval<const ::std::remove_pointer_t<P>&>())>>
+    : ::std::true_type {};
 template <typename P>
 inline constexpr bool has_ordered_pointee_v = has_ordered_pointee<P>::value;
 } // namespace detail
@@ -51,7 +51,7 @@ struct RIDListHandle {
     bool   (*contains)(void* self, RID r)      = nullptr;
     bool   (*remove)  (void* self, RID r)      = nullptr;
     Entity* (*get)    (void* self, RID r)      = nullptr; // New entry
-    void (*collect_rids)(void* self, std::vector<RID>& out) = nullptr;
+    void (*collect_rids)(void* self, ::std::vector<RID>& out) = nullptr;
     // Type-erased insert — for callers holding only a RIDListHandle, with
     // no T in scope. There are TWO of them because recovering the stored T
     // from what such a caller has takes two different exact routes, and
@@ -108,7 +108,7 @@ struct RIDListHandle {
     // rather than a failure, because "no defined order" is a legitimate
     // state for most lists here and not something a caller should special-case.
     void* self                                 = nullptr;
-    void (*collect_rids_ordered)(void* self, std::vector<RID>& out) = nullptr;
+    void (*collect_rids_ordered)(void* self, ::std::vector<RID>& out) = nullptr;
     void (*reorder)(void* self) = nullptr;
     /*
  * NULL WHEN THE POINTEE DECLARES NO ORDER, and that is the signal rather than
@@ -124,17 +124,17 @@ struct RIDListHandle {
  * comparison belongs to that type), so it is reached by a qualified
  * "Provider:Type" and naming that is naming the exemplar's type.
  */
-    void (*search_ordered)(void* self, const void* key, std::vector<RID>& out) = nullptr;
+    void (*search_ordered)(void* self, const void* key, ::std::vector<RID>& out) = nullptr;
     // The same search with the exemplar named by RID -- fully type-erased on
     // both sides, so a caller that cannot name the pointee can still ask.
     // See RIDList::search_ordered_by.
-    void (*search_ordered_by)(void* self, RID exemplar, std::vector<RID>& out) = nullptr;
+    void (*search_ordered_by)(void* self, RID exemplar, ::std::vector<RID>& out) = nullptr;
     size_t  invoke_count()    const { return count(self);             }
     bool    invoke_contains(RID r) const { return contains(self, r);       }
     bool    invoke_remove(RID r)   const { return remove(self, r);         }
     Entity* invoke_get(RID r)      const { return get(self, r);            } 
-    void    invoke_collect_rids(std::vector<RID>& out)  const { return collect_rids(self, out); }
-    void    invoke_collect_rids_ordered(std::vector<RID>& out) const { return collect_rids_ordered(self, out); }
+    void    invoke_collect_rids(::std::vector<RID>& out)  const { return collect_rids(self, out); }
+    void    invoke_collect_rids_ordered(::std::vector<RID>& out) const { return collect_rids_ordered(self, out); }
     void    invoke_reorder() const { reorder(self); }
     void    invoke_insert(RID r, Entity* e) const { insert(self, r, e); }
     void    invoke_insert_iface(RID r, void* iface) const { insert_iface(self, r, iface); }
@@ -142,9 +142,9 @@ struct RIDListHandle {
     RIDListHandle invoke_make_in(MemoryArena& arena, const char* name) const { return make_in(arena, name); }
     // Returns whether this list can be searched at all -- see search_ordered.
     bool    invoke_searchable() const { return search_ordered != nullptr; }
-    void    invoke_search_ordered(const void* key, std::vector<RID>& out) const
+    void    invoke_search_ordered(const void* key, ::std::vector<RID>& out) const
             { if (search_ordered) search_ordered(self, key, out); }
-    void    invoke_search_ordered_by(RID exemplar, std::vector<RID>& out) const
+    void    invoke_search_ordered_by(RID exemplar, ::std::vector<RID>& out) const
             { if (search_ordered_by) search_ordered_by(self, exemplar, out); }
 };
 
@@ -154,7 +154,7 @@ struct RIDList {
     // Define the map type using your ArenaAllocator
     // Note: unordered_map allocates node types, so we must provide the allocator 
     // for the internal pair type.
-    static_assert(std::is_pointer_v<T> && std::is_base_of_v<Entity, std::remove_pointer_t<T>>,
+    static_assert(::std::is_pointer_v<T> && ::std::is_base_of_v<Entity, ::std::remove_pointer_t<T>>,
                   "RIDList<T> requires T to be a pointer to a type derived from Entity.");
     // Stores T, not Entity*. The list is genuinely typed at its own local
     // provider -- inside the module that declared it, where T is a real
@@ -167,12 +167,12 @@ struct RIDList {
     // and is ill-formed -- which is exactly what getTrueType() and
     // getInterfacePointer() exist to route around, and why the two insert
     // slots on the handle take the routes they do.
-    using MapType = std::unordered_map<
+    using MapType = ::std::unordered_map<
         RID,
         T,
-        std::hash<RID>,
-        std::equal_to<RID>,
-        ArenaAllocator<std::pair<const RID, T>>
+        ::std::hash<RID>,
+        ::std::equal_to<RID>,
+        ArenaAllocator<::std::pair<const RID, T>>
     >;
     MapType entities;
 
@@ -201,19 +201,19 @@ struct RIDList {
  * matters, because a bump arena does not reclaim, and a view that
  * reallocated on every rebuild would grow the arena forever.
  */
-    using OrderVec = std::vector<RID, ArenaAllocator<RID>>;
+    using OrderVec = ::std::vector<RID, ArenaAllocator<RID>>;
     mutable OrderVec ordered_;
     mutable bool     ordered_stale_ = true;
 
     // Initialize the map with the singleton arena
     RIDList()
-        : entities(ArenaAllocator<std::pair<const RID, T>>(&MemoryArena::getInstance()))
+        : entities(ArenaAllocator<::std::pair<const RID, T>>(&MemoryArena::getInstance()))
         , ordered_(ArenaAllocator<RID>(&MemoryArena::getInstance())) {}
     // Entity-local variant — used by Entity::addTag<T> so typed children are
     // allocated out of the owning entity's local arena instead of the global
     // singleton, and get torn down with it.
     explicit RIDList(MemoryArena& arena)
-        : entities(ArenaAllocator<std::pair<const RID, T>>(&arena))
+        : entities(ArenaAllocator<::std::pair<const RID, T>>(&arena))
         , ordered_(ArenaAllocator<RID>(&arena)) {}
     void insert(RID rid, T entity) {
         entities[rid] = entity;
@@ -242,13 +242,13 @@ struct RIDList {
  * should not be there at all, but a comparison is the wrong place to
  * discover that.
  */
-    void collect_ordered(std::vector<RID>& out) const {
+    void collect_ordered(::std::vector<RID>& out) const {
         if constexpr (detail::has_ordered_pointee_v<T>) {
             if (ordered_stale_) {
                 ordered_.clear();
                 ordered_.reserve(entities.size());
                 for (auto const& kv : entities) ordered_.push_back(kv.first);
-                std::stable_sort(ordered_.begin(), ordered_.end(),
+                ::std::stable_sort(ordered_.begin(), ordered_.end(),
                     [this](RID a, RID b) {
                         T ea = get_typed(a);
                         T eb = get_typed(b);
@@ -285,17 +285,17 @@ struct RIDList {
  * collect_ordered first, because it is what rebuilds a stale order. Searching a
  * stale index is the one way this could quietly return the wrong range.
  */
-    void search_ordered(const std::remove_pointer_t<T>& key, std::vector<RID>& out) const {
+    void search_ordered(const ::std::remove_pointer_t<T>& key, ::std::vector<RID>& out) const {
         if constexpr (detail::has_ordered_pointee_v<T>) {
-            std::vector<RID> ord;
+            ::std::vector<RID> ord;
             collect_ordered(ord);
-            auto lo = std::lower_bound(ord.begin(), ord.end(), key,
-                [this](RID a, const std::remove_pointer_t<T>& k) {
+            auto lo = ::std::lower_bound(ord.begin(), ord.end(), key,
+                [this](RID a, const ::std::remove_pointer_t<T>& k) {
                     T ea = get_typed(a);
                     return ea ? (*ea < k) : true;     // nulls sort first, as in collect_ordered
                 });
-            auto hi = std::upper_bound(lo, ord.end(), key,
-                [this](const std::remove_pointer_t<T>& k, RID b) {
+            auto hi = ::std::upper_bound(lo, ord.end(), key,
+                [this](const ::std::remove_pointer_t<T>& k, RID b) {
                     T eb = get_typed(b);
                     return eb ? (k < *eb) : false;
                 });
@@ -324,7 +324,7 @@ struct RIDList {
  *
  * The exemplar is included in its own result: it stands where it stands.
  */
-    void search_ordered_by(RID exemplar, std::vector<RID>& out) const {
+    void search_ordered_by(RID exemplar, ::std::vector<RID>& out) const {
         if constexpr (detail::has_ordered_pointee_v<T>) {
             T e = get_typed(exemplar);
             if (!e) return;      // not in this list: no standing to match
@@ -369,20 +369,20 @@ struct RIDList {
             h.get = [](void* self, RID r) -> Entity* {
                 return static_cast<RIDList<T>*>(self)->get(r);
             };
-            h.collect_rids = [](void* self, std::vector<RID>& out) {
+            h.collect_rids = [](void* self, ::std::vector<RID>& out) {
                 auto* list = static_cast<RIDList<T>*>(self);
                 for (auto const& [rid, entity] : list->entities) {
                     out.push_back(rid);
                 }
             };
-            h.collect_rids_ordered = [](void* self, std::vector<RID>& out) {
+            h.collect_rids_ordered = [](void* self, ::std::vector<RID>& out) {
                 static_cast<RIDList<T>*>(self)->collect_ordered(out);
             };
-            h.search_ordered = [](void* self, const void* key, std::vector<RID>& out) {
+            h.search_ordered = [](void* self, const void* key, ::std::vector<RID>& out) {
                 static_cast<RIDList<T>*>(self)->search_ordered(
-                    *static_cast<const std::remove_pointer_t<T>*>(key), out);
+                    *static_cast<const ::std::remove_pointer_t<T>*>(key), out);
             };
-            h.search_ordered_by = [](void* self, RID exemplar, std::vector<RID>& out) {
+            h.search_ordered_by = [](void* self, RID exemplar, ::std::vector<RID>& out) {
                 static_cast<RIDList<T>*>(self)->search_ordered_by(exemplar, out);
             };
             h.reorder = [](void* self) {

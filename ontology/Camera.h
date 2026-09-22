@@ -160,7 +160,7 @@ public:
  * THE DEVICE THIS CAMERA CAN REACH, or null.
  *
  * Concrete and here rather than dispatched, for the reason Drawable.h gives
- * for hoisting anyChildAnimating: every camera needs the identical walk over
+ * for hoisting anyChildNeedsFrame: every camera needs the identical walk over
  * the identical child list, and a copy per leaf is how two of them end up
  * disagreeing. The walk is the one the ontology already uses -- typed
  * children, asked by family name, resolved at the point of use rather than
@@ -173,7 +173,7 @@ public:
  */
     Device_* DeviceSource()
     {
-        std::vector<std::pair<ETCS::Buffer, ETCS::RID>> kids;
+        ::std::vector<::std::pair<ETCS::Buffer, ETCS::RID>> kids;
         this->getTypedChildren(kids);
         for (const auto& entry : kids)
         {

@@ -260,7 +260,7 @@ struct IWireThread
 // ---------------------------------------------------------------------------
 // The observer's own end of one edge. Defined in core because it crosses the
 // wire: two words, trivially copyable, fixed layout -- the same reason TBuffer
-// exists rather than std::string.
+// exists rather than ::std::string.
 //
 // slot is a CACHE of the RID->position inversion, never a replacement for it.
 // The RID stays the identity; the slot makes reading the edge a load and a
@@ -317,6 +317,22 @@ struct IWireObservable
      * (ObservableBase::MarkObservedBelow).
      */
     virtual void MarkObservedLocal(uint64_t origin_rid) = 0;
+
+    /*
+     * A SEQUENCE OF WRITES IS ONE CHANGE -- open one, and the marks inside it
+     * set observers' edges without walking upward until it closes, which then
+     * makes the single statement the sequence was.
+     *
+     * On the wire for the same reason MarkObservedLocal is: the caller that
+     * needs it is usually in another module, writing into a raster it reached by
+     * family, and it holds neither the leaf type nor the base. Use
+     * etcs_observed_batch (ontology/Observable.h) rather than these directly --
+     * a Begin without its End is an entity that never announces again.
+     *
+     * Not a lock. It changes when a statement is made, not who may write.
+     */
+    virtual void BeginBatch() = 0;
+    virtual void EndBatch()   = 0;
 
     // Read-and-clear through a held edge: index, verify, test-and-clear. No
     // search, and a stale handle is detected rather than aliased.
