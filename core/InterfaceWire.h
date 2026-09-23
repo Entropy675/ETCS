@@ -249,9 +249,11 @@ struct IWireThread
 //
 // The general causal structure: something records the state of another and
 // wants to know when that changes. Nothing about pixels, cameras or hashes --
-// those are USERS of it. The merkle hash in particular is its own independently
-// updated structure that happens to fit this shape exactly; it observes and
-// marks through here rather than living on this surface.
+// those are USERS of it. The runtime hash in particular (Entity::getHash) is
+// its own independently updated structure that fits this shape exactly: the
+// same funnel that marks an edge here bumps the hash epoch of every ancestor
+// (Entity::markStateChange), and an observer that hears an edge pulls the hash
+// to learn what the subtree is now.
 //
 // Dirty is PER OBSERVER, which is the whole reason this is a wire and not a
 // bool. Two cameras viewing one scene each need telling once; a single

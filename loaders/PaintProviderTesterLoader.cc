@@ -310,6 +310,21 @@ int main()
         }
     }
 
+    // ── 5b ───────────────────────────────────────────────────────────────
+    // The runtime hash over a REAL provider tree, after everything above moved
+    // it: an audit finds no cache that disagrees with its state, which is the
+    // claim that every write to the tag surface in this module went through a
+    // funnel. A divergence here is a hole in a provider, not in the hash.
+    std::cout << "\n== 5b. the runtime hash audits clean over the document ==\n";
+    {
+        (void)doc->getHash();
+        ETCS::Entity::HashAudit a = etcs_root_hash(doc);
+        std::printf("        (nodes %zu, diverged %zu, skipped %zu)\n", a.nodes, a.diverged, a.skipped);
+        check(a.nodes >= 1, "the audit walked the document");
+        check(a.diverged == 0, "no cache under the document disagrees with its state");
+        check(doc->getHash() == a.top_hash, "the lazy pull agrees with the audit");
+    }
+
     // ── 6 ────────────────────────────────────────────────────────────────
     std::cout << "\n== 6. teardown is clean and idempotent ==\n";
     pin->call("PaintInput.Delete", "", ctx);
