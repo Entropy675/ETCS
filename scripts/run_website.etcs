@@ -135,4 +135,11 @@ web.IsStarted()
 detach ChessProvider/scripts/chess_lobby.etcs
 detach forum_lobby.etcs
 
+# THE PAINT SESSION HOST, on this server. The page's share button talks to
+# /art on its own origin (defaultNode in PaintProvider's www/index.html), and
+# without this line nothing answers there: "[etcs] share: no answer from
+# .../art" is exactly that. paint_lobby.etcs ensures `web` and adds the route,
+# the same way the chess lobby joins -- after Start, for the reason above.
+detach PaintProvider/scripts/paint_lobby.etcs
+
 # http://localhost:8080/
