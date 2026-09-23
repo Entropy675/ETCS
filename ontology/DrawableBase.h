@@ -60,7 +60,9 @@ ETCS_SUPERTYPE_BASE(Drawable), public SurfaceBase<Derived>
      *
      * ContainsLocal is untouched, because that is a question about a rectangle
      * rather than about a node's participation -- and a router that keeps its own
-     * set of live panes has its own answer.
+     * set of live panes has its own answer. The other way a node declines a
+     * pick without lying about its rectangle is the `passthrough` flag, which
+     * PickAt asks beside this: drawn, never hit.
      *
      * The expansion of the dispatch macro, written out, because the guard has to
      * sit between the family entry and the leaf's Concrete.
