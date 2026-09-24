@@ -658,13 +658,25 @@ private:
         // code path with nothing to disagree with itself.
         slab->hugepage_aligned = (origin == PageOrigin::ExplicitHuge);
 
-        if (!slab->hugepage_aligned && !hugepage_fallback_warned_)
+        /*
+         * SAID ONLY WHEN THERE WAS SOMETHING TO MISS: on Linux, and only for
+         * plain pages. THP-madvise is what a stock system gives (no reserved
+         * vm.nr_hugepages) and still backs the slab with huge pages where it
+         * can, and elsewhere -- a browser, a Mac -- there is no huge page to
+         * ask for. Said every run by every module, it was noise.
+         */
+#ifdef __linux__
+        const bool missed = (origin == PageOrigin::Plain);
+#else
+        const bool missed = false;
+#endif
+        if (missed && !hugepage_fallback_warned_)
         {
             hugepage_fallback_warned_ = true;
             ETCS_LOG("MemoryArena",
-                "True huge pages unavailable for at least one child-page-pool slab "
-                "(fell back to " << (origin == PageOrigin::TransparentHuge ? "THP-madvise" : "plain mmap")
-                << ") -- likely vm.nr_hugepages exhaustion. Purely a TLB/performance "
+                "Huge pages unavailable for at least one child-page-pool slab "
+                "(fell back to plain mmap) -- neither vm.nr_hugepages nor THP answered. "
+                "Purely a TLB/performance "
                    "signal now -- page-ownership tracking is uniform regardless (see "
                    "resolveSlabLocked's own comment), so this has no correctness impact "
                    "at all, not even the reduced one it used to have.");
