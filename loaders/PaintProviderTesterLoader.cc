@@ -114,10 +114,21 @@ int main()
     // make_typed_child is the C++ spelling of `doc.spawn(...)`; there is no
     // AddLayer to call afterwards, and nothing to keep in step -- membership is
     // parenthood (PaintDocument::OrderedLayers).
+    //
+    // TWO LAYERS, AS THE PAGE HAS: an opaque white paper under a transparent
+    // ink layer. The checks below read "untouched" as white, and white has to
+    // come from the document -- the view clears to the sheet's own dark before
+    // every render (PaintSurface::Render, so a pan cannot smear), so a document
+    // with one transparent layer shows the plate wherever nothing was painted.
+    ETCS::Entity* paper = ETCS::make_typed_child("PaintProvider", "PaintLayer", doc, loader);
     ETCS::Entity* layer = ETCS::make_typed_child("PaintProvider", "PaintLayer", doc, loader);
-    if (!layer) { std::cerr << "cannot spawn PaintProvider:PaintLayer under the document\n"; return 1; }
+    if (!paper || !layer) { std::cerr << "cannot spawn PaintProvider:PaintLayer under the document\n"; return 1; }
 
+    paper->call("PaintLayer.Create", SIZE.c_str(), ctx);
+    paper->call("PaintLayer.SetOrder", "0", ctx);
+    paper->call("PaintLayer.Clear", "1.0 1.0 1.0 1.0", ctx);
     layer->call("PaintLayer.Create", SIZE.c_str(), ctx);
+    layer->call("PaintLayer.SetOrder", "1", ctx);
     doc->call("PaintDocument.SetActiveLayer", rid_arg(layer).c_str(), ctx);
     psurf->call("PaintSurface.Create", rid_arg(canvas).c_str(), ctx);
     psurf->call("PaintSurface.AttachDocument", rid_arg(doc).c_str(), ctx);
@@ -169,10 +180,11 @@ int main()
     canvas->call("ImageSurface.Clear", "1.0 1.0 1.0 1.0", ctx);
     layer->call("PaintLayer.DrawLine", "0 48 127 48 0.0 1.0 0.0 1.0", ctx);
     doc->call("PaintDocument.RenderToSurface", (rid_arg(canvas) + " 0 0").c_str(), ctx);
-    // BlitTo subsamples on a 4px grid, so the line at y=48 is carried by the
-    // stamp whose top row is y=48. Sampling inside that stamp tests the line;
-    // sampling at y=50 would be testing the subsample rate.
-    check_pixel(px, 64, 49, { 0, 255, 0, 255 }, 8, "DrawLine composited through the document");
+    // ON THE LINE'S OWN ROW. BlitTo is an exact resample now (one output pixel
+    // from one inverse-mapped source pixel), so a one-pixel line at y=48 is at
+    // y=48 and nowhere else; the old 4px-grid stamp that used to carry it to
+    // y=49 is gone, and sampling there was testing the stamp.
+    check_pixel(px, 64, 48, { 0, 255, 0, 255 }, 8, "DrawLine composited through the document");
     check_pixel(px, 64, 10, { 255, 255, 255, 255 }, 2, "and left the rest of the canvas alone");
 
     // ── 4: visibility gating ─────────────────────────────────────────────
