@@ -87,6 +87,20 @@ tree.SetMountPrefix(paint)
 run PaintProvider/scripts/paint_mounts.etcs tree=tree
 tree.SetMountPrefix()
 
+# ── /chess ───────────────────────────────────────────────────────────────────
+#
+# /chess/ is the LOBBY LIST (scripts/www/chess/index.html): the name server's
+# list of everyone online, what game their lobby is for, and who sits with
+# them -- read from /game, which chess_lobby.etcs mounts below. The game a row
+# opens is the wasm chess page, mounted two deep at /chess/play/ from its own
+# module's list (ChessProvider/scripts/chess_mounts.etcs); it plays on the
+# visitor's own runtime and uses this site only as its name server. The
+# server-played page it replaced is at /chess-classic, and /chess.html
+# forwards there (or here) so old links still land.
+tree.SetMountPrefix(chess/play)
+run ChessProvider/scripts/chess_mounts.etcs tree=tree
+tree.SetMountPrefix()
+
 # Printed again after the paint mounts, not only after LoadFromDisk: this is the
 # fastest way to catch a staging mistake, and every name added above is one the
 # page will ask for.
