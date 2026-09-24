@@ -420,6 +420,20 @@ protected:
 };
 }
 
+/*
+ * The navigator's current menu, as JSON (CommandExecutor.h, repl_menu_publish):
+ * what the page draws as buttons when it is showing buttons rather than a
+ * command line. Polled on the drain's clock; a serial inside says whether it
+ * moved. Main thread only, same string-lifetime bargain as the drain.
+ */
+extern "C" EMSCRIPTEN_KEEPALIVE
+const char* etcs_web_shell_menu()
+{
+    static std::string held;
+    held = repl_menu_json();
+    return held.c_str();
+}
+
 extern "C" EMSCRIPTEN_KEEPALIVE
 const char* etcs_web_shell_drain()
 {
