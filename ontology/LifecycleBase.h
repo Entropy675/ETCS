@@ -45,8 +45,8 @@ ETCS_SUPERTYPE_BASE(Lifecycle)
         static_cast<Derived*>(this)->ReleaseConcrete();
         // Delete is NOT called from here, and the obvious version of that hangs:
         //
-        //     DestroyEvent::operator()  <-  VulkanSurface::DeleteConcrete
-        //                               <-  LifecycleBase<VulkanSurface>::Release
+        //     DestroyEvent::operator()  <-  HostSurface::DeleteConcrete
+        //                               <-  LifecycleBase<HostSurface>::Release
         //
         // Delete's body is a blocking request to the loader to destroy this RID,
         // and Release runs from inside the arena walk already destroying it, so

@@ -249,4 +249,40 @@ private:
     }
 };
 
+/*
+ * A RASTER'S BYTES, WHEN THEY ARE ITS PICTURE -- or null.
+ *
+ * Writing straight into a destination's Pixels_ is the fast path several
+ * drawables take instead of the Surface verbs: one blend over a row instead of
+ * a dispatched call per rect. It is only right while those bytes ARE what gets
+ * shown. A surface with a Device under it (ontology/Device.h) may be drawing
+ * through that device instead, where its host bytes are the floor it falls
+ * back to, not the frame -- and a write there never reaches the screen. So the
+ * fast path asks this, and a raster with a Device child is written through its
+ * verbs, which it answers on whichever side it is drawing.
+ *
+ * Any Device, ready or not: a device that is still arriving (a browser's
+ * comes asynchronously) is one the surface will switch to, and a picture it
+ * keeps across that switch has to have been drawn through the verbs.
+ */
+inline Pixels_* etcs_direct_pixels(Pixels_* px)
+{
+    if (!px) return nullptr;
+    ETCS::Entity* e = static_cast<ETCS::Entity*>(px);
+    ::std::vector<::std::pair<ETCS::Buffer, ETCS::RID>> kids;
+    e->getTypedChildren(kids);
+    for (const auto& k : kids)
+    {
+        ETCS::Entity* c = e->getTypedChild(k.first, k.second);
+        if (c && c->getInterfacePointer(ETCS::Buffer("Device"))) return nullptr;
+    }
+    return px;
+}
+
+inline Pixels_* etcs_direct_pixels(ETCS::Entity* e)
+{
+    return e ? etcs_direct_pixels(static_cast<Pixels_*>(e->getInterfacePointer(ETCS::Buffer("Pixels"))))
+             : nullptr;
+}
+
 #endif

@@ -390,8 +390,8 @@ public:
 
 // ---------------------------------------------------------------------------
 // The other side of the raster split (ontology/Raster.h): a Drawable2D whose
-// pixels are somewhere this process cannot address. VulkanSurface is the real
-// one; this is the same claim with the device replaced by two numbers, which
+// pixels are somewhere this process cannot address. No RenderProvider leaf
+// claims it today (ontology/Renderable.h); this is the same claim with the device replaced by two numbers, which
 // is all the ontology can see of a device anyway.
 //
 // Drawable2D as well as Renderable, deliberately -- the coordinate-origin walk
@@ -1256,7 +1256,7 @@ int main()
     // lists that resolve reads -- probed: MISS. The OLD FollowResize resolved
     // at fire time for the same reason and would miss identically, so this is
     // the tester's reach, not a change in behaviour. The full pull is covered
-    // where entities are loader-spawned (VulkanSurface follows GLFWWindow).
+    // where entities are loader-spawned (the window surface follows GLFWWindow).
     //
     // What IS checkable here is the part that used to be a callback list: that
     // following registers an observation edge on the SOURCE, and that a resize

@@ -11,7 +11,7 @@
 #      creation and event polling to whichever thread called them, so
 #      whatever creates the window here has to be whatever polls it. That
 #      is main.Create() below, and then view.RunDemo() (which polls the
-#      parent window every frame -- VulkanSurface::RunDemo). Non-negotiable.
+#      parent window every frame -- HostSurface::RunDemo). Non-negotiable.
 #
 #   2. A ThreadPool worker -- Window.ProduceEvents. Every produce body is
 #      enqueued onto the pool (DEFINE_STREAM_FUNC_PRODUCE, ETCS_API.h), and

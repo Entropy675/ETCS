@@ -42,8 +42,8 @@ ETCS_SUPERTYPE_BASE(Threaded)
  *   script's Delete, the body's own poll), and it has to be answered before
  *   the tag write, which can be refused.
  *
- *   Halted() is polled from frame loops -- VulkanSurface::Retired() is the
- *   first question ProduceFrames and ConsumeFrames ask on every tick. That is
+ *   Halted() is polled from frame loops -- the window surface's Retired() is
+ *   the first question its frame tick asks every time round. That is
  *   an atomic load; hasTag is a mutex and a map lookup.
  *
  * So the flag is the RECORD and the atomic is the LATCH, written together on
@@ -123,7 +123,7 @@ ETCS_SUPERTYPE_BASE(Threaded)
 
     // Refused, because owning a body is not being an actor. A Thread overrides
     // this (ontology/ThreadBase.h); everything else that merely has a loop --
-    // VulkanSurface's frame producer, say -- correctly says no. Same shape as
+    // a window surface's frame tick, say -- correctly says no. Same shape as
     // Resizable_::ResizeTo defaulting false.
     uint64_t Detach(const ETCS::Buffer&) override { return 0; }
 

@@ -40,9 +40,11 @@
 # flatten, the near clip, the perspective divide, the fan and the depth test
 # are arithmetic about a scene and a lens, identical either way. What differs
 # is where a surviving run of pixels goes -- written as bytes into the camera's
-# buffer, or emitted as one DrawRect through the destination. On a
-# VulkanSurface those are device rects, so the frame is produced by the GPU and
-# never exists as host pixels at all. That is the same thing
+# buffer, or emitted as one DrawRect through the destination. Onto a
+# destination that draws through a device those are device rects, and the
+# frame is produced by the GPU without existing as host pixels; here the
+# destination is `stage`, a host compositor, which the window then draws
+# through ITS device as one texture. That is the same thing
 # PolygonDrawable2D has always done one dimension down.
 
 spawn RenderProvider::Instance gpu
