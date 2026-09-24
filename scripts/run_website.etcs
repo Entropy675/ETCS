@@ -8,10 +8,11 @@
 # Order matters twice over.
 #
 # The LANDING PAGE is added first. HttpServer::ResolvePath walks typed children
-# in the order they were added and takes the first match, and chess_web.etcs's
-# own board_page also answers "/" -- so whichever is attached first owns it.
-# Adding landing here, before either lobby is detached, is what makes that
-# deterministic rather than a function of which script ran first.
+# in the order they were added and takes the first match, so a page a lobby
+# script attached could otherwise answer "/" too. Adding landing here, before
+# any lobby is detached, is what makes that deterministic rather than a
+# function of which script ran first. (chess_web.etcs attaches no pages now:
+# only the /game route.)
 #
 # The lobbies are detached AFTER Start, and what makes them find THIS server
 # rather than minting a second one that cannot bind 8080 is the verb their own
