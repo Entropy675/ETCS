@@ -4164,11 +4164,16 @@ inline void etcs_module_root_hash(const ::std::vector<const RIDListHandle*>& row
 
 /*
  * The one root. From a MODULE this is its own image's lists, published under
- * ETCS_MODULE_NAME; from the LOADER it is its own lists plus every module's
- * mirrored rows, grouped by the module that published them. So the same call
- * answers "this module's state" inside a module and "the process's state"
- * inside the loader, which is the only difference between the two images the
- * chain has to know about.
+ * ETCS_MODULE_NAME. From the LOADER it is every module's rows and NOT its
+ * own: the loader is the true outside of the system -- the thing that
+ * observes the chain, carries the signature and will carry the debugger --
+ * and the observer is not part of the observed. Natively a module's rows are
+ * the mirror rows it published; in a collapsed image (the browser) every
+ * module's rows sit in the loader's own map, so they are grouped by the type
+ * owner index instead, and a row no module owns (the loader's own family
+ * aggregates) is left out. Both images therefore digest the same modules
+ * over the same lists, which is what lets a root be compared across an
+ * address.
  */
 inline void etcs_global_root_hash(ETCS::EventNode* owner, unsigned char out[32],
                                   size_t* modules = nullptr, size_t* entities = nullptr)
@@ -4176,11 +4181,23 @@ inline void etcs_global_root_hash(ETCS::EventNode* owner, unsigned char out[32],
     ::std::map<ETCS::Buffer, ::std::vector<const RIDListHandle*>> by_module;
     if (owner)
     {
-        auto& own = by_module[ETCS::Buffer(ETCS_MODULE_NAME)];
-        for (auto& entry : owner->ridMap) own.push_back(&entry.second);
+#ifdef ETCS_LOADER
         for (auto& bucket : owner->ridMirror)
             for (auto& row : bucket.second)
                 by_module[row.module].push_back(&row.handle);
+        if (owner->ridMirror.empty())
+        {
+            for (auto& entry : owner->ridMap)
+            {
+                const ::std::string* who = owner->stream.typeOwner(entry.first.toString());
+                if (!who) continue;                            // nobody's: the outside
+                by_module[ETCS::Buffer(who->c_str())].push_back(&entry.second);
+            }
+        }
+#else
+        auto& own = by_module[ETCS::Buffer(ETCS_MODULE_NAME)];
+        for (auto& entry : owner->ridMap) own.push_back(&entry.second);
+#endif
     }
 
     picohash_ctx_t ctx;
