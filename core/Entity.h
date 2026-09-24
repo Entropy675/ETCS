@@ -26,6 +26,9 @@
 #include <thread>  // the loader stream pair waits out its producer body
 #include <chrono>
 #include <string>
+#include <algorithm>
+#include <set>
+#include <map>
 #include <unordered_map>   // the region-digest table below
 namespace ETCS
 {
@@ -327,6 +330,34 @@ private:
     ::std::vector<ETCS::Buffer, ArenaAllocator<ETCS::Buffer>> typed_child_order_{
         ArenaAllocator<ETCS::Buffer>(local_arena_)
     };
+    /*
+ * ---------------------------------------------------------------------
+ * THE NODE HASH -- this entity's state surface and everything under it, as
+ * one 64-bit value, recomputed only when pulled and only if something moved.
+ *
+ * Three atomics and no flag. `hash_epoch_` counts state transitions on this
+ * node or anything below it (every funnel that moves the surface bumps it,
+ * on every ancestor -- markStateChange); `hash_valid_epoch_` is the epoch the
+ * cached value was computed AT. The cache is current exactly when the two
+ * agree, which is what makes a transition landing DURING a recompute safe
+ * without a lock: the epoch it bumps is the one the recompute is about to
+ * compare against, so the value is stored but never believed. A separate
+ * stale bit had a window between "compare" and "clear" where a mark was lost.
+ *
+ * Mutable, because pulling a hash is an observation, not a change: a const
+ * walk over the tree must be able to fill the caches it passes.
+ * ---------------------------------------------------------------------
+ */
+    mutable ::std::atomic<uint32_t> hash_epoch_{1};
+    mutable ::std::atomic<uint32_t> hash_valid_epoch_{0};
+    mutable ::std::atomic<uint64_t> hash_cached_{0};
+    /*
+ * The full digest, kept only where the node hash IS a digest: a parentless
+ * entity (see computeNodeHash). Written before hash_valid_epoch_ and read
+ * under it seqlock-style (getDigest), so a reader that races a recompute
+ * sees the epoch move and reads again rather than taking a torn copy.
+ */
+    mutable unsigned char           hash_digest_[32] = {};
     /*
  * Per-entity registry of every currently-in-flight stream call's own
  * SignalContext -- see Scope's own comment (Bundles.h) for the full
@@ -1139,6 +1170,7 @@ public:
  * is public, so it's checked rather than assumed.
  */
         if (!newParent || newParent == this) return;
+        bool moved = false;
         /*
  * BOTH locks, held together for the whole migration. The old body
  * only took this entity's own, which was sufficient only because it
@@ -1162,6 +1194,7 @@ public:
  * parent's list by a concurrent getTypedChildren()/getTypedChild()
  * on some other thread.
  */
+        {   // both locks end before the mark below, which takes them again
         ::std::lock_guard<::std::mutex> self_lock(m_tagMutex);
         ::std::lock_guard<::std::mutex> dest_lock(newParent->m_tagMutex);
         for (auto& [tag, handle] : typed_children_)
@@ -1254,8 +1287,18 @@ public:
  * allocation -- see SignalContext::provider's own comment.
  */
                 child->ctx_.setProvider(&newParent->ctx_);
+                moved = true;
             }
         }
+        }
+        /*
+ * A MIGRATION IS A SUBTREE CHANGE ON THE RECEIVING SIDE, and not through any
+ * funnel: the children arrive in newParent's lists without an AddTagEvent, so
+ * nothing else bumps its hash epoch or tells its observers. The dying side
+ * needs nothing -- its retire path marks its own parent. Outside the locks,
+ * because markStateChange walks parents and takes their mutexes.
+ */
+        if (moved) markStateChange(newParent, getRID());
     }
 #ifdef ETCS_LOADER
     /*
@@ -1406,6 +1449,110 @@ public:
         ::std::lock_guard<::std::mutex> lock(m_tagMutex);
         for (auto const& [key, _] : flags_) result.push_back(key);
     }
+    /*
+ * ═══ THE RUNTIME HASH ════════════════════════════════════════════════════
+ *
+ * Two values, two costs, one tree.
+ *
+ * SURFACE HASH -- this node alone: its tag surface, which is the whole of
+ * what a state transition can move (markStateChange). Bare is-a markers,
+ * dispatch tags, origin-affixed relations and flags, each length-prefixed
+ * and typed, in SORTED order -- nothing in the runtime reads the order of
+ * these two maps, so their order is not state. Type-local variables are NOT
+ * in it, on purpose: a position going from 10 to 40 is not a transition until
+ * the physics trait says "falling", and then the flag is.
+ *
+ * NODE HASH -- the surface, then the typed children in the order dispatch
+ * and wrap chains read them (typed_child_order_: first-attachment order of
+ * each tag; within one tag, ascending RID, because the list is a hash map
+ * with no order of its own and RIDs are deterministic). Each child
+ * contributes its tag, its RID and its own node hash, so the value is a
+ * merkle root over the subtree and a change anywhere below moves it.
+ *
+ * XXH3 BELOW A GLOBAL SCOPE BOUNDARY, SHA-256 AT ONE. A node's hash is in
+ * flux on every transition under it -- every flag, every stream call's scope
+ * tag -- and is recomputed lazily on pull. What that surface needs is speed
+ * and equality, not resistance to a forged collision: a forgery has to keep
+ * colliding at every later step of a state that keeps moving, and every
+ * consequence it has lands in another hashed leaf. So every node UNDER a
+ * parent hashes with XXH3. A PARENTLESS entity is a global-scope boundary --
+ * the top of a branch a script named, the thing a module's registry holds
+ * directly -- and its node hash is SHA-256 over the same input (getDigest;
+ * getHash answers its first 64 bits). Above that, etcs_module_root_hash puts
+ * SHA-256 over a module's parentless entities and etcs_global_root_hash over
+ * every module's, so the chain reaches one root from any node, and is
+ * cryptographic from the first boundary up. The strong hash is paid once per
+ * branch per pull, never per transition.
+ *
+ * Domain-separated: a surface hashes under 0x00, a node under 0x01, a module
+ * under 0x03, the global root under 0x04, so no input can be read as
+ * another level's.
+ * ═════════════════════════════════════════════════════════════════════════
+ */
+    uint64_t surfaceHash() const;
+
+    /*
+ * The lazy pull. Current cache: one load and a compare. Otherwise recompute
+ * the subtree -- children are pulled the same way, so a still subtree costs
+ * its cached value and only the path that moved is walked. The epoch read
+ * BEFORE the recompute is the one the cache is stamped with, which is what
+ * makes a transition landing mid-recompute stay visible (see hash_epoch_).
+ *
+ * Observers pull this the way they pull any cached state: an Observable edge
+ * says something below moved, and the pull says what the subtree is now.
+ *
+ * SO THE WORK CLUSTERS WHERE THE CHANGES ARE. A transition costs one
+ * increment per ancestor and no hashing; hashing is paid by whoever pulls,
+ * and only down the paths that moved since they last did. A leaf under an
+ * input loop recomputes as often as something looks at it; a branch that
+ * changes slowly and is read rarely costs nothing between reads. Nothing is
+ * recomputed on a schedule.
+ */
+    uint64_t getHash() const;
+
+    // Whether a pull would answer from the cache. What an audit compares
+    // against: a current cache that disagrees with a recompute is a change
+    // that never went through a funnel.
+    bool hashCurrent() const
+    {
+        return hash_valid_epoch_.load(::std::memory_order_acquire)
+            == hash_epoch_.load(::std::memory_order_acquire);
+    }
+    uint64_t hashCached() const { return hash_cached_.load(::std::memory_order_acquire); }
+
+    // Say this node's subtree moved, without saying why. What the funnels do
+    // through markStateChange; exposed for a walk that finds a divergence and
+    // has to make the tree above it recompute.
+    void markHashStale() const { hash_epoch_.fetch_add(1, ::std::memory_order_acq_rel); }
+
+    // The 32-byte form. For a parentless entity this is its node hash in
+    // full (SHA-256); for a child it is SHA-256 over the same input its XXH3
+    // node hash was taken from -- what an audit of a subtree reports as its
+    // root. Same laziness as getHash.
+    void getDigest(unsigned char out[32]) const;
+    bool isGlobalScope() const { return parent_ == nullptr; }
+
+    // The recompute every pull shares. `audit` non-null forces every level to
+    // recompute rather than trust its cache, and reports each node whose
+    // current cache disagrees with what its state hashes to now. `digest`
+    // non-null receives the SHA-256 of this node's input; for a parentless
+    // entity the returned value is its first 64 bits.
+    struct HashAudit;
+    uint64_t computeNodeHash(HashAudit* audit, unsigned char* digest) const;
+
+    // The epoch a recompute reads before it starts, and the stamp it leaves
+    // after. Public rather than friended (this class friends nothing), and
+    // only meaningful as the pair: a stamp with an epoch read AFTER the
+    // recompute would believe a value the recompute did not see. The digest
+    // lands first, so a reader that sees the epoch sees the digest.
+    uint32_t hashEpoch() const { return hash_epoch_.load(::std::memory_order_acquire); }
+    void     stampHash(uint64_t h, uint32_t epoch, const unsigned char* digest = nullptr) const
+    {
+        if (digest) ::std::memcpy(hash_digest_, digest, 32);
+        hash_cached_.store(h, ::std::memory_order_release);
+        hash_valid_epoch_.store(epoch, ::std::memory_order_release);
+    }
+
     void registerInterfacePointer(const ETCS::Buffer& family, void* ptr)
     {
         ::std::lock_guard<::std::mutex> lock(m_tagMutex);
@@ -2241,16 +2388,27 @@ private:
  *
  * Callers hold no lock here. MarkObserved takes its own and walks parents.
  */
+    /*
+ * AND THE ONE PLACE A STATE CHANGE BECOMES A STALE HASH. The two walks differ
+ * in where they stop: the Observable mark stops at the nearest claimant,
+ * which bubbles on its own; the hash has no claimant to bubble from -- every
+ * ancestor's node hash covers this node, so every ancestor's epoch moves. An
+ * atomic increment per level, and the levels are the depth of a tree that is
+ * rarely more than a handful deep.
+ */
 public:
     static void markStateChange(Entity* from, RID origin)
     {
+        bool told = false;
         for (Entity* n = from; n; n = n->getParent())
         {
             if (n->isDestructed()) return;
+            n->hash_epoch_.fetch_add(1, ::std::memory_order_acq_rel);
+            if (told) continue;
             void* p = n->getInterfacePointer(ETCS::Buffer("Observable"));
             if (!p) continue;
             static_cast<ETCS::IWireObservable*>(p)->MarkObserved(origin);
-            return;
+            told = true;
         }
     }
 private:
@@ -3698,6 +3856,371 @@ private:
     Base*        ptr_ = nullptr;
     LifetimeHold hold_;
 };
+
+/*
+ * ═══ RUNTIME HASH -- definitions ═════════════════════════════════════════
+ *
+ * Below LifetimeHold, because the walk holds each child while it recurses:
+ * getTypedChild answers a pointer, and a Delete racing the walk could reclaim
+ * it between the answer and the read. A child that refuses the hold is
+ * retiring; it is skipped, and the retire funnel has already bumped this
+ * node's epoch, so the value computed without it is not believed past the
+ * next pull.
+ *
+ * NOTHING IN THE WALK EMITS AN ORDERED EVENT (ETCS_ASSERT_NO_LIFETIME_HOLD).
+ * A divergence is marked through markStateChange, which sets dirty edges and
+ * epochs -- atomics, not events.
+ */
+struct Entity::HashAudit
+{
+    size_t   nodes      = 0;   // entities visited
+    size_t   diverged   = 0;   // current caches that did not match their state
+    size_t   skipped    = 0;   // children retiring during the walk, not hashed
+    uint64_t top_hash   = 0;   // the top's own node hash, as the walk computed it
+    unsigned char root[32] = {};   // the top's digest (getDigest), as the walk computed it
+};
+
+namespace etcs_hash_detail
+{
+    // One length-prefixed, kind-tagged field. Length first, so "ab"+"c" and
+    // "a"+"bc" are different inputs -- concatenating bare strings was the
+    // first version's collision, and it needed no attacker to find.
+    inline void put(::std::string& out, unsigned char kind, const char* bytes, size_t n)
+    {
+        out.push_back(static_cast<char>(kind));
+        const uint32_t len = static_cast<uint32_t>(n);
+        out.append(reinterpret_cast<const char*>(&len), sizeof(len));
+        out.append(bytes, n);
+    }
+    inline void put_u64(::std::string& out, uint64_t v)
+    {
+        out.append(reinterpret_cast<const char*>(&v), sizeof(v));
+    }
+    // getTypedChildren answers grouped by tag, in first-attachment order --
+    // that order is state (a wrap chain applies in it) and is kept. Within a
+    // group the list is a hash map with no order of its own, so each group is
+    // put in the one deterministic order there is: ascending RID.
+    inline void order_children(::std::vector<::std::pair<ETCS::Buffer, RID>>& kids)
+    {
+        auto lo = kids.begin();
+        while (lo != kids.end())
+        {
+            auto hi = lo + 1;
+            while (hi != kids.end() && hi->first == lo->first) ++hi;
+            ::std::sort(lo, hi, [](const ::std::pair<ETCS::Buffer, RID>& a,
+                                   const ::std::pair<ETCS::Buffer, RID>& b)
+                                { return a.second < b.second; });
+            lo = hi;
+        }
+    }
+}
+
+inline uint64_t Entity::surfaceHash() const
+{
+    // Snapshot under the tag mutex, hash outside it: XXH3 over a few hundred
+    // bytes is longer than a lock should be held by anything a call() path
+    // waits on.
+    ::std::vector<::std::string> markers, dispatch, relations, flags;
+    {
+        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
+        for (auto const& [key, entry] : tags)
+        {
+            if (entry.child)        { ::std::string r = key.toString();
+                                      etcs_hash_detail::put_u64(r, entry.child->getRID());
+                                      relations.push_back(::std::move(r)); }
+            else if (entry.bundle)  dispatch.push_back(key.toString());
+            else                    markers.push_back(key.toString());
+        }
+        for (auto const& [key, _] : flags_) flags.push_back(key.toString());
+    }
+    ::std::sort(markers.begin(),   markers.end());
+    ::std::sort(dispatch.begin(),  dispatch.end());
+    ::std::sort(relations.begin(), relations.end());
+    ::std::sort(flags.begin(),     flags.end());
+
+    ::std::string in;
+    in.push_back('\x00');                               // a surface, not a node
+    for (auto const& m : markers)   etcs_hash_detail::put(in, 'M', m.data(), m.size());
+    for (auto const& d : dispatch)  etcs_hash_detail::put(in, 'D', d.data(), d.size());
+    for (auto const& r : relations) etcs_hash_detail::put(in, 'R', r.data(), r.size());
+    for (auto const& f : flags)     etcs_hash_detail::put(in, 'F', f.data(), f.size());
+    return XXH3_64bits(in.data(), in.size());
+}
+
+inline uint64_t Entity::computeNodeHash(HashAudit* audit, unsigned char* digest) const
+{
+    if (audit) ++audit->nodes;
+
+    ::std::string in;
+    in.push_back('\x01');                               // a node
+    etcs_hash_detail::put_u64(in, surfaceHash());
+
+    ::std::vector<::std::pair<ETCS::Buffer, RID>> kids;
+    getTypedChildren(kids);
+    etcs_hash_detail::order_children(kids);
+
+    for (auto const& [tag, rid] : kids)
+    {
+        Entity* child = getTypedChild(tag, rid);
+        LifetimeHold hold(child);
+        if (!hold) { if (audit) ++audit->skipped; continue; }
+
+        uint64_t h;
+        if (!audit) h = child->getHash();
+        else
+        {
+            const bool     was_current = child->hashCurrent();
+            const uint64_t was         = child->hashCached();
+            const uint32_t epoch       = child->hashEpoch();
+            unsigned char  cd[32];
+            h = child->computeNodeHash(audit, cd);
+            if (was_current && was != h)
+            {
+                /*
+                 * The cache said current and the state says otherwise: something
+                 * moved this subtree without passing a funnel. Reported, and
+                 * marked so every observer above hears it through the ordinary
+                 * wire -- an audit finding a hole is itself a transition.
+                 *
+                 * EVERY CACHE ON THE PATH ABOVE THE HOLE REPORTS TOO, because each
+                 * was computed from the lie below it. So one unrecorded write
+                 * reads as a chain of divergences from the top down to one node,
+                 * and the DEEPEST of them is where it happened; the rest are its
+                 * consequences. The chain is the trace.
+                 *
+                 * The mark bumps this node's epoch after `epoch` was read, so the
+                 * stamp below leaves a diverged node stale: its next pull
+                 * recomputes once more, cheaply, from the state just verified.
+                 */
+                ++audit->diverged;
+                ETCS_LOG("Hash", "DIVERGENCE at RID:" << rid << " (" << tag
+                         << "): cached 0x" << ::std::hex << was << " but the state hashes to 0x"
+                         << h << ::std::dec << " -- a change that never went through a funnel.");
+                markStateChange(child, rid);
+            }
+            child->stampHash(h, epoch, cd);
+        }
+        ::std::string tagstr = tag.toString();
+        etcs_hash_detail::put(in, 'C', tagstr.data(), tagstr.size());
+        etcs_hash_detail::put_u64(in, rid);
+        etcs_hash_detail::put_u64(in, h);
+    }
+
+    /*
+     * THE LEVEL RULE. A child answers XXH3 and its parent composes over that.
+     * A parentless entity has no parent to compose over it -- what composes
+     * over it is a module's root, which is a global-scope boundary -- so its
+     * node hash is the SHA-256 of the same input, and the 64-bit view is that
+     * digest's first word. One input, two functions, chosen by where the
+     * node stands; nothing above it has to ask which.
+     */
+    const bool global = isGlobalScope();
+    if (digest || global)
+    {
+        unsigned char d[32];
+        picohash_ctx_t ctx;
+        picohash_init_sha256(&ctx);
+        picohash_update(&ctx, in.data(), in.size());
+        picohash_final(&ctx, d);
+        if (digest) ::std::memcpy(digest, d, 32);
+        if (global)
+        {
+            uint64_t first = 0;
+            ::std::memcpy(&first, d, sizeof(first));
+            return first;
+        }
+    }
+    return XXH3_64bits(in.data(), in.size());
+}
+
+inline uint64_t Entity::getHash() const
+{
+    const uint32_t epoch = hash_epoch_.load(::std::memory_order_acquire);
+    if (hash_valid_epoch_.load(::std::memory_order_acquire) == epoch)
+        return hash_cached_.load(::std::memory_order_acquire);
+    // The digest is computed alongside only where it is the node's own hash;
+    // a child's digest is an audit's question, answered on demand.
+    unsigned char d[32];
+    const bool global = isGlobalScope();
+    const uint64_t h = computeNodeHash(nullptr, global ? d : nullptr);
+    stampHash(h, epoch, global ? d : nullptr);
+    return h;
+}
+
+inline void Entity::getDigest(unsigned char out[32]) const
+{
+    if (isGlobalScope())
+    {
+        for (;;)
+        {
+            const uint32_t epoch = hash_epoch_.load(::std::memory_order_acquire);
+            if (hash_valid_epoch_.load(::std::memory_order_acquire) != epoch)
+            { (void)getHash(); continue; }          // fills the digest, then re-read
+            ::std::memcpy(out, hash_digest_, 32);
+            // Same epoch after the copy: the copy was of one stamp, not two.
+            if (hash_valid_epoch_.load(::std::memory_order_acquire) == epoch
+             && hash_epoch_.load(::std::memory_order_acquire) == epoch) return;
+        }
+    }
+    // A child: not cached, because nothing composes over a child's digest --
+    // it is asked for by an audit of a subtree and answered from the input.
+    (void)computeNodeHash(nullptr, out);
+}
+
+/*
+ * THE AUDIT. Recomputes every node under `top` from its state, ignoring every
+ * cache on the way down, and reports the caches that were wrong. `root` is
+ * the top's digest as the walk computed it: for a parentless top that IS its
+ * node hash in full; for a child it is the SHA-256 over the same input its
+ * XXH3 was taken from, so a subtree can be audited and quoted on its own.
+ *
+ * `top` is whatever the caller names: a Shell, a Thread, one node. The whole
+ * active tree costs the whole active tree; that is what an audit is. Leaves
+ * every cache under `top` current, so the incremental pulls that follow
+ * start from a verified state.
+ */
+inline Entity::HashAudit etcs_root_hash(Entity* top)
+{
+    Entity::HashAudit a;
+    if (!top) return a;
+    LifetimeHold hold(top);
+    if (!hold) return a;
+
+    // The top's own epoch, read before, stamped after -- the same discipline
+    // getHash keeps, at the one level computeNodeHash does not stamp itself.
+    const uint32_t epoch       = top->hashEpoch();
+    const bool     was_current = top->hashCurrent();
+    const uint64_t was         = top->hashCached();
+    a.top_hash = top->computeNodeHash(&a, a.root);
+    if (was_current && was != a.top_hash)
+    {
+        ++a.diverged;
+        ETCS_LOG("Hash", "DIVERGENCE at the top, RID:" << top->getRID()
+                 << ": cached 0x" << ::std::hex << was << " but the state hashes to 0x"
+                 << a.top_hash << ::std::dec << ".");
+        Entity::markStateChange(top, top->getRID());
+    }
+    top->stampHash(a.top_hash, epoch, top->isGlobalScope() ? a.root : nullptr);
+    return a;
+}
+
+/*
+ * ═══ THE ROOT ABOVE EVERY BRANCH ═════════════════════════════════════════
+ *
+ * A parentless entity is the top of what a script named, and nothing in the
+ * tree composes over it. What does is the REGISTRY: every entity a module
+ * makes is in that module's lists (ridMap; mirrored into the loader's
+ * ridMirror by module), so "the module's state" is the set of parentless
+ * entities its lists hold, and "the process's state" is that over every
+ * module. Both are SHA-256, because both are global-scope boundaries: the
+ * chain from any leaf is XXH3 up to its branch top, and cryptographic from
+ * there to the one root.
+ *
+ * ORDER IS THE IDENTITY, not the walk. The lists are hash maps, so the
+ * entities are taken in ascending RID -- deterministic across runs, since
+ * RIDs are -- and a module's digest is the same whichever image computed it,
+ * loader or module, because both see the same lists. Modules compose in
+ * name order for the same reason.
+ *
+ * `rows` are every list that might hold one of the module's entities. Family
+ * aggregates and concrete-tag lists overlap (one entity, several rows), which
+ * is why RIDs are collected into a set first: an entity counts once however
+ * many names it answers to. Each is held for the length of its pull.
+ */
+inline void etcs_module_root_hash(const ::std::vector<const RIDListHandle*>& rows,
+                                  unsigned char out[32], size_t* entities = nullptr)
+{
+    ::std::set<RID> rids;
+    ::std::vector<RID> found;
+    for (const RIDListHandle* row : rows)
+    {
+        found.clear();
+        row->invoke_collect_rids(found);
+        rids.insert(found.begin(), found.end());
+    }
+
+    picohash_ctx_t ctx;
+    picohash_init_sha256(&ctx);
+    const unsigned char kind = 0x03;
+    picohash_update(&ctx, &kind, 1);
+    size_t n = 0;
+    for (RID rid : rids)
+    {
+        Entity* e = nullptr;
+        for (const RIDListHandle* row : rows)
+            if ((e = row->invoke_get(rid))) break;
+        if (!e || !e->isGlobalScope()) continue;      // children are under their branch
+        LifetimeHold hold(e);
+        if (!hold) continue;                           // retiring: gone from the next pull
+        unsigned char d[32];
+        e->getDigest(d);
+        picohash_update(&ctx, &rid, sizeof(rid));
+        picohash_update(&ctx, d, 32);
+        ++n;
+    }
+    picohash_final(&ctx, out);
+    if (entities) *entities = n;
+}
+
+/*
+ * The one root. From a MODULE this is its own image's lists, published under
+ * ETCS_MODULE_NAME. From the LOADER it is every module's rows and NOT its
+ * own: the loader is the true outside of the system -- the thing that
+ * observes the chain, carries the signature and will carry the debugger --
+ * and the observer is not part of the observed. Natively a module's rows are
+ * the mirror rows it published; in a collapsed image (the browser) every
+ * module's rows sit in the loader's own map, so they are grouped by the type
+ * owner index instead, and a row no module owns (the loader's own family
+ * aggregates) is left out. Both images therefore digest the same modules
+ * over the same lists, which is what lets a root be compared across an
+ * address.
+ */
+inline void etcs_global_root_hash(ETCS::EventNode* owner, unsigned char out[32],
+                                  size_t* modules = nullptr, size_t* entities = nullptr)
+{
+    ::std::map<ETCS::Buffer, ::std::vector<const RIDListHandle*>> by_module;
+    if (owner)
+    {
+#ifdef ETCS_LOADER
+        for (auto& bucket : owner->ridMirror)
+            for (auto& row : bucket.second)
+                by_module[row.module].push_back(&row.handle);
+        if (owner->ridMirror.empty())
+        {
+            for (auto& entry : owner->ridMap)
+            {
+                const ::std::string* who = owner->stream.typeOwner(entry.first.toString());
+                if (!who) continue;                            // nobody's: the outside
+                by_module[ETCS::Buffer(who->c_str())].push_back(&entry.second);
+            }
+        }
+#else
+        auto& own = by_module[ETCS::Buffer(ETCS_MODULE_NAME)];
+        for (auto& entry : owner->ridMap) own.push_back(&entry.second);
+#endif
+    }
+
+    picohash_ctx_t ctx;
+    picohash_init_sha256(&ctx);
+    const unsigned char kind = 0x04;
+    picohash_update(&ctx, &kind, 1);
+    size_t total = 0;
+    for (auto const& [name, rows] : by_module)
+    {
+        size_t n = 0;
+        unsigned char d[32];
+        etcs_module_root_hash(rows, d, &n);
+        if (n == 0) continue;                          // a module holding nothing says nothing
+        const uint32_t len = static_cast<uint32_t>(name.written);
+        picohash_update(&ctx, &len, sizeof(len));
+        picohash_update(&ctx, name.buf, name.written);
+        picohash_update(&ctx, d, 32);
+        total += n;
+        if (modules) ++*modules;
+    }
+    picohash_final(&ctx, out);
+    if (entities) *entities = total;
+}
 
 /*
  * resolve_in_family, plus the interval. THE FORM TO USE whenever the pointer

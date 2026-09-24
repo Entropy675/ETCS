@@ -33,14 +33,25 @@ tree.MountTree(paint ACE_ROOT/modules/PaintProvider/scripts/www)
 # directory rather than bin/ and why a page never holds a copy).
 tree.MountTree(wasm ACE_ROOT/bin/wasm)
 
-tree.MountFile(paint/paint_routed_pointer.etcs ACE_ROOT/modules/PaintProvider/scripts/paint_routed_pointer.etcs)
-tree.MountFile(paint/PaintProvider/scripts/paint_toolbar.etcs ACE_ROOT/modules/PaintProvider/scripts/paint_toolbar.etcs)
-tree.MountFile(paint/PaintProvider/scripts/paint_wheel.etcs ACE_ROOT/modules/PaintProvider/scripts/paint_wheel.etcs)
-tree.MountFile(paint/PaintProvider/scripts/paint_menu.etcs ACE_ROOT/modules/PaintProvider/scripts/paint_menu.etcs)
-tree.MountFile(paint/PaintProvider/scripts/paint_layers.etcs ACE_ROOT/modules/PaintProvider/scripts/paint_layers.etcs)
-tree.MountFile(paint/PaintProvider/scripts/paint_import.etcs ACE_ROOT/modules/PaintProvider/scripts/paint_import.etcs)
-tree.MountFile(paint/RenderProvider/scripts/render_frames.etcs ACE_ROOT/modules/RenderProvider/scripts/render_frames.etcs)
-tree.MountFile(paint/shell ACE_ROOT/modules/ShellProvider/scripts/www/index.html)
+# The paint page's own files, from its module's list of them -- the site only
+# says where the page lives (FileHtmlPage::SetMountPrefix).
+tree.SetMountPrefix(paint)
+run PaintProvider/scripts/paint_mounts.etcs tree=tree
+tree.SetMountPrefix()
+
+# ── /chess ───────────────────────────────────────────────────────────────────
+#
+# /chess/ is the LOBBY LIST (scripts/www/chess/index.html): the name server's
+# list of everyone online, what game their lobby is for, and who sits with
+# them -- read from /game, which chess_lobby.etcs mounts below. The game a row
+# opens is the wasm chess page, mounted two deep at /chess/play/ from its own
+# module's list (ChessProvider/scripts/chess_mounts.etcs); it plays on the
+# visitor's own runtime and uses this site only as its name server. The
+# server-played page it replaced is at /chess-classic, and /chess.html
+# forwards there (or here) so old links still land.
+tree.SetMountPrefix(chess/play)
+run ChessProvider/scripts/chess_mounts.etcs tree=tree
+tree.SetMountPrefix()
 tree.ListPaths()
 
 spawn NetworkProvider::TarpitNode tarpit
@@ -53,3 +64,9 @@ web.IsStarted()
 
 detach ChessProvider/scripts/chess_lobby.etcs
 detach forum_lobby.etcs
+# THE PAINT SESSION HOST, on this server. The page's share button talks to
+# /art on its own origin (defaultNode in PaintProvider's www/index.html), and
+# without this line nothing answers there: "[etcs] share: no answer from
+# .../art" is exactly that. paint_lobby.etcs ensures `web` and adds the route,
+# the same way the chess lobby joins -- after Start, for the reason above.
+detach PaintProvider/scripts/paint_lobby.etcs

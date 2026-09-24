@@ -1108,6 +1108,18 @@ public:
         // type IS the key into this, exactly as it should be, regardless
         // of which entity happened to addTag<T> it or from where.
         ::std::unordered_map<::std::string, ::std::string> type_owner_index;
+    public:
+        // Which module owns a bare type tag, or null. The one read of the index
+        // from outside this stream: the global root hash groups a collapsed
+        // image's lists by owner (etcs_global_root_hash, Entity.h), because in
+        // that image every module's rows sit in one map with no mirror to say
+        // whose they are.
+        const ::std::string* typeOwner(const ::std::string& tag) const
+        {
+            auto it = type_owner_index.find(tag);
+            return it == type_owner_index.end() ? nullptr : &it->second;
+        }
+    private:
         // Registers every tag in mod->type_catalog as owned by module_name.
         // Logs — does NOT silently overwrite — if a tag name is already
         // claimed by a DIFFERENT module, surfacing a genuine naming

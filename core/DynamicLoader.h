@@ -1063,6 +1063,48 @@ bool ETCS::WorkBundle::operator()(ETCS_RID_SIZE rid, const ETCS::Buffer& conjuga
     return true;
 }
 /*
+ * AN ACTION THAT WAS ASKED FOR AND NEVER REACHED ONE.
+ *
+ * The one site that holds both halves: a call was attempted, and it did not
+ * arrive. Downstream they are already indistinguishable -- a work function that
+ * ran and wrote nothing leaves exactly the buffer a missing one does, and the
+ * trampoline that would have recorded the call is the thing that never ran. So
+ * this is also where an attempt gets recorded when attempts become entries.
+ *
+ * IT NAMES WHAT THE TAG DOES PROVIDE, because that list is in hand right here
+ * and it separates the three causes without a second run: a typo reads as a
+ * near miss in an otherwise right list; an action with a DEFINE_WORK_FUNC but
+ * no entry in its ETCS_TAG_BLOCK reads as an absence from a list that is
+ * otherwise complete -- the one direction the build cannot catch, since the
+ * trampoline is defined, has external linkage and is simply never referenced;
+ * and a call aimed at the wrong type reads as somebody else's surface entirely.
+ * The old line named only what was asked for, which answers none of the three.
+ *
+ * ONE FUNCTION FOR BOTH DISPATCH PATHS, so a second recording site cannot drift
+ * from the first.
+ */
+inline void etcs_report_unreached_action(const ETCS::Buffer& tag,
+                                         const ETCS::Buffer& work,
+                                         const ETCS::FlatMap<ETCS::Buffer, ETCS::WorkBundle>& actions,
+                                         ETCS_RID_SIZE rid, bool stream)
+{
+    ::std::string provided;
+    for (uint32_t i = 0; i < actions.size; ++i)
+    {
+        if (!provided.empty()) provided += ", ";
+        provided += actions.data[i].first.toString();
+        if (actions.data[i].second.isStream) provided += " (stream)";
+    }
+    if (provided.empty())
+        provided = "nothing -- its catalog is empty, so no tag block reached discoverActions";
+
+    ETCS_LOG("ModuleBundle::operator()", "Tag: " << tag << " does not provide requested "
+             << (stream ? "stream action" : "action") << ": " << work << "  (RID:" << rid << ")"
+             << "\n    " << tag << " provides: " << provided
+             << "\n    If " << tag << "::" << work << " has a DEFINE_WORK_FUNC, it is missing "
+                "from that tag's ETCS_TAG_BLOCK -- which compiles, links, and fails only here.");
+}
+/*
  * bool, not void: false means the action was not found in this tag's table, or
  * its WorkBundle refused to dispatch -- never that the action ran and produced
  * no output, which is ordinary. A caller inspecting only the buffer afterward
@@ -1096,8 +1138,7 @@ bool ETCS::ModuleBundle::operator()(ETCS_RID_SIZE rid, const ETCS::Buffer& conju
 #endif
     }
     else
-        ETCS_LOG("ModuleBundle::operator()", "Tag: " << this->tag
-            << " does not provide requested action: " << work);
+        etcs_report_unreached_action(this->tag, work, actions, rid, false);
     return pass;
 }
 bool ETCS::ModuleBundle::operator()(ETCS_RID_SIZE rid, const ETCS::Buffer& conjugate_key,
@@ -1107,8 +1148,7 @@ bool ETCS::ModuleBundle::operator()(ETCS_RID_SIZE rid, const ETCS::Buffer& conju
     auto it = actions.find(work);
     bool pass = false;
     if (it != actions.end()) pass = it->second(rid, conjugate_key, data, ctx);
-    else ETCS_LOG("ModuleBundle::operator()", "Tag: " << this->tag
-             << " does not provide requested action (stream): " << work);
+    else etcs_report_unreached_action(this->tag, work, actions, rid, true);
     return pass;
 }
 /*

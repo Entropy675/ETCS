@@ -2715,6 +2715,92 @@ inline bool& color_enabled()
 // closed, signal raised, stdin gone) -- every loop treats that as "leave".
 using ReplLineSource = ::std::function<bool(const ::std::string& prompt, ::std::string& out)>;
 
+/*
+ * ═══ THE MENU, AS DATA ═══════════════════════════════════════════════════
+ *
+ * Every prompt the navigator puts up is a choice from a list it just printed:
+ * modules, tags, instances, actions, and a few words (back, spawn, kill). The
+ * text is for a terminal; a page with a finger on it wants the same choice as
+ * buttons, and a button has to know what to send. So each loop publishes what
+ * it printed, once, as the menu it is about to take an answer to -- the line
+ * each entry stands for, what kind of thing it is, and whether it wants more
+ * words after it (a payload, a name) -- and the page reads it
+ * (etcs_web_shell_menu, loaders/etcs.cc) and draws it however it likes.
+ *
+ * DATA BESIDE THE TEXT, NOT INSTEAD OF IT. The transcript is unchanged; a page
+ * that never asks sees exactly what it saw. And the answer goes back down the
+ * one line path there is (etcs_web_shell_push_line), so a button and a typed
+ * line are the same thing to every loop below -- nothing here knows which.
+ *
+ * The serial moves on every publish, so a page can tell "a new menu" from
+ * "the same menu, read again" without comparing text.
+ */
+struct ReplMenuItem
+{
+    ::std::string send;    // the line this entry stands for, as the prompt would take it
+    ::std::string label;   // what to show
+    ::std::string kind;    // module dir script tag instance action child scope command
+    bool          args = false;   // wants words after `send`: a payload, a name
+    ::std::string hint;    // what those words are, when it does
+};
+
+struct ReplMenu
+{
+    ::std::mutex  mu;
+    uint64_t      serial = 0;
+    ::std::string json;
+};
+inline ReplMenu& repl_menu() { static ReplMenu m; return m; }
+
+inline ::std::string repl_json_escape(const ::std::string& s)
+{
+    ::std::string o;
+    o.reserve(s.size() + 8);
+    for (unsigned char c : s)
+    {
+        switch (c)
+        {
+        case '"':  o += "\\\""; break;
+        case '\\': o += "\\\\"; break;
+        case '\n': o += "\\n"; break;
+        case '\r': o += "\\r"; break;
+        case '\t': o += "\\t"; break;
+        default:
+            if (c < 0x20) { char b[8]; ::std::snprintf(b, sizeof(b), "\\u%04x", c); o += b; }
+            else o += static_cast<char>(c);
+        }
+    }
+    return o;
+}
+
+inline void repl_menu_publish(const ::std::string& prompt, const ::std::string& title,
+                              const ::std::vector<ReplMenuItem>& items)
+{
+    ReplMenu& m = repl_menu();
+    ::std::lock_guard<::std::mutex> lock(m.mu);
+    ::std::string j = "{\"serial\":" + ::std::to_string(++m.serial)
+                    + ",\"prompt\":\"" + repl_json_escape(prompt) + "\""
+                    + ",\"title\":\"" + repl_json_escape(title) + "\",\"items\":[";
+    for (size_t i = 0; i < items.size(); ++i)
+    {
+        const ReplMenuItem& it = items[i];
+        if (i) j += ",";
+        j += "{\"send\":\"" + repl_json_escape(it.send) + "\",\"label\":\"" + repl_json_escape(it.label)
+           + "\",\"kind\":\"" + repl_json_escape(it.kind) + "\",\"args\":" + (it.args ? "true" : "false")
+           + ",\"hint\":\"" + repl_json_escape(it.hint) + "\"}";
+    }
+    j += "]}";
+    m.json.swap(j);
+}
+
+// The current menu, copied out: what a page polls. Empty until the first prompt.
+inline ::std::string repl_menu_json()
+{
+    ReplMenu& m = repl_menu();
+    ::std::lock_guard<::std::mutex> lock(m.mu);
+    return m.json;
+}
+
 // Output helpers. ETCS_LOG already follows ETCS::log_sink; these are for the
 // handful of places that wrote to cout/cerr directly, which under a session
 // would have gone to the SERVER's console rather than to whoever typed the
@@ -3144,7 +3230,8 @@ inline ETCS::ExecutionContext repl_nav_context(const ::std::string& mod_name,
     return ctx;
 }
 
-inline void repl_shell_print_dir(::std::vector<::std::string>& mods)
+inline void repl_shell_print_dir(::std::vector<::std::string>& mods,
+                                 ::std::vector<ReplMenuItem>* menu = nullptr)
 {
     mods.clear();
     ETCS_SHELL("Navigator", "\n" << COLOR_DIR << "[ " << fs::current_path().string()
@@ -3155,17 +3242,23 @@ inline void repl_shell_print_dir(::std::vector<::std::string>& mods)
         {
             ETCS_SHELL("Navigator", COLOR_DIR << "  [DIR] "
                      << entry.path().filename().string() << COLOR_RESET);
+            if (menu) menu->push_back({"cd " + entry.path().filename().string(),
+                                       entry.path().filename().string() + "/", "dir", false, ""});
         }
         else if (repl_is_module(entry))
         {
             ETCS_SHELL("Navigator", COLOR_LIB << "  [" << mods.size() << "] "
                      << entry.path().stem().string() << COLOR_RESET);
+            if (menu) menu->push_back({::std::to_string(mods.size()), entry.path().stem().string(),
+                                       "module", false, ""});
             mods.push_back(entry.path().stem().string());
         }
         else if (entry.path().extension() == ".etcs")
         {
             ETCS_SHELL("Navigator", COLOR_EXEC << "  [ETCS] "
                      << entry.path().filename().string() << COLOR_RESET);
+            if (menu) menu->push_back({entry.path().filename().string(),
+                                       entry.path().filename().string(), "script", false, ""});
         }
         else
         {
@@ -3185,7 +3278,8 @@ inline void repl_shell_print_dir(::std::vector<::std::string>& mods)
 //
 // Appends onto the same all_mods vector repl_shell_print_dir filled, so
 // numeric selection keeps working unchanged.
-inline void repl_shell_print_live_modules(::std::vector<::std::string>& all_mods)
+inline void repl_shell_print_live_modules(::std::vector<::std::string>& all_mods,
+                                          ::std::vector<ReplMenuItem>* menu = nullptr)
 {
     ::std::unordered_set<::std::string> already(all_mods.begin(), all_mods.end());
     ::std::vector<::std::string> live_only;
@@ -3206,6 +3300,8 @@ inline void repl_shell_print_live_modules(::std::vector<::std::string>& all_mods
     {
         ETCS_SHELL("Navigator", COLOR_LIB << "  [" << all_mods.size() + i << "] "
                  << live_only[i] << COLOR_RESET);
+        if (menu) menu->push_back({::std::to_string(all_mods.size() + i), live_only[i] + " (live)",
+                                   "module", false, ""});
     }
     for (auto& m : live_only) all_mods.push_back(::std::move(m));
 }
@@ -3492,6 +3588,30 @@ inline void repl_shell_action_loop(ETCS::Entity* e, ETCS::Root& nav_root,
                 "  [s<n>] Interrupt by position   [kill <label> [index]] Interrupt directly");
         }
 
+        {
+            ::std::vector<ReplMenuItem> menu;
+            for (size_t i = 0; i < action_list.size(); ++i)
+            {
+                const auto& [action_name, work] = action_list[i];
+                // A payload is optional, so the page asks for one and takes
+                // none: every action here is a work function, and which ones
+                // read their data is not written anywhere a menu could read.
+                menu.push_back({::std::to_string(i), action_name.toString() + (work.isStream ? "  [stream]" : ""),
+                                "action", true, "payload"});
+            }
+            if (parent_rid)
+                menu.push_back({"up", "up: " + parent_mod + "::" + parent_tag, "command", false, ""});
+            for (size_t i = 0; i < children.size(); ++i)
+                menu.push_back({"c" + ::std::to_string(i), children[i].first.toString()
+                                + " RID:" + ::std::to_string(children[i].second), "child", false, ""});
+            for (size_t i = 0; i < scopes.size(); ++i)
+                menu.push_back({"s" + ::std::to_string(i), "stop " + scopes[i].label + " "
+                                + ::std::to_string(scopes[i].index), "scope", false, ""});
+            menu.push_back({"kill", "kill", "command", true, "label [index]"});
+            menu.push_back({"back", "back", "command", false, ""});
+            repl_menu_publish(tag_name + " Act> ", tag_name + " RID:" + ::std::to_string(target_rid), menu);
+        }
+
         ::std::string a_in;
         if (!in(tag_name + " Act> ", a_in)) break;
         if (a_in == "back")                   { break; }
@@ -3762,6 +3882,21 @@ inline void repl_shell_instance_loop(const ::std::string& mod_name, const ::std:
         ETCS_SHELL("Navigator",
             "  [n] Select   [spawn <name>] Create and name   [log file|term] This module"
             "   [back] Return");
+        {
+            ::std::vector<ReplMenuItem> menu;
+            auto named_here = repl_live_globals_for_module(mod_name);
+            for (size_t i = 0; i < live_rids.size(); ++i)
+            {
+                ::std::string label = "RID:" + ::std::to_string(live_rids[i]);
+                for (auto& [name, b] : named_here)
+                    if (b.tag == tag_name && b.rid == live_rids[i]) { label = name + "  " + label; break; }
+                menu.push_back({::std::to_string(i), label, "instance", false, ""});
+            }
+            menu.push_back({"spawn", "spawn", "command", true, "name"});
+            menu.push_back({"log", "log", "command", true, "file | term"});
+            menu.push_back({"back", "back", "command", false, ""});
+            repl_menu_publish(tag_name + " Inst> ", "Live " + tag_name + " in " + mod_name, menu);
+        }
 
         ::std::string i_in;
         if (!in(tag_name + " Inst> ", i_in)) break;
@@ -3915,6 +4050,16 @@ inline void repl_shell_tag_loop(const ::std::string& mod_name, ETCS::Root& nav_r
 
         ETCS_SHELL("Navigator",
             "  [back] Return   [detach] Detach   [log file|term] This module   [exit] Quit");
+        {
+            ::std::vector<ReplMenuItem> menu;
+            for (size_t i = 0; i < tags.size(); ++i)
+                menu.push_back({::std::to_string(i), tags[i].toString(), "tag", false, ""});
+            menu.push_back({"back", "back", "command", false, ""});
+            menu.push_back({"detach", "detach", "command", false, ""});
+            menu.push_back({"log", "log", "command", true, "file | term"});
+            menu.push_back({"exit", "exit", "command", false, ""});
+            repl_menu_publish(mod_name + " Tag> ", "Tags in " + mod_name, menu);
+        }
 
         ::std::string t_in;
         if (!in(mod_name + " Tag> ", t_in)) break;
@@ -3972,9 +4117,14 @@ inline void repl_shell_loop_with(ETCS::SignalContext& sig, ReplLineSource& in)
     while (!(sig.isInterrupted() || sig.isTerminated()))
     {
         ::std::vector<::std::string> available_mods;
-        repl_shell_print_dir(available_mods);
-        repl_shell_print_live_modules(available_mods);
+        ::std::vector<ReplMenuItem> menu;
+        repl_shell_print_dir(available_mods, &menu);
+        repl_shell_print_live_modules(available_mods, &menu);
         ETCS_SHELL("Navigator", "--------------------------------------------------------");
+        menu.push_back({"jobs", "jobs", "command", false, ""});
+        menu.push_back({"cd", "cd", "command", true, "path"});
+        menu.push_back({"exit", "exit", "command", false, ""});
+        repl_menu_publish("Root> ", fs::current_path().string(), menu);
 
         ::std::string mod_input;
         if (!in("Root> ", mod_input)) break;

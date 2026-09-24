@@ -238,6 +238,20 @@ public:
         // which presents as input dying in one region of the picture.
         if (static_cast<Drawable_*>(as_drawable)->Hidden()) return {};
 
+        /*
+     * PASSTHROUGH: DRAWN, NEVER HIT. A state tag -- a lowercase flag in the
+     * entity's own store (Entity::hasTag), not a member of any leaf -- so
+     * every type in the family answers it the same way, a script can
+     * `requires` it, and raising it is a verb on whichever leaf wants it.
+     *
+     * For a node that lies over others without being a thing you press: a
+     * ruler frame around a pane, a grid, a vignette. Its region is real (the
+     * shape of a buffer is the buffer, and ContainsLocal says so), it is only
+     * declining to be the answer to a pick, so the walk falls through to what
+     * is under it. Its children go with it, as a hidden node's do.
+     */
+        if (hasTag(ETCS::Buffer("passthrough"))) return {};
+
         ::std::vector<Drawable_*> ordered;
         static_cast<Drawable_*>(as_drawable)->collectDrawableChildren(ordered);
         for (size_t i = ordered.size(); i-- > 0; )

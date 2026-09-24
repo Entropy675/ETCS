@@ -75,9 +75,21 @@ A `-pthread` build needs cross-origin isolation for `SharedArrayBuffer`, so ever
 On the web, every thread is a Worker and every Worker re-instantiates all open side modules, so thread count is the dominant boot cost. Web builds therefore share ONE thread pool across the loader and every module (`ETCS_SHARED_THREAD_POOL`, default on for wasm, off for native -- `core/ETCS_API.h` for why the two want opposite defaults) with the native worker count of 4. Measured on the paint page: 16 Workers and a first frame at 8.8s, against 34 and 12.1s with a pool per module.
 
 
+Every entity carries a runtime hash of its state surface and everything under it
+(`Entity::getHash`, core/Entity.h "THE RUNTIME HASH"): the tags, flags and typed
+children, recomputed lazily on pull and only along the path a transition touched.
+XXH3 under a parent; SHA-256 at every global-scope boundary -- a parentless
+entity's node hash is its digest (`getDigest`), a module's root is SHA-256 over its
+parentless entities (`etcs_module_root_hash`) and the process's over every module
+(`etcs_global_root_hash`), so the chain reaches one root from any node and is
+cryptographic from the first boundary up. `etcs_root_hash(top)` is the audit: it
+recomputes a subtree from its state and reports every cache that disagrees (a
+change that never went through a funnel -- the deepest reported node is where it
+happened, the ones above are its consequences). `bin/Run_HashTesterLoader` is the
+proof.
+
 TODO:
-- Import merkle hash chain from the completed version in other instance of project
-- Identity system / binary signage (dependent on above)
+- Identity system / binary signage (over the runtime hash)
 - Persistence tag within DatabaseProvider & merge Local/Remote Database ontology types
 
 Example graphical_script.etcs:

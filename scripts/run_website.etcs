@@ -8,10 +8,11 @@
 # Order matters twice over.
 #
 # The LANDING PAGE is added first. HttpServer::ResolvePath walks typed children
-# in the order they were added and takes the first match, and chess_web.etcs's
-# own board_page also answers "/" -- so whichever is attached first owns it.
-# Adding landing here, before either lobby is detached, is what makes that
-# deterministic rather than a function of which script ran first.
+# in the order they were added and takes the first match, so a page a lobby
+# script attached could otherwise answer "/" too. Adding landing here, before
+# any lobby is detached, is what makes that deterministic rather than a
+# function of which script ran first. (chess_web.etcs attaches no pages now:
+# only the /game route.)
 #
 # The lobbies are detached AFTER Start, and what makes them find THIS server
 # rather than minting a second one that cannot bind 8080 is the verb their own
@@ -76,24 +77,30 @@ tree.MountTree(paint ACE_ROOT/modules/PaintProvider/scripts/www)
 # a page never holds a copy).
 tree.MountTree(wasm ACE_ROOT/bin/wasm)
 
-# The scripts the page stages into the browser FS, each at the path it is
-# fetched from (www/modules.json is the source of truth for this list, and
-# serve_paint.etcs mounts the same seven at the root of its own server). A name
-# the page asks for and this does not mount is a 404 -- and the one that matters
-# is render_frames.etcs, the frame pump: losing it leaves a black canvas on a
-# runtime that is otherwise working perfectly.
-tree.MountFile(paint/paint_routed_pointer.etcs ACE_ROOT/modules/PaintProvider/scripts/paint_routed_pointer.etcs)
-tree.MountFile(paint/PaintProvider/scripts/paint_toolbar.etcs ACE_ROOT/modules/PaintProvider/scripts/paint_toolbar.etcs)
-tree.MountFile(paint/PaintProvider/scripts/paint_wheel.etcs ACE_ROOT/modules/PaintProvider/scripts/paint_wheel.etcs)
-tree.MountFile(paint/PaintProvider/scripts/paint_menu.etcs ACE_ROOT/modules/PaintProvider/scripts/paint_menu.etcs)
-tree.MountFile(paint/PaintProvider/scripts/paint_layers.etcs ACE_ROOT/modules/PaintProvider/scripts/paint_layers.etcs)
-tree.MountFile(paint/PaintProvider/scripts/paint_import.etcs ACE_ROOT/modules/PaintProvider/scripts/paint_import.etcs)
-tree.MountFile(paint/RenderProvider/scripts/render_frames.etcs ACE_ROOT/modules/RenderProvider/scripts/render_frames.etcs)
+# The files the page stages into the browser FS, each at the path it is
+# fetched from -- kept as one list in the paint module
+# (PaintProvider/scripts/paint_mounts.etcs, beside www/modules.json), which
+# serve_paint.etcs runs at the root of its own server. The site only says where
+# the page lives (FileHtmlPage::SetMountPrefix). A name the page asks for and
+# nothing mounts is a 404 -- and the one that matters is render_frames.etcs, the
+# frame pump: losing it leaves a black canvas on a working runtime.
+tree.SetMountPrefix(paint)
+run PaintProvider/scripts/paint_mounts.etcs tree=tree
+tree.SetMountPrefix()
 
-# The terminal view, from ShellProvider's own page rather than a copy of it.
-# Mounted at "shell", which is what the paint page's iframe points at; the MIME
-# comes from the DISK name, so an extensionless url still serves text/html.
-tree.MountFile(paint/shell ACE_ROOT/modules/ShellProvider/scripts/www/index.html)
+# ── /chess ───────────────────────────────────────────────────────────────────
+#
+# /chess/ is the LOBBY LIST (scripts/www/chess/index.html): the name server's
+# list of everyone online, what game their lobby is for, and who sits with
+# them -- read from /game, which chess_lobby.etcs mounts below. The game a row
+# opens is the wasm chess page, mounted two deep at /chess/play/ from its own
+# module's list (ChessProvider/scripts/chess_mounts.etcs); it plays on the
+# visitor's own runtime and uses this site only as its name server. The
+# server-played page it replaced is at /chess-classic, and /chess.html
+# forwards there (or here) so old links still land.
+tree.SetMountPrefix(chess/play)
+run ChessProvider/scripts/chess_mounts.etcs tree=tree
+tree.SetMountPrefix()
 
 # Printed again after the paint mounts, not only after LoadFromDisk: this is the
 # fastest way to catch a staging mistake, and every name added above is one the
@@ -129,5 +136,12 @@ web.IsStarted()
 
 detach ChessProvider/scripts/chess_lobby.etcs
 detach forum_lobby.etcs
+
+# THE PAINT SESSION HOST, on this server. The page's share button talks to
+# /art on its own origin (defaultNode in PaintProvider's www/index.html), and
+# without this line nothing answers there: "[etcs] share: no answer from
+# .../art" is exactly that. paint_lobby.etcs ensures `web` and adds the route,
+# the same way the chess lobby joins -- after Start, for the reason above.
+detach PaintProvider/scripts/paint_lobby.etcs
 
 # http://localhost:8080/

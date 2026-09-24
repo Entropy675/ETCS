@@ -122,6 +122,32 @@ int etcs_web_shell_try_pop_line(char* out, int cap)
  * the module's stream for every sample; that traffic belongs on an edge
  * (ProducePointer -> ConsumePointer), which is why the window has one.
  */
+/*
+ * IS THAT NAME UP YET -- the same question etcs_web_call answers as a side
+ * effect, asked without making a call and without logging a complaint.
+ *
+ * WHY IT EARNS ITS OWN ENTRY POINT. A boot script's `spawn` is not on any clock
+ * the page can see, so a page that wants to state something the moment the
+ * runtime can hear it has to poll -- and polling with a real call means every
+ * attempt before the script gets there prints "is not a live global name". The
+ * paint page's own size statement does exactly this, correctly, and paid for it
+ * with fourteen identical lines at the top of every boot log: a normal wait
+ * wearing the costume of an error, which is worse than silence because it
+ * trains a reader to skip the one time it means something.
+ *
+ * So the complaint stays loud in etcs_web_call, where a dead name really is a
+ * mistake, and a page that means "not yet" says that instead.
+ */
+EMSCRIPTEN_KEEPALIVE
+int etcs_web_has(const char* name)
+{
+    if (!name || !*name) return 0;
+    if (!ETCS::EventNode::alive()) return 0;
+    auto bound = ETCS::live_global(name);
+    if (!bound) return 0;
+    return ETCS::resolve_bound_entity(*bound) ? 1 : 0;
+}
+
 EMSCRIPTEN_KEEPALIVE
 int etcs_web_call(const char* name, const char* work, const char* args)
 {
@@ -392,6 +418,20 @@ protected:
         return n;
     }
 };
+}
+
+/*
+ * The navigator's current menu, as JSON (CommandExecutor.h, repl_menu_publish):
+ * what the page draws as buttons when it is showing buttons rather than a
+ * command line. Polled on the drain's clock; a serial inside says whether it
+ * moved. Main thread only, same string-lifetime bargain as the drain.
+ */
+extern "C" EMSCRIPTEN_KEEPALIVE
+const char* etcs_web_shell_menu()
+{
+    static std::string held;
+    held = repl_menu_json();
+    return held.c_str();
 }
 
 extern "C" EMSCRIPTEN_KEEPALIVE
