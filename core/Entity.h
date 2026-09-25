@@ -410,6 +410,9 @@ private:
  */
     ETCS::Buffer source_module_;
     ETCS::Buffer source_tag;
+    // See setRemoteWire. Mutable count: a const walk may still call through.
+    ::std::atomic<ETCS::IWireRemote*> remote_wire_{nullptr};
+    mutable ::std::atomic<int>        remote_calls_{0};
     /*
  * Set true as the FIRST action inside ~Entity(). A no-op operator
  * delete (the child case, below) means the object's own bytes are
@@ -1669,6 +1672,17 @@ public:
 #ifdef ETCS_LOG_FUNCTION_EVOCATION_PATH
         ETCS_LOG("Entity::call", "parsed tag_type=" << tag_type << " action=" << action);
 #endif
+        // A surface of a remote: its own verbs are the far node's, run there
+        // and answered in `data` like any work function (setRemoteWire).
+        if (remoteWire() && tag_type == getSourceTag())
+        {
+            RemoteCallGuard guard(*this);
+            if (ETCS::IWireRemote* far = remoteWire())
+            {
+                far->RemoteWork(action, data, ctx);
+                return;
+            }
+        }
         if (!hasTag(tag_type))
         {
             ETCS_LOG("Entity::call", "Could not find tag " << tag_type << " within tag list, failed action: " << action);
@@ -1797,6 +1811,178 @@ public:
     }
  
  
+    /*
+ * -----------------------------------------------------------------------
+ * ONE HALF OF A STREAM PAIR, the other half running in another runtime.
+ *
+ * `chain_owner` is whose Wrapper children wrap the pair (MirrorBuffer::
+ * wrap_owner_rid_): this entity by default, the surface when this half is
+ * the near end of a pair whose far end is remote -- the far node's authority
+ * layer, mirrored there, is what the frames must pass on both sides.
+ *
+ * The produce/consume contract does not change across a network: the caller
+ * names both halves, the consumer's frame is the pair's lifetime, and the
+ * producer's write end closes when its body returns (ETCS_API.h). What
+ * changes is that one half is somebody else's to run. These run the one that
+ * is ours, on a connected socket whose far end is running the other --
+ * StrategySocket, with the socket as both fds (makePair). The fd is taken
+ * over and closed when the half ends, which is also how the far half learns
+ * this one is gone.
+ *
+ * produceOnto returns when the produce BODY has returned, not when its
+ * trampoline has, for the reason the untyped call below waits
+ * (SharedPage::producers_live) -- and with no deadline: the body ends when
+ * its reader goes away, which on a socket is a write failing, or on a
+ * signal it can see.
+ * -----------------------------------------------------------------------
+ */
+    bool produceOnto(const ETCS::Buffer& conjugateAction, const ETCS::Buffer& config,
+                     int fd, SignalContext ctx = {}, Entity* chain_owner = nullptr)
+    {
+        if (fd < 0) return false;
+        auto [tag_type, action] = parseConjugateActionKey(conjugateAction);
+        ModuleBundle* b = hasTag(tag_type) ? safeBundleFor(tag_type, "producer") : nullptr;
+        if (!b || !b->isActionStream(action))
+        {
+            ETCS_LOG("[CALL]", "produceOnto: RID:" << getRID() << " has no stream "
+                     << tag_type << "." << action << " -- closing the far half's socket.");
+            ::close(fd);
+            return false;
+        }
+        ETCS::SharedPage* page = allocatePage<ETCS::StrategySocket, ETCS::SharedPage>(getRID());
+        ETCS::MirrorBuffer producer(config, ctx);
+        ETCS::MirrorBuffer consumer(config, ctx);
+        ETCS::MirrorBuffer::makePair<ETCS::StrategySocket, ETCS::SharedPage>(
+            producer, consumer, page, static_cast<uint64_t>(fd), static_cast<uint64_t>(fd),
+            chain_owner ? chain_owner : this);
+        ETCS::MBuffer transport;
+        producer.packProducer(transport);
+        {
+            ETCS::ProducerLiveGuard dispatch(producer.producerEnter());
+            try { (*b)(getRID(), myConjugateKey(), action, transport, ctx); }
+            catch (const ::std::exception& e)
+            { ETCS_LOG("[CALL]", "produceOnto: producer failed: " << e.what()); }
+        }
+        while (producer.producerBusy())
+            ::std::this_thread::sleep_for(::std::chrono::milliseconds(2));
+        ETCS::MirrorBuffer::teardownPair<ETCS::StrategySocket, ETCS::SharedPage>(
+            producer, consumer, page);
+        return true;
+    }
+    bool consumeFrom(const ETCS::Buffer& conjugateActionRcv, const ETCS::Buffer& config,
+                     int fd, SignalContext ctx = {}, Entity* chain_owner = nullptr)
+    {
+        if (fd < 0) return false;
+        auto [tag_type, action] = parseConjugateActionKey(conjugateActionRcv);
+        ModuleBundle* b = hasTag(tag_type) ? safeBundleFor(tag_type, "consumer") : nullptr;
+        if (!b || !b->isActionStream(action))
+        {
+            ETCS_LOG("[CALL]", "consumeFrom: RID:" << getRID() << " has no stream "
+                     << tag_type << "." << action << " -- closing the far half's socket.");
+            ::close(fd);
+            return false;
+        }
+        ETCS::SharedPage* page = allocatePage<ETCS::StrategySocket, ETCS::SharedPage>(getRID());
+        ETCS::MirrorBuffer producer(config, ctx);
+        ETCS::MirrorBuffer consumer(config, ctx);
+        ETCS::MirrorBuffer::makePair<ETCS::StrategySocket, ETCS::SharedPage>(
+            producer, consumer, page, static_cast<uint64_t>(fd), static_cast<uint64_t>(fd),
+            chain_owner ? chain_owner : this);
+        ETCS::MBuffer transport;
+        consumer.packConsumer(transport);
+        try { (*b)(getRID(), myConjugateKey(), action, transport, ctx); }
+        catch (const ::std::exception& e)
+        { ETCS_LOG("[CALL]", "consumeFrom: consumer failed: " << e.what()); }
+        ETCS::MirrorBuffer::teardownPair<ETCS::StrategySocket, ETCS::SharedPage>(
+            producer, consumer, page);
+        return true;
+    }
+    /*
+ * A SURFACE OF A REMOTE: this entity is a local instance of a type whose real
+ * node lives in another runtime, and its Remote child (ontology/Remote.h) is
+ * the wire to it. Set and cleared only by that child. While set, every verb
+ * addressed to this entity's own tag, and either half of a stream pair naming
+ * it, runs on the far node instead (call(), callAcrossRuntimes).
+ *
+ * The child's teardown clears the wire and then waits out the calls already
+ * through it -- remote_calls_ counts them -- so a verb in flight never lands
+ * on a child that is gone.
+ */
+    void setRemoteWire(ETCS::IWireRemote* w)
+    {
+        remote_wire_.store(w, ::std::memory_order_release);
+        if (!w)
+            while (remote_calls_.load(::std::memory_order_acquire) > 0)
+                ::std::this_thread::sleep_for(::std::chrono::milliseconds(1));
+    }
+    ETCS::IWireRemote* remoteWire() const { return remote_wire_.load(::std::memory_order_acquire); }
+    struct RemoteCallGuard
+    {
+        const Entity& e;
+        explicit RemoteCallGuard(const Entity& x) : e(x) { e.remote_calls_.fetch_add(1, ::std::memory_order_acq_rel); }
+        ~RemoteCallGuard() { e.remote_calls_.fetch_sub(1, ::std::memory_order_acq_rel); }
+    };
+    /*
+ * A stream pair with a remote end: the far half is asked for by name, the
+ * near half runs here. True when it was such a pair (handled, whatever the
+ * outcome); false leaves the in-process call to proceed. Both ends remote is
+ * refused -- that pair is between two other runtimes, and this one would be
+ * a relay for bytes it cannot read.
+ */
+    bool callAcrossRuntimes(ETCS::Entity* producer_entity,
+                            const ETCS::Buffer& conjugateAction,
+                            const ETCS::Buffer& conjugateActionRcv,
+                            const ETCS::Buffer& config, SignalContext ctx)
+    {
+        if (!producer_entity->remoteWire() && !remoteWire()) return false;
+        RemoteCallGuard g_p(*producer_entity), g_c(*this);
+        ETCS::IWireRemote* far_producer = producer_entity->remoteWire();
+        ETCS::IWireRemote* far_consumer = remoteWire();
+        if (!far_producer && !far_consumer) return false;
+        if (far_producer && far_consumer)
+        {
+            ETCS_LOG("[CALL]", "stream refused: both ends are remote (RID:"
+                     << producer_entity->getRID() << " -> RID:" << getRID() << ").");
+            return true;
+        }
+        // The far half is asked for BY THE SURFACE's wire, which knows the
+        // code it names (the surface is the far node's type, so it has the
+        // action's hash) and the authority layer it must pass (its Wrapper
+        // children); the far side refuses unless both are its own. The near
+        // half then runs here, wrapped by that same layer.
+        Entity* surface = far_producer ? producer_entity : this;
+        const ETCS::Buffer& key = far_producer ? conjugateAction : conjugateActionRcv;
+        const ETCS::Buffer verb = parseConjugateActionKey(key).second;
+        const int fd = (far_producer ? far_producer : far_consumer)->RemoteStream(
+            verb, config, far_producer != nullptr, ctx);
+        if (fd < 0)
+        {
+            ETCS_LOG("[CALL]", "remote " << (far_producer ? "producer " : "consumer ")
+                     << verb << " did not open.");
+            return true;
+        }
+        if (far_producer) consumeFrom(conjugateActionRcv, config, fd, ctx, surface);
+        else              producer_entity->produceOnto(conjugateAction, config, fd, ctx, surface);
+        return true;
+    }
+    // The source-region hash of "Tag.Action" as this entity's bundle has it --
+    // what a link compares before running a verb or a stream half for the far
+    // side (NetworkProvider/Edge.h). 0 when unknown, which never agrees.
+    HASH_TYPE actionHash(const ETCS::Buffer& conjugateAction) const
+    {
+        auto [tag_type, action] = parseConjugateActionKey(conjugateAction);
+        auto it = tags.find(tag_type);
+        if (it == tags.end() || !it->second.bundle) return 0;
+        auto a = it->second.bundle->actions.find(action);
+        return a == it->second.bundle->actions.end() ? 0 : a->second.hash;
+    }
+    // The tag's own hash, composed over all its actions: equal on two sides
+    // means every verb of the type is the same code on both.
+    HASH_TYPE tagHash(const ETCS::Buffer& tag_type) const
+    {
+        auto it = tags.find(tag_type);
+        return (it == tags.end() || !it->second.bundle) ? 0 : it->second.bundle->hash;
+    }
 #ifdef ETCS_LOADER
     /*
  * -----------------------------------------------------------------------
@@ -1832,6 +2018,8 @@ public:
               SignalContext        ctx = {})
     {
         if (!producer_entity) return;
+        if (callAcrossRuntimes(producer_entity, conjugateAction, conjugateActionRcv, config, ctx))
+            return;
         /*
      * NAMED LOCALS, not the structured bindings themselves. A lambda below
      * captures tag_type and action, and capturing a structured binding is a
@@ -2046,6 +2234,10 @@ public:
         using Strategy = typename ETCS::StrategyFor<ProducerTag, ConsumerTag>::type;
         using Page     = typename ETCS::PageFor<Strategy>::type;
         if (!producer_entity) return;
+        // A Remote end is a socket to another runtime, not an fd pair to be
+        // made here -- StrategySocket's pair comes from the far side.
+        if (callAcrossRuntimes(producer_entity, conjugateAction, conjugateActionRcv, config, ctx))
+            return;
         auto [tag_type, action]     = parseConjugateActionKey(conjugateAction);
         auto [tag_type_r, action_r] = parseConjugateActionKey(conjugateActionRcv);
         if (!producer_entity->hasTag(tag_type) || !hasTag(tag_type_r))

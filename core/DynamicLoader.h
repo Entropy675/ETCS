@@ -748,6 +748,7 @@ void ETCS::MirrorBuffer::buildWrapManifest(ETCS::Entity* owner)
         wrap_manifest_[wrap_manifest_len_].tag    = child->getSourceTag();
         ++wrap_manifest_len_;
     }
+    wrap_owner_rid_ = owner->getRID();
     /*
  * LMAX-strategy responsibility, additionally: allocate the scratch
  * pool exactly once here, alongside the manifest walk that just
@@ -768,6 +769,43 @@ void ETCS::MirrorBuffer::buildWrapManifest(ETCS::Entity* owner)
         for (long long i = 0; i < count; ++i)
             new (&wrap_scratch_pool_[i]) MBuffer();
     }
+}
+size_t ETCS::MirrorBuffer::chainOf(ETCS::Entity* owner, WireScope scope, IWireWrapper** out, size_t max)
+{
+    size_t n = 0;
+    if (!owner) return 0;
+    ::std::vector<::std::pair<ETCS::Buffer, RID>> children;
+    owner->getTypedChildren(children);
+    for (auto& [tag, rid] : children)
+    {
+        if (n >= max) break;
+        Entity* child = owner->getTypedChild(tag, rid);
+        if (!child || !child->hasTag(ETCS::Buffer("Wrapper"))) continue;
+        void* raw = child->getInterfacePointer(ETCS::Buffer("Wrapper"));
+        if (!raw) continue;
+        IWireWrapper* w = static_cast<IWireWrapper*>(raw);
+        if (!scopeApplies(w->Scope(), scope)) continue;
+        out[n++] = w;
+    }
+    return n;
+}
+::std::string ETCS::MirrorBuffer::manifestOf(ETCS::Entity* owner, WireScope scope)
+{
+    ::std::string out;
+    if (!owner) return out;
+    ::std::vector<::std::pair<ETCS::Buffer, RID>> children;
+    owner->getTypedChildren(children);
+    for (auto& [tag, rid] : children)
+    {
+        Entity* child = owner->getTypedChild(tag, rid);
+        if (!child || !child->hasTag(ETCS::Buffer("Wrapper"))) continue;
+        void* raw = child->getInterfacePointer(ETCS::Buffer("Wrapper"));
+        if (!raw || !scopeApplies(static_cast<IWireWrapper*>(raw)->Scope(), scope)) continue;
+        const ETCS::Buffer t = child->getSourceTag();
+        out += child->getSourceModule().toString() + ":" + t.toString() + "#"
+             + ::std::to_string(child->tagHash(t)) + ";";
+    }
+    return out;
 }
 /*
  * resolveWrapChain - populates wrap_chain_ (the LIVE, resolved
@@ -795,13 +833,19 @@ void ETCS::MirrorBuffer::resolveWrapChain(ETCS::Entity* handler)
  * uniformity (both sides always carry it), not actually
  * consulted for resolution on this side.
  */
-        if (!handler) return;
+        // The chain's owner, when makePair named one other than the handler
+        // (wrap_owner_rid_'s comment): a remote pair's authority layer.
+        Entity* owner = handler;
+        if (wrap_owner_rid_ && (!handler || handler->getRID() != wrap_owner_rid_))
+            if (Entity* o = ETCS::etcs_resolve_rid_anywhere(&ETCS::getLoader(), wrap_owner_rid_))
+                owner = o;
+        if (!owner) return;
         ::std::vector<::std::pair<ETCS::Buffer, RID>> children;
-        handler->getTypedChildren(children);
+        owner->getTypedChildren(children);
         for (auto& [tag, rid] : children)
         {
             if (wrap_chain_len_ >= MAX_WRAP_STAGES) break;
-            Entity* child = handler->getTypedChild(tag, rid);
+            Entity* child = owner->getTypedChild(tag, rid);
             if (!child || !child->hasTag(ETCS::Buffer("Wrapper"))) continue;
             void* raw = child->getInterfacePointer(ETCS::Buffer("Wrapper"));
             if (!raw) continue;
@@ -835,6 +879,51 @@ void ETCS::MirrorBuffer::resolveWrapChain(ETCS::Entity* handler)
  * so a partial chain from a failed negotiation is still cleaned up
  * correctly with no special-casing needed here.
  */
+    /*
+ * A SOCKET PAIR UNWRAPS WITH ITS OWNER'S OWN STAGES. Such a pair is one half
+ * of a stream whose other half is in another runtime (Entity::produceOnto /
+ * consumeFrom), and its owner is the entity whose authority layer the frames
+ * must pass here -- the far node's own, or the surface that mirrors it. A
+ * stage there may hold what a fresh one cannot (a key, NetworkProvider's
+ * Seal), and it is THAT stage the far side's frames must satisfy. Nothing
+ * else on this side shares the instances: the local pair's producer object
+ * is never used. The owner must still carry exactly the manifest's stages,
+ * or the pair is refused like any unfulfilled one.
+ */
+    if (active_ == ActiveStrategy::Socket && wrap_owner_rid_)
+    {
+        Entity* owner = ETCS::etcs_resolve_rid_anywhere(&ETCS::getLoader(), wrap_owner_rid_);
+        IWireWrapper* live[MAX_WRAP_STAGES] = {};
+        const size_t n = owner ? chainOf(owner, WireScope::Socket, live, MAX_WRAP_STAGES) : 0;
+        bool same = owner && n == wrap_manifest_len_;
+        if (same)
+        {
+            ::std::vector<::std::pair<ETCS::Buffer, RID>> children;
+            owner->getTypedChildren(children);
+            size_t k = 0;
+            for (auto& [tag, rid] : children)
+            {
+                Entity* child = owner->getTypedChild(tag, rid);
+                if (!child || !child->hasTag(ETCS::Buffer("Wrapper"))) continue;
+                void* raw = child->getInterfacePointer(ETCS::Buffer("Wrapper"));
+                if (!raw || !scopeApplies(static_cast<IWireWrapper*>(raw)->Scope(), WireScope::Socket)) continue;
+                if (k >= wrap_manifest_len_
+                    || child->getSourceModule().toString() != wrap_manifest_[k].module.toString()
+                    || child->getSourceTag().toString()    != wrap_manifest_[k].tag.toString())
+                { same = false; break; }
+                ++k;
+            }
+        }
+        if (!same)
+        {
+            ETCS_LOG("MirrorBuffer", "resolveWrapChain: this side's authority layer does not carry "
+                     "the pair's wrappers -- refusing to unwrap.");
+            unwrap_failed_ = true;
+            return;
+        }
+        for (size_t i = 0; i < n; ++i) wrap_chain_[wrap_chain_len_++] = live[i];
+        return;
+    }
     ETCS::Root boot_root(bound_ctx_);
     for (size_t i = 0; i < wrap_manifest_len_; ++i)
     {

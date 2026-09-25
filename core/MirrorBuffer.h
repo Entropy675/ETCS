@@ -3,6 +3,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/socket.h>
+#include <poll.h>
 #include <cerrno>
 #include <cstring>
 #include <stdexcept>
@@ -250,6 +251,16 @@ private:
      * therefore cannot run on a cross-machine pair today, and says so rather
      * than failing open silently.
      */
+    /*
+     * WHOSE WRAPPER CHILDREN wrap this pair. makePair's `owner`, which is the
+     * producer entity for every in-process call -- the same entity the wrap
+     * side's handler is at unpack, so for those this changes nothing. A pair
+     * with a remote end is where they differ: the half run here runs on a local
+     * entity, but the authority layer is the SURFACE's (ontology/Remote.h), the
+     * Wrapper children the far node's own are mirrored on. Packed with the
+     * pair, so the wrap side resolves its chain from this entity (resolveWrapChain).
+     */
+    uint64_t     wrap_owner_rid_ = 0;
     uint64_t     edge_from_rid_ = 0;   // the producer end
     uint64_t     edge_to_rid_   = 0;   // the consumer end
     uint64_t     next_read_seq_ = 0;
@@ -322,6 +333,40 @@ private:
     bool unwrap_failed_ = false;
     bool closed_ = false;
     const char* sideStr() const { return is_producer_ ? "PRODUCER" : "CONSUMER"; }
+    /*
+     * THE LENGTH IN FRONT OF EVERY FD FRAME is four bytes, little-endian, on
+     * every build. It was a size_t, which is eight bytes natively and four in
+     * wasm32 -- invisible while both ends of an fd were one process, and a
+     * corrupt stream the first time a Socket pair's far end was a browser.
+     * Every target this builds for is little-endian, so the native layout IS
+     * the wire layout. A frame is capped by in_ anyway (MAX_FRAME_PAYLOAD).
+     */
+    using FrameLen = uint32_t;
+    /*
+     * An fd that would block is WAITED on, not spun on: the loops below used
+     * to `continue` straight back into read/write, a busy core for as long as
+     * the peer was slow. A Socket fd is non-blocking whatever its flags say
+     * when it is an emscripten socket (recv answers EAGAIN until data
+     * arrives), so there it was a spin for the life of the connection. The
+     * wait is sliced so a signal still ends it; HUP and ERR count as ready,
+     * and the read or write that follows reports them.
+     */
+    //
+    // Answers the revents (0 when a signal or an error ended the wait), because
+    // a read side needs to see a hang-up: emscripten's pipe answers EAGAIN to a
+    // read at EOF instead of 0 and says so only through POLLHUP, so a reader
+    // that saw HUP and then EAGAIN is at the end (see the read loops below).
+    static short waitFd(int fd, short events, const SignalContext& ctx)
+    {
+        while (true)
+        {
+            if (ctx.isInterrupted() || ctx.isTerminated()) return 0;
+            pollfd p{ fd, events, 0 };
+            const int r = ::poll(&p, 1, 100);
+            if (r > 0) return p.revents ? p.revents : events;
+            if (r < 0 && errno != EINTR) return 0;
+        }
+    }
     static void setBlocking(int fd)
     {
         int flags = fcntl(fd, F_GETFL, 0);
@@ -414,6 +459,16 @@ public:
     static void teardownPair(MirrorBuffer& producer,
                              MirrorBuffer& consumer,
                              PageType*     page);
+    /*
+     * An entity's authority layer as the wire sees it: its Wrapper children
+     * whose Scope() includes `scope`, in attach order. chainOf gives the live
+     * stages; manifestOf their identities, "Module:Tag#<tag hash>;...", which
+     * two runtimes compare before either will open a pair to the other's node
+     * -- the same filter buildWrapManifest applies to a pair, so what is
+     * compared is what would wrap. Defined in DynamicLoader.h.
+     */
+    static size_t      chainOf(Entity* owner, WireScope scope, IWireWrapper** out, size_t max);
+    static ::std::string manifestOf(Entity* owner, WireScope scope);
     // -----------------------------------------------------------------------
     // buildWrapManifest(owner) — walks owner's typed_child_order_ (via
     // getTypedChildren/getTypedChild), filters to children tagged
@@ -609,8 +664,7 @@ public:
                 lmax_page_->markConsumed(next_read_seq_);
                 ++next_read_seq_;
                 if (wrap_chain_len_ && !directionAllows(false, "Unwrap")) return false;
-                for (size_t i = wrap_chain_len_; i-- > 0; )
-                    wrap_chain_[i]->Unwrap(frame, bound_ctx_);
+                if (!unwrapFrame(frame)) return false;
                 if (frame.written > Buffer::bufsize)
                 {
                     ::std::cerr << "[MirrorBuffer] readRaw: unwrapped LMAX payload ("
@@ -630,8 +684,7 @@ public:
                 if (!directionAllows(false, "Unwrap")) return false;
                 MBuffer frame;
                 if (!fillAndCopyInto(frame, bound_ctx_)) return false;
-                for (size_t i = wrap_chain_len_; i-- > 0; )
-                    wrap_chain_[i]->Unwrap(frame, bound_ctx_);
+                if (!unwrapFrame(frame)) return false;
                 if (frame.written > Buffer::bufsize)
                 {
                     ::std::cerr << "[MirrorBuffer] readRaw: unwrapped payload ("
@@ -645,6 +698,48 @@ public:
             }
         }
         return false;
+    }
+    /*
+     * Peels the chain off one frame, in reverse attach order, and ends the
+     * stream at a frame a stage refused (wire_refuse, InterfaceWire.h) rather
+     * than delivering it: the far side cannot get a frame past a stage this
+     * side holds.
+     */
+    bool unwrapFrame(MBuffer& frame)
+    {
+        for (size_t i = wrap_chain_len_; i-- > 0; )
+        {
+            wrap_chain_[i]->Unwrap(frame, bound_ctx_);
+            if (wire_refused(frame))
+            {
+                ETCS_LOG("MirrorBuffer", "[" << sideStr() << "] a wrap stage refused a frame -- ending the stream.");
+                return false;
+            }
+        }
+        return true;
+    }
+    // -----------------------------------------------------------------------
+    // writeFrame / readFrame — one frame of up to MAX_FRAME_PAYLOAD bytes, for
+    // a caller whose unit is wider than a Buffer: a Link carrying messages
+    // between runtimes chunks into these (NetworkProvider/Link.h). Pipe and
+    // Socket only -- an LMAX ring carries a pointer to the caller's Buffer and
+    // there is no wider Buffer for it to point at -- and unwrapped, because a
+    // wrap stage is sized for Buffer payloads. The frame is the same
+    // [FrameLen][payload] readRaw and writeRaw use, so the two mix on one fd.
+    // -----------------------------------------------------------------------
+    static constexpr size_t MAX_FRAME_PAYLOAD = MBuffer::bufsize - 1 - sizeof(uint32_t);
+    bool writeFrame(const char* data, size_t len)
+    {
+        if (active_ == ActiveStrategy::LMAX || wrap_chain_len_ > 0 || !shared_page_) return false;
+        if (len > MAX_FRAME_PAYLOAD) return false;
+        MBuffer frame;
+        if (len > 0) frame.writeRaw(data, len);
+        return stageAndFlush(frame);
+    }
+    bool readFrame(MBuffer& out)
+    {
+        if (active_ == ActiveStrategy::LMAX || wrap_chain_len_ > 0) return false;
+        return fillAndCopyInto(out, bound_ctx_);
     }
     // -----------------------------------------------------------------------
     // closeWrite — signals EOF to the consumer.
@@ -695,7 +790,11 @@ public:
                 if (write_fd_ != -1) { ::close(write_fd_); write_fd_ = -1; }
                 break;
             case ActiveStrategy::Socket:
-                if (write_fd_ != -1) ::shutdown(write_fd_, SHUT_WR);
+                // A one-way fd (a link channel's pipe, NetworkProvider/Edge.h)
+                // has no direction to shut down: this half is its only user,
+                // so the end of the stream is closing it.
+                if (write_fd_ != -1 && ::shutdown(write_fd_, SHUT_WR) != 0 && errno == ENOTSOCK)
+                { ::close(write_fd_); write_fd_ = -1; }
                 break;
         }
     }
@@ -732,7 +831,8 @@ public:
                 if (read_fd_ != -1) { ::close(read_fd_); read_fd_ = -1; }
                 break;
             case ActiveStrategy::Socket:
-                if (read_fd_ != -1) ::shutdown(read_fd_, SHUT_RD);
+                if (read_fd_ != -1 && ::shutdown(read_fd_, SHUT_RD) != 0 && errno == ENOTSOCK)
+                { ::close(read_fd_); read_fd_ = -1; }   // see closeWrite
                 break;
         }
     }
@@ -832,7 +932,7 @@ public:
     // Pack transport Buffer for cross-ABI handoff into the stub macro.
     //
     // Layout (read by unpack on the other side of the ABI boundary):
-    //   bool     is_lmax     — true on LMAX path
+    //   int      strategy    — ActiveStrategy: LMAX, Pipe or Socket
     //   bool     is_producer — true when packed by packProducer
     //   int      read_fd     — -1 on LMAX
     //   int      write_fd    — -1 on LMAX
@@ -861,8 +961,11 @@ public:
     // handle pacing on the consumer side.
     void packConsumer(MBuffer& transport) const
     {
-        bool is_lmax = (active_ == ActiveStrategy::LMAX);
-        transport << is_lmax << false; // is_producer = false
+        const bool is_lmax = (active_ == ActiveStrategy::LMAX);
+        // The strategy, not "is it LMAX": unpack used to fold Socket into
+        // Pipe, which closed a socket on closeWrite (the pair's fd, closed
+        // again at teardown) and asserted on the -1 a socket half has.
+        transport << static_cast<int>(active_) << false; // is_producer = false
         transport << read_fd_ << write_fd_;
         transport << (is_lmax ? reinterpret_cast<uint64_t>(lmax_page_)
                                : reinterpret_cast<uint64_t>(shared_page_));
@@ -874,7 +977,7 @@ public:
         // The edge, both ends, in producer-then-consumer order on BOTH halves
         // -- the direction is the field order, so it survives the wire without
         // needing is_producer_ to interpret it.
-        transport << edge_from_rid_ << edge_to_rid_;
+        transport << edge_from_rid_ << edge_to_rid_ << wrap_owner_rid_;
         packWrapManifest(transport);
         // Plain write(), not operator<<, for this last field specifically:
         // config is always the terminal field, and unpack() reconstructs
@@ -891,8 +994,8 @@ public:
     }
     void packProducer(MBuffer& transport) const
     {
-        bool is_lmax = (active_ == ActiveStrategy::LMAX);
-        transport << is_lmax << true; // is_producer = true
+        const bool is_lmax = (active_ == ActiveStrategy::LMAX);
+        transport << static_cast<int>(active_) << true; // is_producer = true; see packConsumer
         transport << read_fd_ << write_fd_;
         transport << (is_lmax ? reinterpret_cast<uint64_t>(lmax_page_)
                                : reinterpret_cast<uint64_t>(shared_page_));
@@ -904,7 +1007,7 @@ public:
         // The edge, both ends, in producer-then-consumer order on BOTH halves
         // -- the direction is the field order, so it survives the wire without
         // needing is_producer_ to interpret it.
-        transport << edge_from_rid_ << edge_to_rid_;
+        transport << edge_from_rid_ << edge_to_rid_ << wrap_owner_rid_;
         packWrapManifest(transport);
         transport.write(config.c_str()); // see packConsumer's own comment
     }
@@ -928,19 +1031,20 @@ public:
     // ever invoking the developer's own _implProduce_/_implConsume_ body.
     bool unpack(MBuffer& transport, Entity* handler = nullptr)
     {
-        bool     is_lmax        = false;
+        int      strategy       = static_cast<int>(ActiveStrategy::Pipe);
         bool     is_producer    = false;
         int      r              = -1;
         int      w              = -1;
         uint64_t rid_or_ptr     = 0;
         uint64_t wrap_scratch_p = 0;
-        transport >> is_lmax >> is_producer >> r >> w >> rid_or_ptr >> wrap_scratch_p;
+        transport >> strategy >> is_producer >> r >> w >> rid_or_ptr >> wrap_scratch_p;
+        const bool is_lmax = (strategy == static_cast<int>(ActiveStrategy::LMAX));
         is_producer_       = is_producer;
         next_read_seq_     = 0;
         wrap_scratch_pool_ = reinterpret_cast<MBuffer*>(wrap_scratch_p); // nullptr if 0, as intended
         for (size_t i = 0; i < ETCS::TAG_WORDS; ++i) transport >> pair_tag_mask_.w[i];
         for (size_t i = 0; i < ETCS::TAG_WORDS; ++i) transport >> pair_module_mask_.w[i];
-        transport >> edge_from_rid_ >> edge_to_rid_;
+        transport >> edge_from_rid_ >> edge_to_rid_ >> wrap_owner_rid_;
         unpackWrapManifest(transport);
         config.writeString(transport.restAsString().c_str());
         if (is_lmax)
@@ -955,18 +1059,29 @@ public:
         }
         else
         {
-            assert(r != -1 && w != -1 && "[MirrorBuffer] unpack: invalid fds");
-            // Socket transport is fd-identical to Pipe at the unpack level;
-            // strategy distinction only matters in teardownPair.
-            active_      = ActiveStrategy::Pipe;
             shared_page_ = reinterpret_cast<SharedPage*>(rid_or_ptr);
             read_fd_     = r;
             write_fd_    = w;
             assert(shared_page_ && "[MirrorBuffer] unpack: null staging SharedPage");
-            // Producer gets non-blocking on both ends — it writes and moves on.
-            // Consumer gets blocking read so it waits for the producer's data.
-            if (is_producer_) { setNonBlocking(read_fd_); setNonBlocking(write_fd_); }
-            else              { setBlocking(read_fd_);    setNonBlocking(write_fd_); }
+            if (strategy == static_cast<int>(ActiveStrategy::Socket))
+            {
+                // One direction per half (the other fd is -1), non-blocking,
+                // and closeWrite/closeRead shut a direction down rather than
+                // closing the socket both halves share -- see makePair.
+                active_ = ActiveStrategy::Socket;
+                assert((is_producer_ ? w : r) != -1 && "[MirrorBuffer] unpack: invalid socket fd");
+                if (read_fd_  != -1) setNonBlocking(read_fd_);
+                if (write_fd_ != -1) setNonBlocking(write_fd_);
+            }
+            else
+            {
+                assert(r != -1 && w != -1 && "[MirrorBuffer] unpack: invalid fds");
+                active_ = ActiveStrategy::Pipe;
+                // Producer gets non-blocking on both ends — it writes and moves on.
+                // Consumer gets blocking read so it waits for the producer's data.
+                if (is_producer_) { setNonBlocking(read_fd_); setNonBlocking(write_fd_); }
+                else              { setBlocking(read_fd_);    setNonBlocking(write_fd_); }
+            }
         }
         resolveWrapChain(handler);
         return !unwrap_failed_;
@@ -1139,7 +1254,7 @@ private:
     // -----------------------------------------------------------------------
     // stageAndFlush<N> — stages a TBuffer<N> payload (plaintext Buffer on
     // the fast path, or the wrapped MBuffer on the wrap path) into
-    // shared_page_ as [size_t len][payload], then flushes to write_fd_.
+    // shared_page_ as [FrameLen len][payload], then flushes to write_fd_.
     // Generic over N so both callers in writeRaw share one implementation
     // rather than duplicating the staging logic per payload width.
     //
@@ -1149,8 +1264,8 @@ private:
     template<size_t N>
     bool stageAndFlush(const TBuffer<N>& payload)
     {
-        size_t len   = payload.written;
-        size_t total = sizeof(size_t) + len;
+        const FrameLen len = static_cast<FrameLen>(payload.written);
+        size_t total = sizeof(FrameLen) + len;
         char* dest = shared_page_->acquireWrite(static_cast<long long>(total));
         if (!dest)
         {
@@ -1164,8 +1279,8 @@ private:
                              ? "the pair was torn down under this write." : "staging page full."));
             return false;
         }
-        ::std::memcpy(dest, &len, sizeof(size_t));
-        if (len > 0) ::std::memcpy(dest + sizeof(size_t), payload.buf, len);
+        ::std::memcpy(dest, &len, sizeof(FrameLen));
+        if (len > 0) ::std::memcpy(dest + sizeof(FrameLen), payload.buf, len);
         return flushStaged(bound_ctx_);
     }
     // Drain shared_page_ to write_fd_ in chunks until empty or signal fires.
@@ -1186,7 +1301,7 @@ private:
             if (n > 0) { sent += n; continue; }
             if (errno == EAGAIN || errno == EWOULDBLOCK)
             {
-                if (ctx.isInterrupted() || ctx.isTerminated()) return false;
+                if (!waitFd(write_fd_, POLLOUT, ctx)) return false;
                 continue;
             }
             ::std::cerr << "[" << sideStr() << "] flushStaged write error: "
@@ -1211,13 +1326,13 @@ private:
     template<size_t N>
     bool tryExtractInto(TBuffer<N>& out)
     {
-        if (in_.read_offset + sizeof(size_t) > in_.written) return false;
-        size_t len = 0;
-        ::std::memcpy(&len, in_.buf + in_.read_offset, sizeof(size_t));
-        in_.read_offset += sizeof(size_t);
+        if (in_.read_offset + sizeof(FrameLen) > in_.written) return false;
+        FrameLen len = 0;
+        ::std::memcpy(&len, in_.buf + in_.read_offset, sizeof(FrameLen));
+        in_.read_offset += sizeof(FrameLen);
         if (in_.read_offset + len > in_.written)
         {
-            in_.read_offset -= sizeof(size_t); // Rollback and wait for more data
+            in_.read_offset -= sizeof(FrameLen); // Rollback and wait for more data
             return false;
         }
         if (len > N)
@@ -1250,6 +1365,7 @@ private:
             ::std::cerr << "[" << sideStr() << "] fillAndCopyInto: read_fd is -1\n";
             return false;
         }
+        bool hung_up = false;
         while (true)
         {
             // Compact the buffer: move any unread trailing data to the front
@@ -1284,7 +1400,14 @@ private:
             }
             if (errno == EAGAIN || errno == EWOULDBLOCK)
             {
-                if (ctx.isInterrupted() || ctx.isTerminated()) return false;
+                if (hung_up)
+                {
+                    ETCS_LOG("MirrorBuffer", "[" << sideStr() << "] Read EOF (hung up).");
+                    return false;
+                }
+                const short ev = waitFd(read_fd_, POLLIN, ctx);
+                if (!ev) return false;
+                hung_up = (ev & POLLHUP) != 0;
                 continue;
             }
             ::std::cerr << "[" << sideStr() << "] fillAndCopyInto read error: "
@@ -1339,7 +1462,7 @@ private:
             if (n > 0) { out_.reset(); return true; }
             if (errno == EAGAIN || errno == EWOULDBLOCK)
             {
-                if (ctx.isInterrupted() || ctx.isTerminated()) return false;
+                if (!waitFd(write_fd_, POLLOUT, ctx)) return false;
                 continue;
             }
             ::std::cerr << "[" << sideStr() << "] flush error: "
@@ -1350,6 +1473,7 @@ private:
     bool fill(const SignalContext& ctx)
     {
         if (read_fd_ == -1) return false;
+        bool hung_up = false;   // see waitFd
         while (true)
         {
             in_.reset();
@@ -1367,7 +1491,10 @@ private:
             }
             if (errno == EAGAIN || errno == EWOULDBLOCK)
             {
-                if (ctx.isInterrupted() || ctx.isTerminated()) return false;
+                if (hung_up) return false;
+                const short ev = waitFd(read_fd_, POLLIN, ctx);
+                if (!ev) return false;
+                hung_up = (ev & POLLHUP) != 0;
                 continue;
             }
             ::std::cerr << "[" << sideStr() << "] fill error: "
@@ -1483,6 +1610,7 @@ inline void MirrorBuffer::makePair<StrategyLMAX, LMAXSequentialSharedPage>(
     {
         producer.buildWrapManifest(owner);
         consumer.wrap_manifest_len_ = producer.wrap_manifest_len_;
+        consumer.wrap_owner_rid_    = producer.wrap_owner_rid_;
         for (size_t i = 0; i < producer.wrap_manifest_len_; ++i)
             consumer.wrap_manifest_[i] = producer.wrap_manifest_[i];
         consumer.wrap_scratch_pool_ = producer.wrap_scratch_pool_;
@@ -1534,6 +1662,7 @@ inline void MirrorBuffer::makePair<StrategyPipe, SharedPage>(
     {
         producer.buildWrapManifest(owner);
         consumer.wrap_manifest_len_ = producer.wrap_manifest_len_;
+        consumer.wrap_owner_rid_    = producer.wrap_owner_rid_;
         for (size_t i = 0; i < producer.wrap_manifest_len_; ++i)
             consumer.wrap_manifest_[i] = producer.wrap_manifest_[i];
     }
@@ -1577,12 +1706,17 @@ inline void MirrorBuffer::makePair<StrategySocket, SharedPage>(
     consumer.writer_rid_  = writer_rid;
     consumer.read_fd_     = cons_fd;
     consumer.write_fd_    = -1;
-    MirrorBuffer::setBlocking(consumer.read_fd_);
+    // Non-blocking like the producer, where the Pipe consumer is blocking:
+    // a socket is usually ONE fd for both halves, so the two calls would
+    // fight over the same flag, and a read blocked in the kernel is one no
+    // signal can end. Reads wait in waitFd instead, in slices.
+    MirrorBuffer::setNonBlocking(consumer.read_fd_);
  
     if (owner)
     {
         producer.buildWrapManifest(owner);
         consumer.wrap_manifest_len_ = producer.wrap_manifest_len_;
+        consumer.wrap_owner_rid_    = producer.wrap_owner_rid_;
         for (size_t i = 0; i < producer.wrap_manifest_len_; ++i)
             consumer.wrap_manifest_[i] = producer.wrap_manifest_[i];
     }
@@ -1659,8 +1793,11 @@ inline void MirrorBuffer::teardownPair<StrategySocket, SharedPage>(
     if (producer.debug_ || consumer.debug_)
         ETCS_LOG("MirrorBuffer", "Socket teardown.");
  
-    // Socket fds are owned by the entity; we close our handle here.
+    // Socket fds are owned by the entity; we close our handle here. One
+    // socket usually carries both halves (a Link's fd reads and writes), and
+    // closing it twice would close whatever the kernel reused the number for.
     auto closefd = [](int& fd) { if (fd != -1) { ::close(fd); fd = -1; } };
+    if (producer.write_fd_ == consumer.read_fd_) consumer.read_fd_ = -1;
     closefd(producer.write_fd_);
     closefd(consumer.read_fd_);
  

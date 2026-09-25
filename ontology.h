@@ -120,6 +120,15 @@
 // wiring. See ontology/Matrix.h.
 #include "ontology/MatrixBase.h"
 #include "ontology/GateBase.h"
+// A node in another runtime, seen through the families both sides share. The
+// runtime calls it (IWireRemote), so it is here with the other wired families.
+// See ontology/Remote.h.
+#include "ontology/RemoteBase.h"
+// What rides on links: who can be reached (Directory) and what happened, in
+// one authority's order (Record). The lobby and session shapes chess and paint
+// each wrote for themselves. See ontology/Directory.h, ontology/Record.h.
+#include "ontology/DirectoryBase.h"
+#include "ontology/RecordBase.h"
 #include "ontology/SwitchableBase.h"
 #include "ontology/FilterBase.h"
 

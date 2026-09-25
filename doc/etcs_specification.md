@@ -379,6 +379,58 @@ thing the rest of this design removes: state held between lines that changes wha
 line means, and a file that can end mid-pair in a way no single line reveals. One line, both
 ends, or it is not a stream.
 
+### Across runtimes
+
+Either end of a stream, and the receiver of any action, may be an entity that lives in **another
+runtime** — a browser tab, a process on another machine. Nothing about the line changes; what
+changes is how the name was bound:
+
+```etcs
+spawn NetworkProvider::Peer peer
+peer.Connect(wss://example.org/link/studio)
+
+spawn DatabaseProvider::LocalDatabase db        # the SAME type as the host's node
+db.spawn(NetworkProvider::Remote remote)       # makes db a surface of a far node
+remote.Bind(db @peer)                          # ...the one the host published as `db`
+
+db.ExecuteRaw(INSERT INTO users (name) VALUES ('guest');)   # runs on the host
+db.QueryProduce(SELECT * FROM users) -> mirror.RowConsume() # host produces, this side consumes
+```
+
+`db` is a **surface**: a local instance of the far node's type, so it is everything that type is
+to every family walk and `requires` bracket. The `Remote` child is the mark that it is not local,
+and the wire: from `Bind` on, its actions run on the far node and come back with that node's
+answer, and a stream naming it runs its half there while this runtime runs the other. The
+caller still names both halves, exactly as in-process. The link's own verbs (`Bind`, `Unbind`,
+`Info`) are the child's, so nothing the far node answers to is shadowed by something only this
+side has.
+
+**One link per pair of runtimes.** However many surfaces are bound through a `Peer`, and however
+many actions and streams run on them, they share its one connection: a stream is a numbered
+channel on it, not a connection of its own. A second `Peer` to an address one already holds is
+refused.
+
+**Same code, same authority.** A surface binds only to the same build of its type (the tag hash,
+below, **ABI integrity**), and each action and stream half names its own hash, which the far side
+checks. And it binds only if it carries the far node's **authority layer**: the node's `Wrapper`
+children on the network scope, which the script attaches to the surface like any child. Every
+frame to or from the node passes them, and a stage can refuse one — a `NetworkProvider::Seal` does,
+unless both sides hold the same key — which refuses the action or ends the stream. A wrapper this
+runtime cannot construct cannot be attached, so that node cannot be reached at all; only what else
+the far side publishes, which reaches it there, can.
+
+The far side decides what is reachable: a `Room` publishes entities by name
+(`room.Publish(db @db)`), and nothing else in that runtime can be bound. The host of a room is its
+authority — every guest's actions arrive there and run in its order — whether it serves the room
+itself (`room.Host(@links studio)`, beside an `HttpServer`'s `LinkHub`) or, unable to accept
+connections, hosts through a server that only splices bytes (`room.HostVia(wss://site/link/studio)`).
+Guests dial the same address either way.
+
+Two families ride on this for anything shared: a **Directory** (`NetworkProvider::Lobby`) lists who
+can be reached, each entry lasting as long as its advertiser's link; a **Record**
+(`NetworkProvider::Ledger`) is lines in the host's order, chained by hash, authored by the link
+each came over, and followed as a stream (`book.Follow(0) -> copy.Mirror()`).
+
 ---
 
 ## Children
@@ -567,6 +619,7 @@ by anything here.
 | Action | `<name>.Action(payload)` — receiver and brackets both mandatory |
 | RID in a payload | `@name` |
 | Stream | `<a>.Produce(payload) -> <b>.Consume(payload)` — one line, both ends |
+| Entity in another runtime | a local instance of its type with a `NetworkProvider::Remote` child, bound to a published name — its actions and stream halves run there, on one link per pair of runtimes, through the node's `Wrapper` authority layer |
 | Interrupting work | `<name>.kill(<label> [index])` |
 | Removing a flag | `<name>.unflag(<flag>)` — the mutable set; a `requires` tag is fixed and out of reach |
 | Scope | local closure + the root script's names as globals; no ancestor chain |
