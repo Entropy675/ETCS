@@ -469,6 +469,15 @@ public:
      */
     static size_t      chainOf(Entity* owner, WireScope scope, IWireWrapper** out, size_t max);
     static ::std::string manifestOf(Entity* owner, WireScope scope);
+    /*
+     * THE LOCAL FRAME, which no MirrorBuffer bridges to another runtime: a
+     * Database -- a resource of a locale, whose surface is this runtime's
+     * own (ontology/Database.h) -- and anything else that says it is only
+     * here with the bare `Local` tag (DatabaseProvider's Persistence: the
+     * verbs of this loader's store). A transport refuses to bind or open a
+     * pair onto one, on either side.
+     */
+    static bool localFrame(Entity* e);   // Defined in DynamicLoader.h.
     // -----------------------------------------------------------------------
     // buildWrapManifest(owner) — walks owner's typed_child_order_ (via
     // getTypedChildren/getTypedChild), filters to children tagged

@@ -900,9 +900,18 @@ public: \
          * ProducerLiveGuard around the body, so an exception leaving counts \
          * as leaving. */ \
         ETCS::SharedPage* _live_token = stream.producerEnter(); \
+        /* The action this pair runs inside goes with the body to its thread, \
+         * so what the body changes is credited to the line that started it \
+         * (core/Provenance.h). */ \
+        if (ETCS::current_action_frame()) ETCS::current_action_frame()->settle(); \
+        ETCS::ActionFrame _action_frame = ETCS::current_action_frame() \
+            ? *ETCS::current_action_frame() : ETCS::ActionFrame{}; \
         try { \
-        self->getThreadPool().enqueue(ETCS::Priority::Medium, ctx, [self, stream = ::std::move(stream), config, _pair_mod, _live_token, _auto_scope = ::std::move(_auto_scope)]() mutable { \
+        self->getThreadPool().enqueue(ETCS::Priority::Medium, ctx, [self, stream = ::std::move(stream), config, _pair_mod, _live_token, _action_frame, _auto_scope = ::std::move(_auto_scope)]() mutable { \
             ETCS::ProducerLiveGuard _auto_live(_live_token); \
+            ETCS::ActionFrame* const _action_saved = ETCS::current_action_frame(); \
+            if (_action_frame.id) ETCS::current_action_frame() = &_action_frame; \
+            struct _ActionRestore { ETCS::ActionFrame* s; ~_ActionRestore() { ETCS::current_action_frame() = s; } } _action_restore{ _action_saved }; \
             ETCS::PairScope _pair_scope(_pair_mod); \
             ETCS_CAUSAL_SCOPE(Type, Name); \
             ETCS::StreamWriteGuard _auto_close(stream); \

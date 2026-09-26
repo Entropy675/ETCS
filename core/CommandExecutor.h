@@ -604,6 +604,32 @@ inline ::std::string substitute_name_tokens(const ::std::string& payload,
     return out;
 }
 
+// The @names a payload refers to and what each named when the line ran --
+// what a replay script needs to name the same entities again without the
+// RIDs (core/Provenance.h). Same tokenising as substitute_name_tokens.
+inline ::std::vector<::std::pair<::std::string, ETCS::RID>>
+collect_name_refs(const ::std::string& payload, ExecutionContext& ctx)
+{
+    ::std::vector<::std::pair<::std::string, ETCS::RID>> refs;
+    bool in_single = false, in_double = false;
+    for (size_t i = 0; i < payload.size(); ++i)
+    {
+        const char ch = payload[i];
+        if ((in_single || in_double) && ch == '\\') { ++i; continue; }
+        if (ch == '\'' && !in_double) { in_single = !in_single; continue; }
+        if (ch == '"'  && !in_single) { in_double = !in_double; continue; }
+        if (ch != '@' || in_single || in_double) continue;
+        size_t end = i + 1;
+        while (end < payload.size()
+               && (::std::isalnum(static_cast<unsigned char>(payload[end])) || payload[end] == '_'))
+            ++end;
+        const ::std::string name = payload.substr(i + 1, end - i - 1);
+        if (const ETCS::RID rid = name.empty() ? 0 : ctx.resolve_name(name)) refs.emplace_back(name, rid);
+        i = end - 1;
+    }
+    return refs;
+}
+
 #endif // ETCS_EXECUTOR_HOST
 
 // ---------------------------------------------------------------------------
@@ -1491,6 +1517,7 @@ inline ExecuteResult execute_command(const Command& cmd,
                 ETCS::Entity* e = ETCS::spawn_entity(c.module, c.tag, ctx, src);
                 if (!e) return {ExecuteStatus::Error, "spawn failed."};
                 ctx.bind(c.name, e->getRID(), c.module, c.tag);
+                ETCS::note_script_name(e->getRID(), c.name);
                 ETCS_LOG("CommandExecutor", "spawn " << c.module << "::" << c.tag
                          << " " << c.name << " -> RID:" << e->getRID());
                 return {ExecuteStatus::Ok, ""};
@@ -1529,6 +1556,7 @@ inline ExecuteResult execute_command(const Command& cmd,
             ETCS::Entity* e = ETCS::spawn_entity(c.module, c.tag, ctx, src);
             if (!e) return {ExecuteStatus::Error, "ensure: spawn failed."};
             ctx.bind(c.name, e->getRID(), c.module, c.tag);
+            ETCS::note_script_name(e->getRID(), c.name);
             ETCS_LOG("CommandExecutor", "ensure " << c.module << "::" << c.tag
                      << " " << c.name << " -> RID:" << e->getRID() << " (new)");
 #endif
@@ -1592,6 +1620,8 @@ inline ExecuteResult execute_command(const Command& cmd,
             if (!ETCS::resolve_module(c.module, src, ctx.root_entity))
                 return {ExecuteStatus::Error, "module not found: " + c.module};
 
+            ETCS::ActionScope action_scope(ETCS::ActionLine{
+                parent->entity->getRID(), "spawn", c.module + "::" + c.tag, {}, 0, {} });
             ETCS::Entity* child = ETCS::make_typed_child(c.module, c.tag,
                                                          parent->entity, src);
             if (!child) return {ExecuteStatus::Error, "child construction failed."};
@@ -1615,6 +1645,8 @@ inline ExecuteResult execute_command(const Command& cmd,
             // Scope::interruptLabel path any other removal does -- if c.flag
             // names an active_scope_* label this reaches in and interrupts
             // that stream call's own SignalContext, not merely bookkeeping.
+            ETCS::ActionScope action_scope(ETCS::ActionLine{
+                r->binding.rid, "unflag", c.flag, {}, 0, {} });
             try { r->entity->removeTag(ETCS::Buffer(c.flag.c_str())); }
             catch (const ::std::exception& ex)
             {
@@ -1715,6 +1747,11 @@ inline ExecuteResult execute_command(const Command& cmd,
                          << " -> " << c.consumer_receiver << "." << c.consumer_action
                          << (payload.empty() ? "" : " [" + payload + "]"));
 
+                // The line, as one action (core/Provenance.h): what a replay
+                // re-runs to put back whatever it changed.
+                ETCS::ActionScope action_scope(ETCS::ActionLine{
+                    r->binding.rid, c.action, c.payload, ETCS::collect_name_refs(c.payload, ctx),
+                    cons->binding.rid, c.consumer_action });
                 try { cons->entity->call(r->entity, prod_buf, cons_buf, config, *ctx.sig); }
                 catch (const ::std::exception& ex)
                 {
@@ -1748,6 +1785,8 @@ inline ExecuteResult execute_command(const Command& cmd,
                          << "(" << payload << ")  [" << r->binding.module
                          << "::" << r->binding.tag << " RID:" << r->binding.rid << "]");
 
+                ETCS::ActionScope action_scope(ETCS::ActionLine{
+                    r->binding.rid, c.action, c.payload, ETCS::collect_name_refs(c.payload, ctx), 0, {} });
                 r->entity->call(act_buf, payload_buf, *ctx.sig);
                 ETCS_LOG("CommandExecutor", "[workFunc]: " << payload_buf);
             }
@@ -4537,6 +4576,73 @@ inline void shell_startup()
  * still-in-flight RequestUnload recheck, and its dlclose, against that module's
  * own running workers.
  */
+/*
+ * CONTINUE WHERE YOU LEFT OFF. DatabaseProvider's Persistence keeps the scene
+ * this loader was in (the entities with a Persistence child, as the script
+ * that makes them again) and leaves a one-line summary at <store>/scene; a
+ * new start offers it back. The loader knows nothing of the store but that
+ * file: the rest is ETCS lines, run as a root script so the scene's names
+ * are globals again --
+ *
+ *   spawn DatabaseProvider::Persistence __resume
+ *   __resume.Resume()          checks the scene, writes <store>/resume.etcs
+ *   <store>/resume.etcs        the scene itself
+ *   __resume.Finish()          did every root come back as it was?
+ *
+ * resume_choice: 0 ask (an interactive start with no script), 1 resume
+ * (--resume), -1 start fresh (--fresh, or a script was given).
+ */
+inline ::std::atomic<int>& resume_choice() { static ::std::atomic<int> c{ 0 }; return c; }
+
+inline ::std::string resume_summary()
+{
+    ::std::ifstream f(ETCS::etcs_store_dir() + "/scene");
+    ::std::string line;
+    if (f) ::std::getline(f, line);
+    return line;
+}
+
+inline bool resume_last_scene(ETCS::SignalContext& sig)
+{
+    const ::std::string script = ETCS::etcs_store_dir() + "/resume.etcs";
+    static ETCS::Root resume_root(sig);                 // the scene's globals outlive this call
+    ETCS::ExecutionContext rc;
+    rc.sig         = &sig;
+    rc.root_entity = &resume_root;
+    rc.is_root     = true;
+
+    ::std::istringstream boot("spawn DatabaseProvider::Persistence __resume\n__resume.Resume()\n");
+    ETCS::run_script(boot, "(resume)", rc);
+    if (!::std::ifstream(script).good())
+    {
+        repl_err() << COLOR_WARN << "etcs: the last scene could not be resumed (see the log)."
+                   << COLOR_RESET << "\n";
+        return false;
+    }
+    ETCS::run_root_script(script, rc);
+    ::std::istringstream finish("__resume.Finish()\n");
+    ETCS::run_script(finish, "(resume)", rc);
+    return true;
+}
+
+// Asks once, before the prompt; the answer is the session's.
+inline void offer_resume(ETCS::SignalContext& sig, const ReplLineSource* in)
+{
+    const int choice = resume_choice().exchange(-1);
+    if (choice < 0) return;
+    const ::std::string summary = resume_summary();
+    if (summary.empty()) return;
+    if (choice == 0)
+    {
+        if (!in) return;
+        ETCS_SHELL("Navigator", COLOR_DIR << "Last time: " << summary << COLOR_RESET);
+        ::std::string answer;
+        if (!(*in)("Continue where you left off? [y/N] ", answer)) return;
+        if (answer != "y" && answer != "Y" && answer != "yes") return;
+    }
+    resume_last_scene(sig);
+}
+
 inline int drive_main_loop_then_exit(ETCS::SignalContext& ctx, int code,
                                      const ::std::string& control_socket = "")
 {
@@ -4590,7 +4696,9 @@ inline int drive_main_loop_then_exit(ETCS::SignalContext& ctx, int code,
                 repl_console_shell = shell;
 
                 ReplLineSource in = repl_shell_line_source(shell, ctx);
+                offer_resume(ctx, &in);
                 repl_shell_loop_with(ctx, in);
+                ETCS::runtime_close();
 
                 repl_console_shell = nullptr;
                 repl_owns_console  = false;
@@ -4640,6 +4748,7 @@ inline int drive_main_loop_then_exit(ETCS::SignalContext& ctx, int code,
 
         ETCS_LOG("ETCS", "[trace] before repl_shell_line_source");
         ReplLineSource in = repl_shell_line_source(shell, ctx);
+        offer_resume(ctx, &in);
         ETCS_LOG("ETCS", "[trace] before repl_shell_loop_with");
         repl_shell_loop_with(ctx, in);
         ETCS_LOG("ETCS", "[trace] after repl_shell_loop_with");
@@ -4671,6 +4780,8 @@ inline int drive_main_loop_then_exit(ETCS::SignalContext& ctx, int code,
     ETCS::wait_for_environment_drain(ctx);
   #endif
 #endif
+    // Before anything is torn down: the last save, then no more (Provenance.h).
+    ETCS::runtime_close();
     ETCS::shutdown_detached_executors();
     ETCS::PendingUnloadRegistry::getInstance().join_all();
     return code;

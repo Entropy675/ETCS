@@ -789,6 +789,10 @@ size_t ETCS::MirrorBuffer::chainOf(ETCS::Entity* owner, WireScope scope, IWireWr
     }
     return n;
 }
+inline bool ETCS::MirrorBuffer::localFrame(ETCS::Entity* e)
+{
+    return e && (e->hasTag(ETCS::Buffer("Database")) || e->hasTag(ETCS::Buffer("Local")));
+}
 ::std::string ETCS::MirrorBuffer::manifestOf(ETCS::Entity* owner, WireScope scope)
 {
     ::std::string out;
@@ -2816,6 +2820,19 @@ void* ETCS_GetLoaderManifest()
 {
     return static_cast<void*>(&ETCS::Entity::getManifest());
 }
+
+// The process's one provenance slot (core/Provenance.h), found by modules the
+// same way as the manifest above.
+extern "C"
+#ifdef _WIN32
+__declspec(dllexport)
+#else
+__attribute__((visibility("default")))
+#endif
+void* ETCS_GetProvenance()
+{
+    return static_cast<void*>(&ETCS::provenance_local());
+}
 #endif // ETCS_LOADER
 
 /*
@@ -3082,6 +3099,9 @@ inline bool ETCS::DestroyEvent::operator()()
  * to remember to signal-and-wait by hand, which is the whole point.
  */
     if (!ETCS::drainEntityScopes(target, "DestroyEvent")) return false;
+    // Read while the target is whole: a child leaving is its parent's change.
+    ETCS::Entity* const leaving_from = target ? target->getParent() : nullptr;
+    const ETCS::RID     leaving      = target ? target->getRID() : rid;
     DLInEvent evt{};
     evt.kind = DLInEvent::Kind::Destroy;
     evt.conjugate_key = conjugate_key;
@@ -3103,6 +3123,8 @@ inline bool ETCS::DestroyEvent::operator()()
 #else
     while ((r = result.load(::std::memory_order_acquire)) < 0);
 #endif
+    if (r != 0 && leaving_from) ETCS::Entity::recordEffect(leaving_from, ETCS::Entity::childKey(leaving), false);
+    if (r != 0) ETCS::forget_script_name(leaving);
     return r != 0;
 }
  
@@ -3138,7 +3160,11 @@ inline ETCS::RID ETCS::AddTagEvent::operator()()
 #else
     while (!ready.load(::std::memory_order_acquire));
 #endif
-    return result.load(::std::memory_order_relaxed);
+    // A child made inside an action is part of that action's effect on its
+    // parent (Entity::recordEffect, core/Provenance.h).
+    const ETCS::RID made = result.load(::std::memory_order_relaxed);
+    if (made && parent) ETCS::Entity::recordEffect(parent, ETCS::Entity::childKey(made), true);
+    return made;
 }
  
 /*

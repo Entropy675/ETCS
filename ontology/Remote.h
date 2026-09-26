@@ -44,6 +44,13 @@
 // on an ordinary StrategySocket MirrorBuffer. A verb is the same with a
 // Buffer instead of a socket.
 //
+// THE FAR FRAME OF ENVIRONMENTAL. When the far node claims Environmental
+// (ontology/Environmental.h), binding brings its named state across and
+// the surface is handed it through ReflectRemote: a reflection starts
+// out showing what the node holds. The local frame -- a Database, or
+// anything tagged `Local` -- is never bound at all (MirrorBuffer::
+// localFrame): what it holds is this runtime's.
+//
 // The child's own verbs (binding, reporting) are the only ones answered
 // locally, and they are the child's -- so nothing the far node can be
 // asked is shadowed by something only this side understands.

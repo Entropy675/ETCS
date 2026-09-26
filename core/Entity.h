@@ -3,6 +3,7 @@
 #include "ETCS_API.h"
 #include "../libs.h"
 #include "Bundles.h"
+#include "Provenance.h"
 #include "ArenaAllocator.h"
 #include "MemoryArena.h"
 #include "RIDList.h"
@@ -28,6 +29,7 @@
 #include <string>
 #include <algorithm>
 #include <array>
+#include <optional>
 #include <set>
 #include <map>
 #include <unordered_map>   // the region-digest table below
@@ -414,6 +416,13 @@ private:
     // See setRemoteWire. Mutable count: a const walk may still call through.
     ::std::atomic<ETCS::IWireRemote*> remote_wire_{nullptr};
     mutable ::std::atomic<int>        remote_calls_{0};
+    // Provenance (core/Provenance.h): the actions that made this entity's tag
+    // surface what it is, kept only once it claims Environmental.
+    ::std::atomic<bool>               environmental_{false};
+    uint64_t                          born_frame_ = 0;   // the action that made it
+    mutable ::std::mutex              actions_mu_;
+    ::std::vector<ETCS::ActionRecord> actions_;
+    uint64_t                          actions_seq_ = 0;
     /*
  * Set true as the FIRST action inside ~Entity(). A no-op operator
  * delete (the child case, below) means the object's own bytes are
@@ -837,7 +846,9 @@ public:
             throw ::std::invalid_argument(
                 ::std::string("addTag: flag must start with a lowercase letter: ")
                 + (s ? s : ""));
-        return ETCS::TagModifyEvent{this, flag, false, &Entity::tagModifyImpl}();
+        const bool on = ETCS::TagModifyEvent{this, flag, false, &Entity::tagModifyImpl}();
+        if (on) recordEffect(this, flagKey(this, flag.toString()), true);
+        return on;
     }
     /*
  * TAG-scope bits beyond this entity's own closure -- ScopeTag passes a
@@ -1405,7 +1416,19 @@ public:
  */
     bool removeTag(const ETCS::Buffer& tag)
     {
-        return ETCS::TagModifyEvent{this, tag, true, &Entity::tagModifyImpl}();
+        // A relation going takes its child with it (above): that is this
+        // entity's change, recorded here, where the action's frame still is.
+        RID leaving = 0;
+        {
+            ::std::lock_guard<::std::mutex> lock(m_tagMutex);
+            auto it = tags.find(tag);
+            if (it != tags.end() && it->second.child) leaving = it->second.child->getRID();
+        }
+        const bool off = ETCS::TagModifyEvent{this, tag, true, &Entity::tagModifyImpl}();
+        const char c = tag.c_str()[0];
+        if (off && c >= 'a' && c <= 'z') recordEffect(this, flagKey(this, tag.toString()), false);
+        if (off && leaving) recordEffect(this, childKey(leaving), false);
+        return off;
     }
     /*
  * See addTag's own overload. ScopeTag's destructor must pass the same extra
@@ -1710,6 +1733,10 @@ public:
 #ifdef ETCS_LOG_FUNCTION_EVOCATION_PATH
         ETCS_LOG("Entity::call", "parsed tag_type=" << tag_type << " action=" << action);
 #endif
+        // The action every tag change beneath it is credited to, when nothing
+        // outside it opened one (the executor does, for a script's lines).
+        ::std::optional<ETCS::ActionScope> action_scope;
+        if (!ETCS::current_action_frame()) action_scope.emplace(getRID(), action, data);
         // A surface of a remote: its own verbs are the far node's, run there
         // and answered in `data` like any work function (setRemoteWire).
         if (remoteWire() && tag_type == getSourceTag())
@@ -1954,6 +1981,75 @@ public:
                 ::std::this_thread::sleep_for(::std::chrono::milliseconds(1));
     }
     ETCS::IWireRemote* remoteWire() const { return remote_wire_.load(::std::memory_order_acquire); }
+
+    /*
+ * PROVENANCE. Set once, by EnvironmentalBase's constructor: from then on every
+ * tag that goes on or off this entity -- or any plain entity beneath it, up to
+ * the next Environmental one -- is recorded against the action it happened in
+ * (core/Provenance.h). The log is what etcs_replay_capture compacts into the
+ * script that rebuilds the entity.
+ */
+    void markEnvironmental()
+    {
+        if (ETCS::ActionFrame* f = ETCS::current_action_frame()) born_frame_ = f->id;
+        environmental_.store(true, ::std::memory_order_release);
+    }
+    bool isEnvironmental() const { return environmental_.load(::std::memory_order_acquire); }
+    ::std::vector<ETCS::ActionRecord> actionLog() const
+    {
+        ::std::lock_guard<::std::mutex> lock(actions_mu_);
+        return actions_;
+    }
+    // After a capture of the log up to `upto`: what is left of that is what
+    // the capture kept. It rebuilds the same surface, and everything dropped
+    // is history the surface no longer shows -- which is the snapshot frames'
+    // to keep, not this log's. Later records are the next capture's.
+    void keepActions(const ::std::vector<uint64_t>& seqs, uint64_t upto)
+    {
+        ::std::lock_guard<::std::mutex> lock(actions_mu_);
+        ::std::vector<ETCS::ActionRecord> kept;
+        for (auto& r : actions_)
+            if (r.seq > upto || ::std::find(seqs.begin(), seqs.end(), r.seq) != seqs.end())
+                kept.push_back(::std::move(r));
+        actions_.swap(kept);
+    }
+    static void recordEffect(Entity* touched, const ::std::string& key, bool created)
+    {
+        Entity* env = touched;
+        while (env && !env->isEnvironmental()) env = env->getParent();
+        if (!env) return;
+        ETCS::ActionFrame* f = ETCS::current_action_frame();
+        // What it does while being made is its making: the line that spawns
+        // it does it again, so it is its parent's record, not its own.
+        if (f && f->id == env->born_frame_) return;
+        ::std::lock_guard<::std::mutex> lock(env->actions_mu_);
+        if (f) f->settle();
+        if (f && !env->actions_.empty() && env->actions_.back().frame == f->id)
+        {
+            (created ? env->actions_.back().created : env->actions_.back().removed).push_back(key);
+            return;
+        }
+        ETCS::ActionRecord r;
+        r.seq   = ++env->actions_seq_;
+        r.frame = f ? f->id : 0;
+        if (f) r.line = f->line;
+        (created ? r.created : r.removed).push_back(key);
+        env->actions_.push_back(::std::move(r));
+    }
+    // The flags that are state -- not the in-flight scopes (surfaceHash).
+    void stateFlags(::std::vector<::std::string>& out) const
+    {
+        const ::std::string scope = ETCS::ScopeTag::kPrefix;
+        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
+        for (auto const& [key, _] : flags_)
+        {
+            ::std::string f = key.toString();
+            if (f.compare(0, scope.size(), scope) != 0) out.push_back(::std::move(f));
+        }
+    }
+    static ::std::string flagKey(const Entity* e, const ::std::string& flag)
+    { return "f:" + ::std::to_string(e->getRID()) + ":" + flag; }
+    static ::std::string childKey(RID child) { return "c:" + ::std::to_string(child); }
     struct RemoteCallGuard
     {
         const Entity& e;
@@ -4413,6 +4509,206 @@ inline Entity::HashAudit etcs_root_hash(Entity* top)
  * is why RIDs are collected into a set first: an entity counts once however
  * many names it answers to. Each is held for the length of its pull.
  */
+/*
+ * ═══ REPLAY CAPTURE ══════════════════════════════════════════════════════
+ *
+ * The ETCS lines that rebuild an Environmental entity (ontology/
+ * Environmental.h) as it is now, from the actions recorded against it
+ * (core/Provenance.h) -- the same script whether it is replayed here, from
+ * this runtime's own store, or on the far side of a MirrorBuffer to build a
+ * reflection.
+ *
+ * WHAT IS KEPT. Every action that put on something still there; then every
+ * later action that took off something a kept action put on -- or replaying
+ * the first would bring it back -- to a fixed point. In the order they ran.
+ * Nothing else: an action whose every effect was later undone is history the
+ * surface no longer shows, and the log drops it here too (keepActions).
+ *
+ * NAMES, NOT RIDS. The entity is `name` (the caller binds it); a child made
+ * by a script line is named here, from its type and the order it was made in,
+ * when the line that makes it is written; @names in a payload become those
+ * names. A RID is never written. What cannot be named -- an action on
+ * something outside what is being rebuilt, a child made in C++ that a later
+ * line addresses, a change made outside any action -- is a warning, and the
+ * caller's hash check after replay is what says whether it mattered.
+ *
+ * REGION. The entity, and the plain entities under it, down to (not into) the
+ * next Environmental ones -- those carry their own record, captured after
+ * their parent's, once the line that makes them has named them.
+ */
+struct ReplayCapture
+{
+    ::std::string                                 script;
+    ::std::vector<::std::pair<::std::string, Entity*>> environmental;   // in rebuild order
+    ::std::vector<::std::pair<size_t, size_t>>    spans;   // each one's own lines in `script`
+    ::std::vector<::std::string>                  warnings;
+};
+
+namespace etcs_replay_detail
+{
+    inline ::std::string ident(const ::std::string& s)
+    {
+        ::std::string o;
+        for (char c : s) o += (::std::isalnum(static_cast<unsigned char>(c)) ? c : '_');
+        return o;
+    }
+    // Rewrites @old-name tokens whose RID is known into @new-name.
+    inline ::std::string rename_refs(const ::std::string& payload,
+                                     const ::std::vector<::std::pair<::std::string, RID>>& refs,
+                                     const ::std::map<RID, ::std::string>& names, bool& unresolved)
+    {
+        ::std::string out;
+        for (size_t i = 0; i < payload.size(); )
+        {
+            if (payload[i] != '@') { out += payload[i++]; continue; }
+            size_t end = i + 1;
+            while (end < payload.size()
+                   && (::std::isalnum(static_cast<unsigned char>(payload[end])) || payload[end] == '_')) ++end;
+            const ::std::string tok = payload.substr(i + 1, end - i - 1);
+            ::std::string repl = payload.substr(i, end - i);
+            for (auto const& [n, rid] : refs)
+                if (n == tok)
+                {
+                    auto it = names.find(rid);
+                    if (it != names.end()) repl = "@" + it->second; else unresolved = true;
+                    break;
+                }
+            out += repl;
+            i = end;
+        }
+        return out;
+    }
+}
+
+inline void etcs_replay_capture(Entity* e, const ::std::string& name,
+                                ::std::map<RID, ::std::string>& names, ReplayCapture& out)
+{
+    if (!e) return;
+    names[e->getRID()] = name;
+    out.environmental.emplace_back(name, e);
+    const size_t at = out.environmental.size() - 1, begin = out.script.size();
+    out.spans.emplace_back(begin, begin);
+
+    // The region and what is live in it.
+    ::std::set<::std::string> live;
+    ::std::vector<Entity*> region{ e }, env_children;
+    ::std::map<RID, Entity*> parent_of;
+    for (size_t i = 0; i < region.size(); ++i)
+    {
+        Entity* x = region[i];
+        ::std::vector<::std::string> fl;
+        x->stateFlags(fl);
+        for (auto& f : fl) live.insert(Entity::flagKey(x, f));
+        ::std::vector<::std::pair<ETCS::Buffer, RID>> kids;
+        x->getTypedChildren(kids);
+        for (auto& [tag, rid] : kids)
+        {
+            Entity* c = x->getTypedChild(tag, rid);
+            if (!c) continue;
+            live.insert(Entity::childKey(rid));
+            parent_of[rid] = x;
+            if (c->isEnvironmental()) env_children.push_back(c);
+            else                      region.push_back(c);
+        }
+    }
+
+    // What to keep: see the banner.
+    const ::std::vector<ActionRecord> log = e->actionLog();
+    ::std::vector<bool> keep(log.size(), false);
+    for (size_t i = 0; i < log.size(); ++i)
+        for (auto& k : log[i].created) if (live.count(k)) { keep[i] = true; break; }
+    for (bool grew = true; grew; )
+    {
+        grew = false;
+        for (size_t j = 0; j < log.size(); ++j)
+        {
+            if (keep[j]) continue;
+            for (size_t i = 0; i < j && !keep[j]; ++i)
+            {
+                if (!keep[i]) continue;
+                for (auto& rk : log[j].removed)
+                    if (::std::find(log[i].created.begin(), log[i].created.end(), rk) != log[i].created.end())
+                    { keep[j] = true; grew = true; break; }
+            }
+        }
+    }
+
+    ::std::map<::std::string, int> made;   // per type, for the names children get
+    ::std::vector<uint64_t> kept;
+    for (size_t i = 0; i < log.size(); ++i)
+    {
+        if (!keep[i]) continue;
+        const ActionRecord& r = log[i];
+        kept.push_back(r.seq);
+        if (!r.frame)
+        {
+            out.warnings.push_back(name + ": a change made outside any action cannot be replayed");
+            continue;
+        }
+        auto recv = names.find(r.line.receiver);
+        if (recv == names.end())
+        {
+            out.warnings.push_back(name + ": '" + r.line.verb + "' ran on something this record does not rebuild");
+            continue;
+        }
+        if (r.line.verb == "spawn")
+        {
+            // One line makes one child: the one under the receiver. Anything
+            // else the line created, the child's own making makes again.
+            RID child = 0;
+            for (auto& k : r.created)
+            {
+                if (k.compare(0, 2, "c:") != 0) continue;
+                const RID c = ::std::strtoull(k.c_str() + 2, nullptr, 10);
+                auto p = parent_of.find(c);
+                if (!child || (p != parent_of.end() && p->second->getRID() == r.line.receiver)) child = c;
+            }
+            if (!child) continue;
+            const ::std::string tag = r.line.payload.substr(r.line.payload.rfind(':') + 1);
+            const ::std::string cname = name + "_" + etcs_replay_detail::ident(tag) + ::std::to_string(++made[tag]);
+            names[child] = cname;
+            out.script += recv->second + ".spawn(" + r.line.payload + " " + cname + ")\n";
+            continue;
+        }
+        if (r.line.payload.find('\n') != ::std::string::npos)
+        {
+            out.warnings.push_back(name + ": '" + r.line.verb + "' took a payload no line can hold");
+            continue;
+        }
+        bool unresolved = false;
+        const ::std::string payload =
+            etcs_replay_detail::rename_refs(r.line.payload, r.line.refs, names, unresolved);
+        if (unresolved)
+            out.warnings.push_back(name + ": '" + r.line.verb + "' names something this record does not rebuild");
+        ::std::string line = recv->second + "." + r.line.verb + "(" + payload + ")";
+        if (r.line.stream_to)
+        {
+            auto to = names.find(r.line.stream_to);
+            if (to == names.end())
+            {
+                out.warnings.push_back(name + ": a stream into something this record does not rebuild");
+                continue;
+            }
+            line += " -> " + to->second + "." + r.line.stream_verb + "()";
+        }
+        out.script += line + "\n";
+    }
+    e->keepActions(kept, log.empty() ? 0 : log.back().seq);
+    out.spans[at].second = out.script.size();
+
+    for (Entity* c : env_children)
+    {
+        auto it = names.find(c->getRID());
+        if (it == names.end())
+        {
+            out.warnings.push_back(name + ": a " + c->getSourceTag().toString()
+                                   + " under it was not made by a script line and cannot be named");
+            continue;
+        }
+        etcs_replay_capture(c, it->second, names, out);
+    }
+}
+
 inline void etcs_module_root_hash(const ::std::vector<const RIDListHandle*>& rows,
                                   unsigned char out[32], size_t* entities = nullptr)
 {

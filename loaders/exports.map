@@ -10,6 +10,7 @@
 ETCS_LOADER_1.0 {
     global:
         ETCS_GetLoaderManifest;
+        ETCS_GetProvenance;      # core/Provenance.h: the one action slot per process
     local:
         *;
 };

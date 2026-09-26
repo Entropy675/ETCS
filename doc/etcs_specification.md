@@ -389,15 +389,16 @@ changes is how the name was bound:
 spawn NetworkProvider::Peer peer
 peer.Connect(wss://example.org/link/studio)
 
-spawn DatabaseProvider::LocalDatabase db        # the SAME type as the host's node
-db.spawn(NetworkProvider::Remote remote)       # makes db a surface of a far node
-remote.Bind(db @peer)                          # ...the one the host published as `db`
+spawn NetworkProvider::Ledger book           # the SAME type as the host's node
+book.spawn(NetworkProvider::Remote remote)     # makes book a surface of a far node
+remote.Bind(book @peer)                        # ...the one the host published as `book`
 
-db.ExecuteRaw(INSERT INTO users (name) VALUES ('guest');)   # runs on the host
-db.QueryProduce(SELECT * FROM users) -> mirror.RowConsume() # host produces, this side consumes
+spawn NetworkProvider::Ledger copy
+book.Append(guest a line)                      # runs on the host
+book.Follow(0) -> copy.Mirror()                # host produces, this side consumes
 ```
 
-`db` is a **surface**: a local instance of the far node's type, so it is everything that type is
+`book` is a **surface**: a local instance of the far node's type, so it is everything that type is
 to every family walk and `requires` bracket. The `Remote` child is the mark that it is not local,
 and the wire: from `Bind` on, its actions run on the far node and come back with that node's
 answer, and a stream naming it runs its half there while this runtime runs the other. The
@@ -419,8 +420,18 @@ unless both sides hold the same key — which refuses the action or ends the str
 runtime cannot construct cannot be attached, so that node cannot be reached at all; only what else
 the far side publishes, which reaches it there, can.
 
+**The local frame never crosses.** A `Database` is a resource of a locale — it is somewhere
+before it is anywhere — so its surface is this runtime's only, and neither side binds or opens a
+stream onto one; nor onto anything else that carries the bare `Local` tag, which is how
+`DatabaseProvider::Persistence` says its verbs are this loader's store. What a database holds
+reaches another runtime only through a type that is published and reads it here.
+
+**A surface starts as a reflection.** When the far node claims `Environmental` (below, **What
+outlives the runtime**), `Bind` brings its named state along and the surface puts it back through
+`ReflectRemote` — a guest's `Ledger` surface holds the host's lines from the moment it binds.
+
 The far side decides what is reachable: a `Room` publishes entities by name
-(`room.Publish(db @db)`), and nothing else in that runtime can be bound. The host of a room is its
+(`room.Publish(book @book)`), and nothing else in that runtime can be bound. The host of a room is its
 authority — every guest's actions arrive there and run in its order — whether it serves the room
 itself (`room.Host(@links studio)`, beside an `HttpServer`'s `LinkHub`) or, unable to accept
 connections, hosts through a server that only splices bytes (`room.HostVia(wss://site/link/studio)`).
@@ -461,6 +472,66 @@ reaches into `web`'s own children by accident.
 There is no receiver-scoped `requires`: a child is not something a caller can hand you, and an
 already-built child of a specific parent is not a slot description — it either is that parent's
 child or it is not, which `attach`/`ensure` on the receiver already say precisely.
+
+---
+
+## What outlives the runtime
+
+Everything a script builds is gone when the runtime stops — except what asks to be kept:
+
+```etcs
+spawn NetworkProvider::Ledger book
+book.spawn(DatabaseProvider::Persistence keep)   # book, and everything under it, is kept
+book.Append(first line)
+book.spawn(NetworkProvider::Ledger margin)
+```
+
+The next time the loader starts with no script it offers the scene back — *Continue where you
+left off?* — and `etcs --resume [script.etcs]` takes it without asking (before the script, which
+can then use it); `--fresh` declines. What comes back is `book` with its lines, `margin` with its
+own, both answering to the names the scene gives them.
+
+**Opt-in, by family.** A type that can be kept claims **Environmental** (`ontology/
+Environmental.h`), and nothing else pays for it: from the moment an entity of such a type exists,
+the runtime records, for every tag that goes on or off it (or on a plain entity beneath it), the
+one script-level action it happened inside — the line, not the calls that line made. Small fast
+types that live purely in the functional realm never claim it and never record anything.
+
+**What is kept is how, not what.** The record is compacted to what the surface still shows —
+every action that put on something still there, and every later action that took off something
+those put on — and written out as ordinary ETCS lines: the script that makes it again. A child a
+line made is named from its parent's name, its type and the order it was made in
+(`book_Ledger1`); `@names` in payloads become those names; no RID is ever written. What the
+script cannot say — state held in members rather than tags, like a ledger's lines, which came
+from whoever appended them — the type captures as named values (`CaptureState`) and puts back
+after its script has run (`RebuildLocal`). Replay is deterministic by the rules of scripts, so
+anything that was not (a clock, input, a far node's answer) belongs in those values, as its
+result. A type that renames a value later says how, oldest first (`MigrateTo`); the ETCS surface
+only grows, so an old script still replays.
+
+**The same script in both frames.** Rebuilding an entity here, from this runtime's store, and
+reflecting it on the far side of a link are one operation seen from two sides: `RebuildLocal`
+is the local frame's slot and `ReflectRemote` the far frame's, and a type says how it answers in
+each.
+
+**Looked up by what it is.** Each Environmental entity's record is keyed by its `Module::Tag` and
+its state hash — the merkle hash of its tags down through its children, over the compile-time
+hashes of the code behind them and **no RIDs** (a RID is where and when something was made; a
+scene made again in another order is the same scene) — and, among entities equal in both, by the
+order they were made in, which a replay reproduces without storing it. So a replay that did not
+make what was saved finds no record, and says so, rather than handing an entity someone else's
+state; and the resume ends by checking every root's hash against the one saved.
+
+**This loader's own.** The store is `persistence.db` in `$ETCS_STORE`, else
+`$XDG_DATA_HOME/etcs`, else `~/.local/share/etcs` (`/persist` in a browser, which the page mounts
+on IndexedDB), beside a key made on first use that never leaves it. Every record and scene is
+MACed with that key; one that does not verify is not replayed. It is saved as it changes, and
+once more as the loader closes.
+
+What may hold a `Persistence` today is a global-scope entity that claims Environmental; the
+capture says what it cannot rebuild (a change made outside any action, an action on something
+the scene does not make) rather than guessing. Live motion — an open stream, a link — is not
+state and does not come back; what it left behind does.
 
 ---
 
@@ -608,6 +679,9 @@ its own module — it lives in that module's arena, not its parent's, and holds 
 lifetime exactly as a global entity would, handing it to a sibling root when it goes. Only its
 place in the graph is its parent's: it leaves with its parent, through its own module.
 
+Before any of that, the loader says it is closing: what keeps the scene saves it one last time
+and then writes nothing more, so a half torn-down runtime is never what the next start resumes.
+
 ---
 
 ## Summary
@@ -625,6 +699,7 @@ place in the graph is its parent's: it leaves with its parent, through its own m
 | RID in a payload | `@name` |
 | Stream | `<a>.Produce(payload) -> <b>.Consume(payload)` — one line, both ends |
 | Entity in another runtime | a local instance of its type with a `NetworkProvider::Remote` child, bound to a published name — its actions and stream halves run there, on one link per pair of runtimes, through the node's `Wrapper` authority layer |
+| Keeping a scene | a `DatabaseProvider::Persistence` child on a global `Environmental` entity — its actions, compacted to a script, plus its named state; offered back at the next start (`--resume` / `--fresh`) |
 | Interrupting work | `<name>.kill(<label> [index])` |
 | Removing a flag | `<name>.unflag(<flag>)` — the mutable set; a `requires` tag is fixed and out of reach |
 | Scope | local closure + the root script's names as globals; no ancestor chain |

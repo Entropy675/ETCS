@@ -124,6 +124,10 @@
 // runtime calls it (IWireRemote), so it is here with the other wired families.
 // See ontology/Remote.h.
 #include "ontology/RemoteBase.h"
+// How an entity is made present in a frame of reference: rebuilt here from its
+// own record, or reflected over a MirrorBuffer -- one replay, two sides. Opt-in.
+// See ontology/Environmental.h.
+#include "ontology/EnvironmentalBase.h"
 // What rides on links: who can be reached (Directory) and what happened, in
 // one authority's order (Record). The lobby and session shapes chess and paint
 // each wrote for themselves. See ontology/Directory.h, ontology/Record.h.
