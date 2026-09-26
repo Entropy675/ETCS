@@ -56,6 +56,14 @@ struct DLInEvent
     // it just calls whatever Entity::addTag/removeTag captured here,
     // mirroring the same reasoning addTagTrampoline<T> already uses for
     // crossing that same boundary.
+    // The target BY NAME -- its RID and the conjugate key its type's list is
+    // published under -- which the handler re-resolves (etcs_tagmodify_target,
+    // DynamicLoader.h), because a RID resolution is the liveness check. The
+    // address rides along only for a type that publishes NO list: there is no
+    // liveness surface to ask about it anywhere in the runtime, so the
+    // emitter's pointer is the whole of what is known, exactly as before.
+    RID                tagmodify_rid = 0;
+    ETCS::Buffer       tagmodify_type;
     ETCS::Entity*      tagmodify_target = nullptr;
     bool               tagmodify_is_remove = false;
     // Returns whether the surface actually moved -- see Entity::tagModifyImpl.

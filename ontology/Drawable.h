@@ -177,8 +177,10 @@ public:
     }
 
     /*
-     * PRESENT BUT NOT DRAWN -- answered by DrawableBase, which owns the flag and
-     * says why it exists (ontology/DrawableBase.h).
+     * PRESENT BUT NOT DRAWN -- the `hidden` flag, which DrawableBase raises,
+     * caches and says why it exists (ontology/DrawableBase.h). Read straight
+     * from the store here, uncached, so a drawable that does not come through
+     * DrawableBase still answers the flag rather than a hard-coded no.
      *
      * Declared here, on the interface, because the two things that must honour it
      * are a container's DRAW and a container's PICK, and the pick walks children
@@ -186,7 +188,7 @@ public:
      * would be the worst of the three arrangements this replaced: invisible and
      * in the way. If you cannot see it, you cannot hit it.
      */
-    virtual bool Hidden() const { return false; }
+    virtual bool Hidden() const { return hasTag(ETCS::Buffer("hidden")); }
 
     /*
  * The recursion the comment above calls the point, written once.

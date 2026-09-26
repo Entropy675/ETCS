@@ -1,5 +1,6 @@
 #ifndef BASE_DRAWABLE_H__
 #define BASE_DRAWABLE_H__
+#include <atomic>
 #include "Drawable.h"
 #include "SurfaceBase.h"
 
@@ -71,22 +72,62 @@ ETCS_SUPERTYPE_BASE(Drawable), public SurfaceBase<Derived>
 
     void DrawInto(Surface_* dst) override
     {
-        if (m_hidden) return;
+        if (Hidden()) return;
         static_cast<Derived*>(this)->DrawIntoConcrete(dst);
     }
 
-    // Marked, because whoever holds a merged copy of this node has to rebuild
-    // without it -- appearing and disappearing are changes like any other.
+    /*
+     * HIDDEN IS A FLAG -- `hidden` in the entity's own store, beside
+     * `passthrough` -- because whether a node is showing is a meaningful
+     * change of state, and meaningful state goes through the tags. That is
+     * what records it: the flag funnel (Entity::tagModifyImpl) marks the
+     * observers, bumps every ancestor's hash epoch, and puts the transition
+     * in the history. A private bool did none of the three, so a window
+     * opening or closing was the one change on the page nothing could see.
+     * It also makes it a script's to ask and to clear -- hasTag, `requires`,
+     * `.unflag(hidden)` -- with no verb of its own.
+     *
+     * ORDERED, so it BLOCKS until the module's ordering thread has applied it,
+     * and must not be raised from inside a lifetime hold
+     * (ETCS_ASSERT_NO_LIFETIME_HOLD). Asking before asking to change is what
+     * keeps a refresh that re-states every row's visibility from paying one
+     * round trip per row that is already right.
+     */
     void SetHidden(bool hidden)
     {
-        if (m_hidden == hidden) return;
-        m_hidden = hidden;
-        etcs_mark_observed(static_cast<Derived*>(this));
+        if (Hidden() == hidden) return;
+        if (hidden) this->addTag("hidden");
+        else        this->removeTag(ETCS::Buffer("hidden"));
     }
-    bool Hidden() const override { return m_hidden; }
+
+    /*
+     * CACHED, as close to where it is read as it can be: this is asked for
+     * every child on every compose and every pick, and a flag lookup takes
+     * the tag mutex. The cache is stamped with the node's hash epoch, which
+     * every flag change bumps (Entity::markStateChange) -- so it is current
+     * exactly when the epochs agree, the same test getHash makes, and a
+     * change landing during a refresh is stored but never believed.
+     *
+     * One atomic, epoch and answer packed together: two atomics could be
+     * written by two refreshing readers in an interleaving that paired a
+     * new epoch with an old answer.
+     */
+    bool Hidden() const override
+    {
+        const uint64_t epoch = this->hashEpoch();
+        uint64_t packed = m_hidden_cache.load(::std::memory_order_acquire);
+        if ((packed >> 1) != epoch)
+        {
+            packed = (epoch << 1) | (this->hasTag(ETCS::Buffer("hidden")) ? 1u : 0u);
+            m_hidden_cache.store(packed, ::std::memory_order_release);
+        }
+        return (packed & 1u) != 0;
+    }
 
 private:
-    bool m_hidden = false;
+    // (epoch << 1) | hidden. Epoch 0 is never current -- hash epochs start at
+    // 1 -- so the first read always looks.
+    mutable ::std::atomic<uint64_t> m_hidden_cache{0};
 };
 
 #endif

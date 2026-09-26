@@ -1245,6 +1245,52 @@ bool ETCS::ModuleBundle::operator()(ETCS_RID_SIZE rid, const ETCS::Buffer& conju
     return pass;
 }
 /*
+ * THE TARGET OF A FLAG CHANGE, FOUND AGAIN WHERE THE CHANGE IS APPLIED.
+ *
+ * The emitter names the entity -- its RID and the key its type's list is
+ * published under -- and the ordering thread resolves that name here, at the
+ * moment the change lands. The resolution IS the liveness check, as it is for a
+ * work function (WorkBundle::operator()): an entity retired while the event sat
+ * in the ring is simply not found, and the change is refused rather than written
+ * into memory the arena may already have handed to somebody else.
+ *
+ * Keyed on TYPE, as every ordinary RID lookup is -- per-provider-type is the
+ * uniqueness the generator guarantees (Entity.h, resolve_in_family).
+ *
+ * Both handlers call this -- the loader's and a module's -- so there is one
+ * place that decides what "still there" means for a flag.
+ */
+/*
+ * WHETHER A TYPE CAN BE ASKED ABOUT AT ALL: some list, in the loader's own map
+ * or mirrored from a module, published under this key. A type with none -- a
+ * test's local leaf, an internal type added without a tag block -- is outside
+ * the registry, and "not found" would say nothing about whether it is alive.
+ */
+inline bool etcs_type_published(const ETCS::Buffer& key)
+{
+    if (key.written == 0) return false;
+    ETCS::EventNode* owner = ETCS::etcs_loader_event_node();
+    if (!owner) return false;
+    const ETCS::Buffer bare = ETCS::etcs_bare_family_key(key);
+    if (owner->ridMap.find(bare) != owner->ridMap.end()) return true;
+    auto m = owner->ridMirror.find(bare);
+    return m != owner->ridMirror.end() && !m->second.empty();
+}
+
+inline ETCS::Entity* etcs_tagmodify_target(const ETCS::DLInEvent& evt)
+{
+    // Unlisted: nothing to check against, so the emitter's word stands.
+    if (!etcs_type_published(evt.tagmodify_type)) return evt.tagmodify_target;
+
+    ETCS::Entity* live = ETCS::etcs_resolve_by_key(evt.tagmodify_type, evt.tagmodify_rid);
+    if (!live)
+        ETCS_LOG("TagModify", "'" << evt.conjugate_key << "' "
+                 << (evt.tagmodify_is_remove ? "off" : "on") << " " << evt.tagmodify_type
+                 << " RID:" << evt.tagmodify_rid << " -- refused: its type's list no longer "
+                    "holds it, so it was retired while the change was queued.");
+    return live;
+}
+/*
  * -- LoaderStream method bodies ------------------------------------------------
  * Declared in EventNode.h, defined here where Module is fully defined.
  * All EventNode state access goes through owner pointer - no getInstance().
@@ -1463,8 +1509,9 @@ ETCS::DispatchResult ETCS::EventNode::LoaderStream::on_event(
  * for the very reason the discipline existed -- a caller cannot pop
  * its frame while spinning on a flag nobody has set.
  */
-            evt.release_value = evt.tagmodify_impl(evt.tagmodify_target, evt.conjugate_key,
-                                                  evt.tagmodify_is_remove) ? 1 : 0;
+            ETCS::Entity* live = etcs_tagmodify_target(evt);
+            evt.release_value = (live && evt.tagmodify_impl(live, evt.conjugate_key,
+                                                             evt.tagmodify_is_remove)) ? 1 : 0;
             return {ETCS::DispatchKind::Inline, &evt};
         }
         case DLInEvent::Kind::PairMask:
@@ -2646,8 +2693,9 @@ ETCS::DispatchResult ETCS::EventNode::ModuleProxy::on_event(
  * EventNode::getInstance() resolves to THIS ModuleProxy -- which is
  * what lets a stream pair's tag mask reach a buffer that can read it.
  */
-        evt.release_value = evt.tagmodify_impl(evt.tagmodify_target, evt.conjugate_key,
-                                              evt.tagmodify_is_remove) ? 1 : 0;
+        ETCS::Entity* live = etcs_tagmodify_target(evt);
+        evt.release_value = (live && evt.tagmodify_impl(live, evt.conjugate_key,
+                                                         evt.tagmodify_is_remove)) ? 1 : 0;
         return {ETCS::DispatchKind::Inline, &evt};
     }
  
@@ -3291,6 +3339,8 @@ inline bool ETCS::TagModifyEvent::operator()()
     DLInEvent evt{};
     evt.kind                = DLInEvent::Kind::TagModify;
     evt.conjugate_key       = conjugate_key;
+    evt.tagmodify_rid       = target->getRID();
+    evt.tagmodify_type      = target->myConjugateKey();
     evt.tagmodify_target    = target;
     evt.tagmodify_is_remove = is_remove;
     evt.tagmodify_impl      = impl;
