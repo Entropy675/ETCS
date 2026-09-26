@@ -3,6 +3,10 @@
 
 #include "Buffer.h"
 #include "SignalContext.h"
+#include "Provenance.h"
+
+#include <string>
+#include <vector>
 
 namespace ETCS
 {
@@ -382,6 +386,38 @@ struct IWireRemote
     virtual bool RemoteWork(const Buffer& action, Buffer& data, const SignalContext& ctx) = 0;
     virtual int  RemoteStream(const Buffer& action, const Buffer& config, bool produces,
                               const SignalContext& ctx) = 0;
+};
+
+// ---------------------------------------------------------------------------
+// IWireEnvironmental — the record's slot. Fulfilled by the Environmental
+// family (ontology/Environmental.h): an entity that can be made present again
+// -- rebuilt here from this runtime's store, or reflected in another runtime.
+//
+// The runtime calls it because the runtime is what sees a tag change and a
+// global name given: every tag that goes on or off it, or on a plain entity
+// beneath it, is recorded against the action that did it (Entity::recordEffect,
+// core/Provenance.h), and compacted into the script that rebuilds it
+// (etcs_replay_capture). The record lives in the family, so an entity that
+// never claims it carries none.
+//
+//   RecordEffect -- `key` came on (`created`) or went off inside `frame`
+//                   (null: outside any action).
+//   ActionLog / KeepActions -- the record, and trimming it to what a capture
+//                   up to record `upto` kept.
+//   NoteName / ScriptName -- the name a script gave it at global scope, which a
+//                   rebuilt scene calls it by again.
+//   Closing -- the loader is leaving (drive_main_loop_then_exit), before any
+//                   teardown: a last word for whatever keeps it.
+// ---------------------------------------------------------------------------
+struct IWireEnvironmental
+{
+    virtual ~IWireEnvironmental() = default;
+    virtual void RecordEffect(const ActionFrame* frame, const ::std::string& key, bool created) = 0;
+    virtual ::std::vector<ActionRecord> ActionLog() const = 0;
+    virtual void KeepActions(const ::std::vector<uint64_t>& seqs, uint64_t upto) = 0;
+    virtual void NoteName(const ::std::string& name) = 0;
+    virtual ::std::string ScriptName() const = 0;
+    virtual void Closing() = 0;
 };
 
 } // namespace ETCS

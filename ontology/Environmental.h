@@ -23,7 +23,8 @@
 //
 // Either way what rebuilds it is not a copy of its state but the ETCS
 // actions that produced it, replayed: the runtime records them as they
-// happen (core/Provenance.h) and compacts them into a script
+// happen, into the family's own record (IWireEnvironmental,
+// core/Provenance.h), and compacts them into a script
 // (etcs_replay_capture, Entity.h). The script is the same for both
 // frames; a local rebuild IS the remote build of the active graph,
 // without the boundary. Which frame an instance is in is a fact of the
@@ -118,7 +119,9 @@ struct EnvironmentState
 };
 } // namespace ETCS
 
-class Environmental_ : virtual public ETCS::Entity
+// IWireEnvironmental first, at offset 0 (core/InterfaceWire.h): the runtime
+// records into it and reads it back without knowing this family.
+class Environmental_ : public ETCS::IWireEnvironmental, virtual public ETCS::Entity
 {
 public:
     virtual ~Environmental_() = default;

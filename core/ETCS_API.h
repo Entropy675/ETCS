@@ -796,6 +796,7 @@ public: \
                      "data=" << data.buf); \
             return; \
         } \
+        ETCS_ACTION_SCOPE(handler, Name, data, ctx); \
         ETCS_CAUSAL_SCOPE(Type, Name); \
         _implWork_##Type##_##Name(*static_cast<Type*>(handler->getTrueType()), ctx, \
                                     FOR_EACH_COMMA(_ARGNAME, __VA_ARGS__)); \
@@ -883,6 +884,7 @@ public: \
             return; \
         } \
         ETCS::Buffer config = stream.getConfig(); \
+        ETCS_ACTION_SCOPE(handler, Name, config, ctx); \
         \
         /* Both masks come off the stream, where unpack() just put them. The \
          * TAG one goes to the ScopeTag, whose TagModifyEvent stays in this \
@@ -901,7 +903,8 @@ public: \
          * as leaving. */ \
         ETCS::SharedPage* _live_token = stream.producerEnter(); \
         /* The action this pair runs inside goes with the body to its thread, \
-         * so what the body changes is credited to the line that started it \
+         * by value -- the frame above ends with this trampoline -- so what \
+         * the body changes is credited to the line that started it \
          * (core/Provenance.h). */ \
         if (ETCS::current_action_frame()) ETCS::current_action_frame()->settle(); \
         ETCS::ActionFrame _action_frame = ETCS::current_action_frame() \
@@ -949,6 +952,7 @@ public: \
             return; \
         } \
         ETCS::Buffer config = stream.getConfig(); \
+        ETCS_ACTION_SCOPE(handler, Name, config, ctx); \
         Type* self = static_cast<Type*>(handler->getTrueType()); \
         ETCS::ScopeTag _auto_scope(self, #Name, ctx, stream.pairTagMask()); \
         stream.bindContext(_auto_scope.ctx()); \
@@ -987,6 +991,11 @@ public: \
     ETCS::CausalScope _causal_edge_scope( \
         _edge_w_##Type##_##Name, &_edge_set_##Type##_##Name)
 
+// The action the body runs inside (core/Provenance.h): the one the caller
+// carried in on ctx, or -- reached from outside any -- this call itself.
+#define ETCS_ACTION_SCOPE(handler, Name, payload, ctx) \
+    ETCS::ActionScope _action_scope((ctx).frame, (handler)->getRID(), ETCS::Buffer(#Name), (payload))
+
 #define DEFINE_WORK_FUNC(Type, Name) \
     void _implWork_##Type##_##Name(Type& self, ETCS::Buffer& data, ETCS::SignalContext ctx); \
     ETCS_CAUSAL_EDGE_STORE(Type, Name) \
@@ -998,6 +1007,7 @@ public: \
                      "to dispatch."); \
             return; \
         } \
+        ETCS_ACTION_SCOPE(handler, Name, data, ctx); \
         ETCS_CAUSAL_SCOPE(Type, Name); \
         _implWork_##Type##_##Name(*static_cast<Type*>(handler->getTrueType()), data, ctx); \
     } \

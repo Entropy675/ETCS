@@ -2,15 +2,9 @@
 #define PROVENANCE_H__
 #include "Buffer.h"
 
-#if !defined(_WIN32)
-#include <dlfcn.h>
-#endif
-
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
-#include <map>
-#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -23,22 +17,28 @@
  * a MirrorBuffer. What rebuilds it is not a copy of its state but the ETCS
  * actions that produced that state, replayed -- so the runtime records, for
  * each tag that goes on or off an Environmental entity (or a plain entity
- * beneath it), the ONE script-level action it happened inside.
+ * beneath it), the ONE script-level action it happened inside. The record
+ * itself is the family's (IWireEnvironmental, core/InterfaceWire.h): an entity
+ * that never claims it carries nothing.
  *
  * ONE ACTION, THE OUTERMOST. A work function that calls others is replayed by
  * replaying it; the calls it makes happen again by themselves. So the frame
  * recorded is the one the executor (or whatever issued the call from outside
  * any call) opened, and everything beneath it is credited to it.
  *
+ * CARRIED BY THE CALL, NOT HELD BY THE PROCESS. Each binary keeps its own
+ * current frame (a thread-local here is one copy per binary, modules being
+ * built hidden). A frame crosses into another binary the way everything else
+ * about a call does: the dispatch stamps it on the SignalContext it forwards
+ * (WorkBundle::operator()), and the callee's trampoline installs it for the
+ * body (ETCS_ACTION_SCOPE, ETCS_API.h). A call arriving with none -- from a
+ * thread of a module's own, over a link -- opens its own there.
+ *
  * RIDS ONLY AT RUNTIME. A frame names its receiver and the entities its
  * payload referred to (@name) by RID, because that is what exists while it
  * runs; the script generated from them (etcs_replay_capture, Entity.h)
  * names them by where they sit in the rebuilt graph instead, and no RID is
  * ever stored.
- *
- * Opt-in by construction: nothing is recorded for an entity with no
- * Environmental entity at or above it, so a type that never claims the
- * family pays one thread-local read per call and nothing else.
  */
 namespace ETCS
 {
@@ -67,11 +67,11 @@ struct ActionFrame
 {
     ActionLine line;
     uint64_t   id = 0;
-    // A call opened from C++ (Entity::call) keeps its verb and payload as
-    // Buffers -- copied, since the body answers in the same one -- and turns
-    // them into strings only if something under it is recorded: most calls
-    // change no Environmental entity, and a hot path should not pay two
-    // allocations to find that out.
+    // A frame a trampoline opens keeps its verb and payload as Buffers --
+    // copied, since the body answers in the same one -- and turns them into
+    // strings only if something under it is recorded: most calls change no
+    // Environmental entity, and a hot path should not pay two allocations to
+    // find that out.
     Buffer lazy_verb, lazy_payload;
     bool   lazy = false;
     void settle()
@@ -83,127 +83,65 @@ struct ActionFrame
     }
 };
 
-/*
- * ONE SLOT PER PROCESS. The executor that opens a frame is the loader's code
- * and the work function that changes a tag is a module's, and each binary
- * has its own copy of every inline static (modules are built hidden). So the
- * frame, the frame counter, the script names and the closing state live in
- * the loader, and a module finds them the way it finds the loader's manifest:
- * ETCS_GetProvenance, looked up in the process's global scope
- * (DynamicLoader.h). With no loader in the process a binary keeps its own.
- */
-struct ProvenanceShared
-{
-    explicit ProvenanceShared(ActionFrame*& (*f)()) : frame(f) {}
-    ActionFrame*& (*frame)();                   // the CALLING thread's, in the loader's TLS
-    std::atomic<uint64_t>        next_frame{ 0 };
-    std::mutex                   names_mu;
-    std::map<RID_T, std::string> names;         // see note_script_name
-    std::atomic<bool>            closing{ false };
-    std::atomic<void (*)()>      closing_hook{ nullptr };
-};
-
-inline ActionFrame*& provenance_thread_frame()
+// This binary's frame on this thread.
+inline ActionFrame*& current_action_frame()
 {
     static thread_local ActionFrame* f = nullptr;
     return f;
 }
-inline ProvenanceShared& provenance_local()
+
+/*
+ * Frame ids without a shared counter: this binary's own count, under high
+ * bits taken from where this binary's counter lives -- distinct per binary,
+ * so two frames opened in two modules never read as one.
+ */
+inline uint64_t next_action_frame_id()
 {
-    static ProvenanceShared p(&provenance_thread_frame);
-    return p;
-}
-inline ProvenanceShared& provenance()
-{
-    static ProvenanceShared* const p = []() -> ProvenanceShared*
-    {
-#if !defined(ETCS_LOADER)
-  #ifdef _WIN32
-        void* sym = reinterpret_cast<void*>(GetProcAddress(GetModuleHandleA(nullptr), "ETCS_GetProvenance"));
-  #else
-        void* sym = dlsym(RTLD_DEFAULT, "ETCS_GetProvenance");
-  #endif
-        if (sym) return static_cast<ProvenanceShared*>(reinterpret_cast<void* (*)()>(sym)());
-#endif
-        return &provenance_local();
+    static std::atomic<uint32_t> next{ 0 };
+    static const uint64_t salt = [] {
+        uint64_t a = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&next));
+        a ^= a >> 33; a *= 0xff51afd7ed558ccdULL; a ^= a >> 33;
+        return (a << 32) | (1ULL << 63);
     }();
-    return *p;
+    return salt | ++next;
 }
 
-inline ActionFrame*& current_action_frame() { return provenance().frame(); }
-
-// Opens a frame if none is open on this thread; the outermost one wins.
+// Installs a frame for this thread if none is; the outermost one wins.
 struct ActionScope
 {
     ActionFrame  frame;
     ActionFrame* saved = nullptr;
     bool         outer = false;
+
+    // A line stated by whoever runs it (the executor's script lines).
     explicit ActionScope(ActionLine line)
     {
         saved = current_action_frame();
         if (saved) return;
-        outer       = true;
-        frame.line  = std::move(line);
-        frame.id    = ++provenance().next_frame;
+        outer      = true;
+        frame.line = std::move(line);
+        frame.id   = next_action_frame_id();
         current_action_frame() = &frame;
     }
-    // The lazy form (ActionFrame::settle).
-    ActionScope(RID_T receiver, const Buffer& verb, const Buffer& payload)
+    // A trampoline's: the frame its caller carried in, if any, else a lazy one
+    // of its own naming the call (ActionFrame::settle).
+    ActionScope(const ActionFrame* carried, RID_T receiver, const Buffer& verb, const Buffer& payload)
     {
         saved = current_action_frame();
         if (saved) return;
-        outer               = true;
+        outer = true;
+        if (carried) { current_action_frame() = const_cast<ActionFrame*>(carried); return; }
         frame.line.receiver = receiver;
         frame.lazy_verb     = verb;
         frame.lazy_payload  = payload;
         frame.lazy          = true;
-        frame.id            = ++provenance().next_frame;
+        frame.id            = next_action_frame_id();
         current_action_frame() = &frame;
     }
     ~ActionScope() { if (outer) current_action_frame() = saved; }
     ActionScope(const ActionScope&) = delete;
     ActionScope& operator=(const ActionScope&) = delete;
 };
-
-/*
- * The name a script gave an entity it made at global scope -- what a rebuilt
- * scene calls it again, so a resumed session answers to the names it had.
- * A hint, not an identity: the last script to make that RID wins.
- */
-inline void note_script_name(RID_T rid, const std::string& name)
-{
-    auto& p = provenance();
-    std::lock_guard<std::mutex> lock(p.names_mu);
-    p.names[rid] = name;
-}
-inline void forget_script_name(RID_T rid)
-{
-    auto& p = provenance();
-    std::lock_guard<std::mutex> lock(p.names_mu);
-    p.names.erase(rid);
-}
-inline std::string script_name(RID_T rid)
-{
-    auto& p = provenance();
-    std::lock_guard<std::mutex> lock(p.names_mu);
-    auto it = p.names.find(rid);
-    return it == p.names.end() ? std::string() : it->second;
-}
-
-/*
- * CLOSING. What keeps this runtime (DatabaseProvider's Persistence) saves
- * as it goes; when the loader leaves -- `exit`, Ctrl+C, a drain -- it says so
- * here once, BEFORE anything is torn down, and the keeper saves one last
- * time and then never again this run: what a teardown looks like half-way
- * is not a scene anyone left.
- */
-inline bool runtime_closing() { return provenance().closing.load(std::memory_order_acquire); }
-inline void set_closing_hook(void (*f)()) { provenance().closing_hook.store(f); }
-inline void runtime_close()
-{
-    if (provenance().closing.exchange(true)) return;
-    if (auto f = provenance().closing_hook.load()) f();
-}
 
 /*
  * Where this runtime keeps what outlives it (Persistence, DatabaseProvider):

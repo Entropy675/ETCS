@@ -29,7 +29,6 @@
 #include <string>
 #include <algorithm>
 #include <array>
-#include <optional>
 #include <set>
 #include <map>
 #include <unordered_map>   // the region-digest table below
@@ -416,13 +415,9 @@ private:
     // See setRemoteWire. Mutable count: a const walk may still call through.
     ::std::atomic<ETCS::IWireRemote*> remote_wire_{nullptr};
     mutable ::std::atomic<int>        remote_calls_{0};
-    // Provenance (core/Provenance.h): the actions that made this entity's tag
-    // surface what it is, kept only once it claims Environmental.
+    // Claims Environmental and is in the graph: its tag changes are recorded
+    // (recordEffect). The record itself is the family's (IWireEnvironmental).
     ::std::atomic<bool>               environmental_{false};
-    uint64_t                          born_frame_ = 0;   // the action that made it
-    mutable ::std::mutex              actions_mu_;
-    ::std::vector<ETCS::ActionRecord> actions_;
-    uint64_t                          actions_seq_ = 0;
     /*
  * Set true as the FIRST action inside ~Entity(). A no-op operator
  * delete (the child case, below) means the object's own bytes are
@@ -1427,7 +1422,7 @@ public:
         const bool off = ETCS::TagModifyEvent{this, tag, true, &Entity::tagModifyImpl}();
         const char c = tag.c_str()[0];
         if (off && c >= 'a' && c <= 'z') recordEffect(this, flagKey(this, tag.toString()), false);
-        if (off && leaving) recordEffect(this, childKey(leaving), false);
+        if (off && leaving) recordEffect(this, childKey(leaving), false, true);
         return off;
     }
     /*
@@ -1733,10 +1728,6 @@ public:
 #ifdef ETCS_LOG_FUNCTION_EVOCATION_PATH
         ETCS_LOG("Entity::call", "parsed tag_type=" << tag_type << " action=" << action);
 #endif
-        // The action every tag change beneath it is credited to, when nothing
-        // outside it opened one (the executor does, for a script's lines).
-        ::std::optional<ETCS::ActionScope> action_scope;
-        if (!ETCS::current_action_frame()) action_scope.emplace(getRID(), action, data);
         // A surface of a remote: its own verbs are the far node's, run there
         // and answered in `data` like any work function (setRemoteWire).
         if (remoteWire() && tag_type == getSourceTag())
@@ -1983,58 +1974,37 @@ public:
     ETCS::IWireRemote* remoteWire() const { return remote_wire_.load(::std::memory_order_acquire); }
 
     /*
- * PROVENANCE. Set once, by EnvironmentalBase's constructor: from then on every
- * tag that goes on or off this entity -- or any plain entity beneath it, up to
- * the next Environmental one -- is recorded against the action it happened in
- * (core/Provenance.h). The log is what etcs_replay_capture compacts into the
- * script that rebuilds the entity.
+ * PROVENANCE. Turned on once, when an entity that claims Environmental joins
+ * the graph (etcs_supertype_fanout) -- after its constructor, so what it does
+ * while being made is its making, not its record. From then on every tag that
+ * goes on or off it, or any plain entity beneath it up to the next
+ * Environmental one, is recorded against the action it happened in
+ * (core/Provenance.h), in the family's own record (IWireEnvironmental).
  */
-    void markEnvironmental()
-    {
-        if (ETCS::ActionFrame* f = ETCS::current_action_frame()) born_frame_ = f->id;
-        environmental_.store(true, ::std::memory_order_release);
-    }
+    void markEnvironmental() { environmental_.store(true, ::std::memory_order_release); }
     bool isEnvironmental() const { return environmental_.load(::std::memory_order_acquire); }
-    ::std::vector<ETCS::ActionRecord> actionLog() const
+    ETCS::IWireEnvironmental* environmentalWire()
     {
-        ::std::lock_guard<::std::mutex> lock(actions_mu_);
-        return actions_;
+        return isEnvironmental()
+            ? static_cast<ETCS::IWireEnvironmental*>(getInterfacePointer(ETCS::Buffer("Environmental")))
+            : nullptr;
     }
-    // After a capture of the log up to `upto`: what is left of that is what
-    // the capture kept. It rebuilds the same surface, and everything dropped
-    // is history the surface no longer shows -- which is the snapshot frames'
-    // to keep, not this log's. Later records are the next capture's.
-    void keepActions(const ::std::vector<uint64_t>& seqs, uint64_t upto)
-    {
-        ::std::lock_guard<::std::mutex> lock(actions_mu_);
-        ::std::vector<ETCS::ActionRecord> kept;
-        for (auto& r : actions_)
-            if (r.seq > upto || ::std::find(seqs.begin(), seqs.end(), r.seq) != seqs.end())
-                kept.push_back(::std::move(r));
-        actions_.swap(kept);
-    }
-    static void recordEffect(Entity* touched, const ::std::string& key, bool created)
+    /*
+ * `in_frame_only`: a child made or removed outside any action is its maker's
+ * business -- a constructor's, a connection's -- not the scene's, and the
+ * executor records the children its own lines make (CommandExecutor.h). A
+ * flag changed outside one is recorded, as what cannot be replayed.
+ */
+    static void recordEffect(Entity* touched, const ::std::string& key, bool created,
+                             bool in_frame_only = false)
     {
         Entity* env = touched;
         while (env && !env->isEnvironmental()) env = env->getParent();
         if (!env) return;
         ETCS::ActionFrame* f = ETCS::current_action_frame();
-        // What it does while being made is its making: the line that spawns
-        // it does it again, so it is its parent's record, not its own.
-        if (f && f->id == env->born_frame_) return;
-        ::std::lock_guard<::std::mutex> lock(env->actions_mu_);
+        if (!f && in_frame_only) return;
         if (f) f->settle();
-        if (f && !env->actions_.empty() && env->actions_.back().frame == f->id)
-        {
-            (created ? env->actions_.back().created : env->actions_.back().removed).push_back(key);
-            return;
-        }
-        ETCS::ActionRecord r;
-        r.seq   = ++env->actions_seq_;
-        r.frame = f ? f->id : 0;
-        if (f) r.line = f->line;
-        (created ? r.created : r.removed).push_back(key);
-        env->actions_.push_back(::std::move(r));
+        if (ETCS::IWireEnvironmental* w = env->environmentalWire()) w->RecordEffect(f, key, created);
     }
     // The flags that are state -- not the in-flight scopes (surfaceHash).
     void stateFlags(::std::vector<::std::string>& out) const
@@ -4076,6 +4046,8 @@ inline void etcs_supertype_fanout(Entity* e)
     ::std::vector<ETCS::Buffer> families;
     e->getInterfaceFamilies(families);
     if (families.empty()) return;
+    // Built and joining the graph: the moment its record starts.
+    if (e->getInterfacePointer(ETCS::Buffer("Environmental"))) e->markEnvironmental();
 
     auto& ridMap = ETCS::EventNode::getInstance().ridMap;
     const RID rid = e->getRID();
@@ -4522,7 +4494,7 @@ inline Entity::HashAudit etcs_root_hash(Entity* top)
  * later action that took off something a kept action put on -- or replaying
  * the first would bring it back -- to a fixed point. In the order they ran.
  * Nothing else: an action whose every effect was later undone is history the
- * surface no longer shows, and the log drops it here too (keepActions).
+ * surface no longer shows, and the record drops it here too (KeepActions).
  *
  * NAMES, NOT RIDS. The entity is `name` (the caller binds it); a child made
  * by a script line is named here, from its type and the order it was made in,
@@ -4581,9 +4553,11 @@ namespace etcs_replay_detail
 }
 
 inline void etcs_replay_capture(Entity* e, const ::std::string& name,
-                                ::std::map<RID, ::std::string>& names, ReplayCapture& out)
+                                ::std::map<RID, ::std::string>& names, ReplayCapture& out,
+                                uint64_t born = 0)
 {
-    if (!e) return;
+    ETCS::IWireEnvironmental* wire = e ? e->environmentalWire() : nullptr;
+    if (!wire) return;
     names[e->getRID()] = name;
     out.environmental.emplace_back(name, e);
     const size_t at = out.environmental.size() - 1, begin = out.script.size();
@@ -4613,7 +4587,17 @@ inline void etcs_replay_capture(Entity* e, const ::std::string& name,
     }
 
     // What to keep: see the banner.
-    const ::std::vector<ActionRecord> log = e->actionLog();
+    // `born`: the action that made this entity. Whatever else it did to it is
+    // its making -- the parent's line does it again -- not its own record.
+    ::std::vector<ActionRecord> log = wire->ActionLog();
+    const uint64_t upto = log.empty() ? 0 : log.back().seq;
+    if (born) log.erase(::std::remove_if(log.begin(), log.end(),
+                                         [born](const ActionRecord& r) { return r.frame == born; }),
+                        log.end());
+    ::std::map<RID, uint64_t> made_in;   // a child -> the action that made it
+    for (auto& r : log)
+        for (auto& k : r.created)
+            if (k.compare(0, 2, "c:") == 0) made_in[::std::strtoull(k.c_str() + 2, nullptr, 10)] = r.frame;
     ::std::vector<bool> keep(log.size(), false);
     for (size_t i = 0; i < log.size(); ++i)
         for (auto& k : log[i].created) if (live.count(k)) { keep[i] = true; break; }
@@ -4693,7 +4677,7 @@ inline void etcs_replay_capture(Entity* e, const ::std::string& name,
         }
         out.script += line + "\n";
     }
-    e->keepActions(kept, log.empty() ? 0 : log.back().seq);
+    wire->KeepActions(kept, upto);
     out.spans[at].second = out.script.size();
 
     for (Entity* c : env_children)
@@ -4705,7 +4689,8 @@ inline void etcs_replay_capture(Entity* e, const ::std::string& name,
                                    + " under it was not made by a script line and cannot be named");
             continue;
         }
-        etcs_replay_capture(c, it->second, names, out);
+        auto m = made_in.find(c->getRID());
+        etcs_replay_capture(c, it->second, names, out, m == made_in.end() ? 0 : m->second);
     }
 }
 

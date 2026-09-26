@@ -80,6 +80,8 @@ extern "C" inline void global_signal_handler(int sig)
 namespace ETCS 
 {
 
+struct ActionFrame;   // core/Provenance.h
+
 // One level of signal authority plus a link to its parent.
 //
 // Previously seven local flags AND seven flattened *_parent slots. A single
@@ -123,6 +125,16 @@ struct SignalContext
     // governs (global -> detach -> run -> scope). Dynamic, per-call,
     // rebuilt every time a context is forwarded.
     const SignalContext* up = nullptr;
+
+    /*
+ * THE ACTION THIS CALL IS PART OF (core/Provenance.h), carried across the
+ * work function boundary so a module's body credits what it changes to the
+ * script line that started the chain, not to itself. STAMPED AT EVERY
+ * DISPATCH from the calling binary's current frame (WorkBundle::operator()),
+ * and read once, by the trampoline, at entry -- never trusted from a stored
+ * copy of a context, which may outlive the frame it named.
+ */
+    const ActionFrame* frame = nullptr;
 
     /*
  * IS THIS LEVEL THE OUTER EDGE OF A CLOSURE?

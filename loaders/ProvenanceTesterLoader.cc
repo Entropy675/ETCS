@@ -24,6 +24,8 @@
  *   6. The same tree made again at other RIDs hashes the same, and so does
  *      the one the captured script describes.
  *   7. EnvironmentState packs, unpacks and migrates its keys.
+ *   8. A frame crosses a call on its SignalContext: the callee runs inside
+ *      the caller's, and a call carrying none opens its own.
  *
  *   ./Run_ProvenanceTesterLoader
  */
@@ -87,11 +89,14 @@ int main()
     {
         Plain* p = arena.allocate<Plain>();
         { ETCS::ActionScope s(line(p, "Mark", "")); p->addTag(ETCS::Buffer("hot")); }
-        check(!p->isEnvironmental() && p->actionLog().empty(), "a plain entity records nothing");
+        check(!p->isEnvironmental() && !p->environmentalWire(), "a plain entity records nothing");
     }
 
     Env* e = arena.allocate<Env>();
-    check(e->isEnvironmental(), "claiming the family turns recording on");
+    check(!e->isEnvironmental(), "what an entity does while being made is not recorded");
+    ETCS::etcs_supertype_fanout(e);   // joining the graph, as _make_ does it
+    check(e->isEnvironmental(), "claiming the family turns recording on once it is in the graph");
+    auto logOf = [](ETCS::Entity* x) { return x->environmentalWire()->ActionLog(); };
 
     // -- 2. one record per frame -----------------------------------------------
     Plain* kid = nullptr;
@@ -105,7 +110,7 @@ int main()
         kid->addTag(ETCS::Buffer("lit"));
     }
     {
-        auto log = e->actionLog();
+        auto log = logOf(e);
         check(log.size() == 2, "two actions, two records");
         check(log.size() == 2 && log[1].created.size() == 2, "...the second holding both of its flags");
         check(log.size() == 2 && log[1].line.receiver == kid->getRID(), "...credited to the line's receiver");
@@ -141,7 +146,11 @@ int main()
         e->addTag(ETCS::Buffer("fed"));
     }
     Env* inner = nullptr;
-    { ETCS::ActionScope s(line(e, "spawn", E)); inner = e->addTag<Env>(); }
+    {
+        ETCS::ActionScope s(line(e, "spawn", E));
+        inner = e->addTag<Env>();
+        inner->addTag(ETCS::Buffer("warmed_at_birth"));   // the spawn's doing, not inner's
+    }
     { ETCS::ActionScope s(line(inner, "Mark", "")); inner->addTag(ETCS::Buffer("inner_on")); }
 
     // -- 5. outside any action ---------------------------------------------------
@@ -163,6 +172,12 @@ int main()
     check(has(cap.script, "e_Plain1.Produce(x) -> e.Consume()"), "a stream line keeps both halves");
     check(has(cap.script, "e.spawn(" + E + " e_Env1)\n"), "an Environmental child is made by its parent's line");
     check(has(cap.script, "e_Env1.Mark()"), "...and captured after it, under the name it gave");
+    {
+        size_t spawns = 0;
+        for (size_t at = 0; (at = cap.script.find("e.spawn(" + E, at)) != std::string::npos; ++at) ++spawns;
+        check(spawns == 1 && !has(cap.script, "e_Env1.spawn"),
+              "what the line that made it did to it is that line's, replayed once");
+    }
     check(cap.environmental.size() == 2 && cap.environmental[1].first == "e_Env1",
           "both are reported, parent first");
     bool stray = false;
@@ -171,7 +186,7 @@ int main()
     check(cap.script.find("RID") == std::string::npos, "no RID is written");
     {
         size_t kept = 0;
-        for (auto& r : e->actionLog()) (void)r, ++kept;
+        for (auto& r : logOf(e)) (void)r, ++kept;
         check(kept == 9, "the log keeps only what the capture kept (9 of 13)");
     }
 
@@ -184,6 +199,7 @@ int main()
         f->addTag(ETCS::Buffer("fed"));
         Env* i2 = f->addTag<Env>();
         i2->addTag(ETCS::Buffer("inner_on"));
+        i2->addTag(ETCS::Buffer("warmed_at_birth"));
         f->addTag(ETCS::Buffer("stray"));
         check(f->getRID() != e->getRID(), "(setup) the second tree has other RIDs");
         check(f->getHash() == e->getHash(), "the tree the script describes hashes the same as the one captured");
@@ -202,6 +218,29 @@ int main()
         back.migrate("old=mid\nmid=new\n");
         check(back.get("new") && !back.get("old"), "migration applies its renames oldest first");
         check(!back.unpack(std::string("\x05\x00\x00\x00ab", 6)), "a truncated state is refused");
+    }
+
+    // -- 8. carried across a call -------------------------------------------------
+    {
+        ETCS::ActionScope outer(line(e, "Outer", ""));
+        ETCS::ActionFrame* here = ETCS::current_action_frame();
+        ETCS::SignalContext ctx;
+        ctx.frame = here;                               // what WorkBundle::operator() stamps
+        ETCS::current_action_frame() = nullptr;         // a module's own slot, empty
+        {
+            ETCS::ActionScope callee(ctx.frame, kid->getRID(), ETCS::Buffer("Inner"), ETCS::Buffer(""));
+            check(ETCS::current_action_frame() == here, "a call carrying a frame runs inside it");
+        }
+        check(ETCS::current_action_frame() == nullptr, "...and leaves the callee's slot as it found it");
+        {
+            ETCS::ActionScope own(nullptr, kid->getRID(), ETCS::Buffer("Alone"), ETCS::Buffer("p"));
+            ETCS::ActionFrame* f = ETCS::current_action_frame();
+            check(f && f != here && f->lazy, "a call carrying none opens its own, lazily");
+            if (f) f->settle();
+            check(f && f->line.verb == "Alone" && f->line.payload == "p", "...and names itself once settled");
+        }
+        ETCS::current_action_frame() = here;
+        check((ETCS::next_action_frame_id() >> 63) != 0, "frame ids carry their binary's salt");
     }
 
     std::printf("\n%s (%d failure%s)\n", g_fail ? "FAILED" : "PASSED",

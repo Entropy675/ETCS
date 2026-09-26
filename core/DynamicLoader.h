@@ -1095,6 +1095,8 @@ bool ETCS::WorkBundle::operator()(ETCS_RID_SIZE rid, const ETCS::Buffer& conjuga
         << " takes action " << this->work_tag << " with data: " << tagbuff.toString());
     ETCS_LOG("WorkBundle::operator()", "about to invoke raw workFunc pointer " << (void*)workFunc << "...");
 #endif
+    // The action this call is part of goes with it (SignalContext::frame).
+    ctx.frame = ETCS::current_action_frame();
     reinterpret_cast<ETCS::WorkFunc>(const_cast<void*>(workFunc))(child, tagbuff, ctx);
 #ifdef ETCS_LOG_FUNCTION_EVOCATION_PATH
     ETCS_LOG("WorkBundle::operator()", "EXIT -- workFunc(...) returned normally for "
@@ -1148,6 +1150,7 @@ bool ETCS::WorkBundle::operator()(ETCS_RID_SIZE rid, const ETCS::Buffer& conjuga
             << "." << work_tag << " -- would have crashed on the call below.");
         return false;
     }
+    ctx.frame = ETCS::current_action_frame();   // as above
     reinterpret_cast<ETCS::StreamFunc>(const_cast<void*>(workFunc))(child, tagbuff, ctx);
 #ifdef ETCS_LOG_FUNCTION_EVOCATION_PATH
     ETCS_LOG("WorkBundle::operator()", "EXIT -- streamFunc(...) returned normally for "
@@ -2868,19 +2871,6 @@ void* ETCS_GetLoaderManifest()
 {
     return static_cast<void*>(&ETCS::Entity::getManifest());
 }
-
-// The process's one provenance slot (core/Provenance.h), found by modules the
-// same way as the manifest above.
-extern "C"
-#ifdef _WIN32
-__declspec(dllexport)
-#else
-__attribute__((visibility("default")))
-#endif
-void* ETCS_GetProvenance()
-{
-    return static_cast<void*>(&ETCS::provenance_local());
-}
 #endif // ETCS_LOADER
 
 /*
@@ -3171,8 +3161,7 @@ inline bool ETCS::DestroyEvent::operator()()
 #else
     while ((r = result.load(::std::memory_order_acquire)) < 0);
 #endif
-    if (r != 0 && leaving_from) ETCS::Entity::recordEffect(leaving_from, ETCS::Entity::childKey(leaving), false);
-    if (r != 0) ETCS::forget_script_name(leaving);
+    if (r != 0 && leaving_from) ETCS::Entity::recordEffect(leaving_from, ETCS::Entity::childKey(leaving), false, true);
     return r != 0;
 }
  
@@ -3211,7 +3200,7 @@ inline ETCS::RID ETCS::AddTagEvent::operator()()
     // A child made inside an action is part of that action's effect on its
     // parent (Entity::recordEffect, core/Provenance.h).
     const ETCS::RID made = result.load(::std::memory_order_relaxed);
-    if (made && parent) ETCS::Entity::recordEffect(parent, ETCS::Entity::childKey(made), true);
+    if (made && parent) ETCS::Entity::recordEffect(parent, ETCS::Entity::childKey(made), true, true);
     return made;
 }
  

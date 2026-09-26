@@ -1517,7 +1517,7 @@ inline ExecuteResult execute_command(const Command& cmd,
                 ETCS::Entity* e = ETCS::spawn_entity(c.module, c.tag, ctx, src);
                 if (!e) return {ExecuteStatus::Error, "spawn failed."};
                 ctx.bind(c.name, e->getRID(), c.module, c.tag);
-                ETCS::note_script_name(e->getRID(), c.name);
+                if (ETCS::IWireEnvironmental* w = e->environmentalWire()) w->NoteName(c.name);
                 ETCS_LOG("CommandExecutor", "spawn " << c.module << "::" << c.tag
                          << " " << c.name << " -> RID:" << e->getRID());
                 return {ExecuteStatus::Ok, ""};
@@ -1556,7 +1556,7 @@ inline ExecuteResult execute_command(const Command& cmd,
             ETCS::Entity* e = ETCS::spawn_entity(c.module, c.tag, ctx, src);
             if (!e) return {ExecuteStatus::Error, "ensure: spawn failed."};
             ctx.bind(c.name, e->getRID(), c.module, c.tag);
-            ETCS::note_script_name(e->getRID(), c.name);
+            if (ETCS::IWireEnvironmental* w = e->environmentalWire()) w->NoteName(c.name);
             ETCS_LOG("CommandExecutor", "ensure " << c.module << "::" << c.tag
                      << " " << c.name << " -> RID:" << e->getRID() << " (new)");
 #endif
@@ -1625,6 +1625,10 @@ inline ExecuteResult execute_command(const Command& cmd,
             ETCS::Entity* child = ETCS::make_typed_child(c.module, c.tag,
                                                          parent->entity, src);
             if (!child) return {ExecuteStatus::Error, "child construction failed."};
+            // This line made it: the module that built it has no frame of
+            // this line's to credit it to (make_typed_child is no work
+            // function), so it is recorded here, where the line is.
+            ETCS::Entity::recordEffect(parent->entity, ETCS::Entity::childKey(child->getRID()), true);
 
             ctx.bind(c.name, child->getRID(), c.module, c.tag);
             ETCS_LOG("CommandExecutor", c.parent_name << "."
@@ -4554,28 +4558,39 @@ inline void shell_startup()
     // start in a binary that may never show a prompt.
 }
 
+namespace ETCS
+{
 /*
- * WHAT -DETCS_REPL_SHELL MEANS NOW.
- *
- * A LOADER flag and nothing else: "this binary should give the operator a
- * terminal". It selects no code -- the terminal is a provider either way -- so
- * the interactive and the drain binary differ in what they DO, not in what is
- * in them. With it: ask the session's Shell for a console and drive the
- * navigator from it. Without it: run the target script and drain, or accept
- * control sessions on a socket. The Shell is spawned either way.
- *
- * An interactive runtime that cannot find one has lost the thing it was built
- * to be, and falls back to drain with that stated rather than silently.
- *
- * control_socket, when non-empty, replaces the drain wait with a control
- * listener -- the headless build's substitute for stdin.
- *
- * Either branch runs shutdown_detached_executors() and
- * PendingUnloadRegistry::join_all() exactly once before returning. The join
- * fixes a reproduced SIGSEGV: main() returning let process exit race a module's
- * still-in-flight RequestUnload recheck, and its dlclose, against that module's
- * own running workers.
+ * THE LOADER IS LEAVING -- said once, BEFORE anything is torn down, to every
+ * Environmental entity through its wire (IWireEnvironmental::Closing): what
+ * keeps a scene (DatabaseProvider's Persistence) saves it one last time and
+ * then writes nothing more, so a half torn-down runtime is never what the
+ * next start resumes.
  */
+inline void runtime_close()
+{
+    static ::std::atomic<bool> closed{ false };
+    if (closed.exchange(true)) return;
+    ETCS::EventNode* owner = &ETCS::EventNode::getInstance();
+    ::std::set<ETCS::RID> rids;
+    auto it = owner->ridMirror.find(ETCS::Buffer("Environmental"));
+    if (it != owner->ridMirror.end())
+        for (auto& row : it->second)
+        {
+            ::std::vector<ETCS::RID> found;
+            row.handle.invoke_collect_rids(found);
+            rids.insert(found.begin(), found.end());
+        }
+    for (ETCS::RID rid : rids)
+    {
+        ETCS::Entity* e = ETCS::etcs_resolve_rid_anywhere(owner, rid);
+        ETCS::LifetimeHold hold(e);
+        if (!hold) continue;
+        if (ETCS::IWireEnvironmental* w = e->environmentalWire()) w->Closing();
+    }
+}
+} // namespace ETCS
+
 /*
  * CONTINUE WHERE YOU LEFT OFF. DatabaseProvider's Persistence keeps the scene
  * this loader was in (the entities with a Persistence child, as the script
@@ -4643,6 +4658,28 @@ inline void offer_resume(ETCS::SignalContext& sig, const ReplLineSource* in)
     resume_last_scene(sig);
 }
 
+/*
+ * WHAT -DETCS_REPL_SHELL MEANS NOW.
+ *
+ * A LOADER flag and nothing else: "this binary should give the operator a
+ * terminal". It selects no code -- the terminal is a provider either way -- so
+ * the interactive and the drain binary differ in what they DO, not in what is
+ * in them. With it: ask the session's Shell for a console and drive the
+ * navigator from it. Without it: run the target script and drain, or accept
+ * control sessions on a socket. The Shell is spawned either way.
+ *
+ * An interactive runtime that cannot find one has lost the thing it was built
+ * to be, and falls back to drain with that stated rather than silently.
+ *
+ * control_socket, when non-empty, replaces the drain wait with a control
+ * listener -- the headless build's substitute for stdin.
+ *
+ * Either branch runs shutdown_detached_executors() and
+ * PendingUnloadRegistry::join_all() exactly once before returning. The join
+ * fixes a reproduced SIGSEGV: main() returning let process exit race a module's
+ * still-in-flight RequestUnload recheck, and its dlclose, against that module's
+ * own running workers.
+ */
 inline int drive_main_loop_then_exit(ETCS::SignalContext& ctx, int code,
                                      const ::std::string& control_socket = "")
 {
