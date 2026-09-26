@@ -27,6 +27,7 @@
 #include <chrono>
 #include <string>
 #include <algorithm>
+#include <array>
 #include <set>
 #include <map>
 #include <unordered_map>   // the region-digest table below
@@ -1498,10 +1499,16 @@ public:
  *
  * NODE HASH -- the surface, then the typed children in the order dispatch
  * and wrap chains read them (typed_child_order_: first-attachment order of
- * each tag; within one tag, ascending RID, because the list is a hash map
- * with no order of its own and RIDs are deterministic). Each child
- * contributes its tag, its RID and its own node hash, so the value is a
- * merkle root over the subtree and a change anywhere below moves it.
+ * each tag; within one tag, by the children's own hashes). Each child
+ * contributes its tag and its own node hash, so the value is a merkle root
+ * over the subtree and a change anywhere below moves it.
+ *
+ * NO RIDS, anywhere in it. A RID is where and when an entity was made; the
+ * same state made again in another order (a replay, a reflection in another
+ * runtime) has other RIDs, and a hash that read them would be one more RID --
+ * two equal states would disagree and a rebuild could never check itself
+ * (ontology/Environmental.h). A relation is its key and its child's type; a
+ * dispatch tag carries the compile-time hash of the code behind it.
  *
  * XXH3 BELOW A GLOBAL SCOPE BOUNDARY, SHA-256 AT ONE. A node's hash is in
  * flux on every transition under it -- every flag, every stream call's scope
@@ -4162,18 +4169,41 @@ inline uint64_t Entity::surfaceHash() const
     // Snapshot under the tag mutex, hash outside it: XXH3 over a few hundred
     // bytes is longer than a lock should be held by anything a call() path
     // waits on.
+    /*
+     * NO RIDS. A RID is where and when an entity was made -- the order types
+     * happened to be created in -- and a scene rebuilt in another order is the
+     * same scene with other RIDs. Hashed, it would make this one more RID: two
+     * equal states would disagree, and a restore could never check itself
+     * (ontology/Environmental.h). So a relation is its key and the type it
+     * points at, and a dispatch tag carries the compile-time hash of the code
+     * behind it (ModuleBundle::hash, over its actions' source regions) -- the
+     * most specific type's own identity, which a rebuilt entity has too.
+     *
+     * NOT THE IN-FLIGHT SCOPES. A call in progress flags its receiver
+     * (ScopeTag::kPrefix); that is the motion of the runtime, not its state,
+     * and a hash taken mid-call must equal one taken after.
+     */
     ::std::vector<::std::string> markers, dispatch, relations, flags;
     {
         ::std::lock_guard<::std::mutex> lock(m_tagMutex);
         for (auto const& [key, entry] : tags)
         {
-            if (entry.child)        { ::std::string r = key.toString();
-                                      etcs_hash_detail::put_u64(r, entry.child->getRID());
+            if (entry.child)        { ::std::string r = key.toString() + "=" +
+                                          entry.child->getSourceModule().toString() + ":" +
+                                          entry.child->getSourceTag().toString();
                                       relations.push_back(::std::move(r)); }
-            else if (entry.bundle)  dispatch.push_back(key.toString());
+            else if (entry.bundle)  { ::std::string d = key.toString();
+                                      etcs_hash_detail::put_u64(d, entry.bundle->hash);
+                                      dispatch.push_back(::std::move(d)); }
             else                    markers.push_back(key.toString());
         }
-        for (auto const& [key, _] : flags_) flags.push_back(key.toString());
+        const ::std::string scope = ETCS::ScopeTag::kPrefix;
+        for (auto const& [key, _] : flags_)
+        {
+            ::std::string f = key.toString();
+            if (f.compare(0, scope.size(), scope) == 0) continue;
+            flags.push_back(::std::move(f));
+        }
     }
     ::std::sort(markers.begin(),   markers.end());
     ::std::sort(dispatch.begin(),  dispatch.end());
@@ -4197,9 +4227,14 @@ inline uint64_t Entity::computeNodeHash(HashAudit* audit, unsigned char* digest)
     in.push_back('\x01');                               // a node
     etcs_hash_detail::put_u64(in, surfaceHash());
 
+    // Children by tag in first-attachment order -- that order is state (a
+    // wrap chain applies in it) -- and within a tag a MULTISET of hashes:
+    // ordered by hash, never by RID, so the same children made at other
+    // RIDs hash the same (surfaceHash).
     ::std::vector<::std::pair<ETCS::Buffer, RID>> kids;
     getTypedChildren(kids);
     etcs_hash_detail::order_children(kids);
+    ::std::vector<::std::pair<::std::string, uint64_t>> composed;
 
     for (auto const& [tag, rid] : kids)
     {
@@ -4242,9 +4277,18 @@ inline uint64_t Entity::computeNodeHash(HashAudit* audit, unsigned char* digest)
             }
             child->stampHash(h, epoch, cd);
         }
-        ::std::string tagstr = tag.toString();
+        composed.emplace_back(tag.toString(), h);
+    }
+    for (auto lo = composed.begin(); lo != composed.end(); )
+    {
+        auto hi = lo + 1;
+        while (hi != composed.end() && hi->first == lo->first) ++hi;
+        ::std::sort(lo, hi);
+        lo = hi;
+    }
+    for (auto const& [tagstr, h] : composed)
+    {
         etcs_hash_detail::put(in, 'C', tagstr.data(), tagstr.size());
-        etcs_hash_detail::put_u64(in, rid);
         etcs_hash_detail::put_u64(in, h);
     }
 
@@ -4381,11 +4425,9 @@ inline void etcs_module_root_hash(const ::std::vector<const RIDListHandle*>& row
         rids.insert(found.begin(), found.end());
     }
 
-    picohash_ctx_t ctx;
-    picohash_init_sha256(&ctx);
-    const unsigned char kind = 0x03;
-    picohash_update(&ctx, &kind, 1);
-    size_t n = 0;
+    // The roots' digests as a multiset, sorted -- not keyed by RID, for the
+    // reason surfaceHash gives.
+    ::std::vector<::std::array<unsigned char, 32>> digests;
     for (RID rid : rids)
     {
         Entity* e = nullptr;
@@ -4394,12 +4436,17 @@ inline void etcs_module_root_hash(const ::std::vector<const RIDListHandle*>& row
         if (!e || !e->isGlobalScope()) continue;      // children are under their branch
         LifetimeHold hold(e);
         if (!hold) continue;                           // retiring: gone from the next pull
-        unsigned char d[32];
-        e->getDigest(d);
-        picohash_update(&ctx, &rid, sizeof(rid));
-        picohash_update(&ctx, d, 32);
-        ++n;
+        ::std::array<unsigned char, 32> d;
+        e->getDigest(d.data());
+        digests.push_back(d);
     }
+    ::std::sort(digests.begin(), digests.end());
+    picohash_ctx_t ctx;
+    picohash_init_sha256(&ctx);
+    const unsigned char kind = 0x03;
+    picohash_update(&ctx, &kind, 1);
+    for (auto const& d : digests) picohash_update(&ctx, d.data(), 32);
+    const size_t n = digests.size();
     picohash_final(&ctx, out);
     if (entities) *entities = n;
 }

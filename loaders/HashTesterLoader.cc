@@ -18,7 +18,8 @@
  *   4. Tag order is state where the runtime reads it (children) and not
  *      where it does not (flags): two trees with the same children attached
  *      in a different tag order hash differently; flags added in a different
- *      order hash the same.
+ *      order hash the same; and the same tree made again, at other RIDs,
+ *      hashes the same -- no RID is in any hash.
  *   5. A child leaving the tree moves the parent's hash.
  *   6. The audit recomputes everything, agrees with the lazy pull on a
  *      clean tree, and REPORTS a divergence when a surface is moved behind
@@ -131,10 +132,9 @@ int main()
         a->addTag<Node>();  a->addTag<Other>();          // Node first, Other second
         Node* b = arena.allocate<Node>();
         b->addTag<Other>(); b->addTag<Node>();           // Other first
-        // The two trees differ only in RIDs and in tag order. RIDs differ
-        // anyway, so compare SURFACES of the parents (identical) and check
-        // the node hashes differ with the RIDs factored out by construction:
-        // hash each parent's children tag sequence directly.
+        // The two trees differ in RIDs and in tag order. RIDs are not in any
+        // hash, so the surfaces are identical and only the order separates
+        // the node hashes.
         std::vector<std::pair<ETCS::Buffer, ETCS::RID>> ka, kb;
         a->getTypedChildren(ka); b->getTypedChildren(kb);
         check(ka.size() == 2 && kb.size() == 2, "both parents report two children");
@@ -142,6 +142,9 @@ int main()
               "children are reported in first-attachment tag order");
         check(a->surfaceHash() == b->surfaceHash(), "the parents' own surfaces are identical");
         check(a->getHash() != b->getHash(), "...and their node hashes are not: child tag order is state");
+        Node* a2 = arena.allocate<Node>();
+        a2->addTag<Node>(); a2->addTag<Other>();         // a again, at other RIDs
+        check(a2->getHash() == a->getHash(), "the same tree made again at other RIDs hashes the same");
 
         Node* f1 = arena.allocate<Node>();
         f1->addTag(ETCS::Buffer("p")); f1->addTag(ETCS::Buffer("q"));
