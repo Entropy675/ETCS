@@ -1080,6 +1080,10 @@ public:
         bool          attachModule(const ::std::string& module_name,
                                     ETCS::LifetimeOwner entity,
                                     const ::std::string& spawn_tag);
+        // The lifetime-token election for a module root attaching to a
+        // loaded module -- attachModule's, and addTagImpl's for a child made
+        // under another module's entity. Ordering-thread only.
+        void          claimLifetime(ETCS::Module* global_mod, ETCS::LifetimeOwner entity);
         // THE Kind::RequestUnload delayed-recheck handler -- called after
         // the delay (see DLInEvent::request_unload_recheck).
         // Re-verifies lifetime_owner is still nullptr before

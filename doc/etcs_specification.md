@@ -600,8 +600,13 @@ the first question. It is no longer what any `_GetHash` export returns.
 ## Shutdown
 
 Loader unload and the root's own vacate are ordered so a module is never unloaded while a call
-into it could still be pending — see the loader-exit-path material for the mechanism. Unchanged
-by anything here.
+into it could still be pending — see the loader-exit-path material for the mechanism.
+
+A module is held by its **roots**: its global-scope entities, and any child one of its types
+became under another module's entity (a `Persistence` under a `Ledger`). Such a child is a root of
+its own module — it lives in that module's arena, not its parent's, and holds the module's
+lifetime exactly as a global entity would, handing it to a sibling root when it goes. Only its
+place in the graph is its parent's: it leaves with its parent, through its own module.
 
 ---
 

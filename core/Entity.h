@@ -472,6 +472,16 @@ private:
     Entity* parent_     = nullptr;
     RID     parent_rid_ = 0;
     /*
+ * A MODULE ROOT WITH A PARENT: a child made by one module under another
+ * module's entity (addTag<T>, crossesModule). To its own module it is a
+ * root like any global-scope entity -- it lives in that module's root
+ * arena, not its parent's, and it is election-visible: it can hold the
+ * module's lifetime token, and a survivor is sought among its siblings
+ * there when it dies (MemoryArena::registerDtor). Only its place in the
+ * graph is its parent's. Set once, before the AddTagEvent.
+ */
+    bool    module_root_ = false;
+    /*
  * Set by addTagTrampoline<T>() (via AddTagEvent, on the loader's
  * ordering thread) iff T's type-provider module registered a
  * module-level RIDList for T at load time (ETCS_TAG_DECLARE /
@@ -717,6 +727,19 @@ public:
  */
     bool isDestructed() const { return destructed_; }
     const ETCS::Buffer& getSourceModule() const { return source_module_; }
+    // Election-visible for its module's lifetime token: global scope, or a
+    // module root under another module's entity (module_root_).
+    bool isModuleRoot() const { return parent_ == nullptr || module_root_; }
+    // Would a child this binary makes under this entity cross into another
+    // module? Only a module knows its own name; the loader makes no types.
+    bool crossesModule() const
+    {
+#if defined(ETCS_LOADER)
+        return false;
+#else
+        return source_module_.written && !(source_module_ == ETCS::Buffer(ETCS_MODULE_NAME));
+#endif
+    }
     const ETCS::Buffer& getSourceTag()    const { return source_tag; }
     /*
  * The single fact everything outside this class needs to branch on:
@@ -870,10 +893,18 @@ public:
     {
         static_assert(::std::is_base_of<Entity, T>::value,
                       "addTag<T>: T must derive from Entity");
+        // A child of another module's entity is a root of its OWN module:
+        // its whole footprint goes in that module's root arena (the one
+        // MemoryArena::getInstance() names in the binary compiling this),
+        // which lives exactly as long as the module does -- not in the
+        // parent's, which the module owning the parent tears down.
+        const bool   boundary = crossesModule();
+        MemoryArena& home     = boundary ? MemoryArena::getInstance() : getArena();
         MemoryArena* saved = s_pending_parent_arena_;
-        s_pending_parent_arena_ = &getArena();
-        T* child = getArena().allocate<T>(::std::forward<Args>(args)...);
+        s_pending_parent_arena_ = &home;
+        T* child = home.allocate<T>(::std::forward<Args>(args)...);
         s_pending_parent_arena_ = saved;
+        child->module_root_ = boundary;
         child->getArena().setScopeTag(T::CONTRACT_TAG);   /*
  * CONTRACT_TAG -- not getSourceTag(), still empty here (setModuleSource
  * runs later, inside addTagImpl, as part of this same blocking call),
@@ -3872,6 +3903,25 @@ inline bool etcs_retire_entity(Entity* e)
     bool released = false;
     if (void* raw = e->getInterfacePointer(ETCS::Buffer("Lifecycle")))
         released = static_cast<ETCS::IWireLifecycle*>(raw)->Release();
+    /*
+ * Children made by ANOTHER module are roots of that module's arena
+ * (addTag<T>), so this entity's own arena teardown never reaches them. They
+ * go here, through their own arena, while this entity is still whole and
+ * still their parent -- which also hands their module's lifetime token on,
+ * or gives it up, the way any root leaving does. A reparent (the
+ * non-cascade delete) moves them before this runs, and there are none left.
+ */
+    {
+        ::std::vector<::std::pair<ETCS::Buffer, RID>> kids;
+        e->getTypedChildren(kids);
+        for (auto& [tag, rid] : kids)
+        {
+            Entity* c = e->getTypedChild(tag, rid);
+            if (!c || !c->isModuleRoot()) continue;
+            etcs_retire_entity(c);
+            c->getOwningArena().deleteEntity(c, true);
+        }
+    }
     /*
  * Then leave the parent's child list, for every entity. This used to happen in
  * ~Entity(), which meant a child was still answerable through getTypedChild

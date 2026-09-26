@@ -1653,6 +1653,74 @@ void ETCS::EventNode::LoaderStream::registerTypeOwnership(
     }
 }
 /*
+ * claimLifetime - the election, for any module root attaching to a loaded
+ * module: a global-scope entity or Root (attachModule), or a child made
+ * under another module's entity (addTagImpl) -- which is a root of its own
+ * module's arena and so holds its module exactly as a global one would.
+ */
+void ETCS::EventNode::LoaderStream::claimLifetime(ETCS::Module* global_mod, ETCS::LifetimeOwner entity)
+{
+    /*
+ * Claim the lifetime-owner slot iff it's currently vacant -- either
+ * this is the very first entity/Root ever to touch this module
+ * (right after its bootstrap), or the previous owner's own
+ * ~Module() already vacated it (a RequestUnloadEvent either already
+ * fired or about to be) and this attach is what saves it from
+ * actually unloading: RequestUnloadEvent's own delayed recheck will
+ * see lifetime_owner non-vacant again and do nothing.
+ */
+    if (!global_mod->lifetime_owner)
+    {
+        entity.module().is_lifetime_owner = true;
+        global_mod->lifetime_owner        = entity;
+        ETCS_LOG("DynamicLoader", "Module '" << global_mod->name
+                 << "' lifetime_owner claimed by entity RID:" << entity.getRID());
+    }
+    else if (global_mod->lifetime_owner.kind == LifetimeOwner::Kind::Root
+             && entity.kind == LifetimeOwner::Kind::Entity)
+    {
+        /*
+ * Explicit hand-off, not a search result: the current owner
+ * being Root-kind means it was never spawned through the
+ * ontology dispatch system at all -- i.e. it's a bootstrap
+ * entity, not a real, dispatchable type. This is the direct,
+ * structural version of a check that used to be inferred from a
+ * side-channel string field (whether the current owner's own
+ * source tag was empty) -- now that Root and Entity are
+ * genuinely distinct types rather than one polymorphically
+ * masquerading as the other, "is the current owner a bootstrap
+ * Root" is something LifetimeOwner::kind can just say directly,
+ * with no heuristic involved.
+ *
+ * Root always lives either on the stack or wherever its own
+ * caller constructed it (never in any module's own arena), while
+ * every real entity spawned from this module lives in the
+ * MODULE's own arena -- two entirely disjoint homes. That means
+ * a bootstrap Root owner can NEVER be discovered as a sibling by
+ * the arena-level search in MemoryArena's own run_entity_delete
+ * callback, and, symmetrically, nothing in the module's own
+ * arena could ever be found from root_registry's side either.
+ * Leaving the token with the Root until its own destruction
+ * would mean promoteOrVacate has nothing to search and no
+ * sibling to find, vacating the module while THIS entity (which
+ * genuinely was spawned/dispatched) is still alive and depending
+ * on it. So the transfer happens here instead, unconditionally,
+ * the moment any real, dispatched entity ever attaches while a
+ * Root still holds the token -- this only ever fires once,
+ * since after the first real entity takes over, lifetime_owner's
+ * own kind is no longer Root and this branch can never match
+ * again.
+ */
+        global_mod->lifetime_owner.module().is_lifetime_owner = false;
+        entity.module().is_lifetime_owner = true;
+        global_mod->lifetime_owner        = entity;
+        ETCS_LOG("DynamicLoader", "Module '" << global_mod->name
+                 << "' lifetime_owner handed off from bootstrap Root to entity RID:"
+                 << entity.getRID());
+    }
+}
+
+/*
  * attachModule - THE single entry point for giving any entity or Root a
  * Module reference for module_name. Current design:
  *
@@ -1900,65 +1968,8 @@ bool ETCS::EventNode::LoaderStream::attachModule(
     if (entity.kind == LifetimeOwner::Kind::Root)
         registerRoot(module_name, &entity.asRoot());
  
-    /*
- * Claim the lifetime-owner slot iff it's currently vacant -- either
- * this is the very first entity/Root ever to touch this module
- * (right after the bootstrap above), or the previous owner's own
- * ~Module() already vacated it (a RequestUnloadEvent either already
- * fired or about to be) and this attach is what saves it from
- * actually unloading: RequestUnloadEvent's own delayed recheck will
- * see lifetime_owner non-vacant again and do nothing.
- */
-    if (!global_mod->lifetime_owner)
-    {
-        entity.module().is_lifetime_owner = true;
-        global_mod->lifetime_owner        = entity;
-        ETCS_LOG("DynamicLoader", "Module '" << module_name
-                 << "' lifetime_owner claimed by entity RID:" << entity.getRID());
-    }
-    else if (global_mod->lifetime_owner.kind == LifetimeOwner::Kind::Root
-             && entity.kind == LifetimeOwner::Kind::Entity)
-    {
-        /*
- * Explicit hand-off, not a search result: the current owner
- * being Root-kind means it was never spawned through the
- * ontology dispatch system at all -- i.e. it's a bootstrap
- * entity, not a real, dispatchable type. This is the direct,
- * structural version of a check that used to be inferred from a
- * side-channel string field (whether the current owner's own
- * source tag was empty) -- now that Root and Entity are
- * genuinely distinct types rather than one polymorphically
- * masquerading as the other, "is the current owner a bootstrap
- * Root" is something LifetimeOwner::kind can just say directly,
- * with no heuristic involved.
- *
- * Root always lives either on the stack or wherever its own
- * caller constructed it (never in any module's own arena), while
- * every real entity spawned from this module lives in the
- * MODULE's own arena -- two entirely disjoint homes. That means
- * a bootstrap Root owner can NEVER be discovered as a sibling by
- * the arena-level search in MemoryArena's own run_entity_delete
- * callback, and, symmetrically, nothing in the module's own
- * arena could ever be found from root_registry's side either.
- * Leaving the token with the Root until its own destruction
- * would mean promoteOrVacate has nothing to search and no
- * sibling to find, vacating the module while THIS entity (which
- * genuinely was spawned/dispatched) is still alive and depending
- * on it. So the transfer happens here instead, unconditionally,
- * the moment any real, dispatched entity ever attaches while a
- * Root still holds the token -- this only ever fires once,
- * since after the first real entity takes over, lifetime_owner's
- * own kind is no longer Root and this branch can never match
- * again.
- */
-        global_mod->lifetime_owner.module().is_lifetime_owner = false;
-        entity.module().is_lifetime_owner = true;
-        global_mod->lifetime_owner        = entity;
-        ETCS_LOG("DynamicLoader", "Module '" << module_name
-                 << "' lifetime_owner handed off from bootstrap Root to entity RID:"
-                 << entity.getRID());
-    }
- 
+    claimLifetime(global_mod, entity);
+
     if (!spawn_tag.empty())
     {
         /*
@@ -2093,9 +2104,7 @@ void ETCS::EventNode::LoaderStream::changeModuleImpl(
  * now (via its own run_entity_delete callback -- see registerDtor<T>'s
  * own comment, MemoryArena.h). No root-vs-child branching needed here
  * anymore: deleteEntity's own callback handles both cases internally
- * (global-scope election-and-evoke, or non-global reparent-and-evoke),
- * keyed off target->getParent() itself, which is exactly what determines
- * which arena is "correct" here too. Always a genuine Entity* -- Root
+ * (module-root election-and-evoke, or child reparent-and-evoke). Always a genuine Entity* -- Root
  * never reaches this at all (see EntityUnloadEvent's own comment,
  * EventNode.h).
  *
@@ -2108,10 +2117,9 @@ void ETCS::EventNode::LoaderStream::changeModuleImpl(
  *   actually lives in -- the same cross-DSO hazard this session traced
  *   and fixed elsewhere for event routing.
  *
- *   CHILD (parent_ != nullptr): target's own parent arena is simply
- *   target->getParent()->getArena() -- no module involvement needed at
- *   all, since only root-level entities are ever module-lifetime-
- *   relevant.
+ *   CHILD (parent_ != nullptr): the arena its record is in -- its
+ *   parent's, or for a module root (a child made under another module's
+ *   entity) its own module's root arena. getOwningArena() is both.
  */
 void ETCS::EventNode::LoaderStream::entityUnloadImpl(ETCS::Entity* target, bool delete_children)
 {
@@ -2519,19 +2527,14 @@ ETCS::RID ETCS::EventNode::LoaderStream::addTagImpl(
         if (mod == nullptr)
         {
             /*
- * Vacant: bootstrap the module against parent's own ultimate
- * ancestor first (spawn_tag "" skips dispatch wiring - that
- * ancestor isn't of this type). No separate "root" concept
- * needed: whatever getRootAncestor() reaches becomes the
- * global instance's first lifetime_owner claimant, exactly
- * like any other first attach. child itself then gets its
- * own module_ populated as an ordinary proxy via the second
- * attachModule call below - a typed child is never itself
- * eligible to claim lifetime_owner (see attachModule's own
- * comment on why only root-level entities are election-
- * visible at all).
+ * Vacant: bootstrap the module. A module root (a child made under another
+ * module's entity -- Entity::crossesModule) bootstraps it itself and claims
+ * the token, as any first attach does. A same-module child's module is its
+ * parent's and already loaded, so reaching here without one means the
+ * parent chain was never attached: bootstrap against its ultimate ancestor
+ * first, which then holds the token.
  */
-            attachModule(mod_name, parent->getRootAncestor(), "");
+            if (!child->isModuleRoot()) attachModule(mod_name, parent->getRootAncestor(), "");
             attachModule(mod_name, child, child_type_tag);
         }
         else
@@ -2543,20 +2546,18 @@ ETCS::RID ETCS::EventNode::LoaderStream::addTagImpl(
                 child->setModuleSource(ETCS::Buffer(child_type_tag.c_str()), ETCS::Buffer(mod_name.c_str()));
                 child->addTag(cat_it->second);
                 /*
- * Populate child's own module_ as an ordinary proxy onto
- * the already-loaded global instance -- a plain pointer
- * assignment, deliberately NOT the full attachModule()
- * (which also runs lifetime_owner claim logic with no
- * way to suppress it for a typed child specifically). A
- * typed/addTag<T> child must never become lifetime_owner:
- * registerDtor<T>'s own non-global branch (MemoryArena.h)
- * reparents-or-cascades a child on destruction and NEVER
- * calls promoteOrVacate -- if a child ever held
- * lifetime_owner, destroying it would leave
- * global_mod->lifetime_owner permanently dangling, with
- * nothing left to ever clear it.
+ * Populate child's own module_ as a proxy onto the already-loaded global
+ * instance -- a plain pointer assignment, not the full attachModule().
+ *
+ * A MODULE ROOT then stands for the token like any global-scope entity: it
+ * is a root of its own module's arena (Entity::module_root_), and dying it
+ * hands the token to a sibling there or gives it up (registerDtor<T>'s
+ * module-root branch, MemoryArena.h). An ordinary child never claims: its
+ * module is held by the root above it, and its own death reparents or
+ * cascades without an election.
  */
                 child->module_.parent = mod;
+                if (child->isModuleRoot()) claimLifetime(mod, child);
             }
             else
                 ETCS_LOG("DynamicLoader", "addTagImpl: '" << child_type_tag
@@ -3147,7 +3148,7 @@ inline ETCS::RID ETCS::AddTagEvent::operator()()
  * ~Entity() no longer triggers anything itself (see entityUnloadImpl's
  * own comment for why). By the time this returns, entityUnloadImpl has
  * determined target's correct parent arena and MemoryArena::deleteEntity
- * has fully run: election-and-evoke (global scope) or reparent-and-evoke
+ * has fully run: election-and-evoke (module root) or reparent-and-evoke
  * (child), all decided synchronously, before target's own destructor
  * even starts, on the loader's own ordering thread.
  *

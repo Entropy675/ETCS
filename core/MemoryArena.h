@@ -1246,10 +1246,12 @@ public:
     // DynamicLoader.h).
     //
     // Three cases, decided each time deleteEntity actually runs:
-    //   - Global (getParent() == nullptr): search for a sibling,
-    //     promoteOrVacate, evoke e AND its own arena unconditionally --
-    //     already a full subtree delete regardless of delete_children,
-    //     since only root-level entities are ever lifetime_owner-eligible.
+    //   - A module root (isModuleRoot: global scope, or a child made under
+    //     another module's entity, which lives in its own module's root
+    //     arena): search for a sibling, promoteOrVacate, evoke e AND its own
+    //     arena unconditionally -- already a full subtree delete regardless
+    //     of delete_children, since module roots are what the lifetime token
+    //     is handed between.
     //   - Non-global, delete_children == true: evoke e, then evoke e's
     //     own arena too -- its ~MemoryArena() walks e's own dtor chain in
     //     turn, cascading the subtree via ordinary nested teardown. Never
@@ -1272,7 +1274,7 @@ public:
                         [](void* p, MemoryArena& parentArena, bool delete_children)
                         {
                             T* e = static_cast<T*>(p);
-                            if (e->getParent() == nullptr)
+                            if (e->isModuleRoot())
                             {
                                 Entity* survivor = parentArena.findNextCandidateScope(
                                     [](Entity*) { return true; }, e);
