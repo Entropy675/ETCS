@@ -51,11 +51,12 @@ landing.SetHtmlFromFile(ACE_ROOT/scripts/www/index.html)
 # /whitepaper.html. One page type, no per-document entity, and adding a
 # document is copying a file rather than editing this script.
 web.spawn(NetworkProvider::FileHtmlPage tree)
-# THE LINK HUB, for a shared canvas. The page's share button hosts a Room
-# in its own runtime through this hub (PaintShare, paint_host.etcs), and the
-# people it invites link to it here at /link/<session>: the hub splices bytes
-# between them and holds nothing of the session. Without it, "share" has
-# nowhere to host through.
+# THE LINK HUB, for a shared canvas and for a game of chess. A page hosts a
+# Room in its own runtime through this hub (PaintShare, paint_host.etcs;
+# ChessShare, chess_host.etcs), and the people it invites link to it here at
+# /link/<session>: the hub splices bytes between them and holds nothing of
+# the session. The chess hall and the ranked tables are Rooms of this
+# runtime's own on the same hub (/link/hall, /link/table1).
 web.spawn(NetworkProvider::LinkHub links)
 tree.LoadFromDisk(ACE_ROOT/scripts/www)
 tree.ListPaths()
@@ -96,14 +97,15 @@ tree.SetMountPrefix()
 
 # ── /chess ───────────────────────────────────────────────────────────────────
 #
-# /chess/ is the LOBBY LIST (scripts/www/chess/index.html): the name server's
-# list of everyone online, what game their lobby is for, and who sits with
-# them -- read from /game, which chess_lobby.etcs mounts below. The game a row
-# opens is the wasm chess page, mounted two deep at /chess/play/ from its own
-# module's list (ChessProvider/scripts/chess_mounts.etcs); it plays on the
-# visitor's own runtime and uses this site only as its name server. The
-# server-played page it replaced is at /chess-classic, and /chess.html
-# forwards there (or here) so old links still land.
+# /chess/ is a LANDING PAGE (scripts/www/chess/index.html): what there is to
+# play, and the buttons that open it. The game is the wasm chess page, mounted
+# two deep at /chess/play/ from its own module's list
+# (ChessProvider/scripts/chess_mounts.etcs); it plays on the visitor's own
+# runtime, and its hall -- who is hosting, which ranked table has a seat -- is
+# a listing over the link, read from the two services this site runs below
+# (chess_service.etcs, after Start). The server-played page it replaced is at
+# /chess-classic, and /chess.html forwards there (or here) so old links still
+# land.
 tree.SetMountPrefix(chess/play)
 run ChessProvider/scripts/chess_mounts.etcs tree=tree
 tree.SetMountPrefix()
@@ -140,7 +142,10 @@ web.AddHandler(@web Serve)
 web.Start()
 web.IsStarted()
 
-detach ChessProvider/scripts/chess_lobby.etcs
+# THE HALL AND THE RANKED TABLES, on the hub above: the name server every
+# casual game finds its partner through, and the two tables this runtime
+# hosts and judges (ChessProvider/scripts/chess_service.etcs).
+run ChessProvider/scripts/chess_service.etcs links=links
 detach forum_lobby.etcs
 
 

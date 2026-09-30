@@ -1,0 +1,98 @@
+#!/usr/bin/env etcs
+#IMPORT ACE_ROOT/modules
+
+# THE CHESS SEAT, IN A WINDOW.
+#
+#     ./bin/etcs scripts/chess_table.etcs
+#
+# Runs the boot script the browser page runs
+# (ChessProvider/scripts/www/boot_chess.etcs) on the OS runtime: one window,
+# the same board, the same table. There is no copy of it here.
+#
+# WHAT A WINDOW HAS NO DOM FOR is added first: the page keeps its chat and its
+# command line in HTML beside the canvas, so here they are two panes on the
+# stage's right edge -- the conversation as rows of labels, the line being
+# typed as one -- parked off the edge and slid in with Tab (ChessTable::Step
+# moves them a frame at a time; Esc or Tab slides them out). While they are in,
+# the keyboard is the line's: Enter sends it, as a word to the table, or as a
+# verb with a leading slash (/sit black, /resign, /draw, /decline, /reset,
+# /flip, /fen <fen>, /help).
+#
+# AN ORCHESTRATION, WHICH IS WHY IT IS HERE: it composes what the boot makes
+# with what the OS needs beside it, the way paint_editor.etcs composes paint's.
+# The stage and the table are made HERE and taken by the boot (`ensure` there),
+# which is what lets the bars be the stage's children and the table's rows
+# before the board exists; the game and the share are made here for the other
+# reason `ensure` exists -- a name a root script spawns is a global, and one a
+# sub-script spawns is not, so `game` and `share` answer at the prompt beside
+# the window (and to the session test, which drives this the way a page
+# drives the boot). A click lands on the board only; the bars answer nothing
+# but keys. Each chat row is one line, the row script placing nothing: the
+# table puts each row under the last (ChessTable::ChatRow).
+
+spawn RenderProvider::CompositeDrawable2D stage
+stage.Create(1024, 768)
+spawn ChessProvider::ChessGame game
+spawn ChessProvider::ChessShare share
+spawn ChessProvider::ChessTable table
+table.Create()
+
+# ── the conversation, thirty rows, below the column that says whose move ────────────────────────────────────────────
+stage.spawn(RenderProvider::CompositeDrawable2D chat_pane)
+chat_pane.Create(320, 500)
+chat_pane.SetPosition(1024, 140)
+chat_pane.SetOrder(40)
+chat_pane.SetBackground(0.106, 0.110, 0.078, 0.96)
+chat_pane.SetHidden(1)
+run ChessProvider/scripts/chess_chat_row.etcs pane=chat_pane table=table
+run ChessProvider/scripts/chess_chat_row.etcs pane=chat_pane table=table
+run ChessProvider/scripts/chess_chat_row.etcs pane=chat_pane table=table
+run ChessProvider/scripts/chess_chat_row.etcs pane=chat_pane table=table
+run ChessProvider/scripts/chess_chat_row.etcs pane=chat_pane table=table
+run ChessProvider/scripts/chess_chat_row.etcs pane=chat_pane table=table
+run ChessProvider/scripts/chess_chat_row.etcs pane=chat_pane table=table
+run ChessProvider/scripts/chess_chat_row.etcs pane=chat_pane table=table
+run ChessProvider/scripts/chess_chat_row.etcs pane=chat_pane table=table
+run ChessProvider/scripts/chess_chat_row.etcs pane=chat_pane table=table
+run ChessProvider/scripts/chess_chat_row.etcs pane=chat_pane table=table
+run ChessProvider/scripts/chess_chat_row.etcs pane=chat_pane table=table
+run ChessProvider/scripts/chess_chat_row.etcs pane=chat_pane table=table
+run ChessProvider/scripts/chess_chat_row.etcs pane=chat_pane table=table
+run ChessProvider/scripts/chess_chat_row.etcs pane=chat_pane table=table
+run ChessProvider/scripts/chess_chat_row.etcs pane=chat_pane table=table
+run ChessProvider/scripts/chess_chat_row.etcs pane=chat_pane table=table
+run ChessProvider/scripts/chess_chat_row.etcs pane=chat_pane table=table
+run ChessProvider/scripts/chess_chat_row.etcs pane=chat_pane table=table
+run ChessProvider/scripts/chess_chat_row.etcs pane=chat_pane table=table
+run ChessProvider/scripts/chess_chat_row.etcs pane=chat_pane table=table
+run ChessProvider/scripts/chess_chat_row.etcs pane=chat_pane table=table
+run ChessProvider/scripts/chess_chat_row.etcs pane=chat_pane table=table
+run ChessProvider/scripts/chess_chat_row.etcs pane=chat_pane table=table
+run ChessProvider/scripts/chess_chat_row.etcs pane=chat_pane table=table
+run ChessProvider/scripts/chess_chat_row.etcs pane=chat_pane table=table
+run ChessProvider/scripts/chess_chat_row.etcs pane=chat_pane table=table
+run ChessProvider/scripts/chess_chat_row.etcs pane=chat_pane table=table
+run ChessProvider/scripts/chess_chat_row.etcs pane=chat_pane table=table
+run ChessProvider/scripts/chess_chat_row.etcs pane=chat_pane table=table
+
+# ── the line being typed ─────────────────────────────────────────────────────
+stage.spawn(RenderProvider::CompositeDrawable2D cmd_pane)
+cmd_pane.Create(320, 40)
+cmd_pane.SetPosition(1024, 696)
+cmd_pane.SetOrder(40)
+cmd_pane.SetBackground(0.106, 0.110, 0.078, 0.96)
+cmd_pane.SetHidden(1)
+cmd_pane.spawn(RenderProvider::TextLabel cmd_line)
+cmd_line.Create()
+cmd_line.SetPosition(8, 12)
+cmd_line.SetSize(8)
+cmd_line.SetColor(0.94, 0.89, 0.78, 1.0)
+cmd_line.SetOrder(41)
+cmd_line.SetText(> _)
+table.BindLine(@cmd_line)
+
+# In at x=696 (a 320px pane against the right edge, 8px in), out at 1024.
+table.BindBars(@chat_pane @cmd_pane 696 1024)
+
+# ── and the seat itself ──────────────────────────────────────────────────────
+run ChessProvider/scripts/www/boot_chess.etcs

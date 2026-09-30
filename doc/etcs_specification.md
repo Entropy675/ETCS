@@ -260,24 +260,27 @@ decidable rather than dependent on how deep something happens to sit.
 ```etcs
 # run_tls_website.etcs -- the root. Its names are the runtime's globals.
 spawn NetworkProvider::HttpServer web
+web.spawn(NetworkProvider::LinkHub links)
 ...
-detach chess_lobby.etcs
+run ChessProvider/scripts/chess_service.etcs links=links
 ```
 
 ```etcs
-# chess_lobby.etcs -- says nothing about web; does not need to.
-spawn ChessProvider::ChessNode node
-node.Mount(game)
-detach chess_web.etcs game=node
+# chess_service.etcs -- says nothing about web; it was handed the hub.
+requires links [LinkHub]
+spawn NetworkProvider::Lobby hall_list
+...
+run ChessProvider/scripts/chess_ranked_table.etcs links=links hall=hall_list
+run ChessProvider/scripts/chess_ranked_table.etcs links=links hall=hall_list
 ```
 
 ```etcs
-# chess_web.etcs -- ensure finds the root's web two levels up, because it is
-# global rather than inherited. Run this file on its own and the same line
-# creates a server instead.
-requires game
-ensure NetworkProvider::HttpServer web
-web.SetPort(8080)
+# chess_ranked_table.etcs -- run twice above, and its names are its own each
+# time: `game` here is not the other run's `game`, and neither is a global.
+requires links [LinkHub]
+requires hall [Lobby]
+spawn ChessProvider::ChessGame game
+...
 ```
 
 ---
@@ -570,8 +573,8 @@ state and does not come back; what it left behind does.
 `detach` and `run` launch another `.etcs` file with an optional set of bindings:
 
 ```etcs
-detach chess_lobby.etcs
-detach chess_web.etcs game=node
+detach forum_lobby.etcs
+run    ChessProvider/scripts/chess_service.etcs links=links
 run    forum_web.etcs forum=node
 ```
 
@@ -637,9 +640,9 @@ and it is the one that runs.
 An action that fails on its own terms — a payload the work function rejects, a `SetPort` refused
 because the server is already listening — reports the failure and the script continues. That is
 deliberate. A trace records what was attempted and what came of it, and a refusal is a result,
-not a broken transcript. `run_tls_website.etcs` depends on exactly this: `chess_web.etcs` carries
-its own `web.SetPort(8080)`, and against an already-started server on 8443 that is *supposed* to
-be refused with a visible line rather than taken or fatal.
+not a broken transcript. A sub-script that `ensure`s the site's server and carries its own
+`web.SetPort(8080)` depends on exactly this: against an already-started server on 8443 that is
+*supposed* to be refused with a visible line rather than taken or fatal.
 
 ### The liveness rule
 
