@@ -867,7 +867,62 @@ public: \
 // CONSUME gets no such guard: the consumer is the READ side. On Pipe it
 // does hold a write_fd_ (the ack channel, see makePair), and closing that
 // would be wrong.
-#define DEFINE_STREAM_FUNC_PRODUCE(Type, Name) \
+/*
+ * WHERE A PRODUCE BODY RUNS. On the module's pool, ordinarily: a body that
+ * answers and returns is a task. But a body that STANDS -- follows a record,
+ * watches a listing, emits a page's changes for as long as the session
+ * lasts -- would hold a pool worker for the life of its edge, and on a web
+ * build a module's pool is two workers (DEFAULT_THREAD_POOL_THREADS): two
+ * standing bodies were the pool, and every produce enqueued after them
+ * never ran, silently. So:
+ *
+ *   DEFINE_STREAM_FUNC_PRODUCE_STANDING  the body gets a thread of its own
+ *                                        (etcs_standing_start), never a worker
+ *   MirrorBuffer::produceHere            a caller that already holds a thread
+ *                                        for this body -- a link's edge running
+ *                                        a far pair's half (Entity::produceOnto)
+ *                                        -- has it run there, whichever kind
+ */
+namespace ETCS
+{
+// This image's standing bodies: started on their own threads, finished ones
+// joined as new ones start, the rest at exit -- so none outlives the module.
+class StandingThreads
+{
+public:
+    static StandingThreads& get() { static StandingThreads s; return s; }
+    template<class F>
+    void start(F&& body)
+    {
+        ::std::lock_guard<::std::mutex> lock(mu_);
+        reapLocked();
+        auto done = ::std::make_shared<::std::atomic<bool>>(false);
+        threads_.push_back({ ::std::thread([body = ::std::forward<F>(body), done]() mutable { body(); done->store(true); }), done });
+    }
+    ~StandingThreads()
+    {
+        ::std::lock_guard<::std::mutex> lock(mu_);
+        for (auto& t : threads_) if (t.th.joinable()) t.th.join();
+    }
+private:
+    struct Entry { ::std::thread th; ::std::shared_ptr<::std::atomic<bool>> done; };
+    void reapLocked()
+    {
+        for (auto it = threads_.begin(); it != threads_.end(); )
+        {
+            if (it->done->load()) { it->th.join(); it = threads_.erase(it); }
+            else ++it;
+        }
+    }
+    ::std::mutex       mu_;
+    ::std::vector<Entry> threads_;
+};
+} // namespace ETCS
+
+#define DEFINE_STREAM_FUNC_PRODUCE(Type, Name)          ETCS_DEFINE_STREAM_FUNC_PRODUCE_(Type, Name, false)
+#define DEFINE_STREAM_FUNC_PRODUCE_STANDING(Type, Name) ETCS_DEFINE_STREAM_FUNC_PRODUCE_(Type, Name, true)
+
+#define ETCS_DEFINE_STREAM_FUNC_PRODUCE_(Type, Name, Standing) \
     void _implProduce_##Type##_##Name(Type& self, ETCS::MirrorBuffer& stream, ETCS::Buffer data, ETCS::SignalContext ctx); \
     ETCS_CAUSAL_EDGE_STORE(Type, Name) \
     \
@@ -902,6 +957,7 @@ public: \
          * ProducerLiveGuard around the body, so an exception leaving counts \
          * as leaving. */ \
         ETCS::SharedPage* _live_token = stream.producerEnter(); \
+        const bool _here = stream.produceHere(); \
         /* The action this pair runs inside goes with the body to its thread, \
          * by value -- the frame above ends with this trampoline -- so what \
          * the body changes is credited to the line that started it \
@@ -909,8 +965,7 @@ public: \
         if (ETCS::current_action_frame()) ETCS::current_action_frame()->settle(); \
         ETCS::ActionFrame _action_frame = ETCS::current_action_frame() \
             ? *ETCS::current_action_frame() : ETCS::ActionFrame{}; \
-        try { \
-        self->getThreadPool().enqueue(ETCS::Priority::Medium, ctx, [self, stream = ::std::move(stream), config, _pair_mod, _live_token, _action_frame, _auto_scope = ::std::move(_auto_scope)]() mutable { \
+        auto _body = [self, stream = ::std::move(stream), config, _pair_mod, _live_token, _action_frame, _auto_scope = ::std::move(_auto_scope)]() mutable { \
             ETCS::ProducerLiveGuard _auto_live(_live_token); \
             ETCS::ActionFrame* const _action_saved = ETCS::current_action_frame(); \
             if (_action_frame.id) ETCS::current_action_frame() = &_action_frame; \
@@ -919,7 +974,11 @@ public: \
             ETCS_CAUSAL_SCOPE(Type, Name); \
             ETCS::StreamWriteGuard _auto_close(stream); \
             _implProduce_##Type##_##Name(*self, stream, config, _auto_scope.ctx()); \
-        }); \
+        }; \
+        if (_here) { _body(); return; } \
+        try { \
+        if (Standing) ETCS::StandingThreads::get().start(::std::move(_body)); \
+        else self->getThreadPool().enqueue(ETCS::Priority::Medium, ctx, ::std::move(_body)); \
         } catch (...) { \
             /* enqueue throws once the pool is stopping. The body will never \
              * run, so release the raise here rather than leaving the pair's \

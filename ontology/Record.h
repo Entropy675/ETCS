@@ -33,6 +33,18 @@
 // Reading is Since: the lines from a sequence on, as many as fit. A
 // follower that wants them as they happen streams them instead
 // (the leaf's own Follow, NetworkProvider/Ledger.h).
+//
+// A RECORD KEEPS ITS LINES FROM THE LAST CHECKPOINT ON. A line that
+// states everything a reader needs (a page, a board) makes the lines
+// before it history nobody replays, and a record that keeps them only
+// grows with use. The writer says so -- Checkpoint(seq) -- and the
+// record drops what came before `seq`. A reader asking from before it
+// is answered from the checkpoint instead, told first where that is
+// and what the chain was there ("~ <seq> <chain hex>"), and it starts
+// its own chain from that rather than from zero.
+//
+// Checkpoint is the ordering authority's: a guest cannot shorten the
+// history everyone else reads.
 
 class Record_ : virtual public ETCS::Entity
 {
@@ -43,8 +55,11 @@ public:
     virtual uint64_t    Append(const std::string& author, const std::string& line) = 0;
     // "<next seq> <chain hex>"
     virtual std::string Head() const = 0;
-    // "<from> <to> <chain hex at to>\n" then "<seq> <author> <line>\n" per line.
+    // "<from> <to> <chain hex at to>\n" then "<seq> <author> <line>\n" per line,
+    // led by "~ <checkpoint> <chain hex there>\n" when `seq` is before it.
     virtual std::string Since(uint64_t seq, size_t budget) const = 0;
+    // Drops the lines before `seq`; false when refused or out of range.
+    virtual bool        Checkpoint(uint64_t seq) = 0;
 };
 
 #endif // SUPERTYPE_RECORD_H__

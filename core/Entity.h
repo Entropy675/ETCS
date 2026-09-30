@@ -1911,6 +1911,9 @@ public:
         ETCS::MirrorBuffer::makePair<ETCS::StrategySocket, ETCS::SharedPage>(
             producer, consumer, page, static_cast<uint64_t>(fd), static_cast<uint64_t>(fd),
             chain_owner ? chain_owner : this);
+        // This thread is the body's: the caller gave it one (a link's edge),
+        // and a pool worker is not to be held for the life of a far edge.
+        producer.produceHere(true);
         ETCS::MBuffer transport;
         producer.packProducer(transport);
         {

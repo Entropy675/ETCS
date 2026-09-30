@@ -332,6 +332,15 @@ private:
     // developer's own _implProduce_/_implConsume_ body.
     bool unwrap_failed_ = false;
     bool closed_ = false;
+    /*
+     * THE BODY RUNS ON THE THREAD THAT UNPACKS IT. Set by whoever made the
+     * pair holding a thread for the produce half already -- a link's edge
+     * running a far pair's half (Entity::produceOnto) -- and read by the
+     * produce trampoline (ETCS_API.h), which then runs the body there rather
+     * than on the module's pool. Packed with the rest, since the trampoline
+     * is in the producer's own module and a thread-local would not cross.
+     */
+    bool produce_here_ = false;
     const char* sideStr() const { return is_producer_ ? "PRODUCER" : "CONSUMER"; }
     /*
      * THE LENGTH IN FRONT OF EVERY FD FRAME is four bytes, little-endian, on
@@ -430,6 +439,8 @@ public:
     MirrorBuffer(const Buffer& data, SignalContext ctx)
         : config(data), bound_ctx_(ctx) {}
     void bindContext(SignalContext ctx) { bound_ctx_ = ctx; }
+    void produceHere(bool on) { produce_here_ = on; }
+    bool produceHere() const  { return produce_here_; }
     // -----------------------------------------------------------------------
     // makePair<Strategy, PageType> / teardownPair<Strategy, PageType>
     //
@@ -651,6 +662,25 @@ public:
                 assert(lmax_page_ && "readRaw: null LMAX page");
                 const LBuffer* lbuf = lmaxAcquireBlocking(bound_ctx_);
                 if (!lbuf) return false;
+                if (LmaxMessage* m = lmaxMessageIn(*lbuf))
+                {
+                    // A message, read as a Buffer: whole if it fits one, and
+                    // taken either way, so its writer is not left waiting.
+                    bool fits = false;
+                    int expect = 0;
+                    if (m->state.compare_exchange_strong(expect, 1, ::std::memory_order_acq_rel))
+                    {
+                        fits = m->bytes.size() < Buffer::bufsize;
+                        slot.reset();
+                        if (fits) slot.writeRaw(m->bytes.data(), m->bytes.size());
+                        else ETCS_LOG("MirrorBuffer", "[CONSUMER] a " << m->bytes.size()
+                                      << "-byte message is wider than a Buffer -- read it with readMessage.");
+                    }
+                    m->release();
+                    lmax_page_->markConsumed(next_read_seq_);
+                    ++next_read_seq_;
+                    return fits;
+                }
                 if (wrap_chain_len_ == 0)
                 {
                     // Fast path — unchanged.
@@ -749,6 +779,134 @@ public:
     {
         if (active_ == ActiveStrategy::LMAX || wrap_chain_len_ > 0) return false;
         return fillAndCopyInto(out, bound_ctx_);
+    }
+    // -----------------------------------------------------------------------
+    // writeMessage / readMessage — ONE UNIT OF ANY SIZE, up to MAX_MESSAGE, on
+    // every strategy and through the wrap chain.
+    //
+    // A pair's unit is a Buffer (or, unwrapped, one MBuffer frame), and a
+    // stream whose unit is a whole picture or a whole record had nowhere to put
+    // it: a page baseline is megabytes. So a message goes as a run of frames,
+    // each length word carrying FRAME_MORE while another piece follows, and
+    // readMessage joins them. A message that fits one frame IS one plain frame
+    // -- readRaw reads it like any other -- and readMessage takes a plain
+    // frame as a message of its own, so either end can move to messages first.
+    //
+    // Pieces: MAX_FRAME_PAYLOAD unwrapped (or what the staging page holds, if
+    // less); a Buffer's worth through a wrap chain, one Wrap per piece, since a
+    // stage is sized for Buffer payloads.
+    //
+    // LMAX has no frame to split and no lifetime to lend: the ring carries a
+    // pointer. A message is handed over as an LmaxMessage owning its bytes,
+    // and the writer waits until the reader has taken it (or withdraws it on
+    // a signal), so there is one in flight per pair, as with a Buffer.
+    //
+    // Too big for the reader's cap: the rest is still read, so the stream stays
+    // in step, and the read answers false.
+    // -----------------------------------------------------------------------
+    static constexpr size_t   MAX_MESSAGE = 64u << 20;
+    static constexpr FrameLen FRAME_MORE  = 0x80000000u;
+    bool writeMessage(const char* data, size_t len)
+    {
+        if (len > MAX_MESSAGE) return false;
+        switch (active_)
+        {
+            case ActiveStrategy::LMAX:
+                if (!lmax_page_) return false;
+                if (wrap_chain_len_ == 0) return lmaxHandOver(data, len);
+                return wrappedPieces(data, len);
+            case ActiveStrategy::Pipe:
+            case ActiveStrategy::Socket:
+            {
+                if (!shared_page_) return false;
+                if (wrap_chain_len_ > 0) return wrappedPieces(data, len);
+                // A piece is staged whole, and a module's arena may hand the
+                // staging page a chunk smaller than a frame.
+                const size_t piece = ::std::min(MAX_FRAME_PAYLOAD,
+                    static_cast<size_t>(shared_page_->capacity) - sizeof(FrameLen));
+                size_t at = 0;
+                do
+                {
+                    const size_t n = ::std::min(len - at, piece);
+                    MBuffer piece;
+                    if (n) piece.writeRaw(data + at, n);
+                    at += n;
+                    if (!stageAndFlush(piece, at < len)) return false;
+                } while (at < len);
+                return true;
+            }
+        }
+        return false;
+    }
+    bool writeMessage(const ::std::string& s) { return writeMessage(s.data(), s.size()); }
+    bool readMessage(::std::string& out, size_t cap = MAX_MESSAGE)
+    {
+        out.clear();
+        bool fits = true, more = true;
+        auto take = [&](const char* p, size_t n)
+        {
+            if (!fits) return;
+            if (out.size() + n > cap) { fits = false; out.clear(); return; }
+            out.append(p, n);
+        };
+        switch (active_)
+        {
+            case ActiveStrategy::LMAX:
+            {
+                if (!lmax_page_) return false;
+                while (more)
+                {
+                    const LBuffer* lbuf = lmaxAcquireBlocking(bound_ctx_);
+                    if (!lbuf) return false;
+                    more = false;
+                    if (LmaxMessage* m = lmaxMessageIn(*lbuf))
+                    {
+                        int expect = 0;
+                        if (m->state.compare_exchange_strong(expect, 1, ::std::memory_order_acq_rel))
+                        {
+                            if (m->bytes.size() > cap) fits = false;
+                            else out = ::std::move(m->bytes);
+                        }
+                        m->release();
+                    }
+                    else if (wrap_chain_len_ > 0)
+                    {
+                        const MBuffer* ptr = nullptr;
+                        ::std::memcpy(&ptr, lbuf->buf, sizeof(MBuffer*));
+                        more = lbuf->written > sizeof(MBuffer*) && lbuf->buf[sizeof(MBuffer*)] == '+';
+                        MBuffer frame = *ptr;
+                        lmax_page_->markConsumed(next_read_seq_);
+                        ++next_read_seq_;
+                        if (!unwrapFrame(frame)) return false;
+                        take(frame.buf, frame.written);
+                        continue;
+                    }
+                    else
+                    {
+                        const Buffer* ptr = nullptr;
+                        ::std::memcpy(&ptr, lbuf->buf, sizeof(Buffer*));
+                        take(ptr->buf, ptr->written);
+                    }
+                    lmax_page_->markConsumed(next_read_seq_);
+                    ++next_read_seq_;
+                }
+                return fits;
+            }
+            case ActiveStrategy::Pipe:
+            case ActiveStrategy::Socket:
+                while (more)
+                {
+                    MBuffer piece;
+                    if (!fillAndCopyInto(piece, bound_ctx_, &more)) return false;
+                    if (wrap_chain_len_ > 0)
+                    {
+                        if (!directionAllows(false, "Unwrap") || !unwrapFrame(piece)) return false;
+                    }
+                    take(piece.buf, piece.written);
+                }
+                return fits;
+        }
+        return false;
     }
     // -----------------------------------------------------------------------
     // closeWrite — signals EOF to the consumer.
@@ -986,7 +1144,7 @@ public:
         // The edge, both ends, in producer-then-consumer order on BOTH halves
         // -- the direction is the field order, so it survives the wire without
         // needing is_producer_ to interpret it.
-        transport << edge_from_rid_ << edge_to_rid_ << wrap_owner_rid_;
+        transport << edge_from_rid_ << edge_to_rid_ << wrap_owner_rid_ << produce_here_;
         packWrapManifest(transport);
         // Plain write(), not operator<<, for this last field specifically:
         // config is always the terminal field, and unpack() reconstructs
@@ -1016,7 +1174,7 @@ public:
         // The edge, both ends, in producer-then-consumer order on BOTH halves
         // -- the direction is the field order, so it survives the wire without
         // needing is_producer_ to interpret it.
-        transport << edge_from_rid_ << edge_to_rid_ << wrap_owner_rid_;
+        transport << edge_from_rid_ << edge_to_rid_ << wrap_owner_rid_ << produce_here_;
         packWrapManifest(transport);
         transport.write(config.c_str()); // see packConsumer's own comment
     }
@@ -1053,7 +1211,7 @@ public:
         wrap_scratch_pool_ = reinterpret_cast<MBuffer*>(wrap_scratch_p); // nullptr if 0, as intended
         for (size_t i = 0; i < ETCS::TAG_WORDS; ++i) transport >> pair_tag_mask_.w[i];
         for (size_t i = 0; i < ETCS::TAG_WORDS; ++i) transport >> pair_module_mask_.w[i];
-        transport >> edge_from_rid_ >> edge_to_rid_ >> wrap_owner_rid_;
+        transport >> edge_from_rid_ >> edge_to_rid_ >> wrap_owner_rid_ >> produce_here_;
         unpackWrapManifest(transport);
         config.writeString(transport.restAsString().c_str());
         if (is_lmax)
@@ -1137,6 +1295,29 @@ public:
 
     int    readFd()  const { return read_fd_; }
     int    writeFd() const { return write_fd_; }
+    /*
+     * WHETHER THE READER HAS GONE, asked without writing: a standing producer
+     * with nothing to send would otherwise never learn its consumer left --
+     * the next write is what fails, and there may be none. Pipe and Socket
+     * ask the fd (a closed read end answers ERR or HUP); LMAX asks the ring.
+     */
+    bool readerGone() const
+    {
+        switch (active_)
+        {
+            case ActiveStrategy::LMAX:
+                return !lmax_page_ || lmax_page_->tombstoned.load(::std::memory_order_acquire);
+            case ActiveStrategy::Pipe:
+            case ActiveStrategy::Socket:
+            {
+                if (write_fd_ == -1) return true;
+                pollfd p{ write_fd_, POLLOUT, 0 };
+                if (::poll(&p, 1, 0) < 0) return errno != EINTR && errno != EAGAIN;
+                return (p.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0;
+            }
+        }
+        return true;
+    }
     bool   isProducer() const { return is_producer_; }
     uint64_t producerRid() const { return edge_from_rid_; }
     uint64_t consumerRid() const { return edge_to_rid_; }
@@ -1164,7 +1345,8 @@ public:
           pair_tag_mask_(o.pair_tag_mask_),
           pair_module_mask_(o.pair_module_mask_),
           unwrap_failed_(o.unwrap_failed_), 
-          closed_(o.closed_)
+          closed_(o.closed_),
+          produce_here_(o.produce_here_)
     {
         for (size_t i = 0; i < wrap_chain_len_; ++i)      wrap_chain_[i] = o.wrap_chain_[i];
         for (size_t i = 0; i < wrap_manifest_len_; ++i)   wrap_manifest_[i] = o.wrap_manifest_[i];
@@ -1219,7 +1401,79 @@ private:
     // active_. This is that switch, made reachable from both callers instead of
     // written out once and forgotten once.
     // -----------------------------------------------------------------------
-    bool emitWrapped(MBuffer& staged)
+    // A message on an LMAX pair: its bytes, owned here rather than lent, and
+    // two references -- the writer's and the ring slot's. `state` is who got
+    // it: 0 nobody yet, 1 the reader, 2 the writer took it back on a signal.
+    struct LmaxMessage
+    {
+        ::std::atomic<int> refs{ 2 };
+        ::std::atomic<int> state{ 0 };
+        ::std::string      bytes;
+        void release() { if (refs.fetch_sub(1, ::std::memory_order_acq_rel) == 1) delete this; }
+    };
+    static constexpr char LMAX_MESSAGE_MARK = 'M';
+    // The slot's message, or null for a plain Buffer* / MBuffer* slot.
+    static LmaxMessage* lmaxMessageIn(const LBuffer& slot)
+    {
+        if (slot.written != sizeof(LmaxMessage*) + 1 || slot.buf[sizeof(LmaxMessage*)] != LMAX_MESSAGE_MARK)
+            return nullptr;
+        LmaxMessage* m = nullptr;
+        ::std::memcpy(&m, slot.buf, sizeof m);
+        return m;
+    }
+    bool lmaxHandOver(const char* data, size_t len)
+    {
+        if (!directionAllows(true, "writeMessage")) return false;
+        if (lmax_page_->tombstoned.load(::std::memory_order_acquire)) return false;
+        LmaxMessage* m = new LmaxMessage();
+        if (len) m->bytes.assign(data, len);
+        LBuffer slot;
+        ::std::memcpy(slot.buf, &m, sizeof m);
+        slot.buf[sizeof m] = LMAX_MESSAGE_MARK;
+        slot.written = sizeof m + 1;
+        int retries = 0;
+        while (lmax_page_->write(writer_rid_, slot) == UINT64_MAX)
+        {
+            if (bound_ctx_.isInterrupted() || bound_ctx_.isTerminated())
+            { m->release(); m->release(); return false; }   // never published
+            LMAXSequentialSharedPage::progressiveYield(retries);
+        }
+        // Published: the slot's reference is the reader's (or teardownPair's).
+        retries = 0;
+        while (m->state.load(::std::memory_order_acquire) == 0)
+        {
+            if (bound_ctx_.isInterrupted() || bound_ctx_.isTerminated()
+                || lmax_page_->tombstoned.load(::std::memory_order_acquire))
+            {
+                int expect = 0;
+                if (m->state.compare_exchange_strong(expect, 2, ::std::memory_order_acq_rel))
+                { m->release(); return false; }
+                break;                                      // the reader got there first
+            }
+            LMAXSequentialSharedPage::progressiveYield(retries);
+        }
+        m->release();
+        return true;
+    }
+    // Buffer-sized pieces, each through the chain like a writeRaw.
+    bool wrappedPieces(const char* data, size_t len)
+    {
+        if (!directionAllows(true, "Wrap")) return false;
+        constexpr size_t kPiece = Buffer::bufsize - 1;
+        size_t at = 0;
+        do
+        {
+            const size_t n = ::std::min(len - at, kPiece);
+            MBuffer staged;
+            if (n) staged.writeRaw(data + at, n);
+            at += n;
+            for (size_t i = 0; i < wrap_chain_len_; ++i)
+                wrap_chain_[i]->Wrap(staged, bound_ctx_);
+            if (!emitWrapped(staged, at < len)) return false;
+        } while (at < len);
+        return true;
+    }
+    bool emitWrapped(MBuffer& staged, bool more = false)
     {
         switch (active_)
         {
@@ -1243,6 +1497,8 @@ private:
                 const MBuffer* ptr = &scratch;
                 ::std::memcpy(ptr_slot.buf, &ptr, sizeof(MBuffer*));
                 ptr_slot.written = sizeof(MBuffer*);
+                // A message's piece says whether another follows (readMessage).
+                if (more) { ptr_slot.buf[sizeof(MBuffer*)] = '+'; ptr_slot.written += 1; }
                 int retries = 0;
                 while (lmax_page_->write(writer_rid_, ptr_slot) == UINT64_MAX)
                 {
@@ -1256,7 +1512,7 @@ private:
             case ActiveStrategy::Pipe:
             case ActiveStrategy::Socket:
                 if (!shared_page_) return false;
-                return stageAndFlush(staged);
+                return stageAndFlush(staged, more);
         }
         return false;
     }
@@ -1271,9 +1527,10 @@ private:
     // see its comment for the bug that being called directly caused.
     // -----------------------------------------------------------------------
     template<size_t N>
-    bool stageAndFlush(const TBuffer<N>& payload)
+    bool stageAndFlush(const TBuffer<N>& payload, bool more = false)
     {
         const FrameLen len = static_cast<FrameLen>(payload.written);
+        const FrameLen word = more ? (len | FRAME_MORE) : len;
         size_t total = sizeof(FrameLen) + len;
         char* dest = shared_page_->acquireWrite(static_cast<long long>(total));
         if (!dest)
@@ -1288,7 +1545,7 @@ private:
                              ? "the pair was torn down under this write." : "staging page full."));
             return false;
         }
-        ::std::memcpy(dest, &len, sizeof(FrameLen));
+        ::std::memcpy(dest, &word, sizeof(FrameLen));
         if (len > 0) ::std::memcpy(dest + sizeof(FrameLen), payload.buf, len);
         return flushStaged(bound_ctx_);
     }
@@ -1333,11 +1590,14 @@ private:
     // second, hand-duplicated copy of this function.
     // -----------------------------------------------------------------------
     template<size_t N>
-    bool tryExtractInto(TBuffer<N>& out)
+    bool tryExtractInto(TBuffer<N>& out, bool* more = nullptr)
     {
         if (in_.read_offset + sizeof(FrameLen) > in_.written) return false;
         FrameLen len = 0;
         ::std::memcpy(&len, in_.buf + in_.read_offset, sizeof(FrameLen));
+        // A message's piece: the flag rides the length word (writeMessage).
+        const bool piece_more = (len & FRAME_MORE) != 0;
+        len &= ~FRAME_MORE;
         in_.read_offset += sizeof(FrameLen);
         if (in_.read_offset + len > in_.written)
         {
@@ -1359,16 +1619,17 @@ private:
             out.written = len;
         }
         in_.read_offset += len;
+        if (more) *more = piece_more;
         return true;
     }
     // Fill in_ from fd, extract one frame into `out`. Handles partial
     // reads cleanly. Generic replacement for the old Buffer-only
     // fillAndCopy, for the identical reason tryExtractInto is generic.
     template<size_t N>
-    bool fillAndCopyInto(TBuffer<N>& out, const SignalContext& ctx)
+    bool fillAndCopyInto(TBuffer<N>& out, const SignalContext& ctx, bool* more = nullptr)
     {
         // Fast path: we already buffered enough data from a previous read
-        if (tryExtractInto(out)) return true;
+        if (tryExtractInto(out, more)) return true;
         if (read_fd_ == -1)
         {
             ::std::cerr << "[" << sideStr() << "] fillAndCopyInto: read_fd is -1\n";
@@ -1399,7 +1660,7 @@ private:
                 in_.written += static_cast<size_t>(bytes);
                 in_.buf[in_.written] = '\0';
                 // Try to extract now that we have more data
-                if (tryExtractInto(out)) return true;
+                if (tryExtractInto(out, more)) return true;
                 continue; // Need more data to complete the frame
             }
             if (bytes == 0)
@@ -1766,7 +2027,19 @@ inline void MirrorBuffer::teardownPair<StrategyLMAX, LMAXSequentialSharedPage>(
         ETCS_LOG("MirrorBuffer", "LMAX teardown."
                  << " slots=" << (page ? page->slot_count_ : 0));
  
-    if (page) page->tombstone();
+    if (page)
+    {
+        page->tombstone();
+        // A message nobody read holds its slot's reference: the consumer body
+        // has returned by now (the pair's frame ends with it), so drop it here.
+        for (uint64_t seq = page->consumer_cursor_.load(::std::memory_order_acquire); ; ++seq)
+        {
+            const LBuffer* slot = page->acquireRead(seq);
+            if (!slot) break;
+            if (LmaxMessage* m = lmaxMessageIn(*slot)) m->release();
+            page->markConsumed(seq);
+        }
+    }
     producer.lmax_page_     = nullptr;
     consumer.lmax_page_     = nullptr;
     producer.next_read_seq_ = 0;

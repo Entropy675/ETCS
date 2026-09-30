@@ -51,6 +51,12 @@ landing.SetHtmlFromFile(ACE_ROOT/scripts/www/index.html)
 # /whitepaper.html. One page type, no per-document entity, and adding a
 # document is copying a file rather than editing this script.
 web.spawn(NetworkProvider::FileHtmlPage tree)
+# THE LINK HUB, for a shared canvas. The page's share button hosts a Room
+# in its own runtime through this hub (PaintShare, paint_host.etcs), and the
+# people it invites link to it here at /link/<session>: the hub splices bytes
+# between them and holds nothing of the session. Without it, "share" has
+# nowhere to host through.
+web.spawn(NetworkProvider::LinkHub links)
 tree.LoadFromDisk(ACE_ROOT/scripts/www)
 tree.ListPaths()
 
@@ -137,11 +143,5 @@ web.IsStarted()
 detach ChessProvider/scripts/chess_lobby.etcs
 detach forum_lobby.etcs
 
-# THE PAINT SESSION HOST, on this server. The page's share button talks to
-# /art on its own origin (defaultNode in PaintProvider's www/index.html), and
-# without this line nothing answers there: "[etcs] share: no answer from
-# .../art" is exactly that. paint_lobby.etcs ensures `web` and adds the route,
-# the same way the chess lobby joins -- after Start, for the reason above.
-detach PaintProvider/scripts/paint_lobby.etcs
 
 # http://localhost:8080/

@@ -379,6 +379,15 @@ thing the rest of this design removes: state held between lines that changes wha
 line means, and a file that can end mid-pair in a way no single line reveals. One line, both
 ends, or it is not a stream.
 
+**Where a produce body runs.** The consumer runs on the caller's thread and owns the pair's frame;
+the producer's body is a task on its module's pool — unless it STANDS. A body that follows a
+record, watches a listing or emits a page's changes for as long as a session lasts is declared
+`DEFINE_STREAM_FUNC_PRODUCE_STANDING` and gets a thread of its own, since a pool worker held for
+the life of an edge is a worker the module no longer has (a web build's pool is two). And a half
+run for another runtime's pair (a link's edge, `Entity::produceOnto`) runs on the thread that
+runs it, whichever kind of body it is. A standing body learns its reader has gone without writing
+(`MirrorBuffer::readerGone`), so a follower that leaves is noticed while the record is quiet.
+
 ### Across runtimes
 
 Either end of a stream, and the receiver of any action, may be an entity that lives in **another
@@ -411,6 +420,17 @@ many actions and streams run on them, they share its one connection: a stream is
 channel on it, not a connection of its own. A second `Peer` to an address one already holds is
 refused.
 
+**A browser is a runtime like any other.** The web build dials the same way (its socket is the
+browser's WebSocket), so a page's runtime binds surfaces and opens streams on a native one
+directly. A page cannot accept a connection, so a page that hosts does it through a hub
+(`room.HostVia`, below), which splices bytes and understands none of them.
+
+**A stream's unit is a message, of any size.** An action's payload is a `Buffer`, but a stream
+half may write and read whole messages (`MirrorBuffer::writeMessage` / `readMessage`): a page, a
+photograph, a record's line. Each goes as a run of frames and arrives as one, on every strategy —
+in process, between processes, and across a link — and a message that fits one frame is an
+ordinary frame.
+
 **Same code, same authority.** A surface binds only to the same build of its type (the tag hash,
 below, **ABI integrity**), and each action and stream half names its own hash, which the far side
 checks. And it binds only if it carries the far node's **authority layer**: the node's `Wrapper`
@@ -431,16 +451,26 @@ outlives the runtime**), `Bind` brings its named state along and the surface put
 `ReflectRemote` — a guest's `Ledger` surface holds the host's lines from the moment it binds.
 
 The far side decides what is reachable: a `Room` publishes entities by name
-(`room.Publish(book @book)`), and nothing else in that runtime can be bound. The host of a room is its
+(`room.Publish(book @book)`) — and by verb, when the publication lists them
+(`room.Publish(minutes @minutes Head Since Follow)`: a record published to be read) — and nothing
+else in that runtime can be bound. The way in to a record published that way is a *door*: a
+sealed `Ledger` fed into it (`door.Feed(@minutes)`), so writing takes the key and reading does
+not. One guest per name: a second link under a name already linked is refused at the hello. And
+the link is symmetric — what a guest publishes on its `Peer`, the host binds through the `Room` by
+the guest's name (`remote.Bind(mail @room alice)`), the one channel that is that guest's alone. The host of a room is its
 authority — every guest's actions arrive there and run in its order — whether it serves the room
 itself (`room.Host(@links studio)`, beside an `HttpServer`'s `LinkHub`) or, unable to accept
 connections, hosts through a server that only splices bytes (`room.HostVia(wss://site/link/studio)`).
 Guests dial the same address either way.
 
 Two families ride on this for anything shared: a **Directory** (`NetworkProvider::Lobby`) lists who
-can be reached, each entry lasting as long as its advertiser's link; a **Record**
+can be reached, each entry lasting as long as its advertiser's link, and watched as a stream
+(`lobby.Watch() -> copy.Mirror()`: the listing whole, on every change); a **Record**
 (`NetworkProvider::Ledger`) is lines in the host's order, chained by hash, authored by the link
-each came over, and followed as a stream (`book.Follow(0) -> copy.Mirror()`).
+each came over, and followed as a stream (`book.Follow(0) -> copy.Mirror()`). A line too big for an
+action is streamed in (`x.Produce -> book.Take()`), and the host keeps the record from its last
+**checkpoint** on (`book.Checkpoint(<seq>)`): a line that states everything makes those before it
+history nobody replays, and a reader from before it restarts there.
 
 ---
 
