@@ -197,6 +197,7 @@ public:
     bool m_want_device = true;
     bool SetDeviceProjectionConcrete(bool on) { m_want_device = on; return on == m_want_device; }
     bool DeviceProjectionRequestedConcrete() const { return m_want_device; }
+    bool DeviceProjectionLandsConcrete() const     { return true; }
 
     bool RenderConcrete()
     {

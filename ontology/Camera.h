@@ -157,6 +157,19 @@ public:
     virtual bool DeviceProjectionRequested() const = 0;
 
     /*
+     * WHETHER THE DEVICE PICTURE HAS ANYWHERE TO LAND. A device projection is
+     * not pixels: it is a scene the device draws when the camera is blitted
+     * into a surface that draws through that device. Blitted into host pixels
+     * -- a compositor, an offscreen layer -- there is nothing to take it, and
+     * the camera has produced no picture at all. The leaf asks its
+     * destination where it is drawn (DrawInto), every time, since a surface
+     * moves on and off its device by itself; yes is the default, because
+     * the host is the fallback rather than the assumption. A third fact
+     * about the graph, derived like the second, never a mode.
+     */
+    virtual bool DeviceProjectionLands() const = 0;
+
+    /*
  * THE DEVICE THIS CAMERA CAN REACH, or null.
  *
  * Concrete and here rather than dispatched, for the reason Drawable.h gives
@@ -187,9 +200,13 @@ public:
         return nullptr;
     }
 
-    // Wanted AND still available. This is what a projection branches on, and
-    // the only thing that should be: it is a fact about the graph right now.
-    bool DeviceProjection() { return DeviceProjectionRequested() && DeviceSource() != nullptr; }
+    // Wanted, landing somewhere, AND still available. This is what a
+    // projection branches on, and the only thing that should be: it is a
+    // fact about the graph right now.
+    bool DeviceProjection()
+    {
+        return DeviceProjectionRequested() && DeviceProjectionLands() && DeviceSource() != nullptr;
+    }
 };
 
 #endif

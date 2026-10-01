@@ -36,16 +36,21 @@
 # can never disagree (ontology/Camera.h). Nothing to reset, because the host is
 # what a camera falls back to rather than something it has to be told to use.
 #
-# WHAT ACTUALLY CHANGES DOWNSTREAM. Nothing above the sink: the view, the
-# flatten, the near clip, the perspective divide, the fan and the depth test
-# are arithmetic about a scene and a lens, identical either way. What differs
-# is where a surviving run of pixels goes -- written as bytes into the camera's
-# buffer, or emitted as one DrawRect through the destination. Onto a
-# destination that draws through a device those are device rects, and the
-# frame is produced by the GPU without existing as host pixels; here the
-# destination is `stage`, a host compositor, which the window then draws
-# through ITS device as one texture. That is the same thing
-# PolygonDrawable2D has always done one dimension down.
+# WHAT ACTUALLY CHANGES DOWNSTREAM. The scene is not rasterised at all: the
+# camera collects one op per node -- which mesh, the node's matrix straight
+# from its OrderVector, its colour -- with the view and the lens, and hands
+# that to the window surface it is blitted into, whose device draws it into
+# a texture of its own, colour and depth, that the blit then samples
+# (OS/DeviceFrame.h). So the frame is produced by the GPU without existing
+# as host pixels at any point, and the camera composes exactly as a layer
+# would at its place in the tree.
+#
+# WHICH IS WHY THE CAMERA SITS DIRECTLY UNDER THE WINDOW'S SURFACE. A device
+# projection lands only in a surface that draws through a device; under a
+# host compositor there is nothing to take it, and the camera notices and
+# projects on the host into that compositor instead (ontology/Camera.h,
+# DeviceProjectionLands). The host version keeps its compositor; this one
+# composes the camera itself.
 
 spawn RenderProvider::Instance gpu
 gpu.Create()
@@ -56,12 +61,7 @@ main.Create(1024, 768, 'ETCS 3D scene -- device projection')
 main.spawn(RenderProvider::Surface view)
 view.Create(@gpu)
 
-spawn RenderProvider::CompositeDrawable2D stage
-stage.Create(1024, 768)
-stage.SetPosition(0, 0)
-stage.SetBackground(0.04, 0.05, 0.08, 1.0)
-
-stage.spawn(RenderProvider::Camera3D eye)
+spawn RenderProvider::Camera3D eye
 eye.Create(1024, 768)
 eye.SetPosition(0, 0)
 eye.SetOrder(1)
@@ -97,8 +97,8 @@ eye.SetScene(@world)
 # Unchanged from the host version, and that is the point worth watching: these
 # are children of the camera and know nothing about how their parent's frame is
 # produced. In device mode the camera owns no picture for them to be drawn
-# into, so they compose onto the destination exactly as the camera's own spans
-# do -- same tree, same order, same coordinates.
+# into, so they are replayed onto the destination as rects, above the scene's
+# texture -- same tree, same order, same coordinates.
 eye.spawn(RenderProvider::TextLabel hud)
 hud.Create(24)
 hud.SetText(%f fps -- device projection -- wasd move / mouse look / ctrl+tab)
@@ -119,7 +119,7 @@ reticle.SetFill(1.0, 1.0, 1.0, 0.55)
 reticle.SetOrder(10)
 
 view.Clear(0.02, 0.02, 0.03, 1.0)
-view.Compose(@stage)
+view.Compose(@eye)
 
 main.CaptureMouse(1)
 
