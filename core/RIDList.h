@@ -43,6 +43,35 @@ struct has_ordered_pointee<P, ::std::void_t<decltype(
     : ::std::true_type {};
 template <typename P>
 inline constexpr bool has_ordered_pointee_v = has_ordered_pointee<P>::value;
+
+/*
+ * A STABLE MERGE SORT WITH EVERY INDEX CHECKED. std::stable_sort's insertion
+ * pass walks left without a bound once it has asked the relation once, trusting
+ * it to answer the same way again; a key that commits mid-sort breaks that
+ * trust and the walk leaves the vector. Here a relation that contradicts itself
+ * yields SOME permutation of the input, never a read out of range -- the epoch
+ * check in collect_ordered then decides whether that permutation is believed.
+ * Left wins ties, so it is stable.
+ */
+template <typename Vec, typename Less>
+inline void guarded_stable_sort(Vec& v, Vec& tmp, Less less)
+{
+    const size_t n = v.size();
+    if (n < 2) return;
+    tmp.resize(n);
+    for (size_t w = 1; w < n; w *= 2)
+    {
+        for (size_t lo = 0; lo < n; lo += 2 * w)
+        {
+            const size_t mid = ::std::min(lo + w, n), hi = ::std::min(lo + 2 * w, n);
+            size_t i = lo, j = mid, k = lo;
+            while (i < mid && j < hi) tmp[k++] = less(v[j], v[i]) ? v[j++] : v[i++];
+            while (i < mid) tmp[k++] = v[i++];
+            while (j < hi)  tmp[k++] = v[j++];
+        }
+        ::std::copy(tmp.begin(), tmp.begin() + n, v.begin());
+    }
+}
 } // namespace detail
 // ── RIDListHandle ─────────────────────────────────────────────────────────────
 struct RIDListHandle {
@@ -203,18 +232,21 @@ struct RIDList {
  */
     using OrderVec = ::std::vector<RID, ArenaAllocator<RID>>;
     mutable OrderVec ordered_;
+    mutable OrderVec scratch_;      // the merge's other half, kept like ordered_
     mutable bool     ordered_stale_ = true;
 
     // Initialize the map with the singleton arena
     RIDList()
         : entities(ArenaAllocator<::std::pair<const RID, T>>(&MemoryArena::getInstance()))
-        , ordered_(ArenaAllocator<RID>(&MemoryArena::getInstance())) {}
+        , ordered_(ArenaAllocator<RID>(&MemoryArena::getInstance()))
+        , scratch_(ArenaAllocator<RID>(&MemoryArena::getInstance())) {}
     // Entity-local variant — used by Entity::addTag<T> so typed children are
     // allocated out of the owning entity's local arena instead of the global
     // singleton, and get torn down with it.
     explicit RIDList(MemoryArena& arena)
         : entities(ArenaAllocator<::std::pair<const RID, T>>(&arena))
-        , ordered_(ArenaAllocator<RID>(&arena)) {}
+        , ordered_(ArenaAllocator<RID>(&arena))
+        , scratch_(ArenaAllocator<RID>(&arena)) {}
     void insert(RID rid, T entity) {
         entities[rid] = entity;
         ordered_stale_ = true;
@@ -242,20 +274,46 @@ struct RIDList {
  * should not be there at all, but a comparison is the wrong place to
  * discover that.
  */
+    /*
+ * A SORT SEES ONE COMMITTED STATE OR IS NOT BELIEVED. The relation reads the
+ * members' live tag state (a hidden drawable loses), and a tag change commits
+ * on its module's ordering thread while this sorts on the reader's. The
+ * members' hash epochs are read before and after: every funnel bumps them
+ * (Entity::markStateChange), so equal epochs mean the sort straddled no
+ * commit -- the same before-or-after a Causal entity's rows give a reader
+ * (ontology/CausalBase.h). A sort that did straddle one is sorted again, a
+ * bounded number of times; past that it is returned but not cached, and the
+ * next read tries again. A commit still between its write and its bump when
+ * the epochs are checked is caught one read later instead: its own mark
+ * (reorderTypedChild) waits on the parent's lock this read holds, and lands
+ * after it.
+ */
     void collect_ordered(::std::vector<RID>& out) const {
         if constexpr (detail::has_ordered_pointee_v<T>) {
             if (ordered_stale_) {
                 ordered_.clear();
                 ordered_.reserve(entities.size());
                 for (auto const& kv : entities) ordered_.push_back(kv.first);
-                ::std::stable_sort(ordered_.begin(), ordered_.end(),
-                    [this](RID a, RID b) {
-                        T ea = get_typed(a);
-                        T eb = get_typed(b);
-                        if (!ea || !eb) return ea != nullptr ? false : eb != nullptr;
-                        return *ea < *eb;
-                    });
-                ordered_stale_ = false;
+                auto less = [this](RID a, RID b) {
+                    T ea = get_typed(a);
+                    T eb = get_typed(b);
+                    if (!ea || !eb) return ea != nullptr ? false : eb != nullptr;
+                    return *ea < *eb;
+                };
+                auto epochs = [this](::std::vector<uint32_t>& e) {
+                    e.clear();
+                    for (auto const& kv : entities) e.push_back(kv.second ? kv.second->hashEpoch() : 0u);
+                };
+                constexpr int kPasses = 3;
+                ::std::vector<uint32_t> before, after;
+                bool settled = false;
+                for (int pass = 0; pass < kPasses && !settled; ++pass) {
+                    epochs(before);
+                    detail::guarded_stable_sort(ordered_, scratch_, less);
+                    epochs(after);
+                    settled = (before == after);
+                }
+                ordered_stale_ = !settled;
             }
             out.insert(out.end(), ordered_.begin(), ordered_.end());
         } else {
