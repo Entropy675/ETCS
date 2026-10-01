@@ -2639,6 +2639,7 @@ ETCS::RID ETCS::EventNode::LoaderStream::addTagImpl(
  */
     const ETCS::RID rid = trampoline(parent, child, tag);
     ETCS::Entity::markStateChange(parent, rid);
+    ETCS::Entity::noteDepth(child);
     return rid;
 }
  

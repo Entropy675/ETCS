@@ -68,6 +68,7 @@ public:
     ETCS::ObserverEdge Observe(uint64_t observer_rid) override = 0;
     void Unobserve(uint64_t observer_rid) override = 0;
     void MarkObserved(uint64_t origin_rid) override = 0;
+    bool MarkObservedHop(uint64_t origin_rid) override = 0;
     void BeginBatch() override = 0;
     void EndBatch() override   = 0;
     bool TakeObserved(const ETCS::ObserverEdge& edge) override = 0;

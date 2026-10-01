@@ -337,6 +337,16 @@ struct IWireObservable
     virtual void MarkObservedLocal(uint64_t origin_rid) = 0;
 
     /*
+     * One hop of MarkObserved's walk upward, taken at THIS entity: mark my
+     * observers, and answer whether the statement travels on to the next
+     * Observable above -- false inside a batch, whose EndBatch carries it
+     * instead. The walk is a loop in the entity that changed, one hop per
+     * Observable ancestor (ObservableBase.h), which is why this is on the
+     * wire: the ancestor is reached by family name, not by type.
+     */
+    virtual bool MarkObservedHop(uint64_t origin_rid) = 0;
+
+    /*
      * A SEQUENCE OF WRITES IS ONE CHANGE -- open one, and the marks inside it
      * set observers' edges without walking upward until it closes, which then
      * makes the single statement the sequence was.

@@ -1648,6 +1648,21 @@ public:
         rec->dtor(rec->ptr);
     }
 
+    /*
+     * Every entity in this arena, oldest first, each through its own
+     * run_entity_delete -- which, for a child with children, calls THIS on
+     * the child's arena before reclaiming it. So a cascade is recursive to
+     * the depth of the branch: two frames a level (this loop and the
+     * callback's), a few hundred bytes. That is the one recursion over the
+     * tree the runtime still has (getHash and MarkObserved are loops,
+     * core/Entity.h computeNodeHash, ontology/ObservableBase.h), and it is
+     * left so deliberately: the callback is a lambda captured per type at
+     * registerDtor, and the order it keeps -- children reclaimed before the
+     * entity whose arena they live in -- is the whole correctness of
+     * teardown. What bounds it instead is the attach: Entity::noteDepth
+     * says, at 64, 1,024, 16,384 and 262,144 levels, what a delete of such
+     * a branch will cost, so a script that builds one was told.
+     */
     void destroyChildEntitiesFirst()
     {
         while (true)

@@ -361,6 +361,21 @@ private:
  */
     mutable unsigned char           hash_digest_[32] = {};
     /*
+ * HOW FAR DOWN THIS ENTITY IS: the number of parents above it. Written
+ * where parent_ is (addTagTrampoline, reparentChildrenTo -- the two
+ * writers of that link) and read nowhere the runtime branches on. It
+ * exists to be WATCHED. Two walks over the tree are still one C++ frame
+ * per level -- the cascade delete (MemoryArena::destroyChildEntitiesFirst
+ * re-entering run_entity_delete per child) and a nested arena's teardown
+ * -- and a tree deep enough exhausts the thread's stack in them with no
+ * warning of its own. There is no cap: a script may build what it likes.
+ * Instead the attach that crosses each of kDepthWarnAt says so,
+ * once per process per threshold, naming the RID (below, in
+ * addTagTrampoline). getHash and MarkObserved were the other two
+ * recursive walks and are loops now (computeNodeHash, ObservableBase.h).
+ */
+    uint32_t depth_ = 0;
+    /*
  * Per-entity registry of every currently-in-flight stream call's own
  * SignalContext -- see Scope's own comment (Bundles.h) for the full
  * reasoning. A plain, default-constructed member; no special init
@@ -1311,6 +1326,7 @@ public:
                 dest->invoke_insert(rid, child);
                 handle.invoke_remove(rid);
                 child->parent_ = newParent;
+                child->depth_  = newParent->depth_ + 1;   // its own subtree: renumberDepth, below the locks
                 /*
  * parent_rid_ deliberately untouched -- addTagTrampoline<T>
  * sets it to child->getRID(), which is the same value in any
@@ -1339,7 +1355,72 @@ public:
  * needs nothing -- its retire path marks its own parent. Outside the locks,
  * because markStateChange walks parents and takes their mutexes.
  */
-        if (moved) markStateChange(newParent, getRID());
+        if (moved)
+        {
+            markStateChange(newParent, getRID());
+            // Everything under the moved children is one level nearer the
+            // root now. Outside the locks: the walk takes each entity's own.
+            renumberDepth(newParent);
+        }
+    }
+
+    /*
+     * depth_ for everything under `top`, from top's own. A loop over an
+     * explicit frontier rather than a recursion, for the reason depth_
+     * exists at all. Only reparenting needs it: an attach sets one entity
+     * from its parent, and a subtree never moves otherwise.
+     */
+    static void renumberDepth(Entity* top)
+    {
+        ::std::vector<Entity*> frontier{ top };
+        ::std::vector<::std::pair<ETCS::Buffer, RID>> kids;
+        while (!frontier.empty())
+        {
+            Entity* n = frontier.back();
+            frontier.pop_back();
+            kids.clear();
+            n->getTypedChildren(kids);
+            for (const auto& [tag, rid] : kids)
+            {
+                Entity* c = n->getTypedChild(tag, rid);
+                if (!c || c->parent_ != n) continue;
+                c->depth_ = n->depth_ + 1;
+                frontier.push_back(c);
+            }
+        }
+    }
+
+    /*
+     * THE GRADUATED WARNING. An attach that lands exactly on a threshold
+     * says so, once per process per threshold: the first line is a note, the
+     * later ones say what is at stake, and none of them refuses anything --
+     * the tree is whatever a script built, and a limit here would be a
+     * policy the runtime has no standing to hold. What the numbers mean:
+     * every recursive walk that is left costs a few hundred bytes of stack
+     * per level, so 16,384 levels is a few megabytes -- the size of a
+     * default thread stack -- and 262,144 is past any. Called after the
+     * attach, outside the parent's lock (addTagImpl): a log line is not
+     * something to hold a tag mutex across.
+     */
+    static constexpr uint32_t kDepthWarnAt[4] = { 64, 1024, 16384, 262144 };
+    static void noteDepth(const Entity* child)
+    {
+        static ::std::atomic<uint32_t> announced{ 0 };   // how many thresholds have been
+        const uint32_t d = child->depth_;
+        for (uint32_t i = announced.load(::std::memory_order_acquire); i < 4; ++i)
+        {
+            if (d < kDepthWarnAt[i]) return;
+            uint32_t expect = i;
+            if (!announced.compare_exchange_strong(expect, i + 1, ::std::memory_order_acq_rel)) return;
+            static const char* const what[4] = {
+                "a deep tree; nothing to do yet",
+                "the cascade delete of a branch this deep is a recursion this deep (MemoryArena::destroyChildEntitiesFirst)",
+                "a cascade delete of a branch this deep may exhaust a default thread stack",
+                "a cascade delete of a branch this deep will exhaust any thread stack -- delete it in parts, or without its children",
+            };
+            ETCS_LOG("Entity", "RID:" << child->getRID() << " attached at depth " << d
+                     << " (threshold " << kDepthWarnAt[i] << "): " << what[i] << ".");
+        }
     }
 #ifdef ETCS_LOADER
     /*
@@ -1590,6 +1671,9 @@ public:
     // root. Same laziness as getHash.
     void getDigest(unsigned char out[32]) const;
     bool isGlobalScope() const { return parent_ == nullptr; }
+
+    // Parents above this entity: 0 at the top of a branch. See depth_.
+    uint32_t depth() const { return depth_; }
 
     // The recompute every pull shares. `audit` non-null forces every level to
     // recompute rather than trust its cache, and reports each node whose
@@ -2699,12 +2783,13 @@ public:
     static void markStateChange(Entity* from, RID origin)
     {
         bool told = false;
+        const ETCS::Buffer family("Observable");
         for (Entity* n = from; n; n = n->getParent())
         {
             if (n->isDestructed()) return;
             n->hash_epoch_.fetch_add(1, ::std::memory_order_acq_rel);
             if (told) continue;
-            void* p = n->getInterfacePointer(ETCS::Buffer("Observable"));
+            void* p = n->getInterfacePointer(family);
             if (!p) continue;
             static_cast<ETCS::IWireObservable*>(p)->MarkObserved(origin);
             told = true;
@@ -2925,6 +3010,7 @@ template<typename T>
  
         child->parent_     = parent;
         child->parent_rid_ = rid;
+        child->depth_      = parent->depth_ + 1;    // noted after the lock: addTagImpl
         /*
  * Passive edge, set at the same moment and in the same place as
  * parent_ itself -- these two are the same fact recorded twice, for
@@ -4290,104 +4376,169 @@ inline uint64_t Entity::surfaceHash() const
     return XXH3_64bits(in.data(), in.size());
 }
 
+/*
+ * ONE FRAME PER LEVEL, ON THE HEAP, NOT THE STACK. The recompute is a
+ * post-order walk -- a node's input is its surface and its children's
+ * hashes -- and written as a call per child it was a C++ frame per level
+ * of the tree, with the strings and vectors below in each. A tree is as
+ * deep as somebody made it (depth_ and its warnings, addTagTrampoline), so
+ * the levels live in this vector and the walk is a loop; the stack cost of
+ * a pull is one frame whatever the depth. The order of reads and stamps is
+ * the recursive one's exactly: a child's epoch is read BEFORE its subtree
+ * is hashed and stamped after, and a child whose cache is current is taken
+ * from the cache without descending (the lazy pull, getHash).
+ */
+struct EntityHashFrame
+{
+    const Entity*  node = nullptr;
+    ETCS::Buffer   tag;                 // under which the parent composes it
+    RID            rid  = 0;
+    uint32_t       epoch = 0;           // read before, stamped after
+    bool           was_current = false; // audit: what the cache claimed
+    uint64_t       was = 0;
+    LifetimeHold   hold;                // the parent's hold on this child, for the whole subtree
+    ::std::vector<::std::pair<ETCS::Buffer, RID>>           kids;
+    size_t                                                  next = 0;
+    ::std::vector<::std::pair<::std::string, uint64_t>>     composed;
+};
+
 inline uint64_t Entity::computeNodeHash(HashAudit* audit, unsigned char* digest) const
 {
-    if (audit) ++audit->nodes;
-
-    ::std::string in;
-    in.push_back('\x01');                               // a node
-    etcs_hash_detail::put_u64(in, surfaceHash());
+    // Finish one level: compose the children's hashes into the node's input
+    // and take the hash the level rule says (below), filling `d` with the
+    // SHA-256 when asked.
+    auto finish = [](EntityHashFrame& f, unsigned char* d) -> uint64_t
+    {
+        ::std::string in;
+        in.push_back('\x01');                               // a node
+        etcs_hash_detail::put_u64(in, f.node->surfaceHash());
+        for (auto lo = f.composed.begin(); lo != f.composed.end(); )
+        {
+            auto hi = lo + 1;
+            while (hi != f.composed.end() && hi->first == lo->first) ++hi;
+            ::std::sort(lo, hi);
+            lo = hi;
+        }
+        for (auto const& [tagstr, h] : f.composed)
+        {
+            etcs_hash_detail::put(in, 'C', tagstr.data(), tagstr.size());
+            etcs_hash_detail::put_u64(in, h);
+        }
+        /*
+         * THE LEVEL RULE. A child answers XXH3 and its parent composes over
+         * that. A parentless entity has no parent to compose over it -- what
+         * composes over it is a module's root, which is a global-scope
+         * boundary -- so its node hash is the SHA-256 of the same input, and
+         * the 64-bit view is that digest's first word. One input, two
+         * functions, chosen by where the node stands; nothing above it has
+         * to ask which.
+         */
+        const bool global = f.node->isGlobalScope();
+        if (d || global)
+        {
+            unsigned char dd[32];
+            picohash_ctx_t ctx;
+            picohash_init_sha256(&ctx);
+            picohash_update(&ctx, in.data(), in.size());
+            picohash_final(&ctx, dd);
+            if (d) ::std::memcpy(d, dd, 32);
+            if (global)
+            {
+                uint64_t first = 0;
+                ::std::memcpy(&first, dd, sizeof(first));
+                return first;
+            }
+        }
+        return XXH3_64bits(in.data(), in.size());
+    };
 
     // Children by tag in first-attachment order -- that order is state (a
     // wrap chain applies in it) -- and within a tag a MULTISET of hashes:
     // ordered by hash, never by RID, so the same children made at other
     // RIDs hash the same (surfaceHash).
-    ::std::vector<::std::pair<ETCS::Buffer, RID>> kids;
-    getTypedChildren(kids);
-    etcs_hash_detail::order_children(kids);
-    ::std::vector<::std::pair<::std::string, uint64_t>> composed;
-
-    for (auto const& [tag, rid] : kids)
+    auto open = [](EntityHashFrame& f)
     {
-        Entity* child = getTypedChild(tag, rid);
-        LifetimeHold hold(child);
-        if (!hold) { if (audit) ++audit->skipped; continue; }
+        f.node->getTypedChildren(f.kids);
+        etcs_hash_detail::order_children(f.kids);
+    };
 
-        uint64_t h;
-        if (!audit) h = child->getHash();
-        else
+    ::std::vector<EntityHashFrame> frames;
+    frames.reserve(16);
+    frames.emplace_back();
+    frames.back().node = this;
+    open(frames.back());
+    if (audit) ++audit->nodes;
+
+    for (;;)
+    {
+        EntityHashFrame& f = frames.back();
+        if (f.next < f.kids.size())
         {
-            const bool     was_current = child->hashCurrent();
-            const uint64_t was         = child->hashCached();
-            const uint32_t epoch       = child->hashEpoch();
-            unsigned char  cd[32];
-            h = child->computeNodeHash(audit, cd);
-            if (was_current && was != h)
+            const auto [tag, rid] = f.kids[f.next++];
+            Entity* child = f.node->getTypedChild(tag, rid);
+            LifetimeHold hold(child);
+            if (!hold) { if (audit) ++audit->skipped; continue; }
+
+            // The lazy pull: a current cache is the child's answer, and its
+            // subtree is not walked.
+            if (!audit && child->hashCurrent())
             {
-                /*
-                 * The cache said current and the state says otherwise: something
-                 * moved this subtree without passing a funnel. Reported, and
-                 * marked so every observer above hears it through the ordinary
-                 * wire -- an audit finding a hole is itself a transition.
-                 *
-                 * EVERY CACHE ON THE PATH ABOVE THE HOLE REPORTS TOO, because each
-                 * was computed from the lie below it. So one unrecorded write
-                 * reads as a chain of divergences from the top down to one node,
-                 * and the DEEPEST of them is where it happened; the rest are its
-                 * consequences. The chain is the trace.
-                 *
-                 * The mark bumps this node's epoch after `epoch` was read, so the
-                 * stamp below leaves a diverged node stale: its next pull
-                 * recomputes once more, cheaply, from the state just verified.
-                 */
-                ++audit->diverged;
-                ETCS_LOG("Hash", "DIVERGENCE at RID:" << rid << " (" << tag
-                         << "): cached 0x" << ::std::hex << was << " but the state hashes to 0x"
-                         << h << ::std::dec << " -- a change that never went through a funnel.");
-                markStateChange(child, rid);
+                f.composed.emplace_back(tag.toString(), child->hashCached());
+                continue;
             }
-            child->stampHash(h, epoch, cd);
+            // Down a level. `f` may move when the vector grows; nothing
+            // below reads it again before the next iteration re-takes back().
+            EntityHashFrame c;
+            c.node        = child;
+            c.tag         = tag;
+            c.rid         = rid;
+            c.epoch       = child->hashEpoch();
+            c.was_current = audit ? child->hashCurrent() : false;
+            c.was         = audit ? child->hashCached()  : 0;
+            c.hold        = ::std::move(hold);
+            open(c);
+            frames.push_back(::std::move(c));
+            if (audit) ++audit->nodes;
+            continue;
         }
-        composed.emplace_back(tag.toString(), h);
-    }
-    for (auto lo = composed.begin(); lo != composed.end(); )
-    {
-        auto hi = lo + 1;
-        while (hi != composed.end() && hi->first == lo->first) ++hi;
-        ::std::sort(lo, hi);
-        lo = hi;
-    }
-    for (auto const& [tagstr, h] : composed)
-    {
-        etcs_hash_detail::put(in, 'C', tagstr.data(), tagstr.size());
-        etcs_hash_detail::put_u64(in, h);
-    }
 
-    /*
-     * THE LEVEL RULE. A child answers XXH3 and its parent composes over that.
-     * A parentless entity has no parent to compose over it -- what composes
-     * over it is a module's root, which is a global-scope boundary -- so its
-     * node hash is the SHA-256 of the same input, and the 64-bit view is that
-     * digest's first word. One input, two functions, chosen by where the
-     * node stands; nothing above it has to ask which.
-     */
-    const bool global = isGlobalScope();
-    if (digest || global)
-    {
-        unsigned char d[32];
-        picohash_ctx_t ctx;
-        picohash_init_sha256(&ctx);
-        picohash_update(&ctx, in.data(), in.size());
-        picohash_final(&ctx, d);
-        if (digest) ::std::memcpy(digest, d, 32);
-        if (global)
+        // Every child composed: this level's hash.
+        if (frames.size() == 1) return finish(f, digest);
+
+        unsigned char cd[32];
+        const uint64_t h = finish(f, audit ? cd : nullptr);
+        if (audit && f.was_current && f.was != h)
         {
-            uint64_t first = 0;
-            ::std::memcpy(&first, d, sizeof(first));
-            return first;
+            /*
+             * The cache said current and the state says otherwise: something
+             * moved this subtree without passing a funnel. Reported, and
+             * marked so every observer above hears it through the ordinary
+             * wire -- an audit finding a hole is itself a transition.
+             *
+             * EVERY CACHE ON THE PATH ABOVE THE HOLE REPORTS TOO, because each
+             * was computed from the lie below it. So one unrecorded write
+             * reads as a chain of divergences from the top down to one node,
+             * and the DEEPEST of them is where it happened; the rest are its
+             * consequences. The chain is the trace.
+             *
+             * The mark bumps this node's epoch after `epoch` was read, so the
+             * stamp below leaves a diverged node stale: its next pull
+             * recomputes once more, cheaply, from the state just verified.
+             */
+            ++audit->diverged;
+            ETCS_LOG("Hash", "DIVERGENCE at RID:" << f.rid << " (" << f.tag
+                     << "): cached 0x" << ::std::hex << f.was << " but the state hashes to 0x"
+                     << h << ::std::dec << " -- a change that never went through a funnel.");
+            markStateChange(const_cast<Entity*>(f.node), f.rid);
         }
+        // What the child's own getHash would have stamped: the epoch read
+        // before its subtree was hashed. A child is never global, so its
+        // digest is kept only by an audit.
+        f.node->stampHash(h, f.epoch, audit ? cd : nullptr);
+        const ::std::string tagstr = f.tag.toString();
+        frames.pop_back();
+        frames.back().composed.emplace_back(tagstr, h);
     }
-    return XXH3_64bits(in.data(), in.size());
 }
 
 inline uint64_t Entity::getHash() const

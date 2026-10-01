@@ -32,6 +32,10 @@
  *      one entity deep in a provider moves both -- and A-B-A restores them.
  *      A real provider entity is spawned for this, so the loader's mirror has
  *      rows to walk (the tester's own leaves are in no registry).
+ *   9. Depth is not a limit: a chain thousands of levels deep is built,
+ *      pulled, audited, marked from its leaf and observed at its top -- the
+ *      pull and the mark are loops, not a frame per level (core/Entity.h,
+ *      depth_) -- and every level knows how deep it is.
  *
  *   ./Run_HashTesterLoader
  */
@@ -287,6 +291,31 @@ int main()
             etcs_global_root_hash(ldr, g2);
             check(!std::equal(g0, g0 + 32, g2), "an entity leaving the registry moves the global root");
         }
+    }
+
+    // -- 9. depth ----------------------------------------------------------------
+    {
+        std::cout << "\n-- 9. a deep chain --\n";
+        constexpr uint32_t DEPTH = 6000;
+        Node* root = arena.allocate<Node>();
+        Node* tip  = root;
+        for (uint32_t i = 0; i < DEPTH; ++i) tip = tip->addTag<Node>();
+        check(root->depth() == 0 && tip->depth() == DEPTH, "every level knows its depth");
+
+        const uint64_t deep0 = root->getHash();
+        check(root->hashCurrent() && tip->hashCurrent(), "a pull through the whole chain fills every cache");
+        ETCS::Entity::HashAudit a = etcs_root_hash(root);
+        check(a.nodes == DEPTH + 1 && a.diverged == 0 && a.top_hash == deep0,
+              "the audit walks every level and agrees with the pull");
+
+        ETCS::ObserverEdge edge = root->Observe(root->getRID());
+        (void)root->TakeObserved(edge);
+        tip->addTag(ETCS::Buffer("deep"));
+        check(!root->hashCurrent(), "a flag at the tip reaches the root's epoch");
+        check(root->TakeObserved(edge), "...and its observer, through every level between");
+        check(root->getHash() != deep0, "and the root hash moved");
+        tip->removeTag(ETCS::Buffer("deep"));
+        check(root->getHash() == deep0, "A-B-A at depth");
     }
 
     std::printf("\n%s (%d failure%s)\n", g_fail ? "FAILED" : "PASSED",
