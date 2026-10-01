@@ -1993,7 +1993,7 @@ int main()
         // fourth slot is a RID and no product may touch it, which is why this
         // is a function rather than a cast.
         OrderVector ov;
-        ov.PlaceAt(3.0f, 4.0f, 5.0f);
+        ov.PlaceAt(Fixed::FromInt(3), Fixed::FromInt(4), Fixed::FromInt(5));
         ov.rid = 12345;
         const Matrix4 om = ov.ToMatrix4();
         check(om.at(0,3)==3.0f && om.at(1,3)==4.0f && om.at(2,3)==5.0f,
