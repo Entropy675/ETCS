@@ -32,10 +32,11 @@
  *      one entity deep in a provider moves both -- and A-B-A restores them.
  *      A real provider entity is spawned for this, so the loader's mirror has
  *      rows to walk (the tester's own leaves are in no registry).
- *   9. Depth is not a limit: a chain thousands of levels deep is built,
- *      pulled, audited, marked from its leaf and observed at its top -- the
- *      pull and the mark are loops, not a frame per level (core/Entity.h,
- *      depth_) -- and every level knows how deep it is.
+ *   9. Depth is not a limit: a chain twenty thousand levels deep is built,
+ *      pulled, audited, marked from its leaf and observed at its top, then
+ *      deleted as a cascade -- the pull, the mark and the cascade are loops,
+ *      not a frame per level (core/Entity.h depth_, MemoryArena::cascade) --
+ *      and every level knows how deep it is.
  *
  *   ./Run_HashTesterLoader
  */
@@ -45,6 +46,7 @@
 #endif
 #include "../ETCS.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
@@ -296,13 +298,17 @@ int main()
     // -- 9. depth ----------------------------------------------------------------
     {
         std::cout << "\n-- 9. a deep chain --\n";
-        constexpr uint32_t DEPTH = 6000;
+        constexpr uint32_t DEPTH = 20000;
+        auto t0 = std::chrono::steady_clock::now();
+        auto ms = [&t0]() { const auto now = std::chrono::steady_clock::now(); const double v = std::chrono::duration<double, std::milli>(now - t0).count(); t0 = now; return v; };
         Node* root = arena.allocate<Node>();
         Node* tip  = root;
         for (uint32_t i = 0; i < DEPTH; ++i) tip = tip->addTag<Node>();
+        std::printf("        (built %u levels in %.0f ms)\n", DEPTH, ms());
         check(root->depth() == 0 && tip->depth() == DEPTH, "every level knows its depth");
 
         const uint64_t deep0 = root->getHash();
+        std::printf("        (pulled in %.0f ms)\n", ms());
         check(root->hashCurrent() && tip->hashCurrent(), "a pull through the whole chain fills every cache");
         ETCS::Entity::HashAudit a = etcs_root_hash(root);
         check(a.nodes == DEPTH + 1 && a.diverged == 0 && a.top_hash == deep0,
@@ -316,6 +322,19 @@ int main()
         check(root->getHash() != deep0, "and the root hash moved");
         tip->removeTag(ETCS::Buffer("deep"));
         check(root->getHash() == deep0, "A-B-A at depth");
+
+        // And down again: the cascade delete of the whole chain is a loop
+        // over an explicit stack (MemoryArena::cascade), so a branch this
+        // deep goes without a frame per level -- a depth that overflowed
+        // the recursive teardown before. (Forty thousand ran too: 0.9 s to
+        // delete; what bounds this tester is the BUILD, since every attach
+        // bumps every ancestor's hash epoch -- a chain's quadratic.)
+        (void)ms();
+        arena.deleteEntity(root, true);
+        std::printf("        (cascade-deleted %u levels in %.0f ms)\n", DEPTH, ms());
+        Node* again = arena.allocate<Node>();
+        check(again != nullptr && again->getHash() != 0, "the arena is whole after the cascade: a new node hashes");
+        arena.deleteEntity(again, true);
     }
 
     std::printf("\n%s (%d failure%s)\n", g_fail ? "FAILED" : "PASSED",

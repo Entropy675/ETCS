@@ -220,6 +220,7 @@ private:
     // why neither alone is enough.
     ::std::atomic<int>                    lifetime_holds_{ 0 };
     ::std::atomic<bool>                   retiring_{ false };
+    ::std::atomic<bool>                   retired_{ false };    // etcs_retire_entity told the parent: once per entity
     /*
  * ---------------------------------------------------------------------
  * owning_arena_ - the arena this entity's OWN outer object and its
@@ -364,15 +365,15 @@ private:
  * HOW FAR DOWN THIS ENTITY IS: the number of parents above it. Written
  * where parent_ is (addTagTrampoline, reparentChildrenTo -- the two
  * writers of that link) and read nowhere the runtime branches on. It
- * exists to be WATCHED. Two walks over the tree are still one C++ frame
- * per level -- the cascade delete (MemoryArena::destroyChildEntitiesFirst
- * re-entering run_entity_delete per child) and a nested arena's teardown
- * -- and a tree deep enough exhausts the thread's stack in them with no
- * warning of its own. There is no cap: a script may build what it likes.
- * Instead the attach that crosses each of kDepthWarnAt says so,
- * once per process per threshold, naming the RID (below, in
- * addTagTrampoline). getHash and MarkObserved were the other two
- * recursive walks and are loops now (computeNodeHash, ObservableBase.h).
+ * exists to be WATCHED. The runtime's own walks over the tree are loops
+ * -- the hash pull (computeNodeHash), the observed mark (ObservableBase),
+ * the cascade delete and the arena teardown (MemoryArena::cascade,
+ * memoryTeardown) -- so no depth exhausts a stack in core. What still
+ * recurses is a family's or a leaf's own walk over its subtree (a Causal
+ * interaction, a scene's collect), one frame per level in whichever
+ * module wrote it. There is no cap: a script may build what it likes.
+ * Instead the attach that crosses each of kDepthWarnAt says so, once per
+ * process per threshold, naming the RID (noteDepth, from addTagImpl).
  */
     uint32_t depth_ = 0;
     /*
@@ -1396,11 +1397,11 @@ public:
      * later ones say what is at stake, and none of them refuses anything --
      * the tree is whatever a script built, and a limit here would be a
      * policy the runtime has no standing to hold. What the numbers mean:
-     * every recursive walk that is left costs a few hundred bytes of stack
-     * per level, so 16,384 levels is a few megabytes -- the size of a
-     * default thread stack -- and 262,144 is past any. Called after the
-     * attach, outside the parent's lock (addTagImpl): a log line is not
-     * something to hold a tag mutex across.
+     * core walks the tree in loops, but a family's own recursive walk costs
+     * a few hundred bytes of stack per level, so 16,384 levels is a few
+     * megabytes -- the size of a default thread stack -- and 262,144 is
+     * past any. Called after the attach, outside the parent's lock
+     * (addTagImpl): a log line is not something to hold a tag mutex across.
      */
     static constexpr uint32_t kDepthWarnAt[4] = { 64, 1024, 16384, 262144 };
     static void noteDepth(const Entity* child)
@@ -1414,9 +1415,9 @@ public:
             if (!announced.compare_exchange_strong(expect, i + 1, ::std::memory_order_acq_rel)) return;
             static const char* const what[4] = {
                 "a deep tree; nothing to do yet",
-                "the cascade delete of a branch this deep is a recursion this deep (MemoryArena::destroyChildEntitiesFirst)",
-                "a cascade delete of a branch this deep may exhaust a default thread stack",
-                "a cascade delete of a branch this deep will exhaust any thread stack -- delete it in parts, or without its children",
+                "core walks it in loops, but a family's recursive walk over this branch (an interaction, a collect) is a recursion this deep",
+                "a family's recursive walk over a branch this deep may exhaust a default thread stack",
+                "a family's recursive walk over a branch this deep will exhaust any thread stack",
             };
             ETCS_LOG("Entity", "RID:" << child->getRID() << " attached at depth " << d
                      << " (threshold " << kDepthWarnAt[i] << "): " << what[i] << ".");
@@ -1768,6 +1769,8 @@ public:
     // only a snapshot -- take a hold if you are about to USE it.
     bool isRetiring() const { return retiring_.load(::std::memory_order_seq_cst); }
     void beginRetire()      { retiring_.store(true, ::std::memory_order_seq_cst); }
+    // True for the one retire that gets to tell the parent (etcs_retire_entity).
+    bool markRetired()      { return !retired_.exchange(true, ::std::memory_order_acq_rel); }
 
     // True once nothing is inside. The deadline is so that a walk which breaks
     // the no-event rule degrades to the old behaviour with a line naming it,
@@ -4135,7 +4138,16 @@ inline bool etcs_retire_entity(Entity* e)
  * where an ancestor may already have run ~Entity() -- the one context tag
  * modification never reaches.
  */
-    Entity::markStateChange(e->getParent(), e->getRID());
+    // ONCE PER ENTITY, AND NOT UNDER A CASCADE. Every way an entity dies
+    // reaches here more than once (the cascade's driver, then reclaimEntity,
+    // each in its own image -- and the rest of this function is meant to run
+    // in each, since a family list lives in the image that published it),
+    // but the walk up the tree is one statement, and over a deep chain it was
+    // most of a delete. Under a cascade the subtree's root told the tree
+    // above (MemoryArena::deleteEntity), and every ancestor this would reach
+    // up to it is dying with it.
+    if (etcs_cascade_depth == 0 && e->markRetired())
+        Entity::markStateChange(e->getParent(), e->getRID());
     // And leave every registry it was published into, keyed the way it was
     // admitted. This is what turns "the RID resolved" into "it is alive".
     etcs_supertype_fanin(e);
