@@ -612,19 +612,22 @@ public: \
 #define ETCS_DISPATCH_CONCAT3(a,b,c)  ETCS_DISPATCH_CONCAT3_(a,b,c)
 // --- Underlying zero-arg / N-arg implementations (not called directly —
 // use ETCS_DISPATCH_METHOD / ETCS_DISPATCH_METHOD_CONST below) ---
+// The wrapper is `override`: it answers the family's pure virtual of the
+// same name, always, and saying so keeps a base that marks its other
+// overrides from drawing clang's inconsistent-override warning on these.
 #define ETCS_DISPATCH_METHOD_0(RetType, Name) \
     virtual RetType Name##Concrete() = 0; \
-    RetType Name() { return static_cast<Derived*>(this)->Name##Concrete(); }
+    RetType Name() override { return static_cast<Derived*>(this)->Name##Concrete(); }
 #define ETCS_DISPATCH_METHOD_N(RetType, Name, ...) \
     virtual RetType Name##Concrete(FOR_EACH_COMMA(_PARAM, __VA_ARGS__)) = 0; \
-    RetType Name(FOR_EACH_COMMA(_PARAM, __VA_ARGS__)) \
+    RetType Name(FOR_EACH_COMMA(_PARAM, __VA_ARGS__)) override \
     { return static_cast<Derived*>(this)->Name##Concrete(FOR_EACH_COMMA(_ARGNAME, __VA_ARGS__)); }
 #define ETCS_DISPATCH_METHOD_0_CONST(RetType, Name) \
     virtual RetType Name##Concrete() const = 0; \
-    RetType Name() const { return static_cast<const Derived*>(this)->Name##Concrete(); }
+    RetType Name() const override { return static_cast<const Derived*>(this)->Name##Concrete(); }
 #define ETCS_DISPATCH_METHOD_N_CONST(RetType, Name, ...) \
     virtual RetType Name##Concrete(FOR_EACH_COMMA(_PARAM, __VA_ARGS__)) const = 0; \
-    RetType Name(FOR_EACH_COMMA(_PARAM, __VA_ARGS__)) const \
+    RetType Name(FOR_EACH_COMMA(_PARAM, __VA_ARGS__)) const override \
     { return static_cast<const Derived*>(this)->Name##Concrete(FOR_EACH_COMMA(_ARGNAME, __VA_ARGS__)); }
 // --- Public entry points: arity is inferred, const-ness is not (it's a
 // genuine semantic choice, not derivable from the argument list) ---
