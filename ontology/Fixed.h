@@ -21,10 +21,17 @@
 // scaling to and from the type is exact: a script's literal, parsed to a
 // float, times 2^32, truncated, is one integer on every platform.
 //
-// MULTIPLY AND DIVIDE GO THROUGH 128 BITS, which every target this runs on
-// has (a compiler-lowered pair of words on WASM), so a product of two
-// in-range values is exact before it is scaled back, and there is no
-// intermediate rounding that could depend on the machine.
+// MULTIPLY AND DIVIDE ARE EXACT IN 128 BITS: the product of two in-range
+// values is whole before it is scaled back, and the quotient is the whole
+// quotient, so there is no intermediate rounding that could depend on the
+// machine. The DEFINITION is floor((a*b) / 2^32) and trunc((a*2^32) / b),
+// taken in the low 64 bits -- an integer function with one answer -- and it
+// has two spellings here: __int128 where the machine has it (one multiply
+// and one divide instruction on x86-64), and 64-bit halves (fixed_detail)
+// on WASM, which has no 128-bit instructions and where every __int128
+// operation is a library call, the divide a 128-step loop -- thirty times
+// the native cost on the causal path. Both spellings of one definition;
+// OrderVectorTesterLoader holds them to the bit against each other.
 //
 // THE FUNCTIONS THAT ARE NOT ARITHMETIC -- sqrt, exp, sin, cos -- are written
 // here from the arithmetic, with a fixed number of terms, so that their
@@ -37,6 +44,58 @@
 // worlds is a place worth being able to see in the code, so crossing it is a
 // named call (From / ToFloat) and never an accident of overload resolution.
 // ---------------------------------------------------------------------------
+namespace fixed_detail
+{
+    // |a| * |b| as (hi, lo): four 32x32 products, which every target does
+    // in one instruction each.
+    inline void umul(uint64_t a, uint64_t b, uint64_t& hi, uint64_t& lo)
+    {
+        const uint64_t a0 = a & 0xffffffffull, a1 = a >> 32;
+        const uint64_t b0 = b & 0xffffffffull, b1 = b >> 32;
+        const uint64_t p00 = a0 * b0, p01 = a0 * b1, p10 = a1 * b0, p11 = a1 * b1;
+        const uint64_t mid = (p00 >> 32) + (p01 & 0xffffffffull) + (p10 & 0xffffffffull);
+        lo = (mid << 32) | (p00 & 0xffffffffull);
+        hi = p11 + (p01 >> 32) + (p10 >> 32) + (mid >> 32);
+    }
+
+    inline int clz(uint64_t v)
+    {
+#if defined(__GNUC__) || defined(__clang__)
+        return __builtin_clzll(v);
+#else
+        int n = 0; while (!(v & (1ull << 63))) { v <<= 1; ++n; } return n;
+#endif
+    }
+
+    // (u1:u0) / v with u1 < v: the two-digit schoolbook division, base 2^32
+    // (Hacker's Delight, divlu2). Native 64-bit operations throughout.
+    inline uint64_t divlu(uint64_t u1, uint64_t u0, uint64_t v)
+    {
+        const uint64_t b = 1ull << 32;
+        const int s = clz(v);
+        v <<= s;
+        const uint64_t vn1 = v >> 32, vn0 = v & 0xffffffffull;
+        const uint64_t un32 = s ? (u1 << s) | (u0 >> (64 - s)) : u1;
+        const uint64_t un10 = u0 << s;
+        const uint64_t un1 = un10 >> 32, un0 = un10 & 0xffffffffull;
+        uint64_t q1 = un32 / vn1, rhat = un32 - q1 * vn1;
+        while (q1 >= b || q1 * vn0 > b * rhat + un1) { --q1; rhat += vn1; if (rhat >= b) break; }
+        const uint64_t un21 = un32 * b + un1 - q1 * v;
+        uint64_t q0 = un21 / vn1;
+        rhat = un21 - q0 * vn1;
+        while (q0 >= b || q0 * vn0 > b * rhat + un0) { --q0; rhat += vn1; if (rhat >= b) break; }
+        return q1 * b + q0;
+    }
+
+    // The low 64 bits of the full quotient (hi:lo) / v, for any size of
+    // quotient: the high digit first, its remainder leading the low one.
+    inline uint64_t udiv128_low(uint64_t hi, uint64_t lo, uint64_t v)
+    {
+        const uint64_t r = hi % v;          // the high quotient digit itself is above 64 bits: dropped
+        return divlu(r, lo, v);
+    }
+}
+
 struct Fixed
 {
     static constexpr int     SHIFT = 32;
@@ -69,6 +128,33 @@ struct Fixed
     constexpr Fixed operator+(Fixed o) const { return FromRaw(raw + o.raw); }
     constexpr Fixed operator-(Fixed o) const { return FromRaw(raw - o.raw); }
     constexpr Fixed operator-()        const { return FromRaw(-raw); }
+    // floor((a * b) / 2^32), low 64 bits, in halves: the magnitudes' product
+    // shifted, rounded toward minus infinity when the sign is negative (what
+    // an arithmetic shift of the signed product is).
+    static int64_t MulHalves(int64_t a, int64_t b)
+    {
+        const bool neg = (a < 0) != (b < 0);
+        uint64_t hi, lo;
+        fixed_detail::umul(mag(a), mag(b), hi, lo);
+        uint64_t q = (lo >> SHIFT) | (hi << (64 - SHIFT));
+        if (neg)
+        {
+            if (lo & 0xffffffffull) ++q;   // ceil of the magnitude: floor of the negative
+            q = 0 - q;
+        }
+        return static_cast<int64_t>(q);
+    }
+    // trunc((a * 2^32) / b), low 64 bits, in halves. b != 0.
+    static int64_t DivHalves(int64_t a, int64_t b)
+    {
+        const bool neg = (a < 0) != (b < 0);
+        const uint64_t n = mag(a);
+        uint64_t q = fixed_detail::udiv128_low(n >> (64 - SHIFT), n << SHIFT, mag(b));
+        if (neg) q = 0 - q;
+        return static_cast<int64_t>(q);
+    }
+
+#if defined(__SIZEOF_INT128__) && !defined(__EMSCRIPTEN__)
     Fixed operator*(Fixed o) const
     {
         return FromRaw(static_cast<int64_t>((static_cast<__int128>(raw) * o.raw) >> SHIFT));
@@ -81,6 +167,10 @@ struct Fixed
         if (o.raw == 0) return Zero();
         return FromRaw(static_cast<int64_t>((static_cast<__int128>(raw) << SHIFT) / o.raw));
     }
+#else
+    Fixed operator*(Fixed o) const { return FromRaw(MulHalves(raw, o.raw)); }
+    Fixed operator/(Fixed o) const { return o.raw == 0 ? Zero() : FromRaw(DivHalves(raw, o.raw)); }
+#endif
     Fixed& operator+=(Fixed o) { raw += o.raw; return *this; }
     Fixed& operator-=(Fixed o) { raw -= o.raw; return *this; }
     Fixed& operator*=(Fixed o) { *this = *this * o; return *this; }
@@ -92,6 +182,9 @@ struct Fixed
     constexpr bool operator<=(Fixed o) const { return raw <= o.raw; }
     constexpr bool operator> (Fixed o) const { return raw >  o.raw; }
     constexpr bool operator>=(Fixed o) const { return raw >= o.raw; }
+
+    // The magnitude, as a width that holds INT64_MIN's.
+    static constexpr uint64_t mag(int64_t v) { return v < 0 ? 0 - static_cast<uint64_t>(v) : static_cast<uint64_t>(v); }
 
     constexpr bool IsZero()     const { return raw == 0; }
     constexpr bool IsPositive() const { return raw > 0; }
@@ -114,10 +207,13 @@ struct Fixed
     Fixed Sqrt() const
     {
         if (raw <= 0) return Zero();
-        const unsigned __int128 n = static_cast<unsigned __int128>(raw) << SHIFT;
-        unsigned __int128 r = static_cast<unsigned __int128>(__builtin_sqrt(static_cast<double>(raw)) * 65536.0);
-        while (r * r > n) --r;
-        while ((r + 1) * (r + 1) <= n) ++r;
+        const uint64_t n_hi = static_cast<uint64_t>(raw) >> (64 - SHIFT);
+        const uint64_t n_lo = static_cast<uint64_t>(raw) << SHIFT;
+        // r*r > n, in halves: the root is below 2^48, so its square fits.
+        auto above = [&](uint64_t r) { uint64_t hi, lo; fixed_detail::umul(r, r, hi, lo); return hi > n_hi || (hi == n_hi && lo > n_lo); };
+        uint64_t r = static_cast<uint64_t>(__builtin_sqrt(static_cast<double>(raw)) * 65536.0);
+        while (above(r)) --r;
+        while (!above(r + 1)) ++r;
         return FromRaw(static_cast<int64_t>(r));
     }
 

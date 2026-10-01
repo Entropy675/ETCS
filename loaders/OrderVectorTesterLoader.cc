@@ -64,6 +64,48 @@ int main(int, char**)
         check(Fixed::Zero().Sin() == Fixed::Zero() && Fixed::Zero().Cos() == Fixed::One(), "sin(0) = 0, cos(0) = 1, exactly");
         check(Fixed::From(3.0).Exp().ToDouble() < 20.1 && Fixed::From(3.0).Exp().ToDouble() > 20.0, "exp(3) ~ 20.09");
         check(Fixed::FromInt(-100).Exp().IsZero(), "exp(-100) underflows to zero, honestly");
+
+        /*
+         * THE HALVES AGAINST THE WHOLE. Fixed has two spellings of one
+         * definition -- floor((a*b)/2^32) and trunc((a*2^32)/b) in the low
+         * 64 bits -- __int128 natively and 64-bit halves on WASM
+         * (Fixed::MulHalves/DivHalves, fixed_detail). This tester runs where
+         * __int128 exists, so it holds the halves to the reference bit for
+         * bit over a splitmix walk of the whole range: small, huge, mixed
+         * signs, the overflowing quotients included. What the browser runs
+         * is thereby what the native build runs.
+         */
+        {
+            uint64_t st = 0x9e3779b97f4a7c15ull;
+            auto next = [&st]() { st += 0x9e3779b97f4a7c15ull; uint64_t z = st; z ^= z >> 30; z *= 0xbf58476d1ce4e5b9ull; z ^= z >> 27; z *= 0x94d049bb133111ebull; return z ^ (z >> 31); };
+            auto draw = [&next]() -> int64_t {
+                const uint64_t r = next();
+                const int width = static_cast<int>(r % 64) + 1;          // every magnitude class
+                const uint64_t m = width == 64 ? next() : (next() & ((1ull << width) - 1));
+                return (r & 1) ? -static_cast<int64_t>(m) : static_cast<int64_t>(m);
+            };
+            bool mul_ok = true, div_ok = true, sqrt_ok = true;
+            for (int i = 0; i < 200000; ++i)
+            {
+                const int64_t a = draw(), b = draw();
+                const int64_t m_ref = static_cast<int64_t>((static_cast<__int128>(a) * b) >> 32);
+                if (Fixed::MulHalves(a, b) != m_ref || (Fixed::FromRaw(a) * Fixed::FromRaw(b)).raw != m_ref) mul_ok = false;
+                if (b != 0)
+                {
+                    const int64_t d_ref = static_cast<int64_t>((static_cast<__int128>(a) << 32) / b);
+                    if (Fixed::DivHalves(a, b) != d_ref || (Fixed::FromRaw(a) / Fixed::FromRaw(b)).raw != d_ref) div_ok = false;
+                }
+                if (a > 0)
+                {
+                    const unsigned __int128 n = static_cast<unsigned __int128>(a) << 32;
+                    unsigned __int128 r = Fixed::FromRaw(a).Sqrt().raw;
+                    if (r * r > n || (r + 1) * (r + 1) <= n) sqrt_ok = false;
+                }
+            }
+            check(mul_ok,  "200,000 products agree with __int128 to the bit, both signs, every width");
+            check(div_ok,  "200,000 quotients agree with __int128 to the bit, overflowing ones included");
+            check(sqrt_ok, "200,000 roots are the exact floor root");
+        }
     }
 
     std::printf("\n-- the invariants ---------------------------------------------------\n");
