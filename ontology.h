@@ -112,6 +112,10 @@
 // finished, come back", and nothing else about the entity has to be true. Note
 // that the family deliberately does NOT say who steps it; see ontology/Animated.h.
 #include "ontology/AnimatedBase.h"
+// Causal is the physics as a trait: an entity that has an OrderVector, and
+// therefore a history. A projection of it (a camera, a mesh on a device) is a
+// separate claim a runtime can decline to make -- see ontology/Causal.h.
+#include "ontology/CausalBase.h"
 #include "ontology/ParserBase.h"
 #include "ontology/WrapperBase.h"
 // Matrix refines Wrapper: one step, and a forward link, in a transform chain.

@@ -227,6 +227,35 @@ word for two things. The compiler cannot tell that case from a genuine
 one; only the author can, and the tell is that neither of the two sanctioned
 resolutions produces a sentence you would want to write down.
 
+### A second worked case: `Causal`, and a family that is not a picture
+
+The 3D node used to hold its physics as private state of a drawable: the
+position, the rate, the heat it shed, all fields of `Scene3D`, advanced by
+the same call that projected it into a camera. That made "what a thing
+does" a property of "being looked at", and a scene nobody was projecting
+did not happen.
+
+The fix was the orthogonal fold-in §3 describes, applied to the physics:
+`Causal_` / `CausalBase` (`ontology/Causal.h`, `CausalBase.h`) is the family
+that *has rows* — the OrderVector (`ontology/OrderVector.h`), fixed-point
+throughout (`ontology/Fixed.h`) so two runtimes reach the same state to the
+bit — and interacts over an interval: commit the entropy owed, step, then
+the members. A leaf writes the step (`StepConcrete`) and nothing else; the
+base owns the rows, the emission into the container, the tick, the driver
+(`Run`) and the hash. `Scene3D` claims it beside `Drawable3D`, and its
+projection is now *derived from* the rows — `OrderVector::ToMatrix4` is the
+one place the fixed rows become floats, which is the boundary between a
+state and a picture of it.
+
+Two things follow that are worth stating. A `Causal` container takes the
+crossings of any `Causal` member through the family, so a foreign
+provider's entity nests in a scene's causal order without the scene knowing
+its type. And since the family has a driver, a scene runs headless at
+whatever rate the caller asks (`Scene3D.Run ticks dt_ms`), with the picture
+optional: the device path (`RenderProvider/OS/DeviceFrame.h`) is the same
+rows handed to a GPU as a matrix per node, and choosing not to render costs
+the physics nothing.
+
 ---
 
 ## 6. Summary of the constraint model
