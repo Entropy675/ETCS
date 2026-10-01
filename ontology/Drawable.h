@@ -134,9 +134,22 @@ public:
             if (!iface) continue;
             out.push_back(static_cast<Drawable_*>(iface));
         }
-        ::std::stable_sort(out.begin(), out.end(),
-                         [](Drawable_* a, Drawable_* b) { return a->Order() < b->Order(); });
+        ::std::stable_sort(out.begin(), out.end(), Below);
     }
+
+    /*
+ * THE CROSS-TYPE COMPARISON, stated once: hidden loses to anything shown, then
+ * Order(). The scalar every member can answer is Order(); whether it is shown
+ * is the one piece of tag state that outranks it. Order() itself stays the
+ * stated number -- FocusWindow reads it back and restores it -- so the
+ * projection lives here, in the comparison, and every reader ranking a mixed
+ * set asks this rather than comparing Order() on its own.
+ */
+    static ::std::pair<bool, int32_t> Rank(Drawable_* d)
+    {
+        return { !d->Hidden(), d->Order() };
+    }
+    static bool Below(Drawable_* a, Drawable_* b) { return Rank(a) < Rank(b); }
 
     /*
  * Will this subtree need composing again even if nobody marks it?
@@ -255,8 +268,8 @@ protected:
  * waiting for the first script that removes a layer mid-run.
  */
     // A child named the way the blit source is: by RID, resolved at the point
-    // of use. Order is snapshotted because only the sort needs it.
-    struct ChildRef { ETCS::Buffer tag; ETCS::RID rid; int32_t order; };
+    // of use. The rank is snapshotted because only the sort needs it.
+    struct ChildRef { ETCS::Buffer tag; ETCS::RID rid; ::std::pair<bool, int32_t> rank; };
 
     void collectDrawableChildRefs(::std::vector<ChildRef>& out)
     {
@@ -270,10 +283,10 @@ protected:
             void* iface = child->getInterfacePointer(ETCS::Buffer("Drawable"));
             if (!iface) continue;
             out.push_back(ChildRef{entry.first, entry.second,
-                                   static_cast<Drawable_*>(iface)->Order()});
+                                   Rank(static_cast<Drawable_*>(iface))});
         }
         ::std::stable_sort(out.begin(), out.end(),
-                         [](const ChildRef& a, const ChildRef& b) { return a.order < b.order; });
+                         [](const ChildRef& a, const ChildRef& b) { return a.rank < b.rank; });
     }
 
     /*

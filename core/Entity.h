@@ -2782,6 +2782,19 @@ private:
 public:
     static void markStateChange(Entity* from, RID origin)
     {
+        /*
+ * AN ORDERABLE'S KEY IS ITS TAG STATE. A leaf's operator< may read any of its
+ * tags or flags (a hidden drawable loses every comparison), so a change to
+ * `from`'s own tag state can move it among its siblings -- the case RIDList
+ * cannot see, since membership stayed put. Marks the parent's list stale and
+ * never sorts: a burst of changes costs one rebuild, at the next ordered read.
+ * `from` only -- an ancestor's subtree moved, not its key.
+ */
+        if (from && !from->isDestructed()
+            && from->getInterfacePointer(ETCS::Buffer("Orderable")))
+            if (Entity* p = from->getParent(); p && !p->isDestructed())
+                p->reorderTypedChild(from->getRID());
+
         bool told = false;
         const ETCS::Buffer family("Observable");
         for (Entity* n = from; n; n = n->getParent())
