@@ -29,9 +29,11 @@
 // has two spellings here: __int128 where the machine has it (one multiply
 // and one divide instruction on x86-64), and 64-bit halves (fixed_detail)
 // on WASM, which has no 128-bit instructions and where every __int128
-// operation is a library call, the divide a 128-step loop -- thirty times
-// the native cost on the causal path. Both spellings of one definition;
-// OrderVectorTesterLoader holds them to the bit against each other.
+// operation is a library call, the divide a 128-step loop. Measured in the
+// browser, the same scene for 200,000 ticks with each spelling built in:
+// 90 ms with __int128, 47 ms in halves, the same hash from both. Both are
+// one definition; OrderVectorTesterLoader holds them to the bit against each
+// other.
 //
 // THE FUNCTIONS THAT ARE NOT ARITHMETIC -- sqrt, exp, sin, cos -- are written
 // here from the arithmetic, with a fixed number of terms, so that their
