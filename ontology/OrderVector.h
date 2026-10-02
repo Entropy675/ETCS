@@ -12,7 +12,7 @@
 // OrderVector — four rows of four, each a distinguishable unit of space, and
 // the one causal statement of where and how a thing is.
 //
-//     row 0   (x,  y,  z,  RID)      where it is, and which thing it is
+//     row 0   (x,  y,  z,  id)       where it is, and what thing it is
 //     row 1   (Ox, Oy, Oz, E)        where its energy is going, and how much
 //     row 2   (Fx, Fy, Fz, r)        what it turns about, and how far it reaches
 //     row 3   (qx, qy, qz, qw)       which way it faces -- a unit quaternion
@@ -27,6 +27,17 @@
 // which is the PROJECTION of this record into a picture -- and a projection
 // is something a runtime can decline to make and still run all of the logic,
 // faster, with nothing on screen. That is what the split is for.
+//
+// ROW 0'S FOURTH SLOT IS WHAT THE THING IS, NOT WHEN IT WAS MADE. It is the
+// entity's state hash (core/Entity.h, surfaceHash and the merkle over the
+// children: tags, relations, dispatch -- no RIDs), set by the family base
+// whenever that hash moves. A RID is the order types happened to be created
+// in, and a scene rebuilt in another order is the same scene; an identity
+// that changed with it would make every crossing's uncertainty, and so every
+// draw, a function of creation order (ontology/Environmental.h says the same
+// of the state hash). Two things of one state are then one identity, and it
+// is the ROWS that tell them apart -- two indistinguishable units at the
+// same place with the same energy are, for the physics, the same unit twice.
 //
 // ROW 1 IS A DIRECTION AND A FRACTION AT THE SAME TIME. O is not a velocity:
 // |O| lies in [0,1] and is the SHARE of E that is kinetic along O/|O|.
@@ -79,10 +90,15 @@
 // no sentinel. Angular RATE -- the share of E that is rotational -- is still
 // deliberately absent: the linear rows carry causality for now.
 //
-// THE INVARIANT IS STRUCTURAL, not checked. Impulse adds j joules along a
-// unit direction: |K| grows by AT MOST j while E grows by exactly j, so
-// |O| <= 1 survives every impulse; Dissipate can only lower it. No sequence
-// of the operations below leaves a point with more kinetic energy than energy.
+// THE INVARIANT IS STRUCTURAL, AND STATED WITH ITS SLACK. Impulse adds j
+// joules along a unit direction: |K| grows by AT MOST j while E grows by
+// exactly j, so |O| <= 1 survives every impulse; Dissipate can only lower it.
+// No sequence of the operations below leaves a point with more kinetic energy
+// than energy -- up to the last bits of a truncating divide, which is why
+// Holds() carries an epsilon and the tester fuzzes the operation set against
+// it (loaders/OrderVectorTesterLoader.cc) rather than this comment standing
+// alone. The constraints the family upholds, and which of them this struct
+// is responsible for, are listed in ontology/etcs_causal_constraints.md.
 //
 // The two meta fields are properties of the causal step this vector
 // represents -- the span it settles and the uncertainty a draw inside it
@@ -94,10 +110,10 @@
 struct OrderVector
 {
     // ── row 0: the point ────────────────────────────────────────────────
-    // RID in the fourth slot: identity is a coordinate here. Two units at the
-    // same position are still two units.
-    Fixed     x, y, z;
-    ETCS::RID rid = 0;
+    // The identity in the fourth slot: the state hash of the thing whose rows
+    // these are (see above). Zero until the family base has set it.
+    Fixed    x, y, z;
+    uint64_t id = 0;
 
     // ── row 1: the order ────────────────────────────────────────────────
     Fixed ox, oy, oz, energy;
@@ -135,7 +151,13 @@ struct OrderVector
     }
 
     Fixed KineticFraction() const { return Fixed::Length(ox, oy, oz); }
-    Fixed KineticEnergy()   const { return KineticFraction() * energy; }
+    // |K| as the length of K = O * E, not |O| * E: the three products lose a
+    // last bit each either way, but a root taken of |O|^2 first amplifies
+    // that loss by 1/(2|O|) and the energy multiplies it after -- a nearly
+    // still body of a thousand joules read its ordered energy with an error
+    // a thousand times the slack the invariants allow. Taken this way the
+    // error is a few last bits, whatever |O| is.
+    Fixed KineticEnergy()   const { return Fixed::Length(ox * energy, oy * energy, oz * energy); }
     Fixed Heat()            const { return energy - KineticEnergy(); }
 
     // The direction of travel, or zero when there is none -- the honest
@@ -151,7 +173,7 @@ struct OrderVector
         vx = vy = vz = Fixed::Zero();
         if (!mass.IsPositive()) return;
         const Fixed m  = KineticFraction();
-        const Fixed ke = m * energy;
+        const Fixed ke = KineticEnergy();
         if (!ke.IsPositive()) return;
         Fixed dx, dy, dz;
         directionGiven(m, dx, dy, dz);
@@ -221,10 +243,63 @@ struct OrderVector
     // The whole commit in one reading of the heat: that share of it, taken
     // out, as the event. EmissionOver + EmitEvent read the heat twice; a
     // driver doing this thousands of times a second reads it once.
+    //
+    // THE LAST QUANTUM LEAVES WHOLE: once the heat is so small that its share
+    // truncates to nothing, the whole of it goes. Otherwise a body would hold
+    // a residual it could never emit, with its clock stopped while it still
+    // had heat -- and "no heat left" (the clock stopping) is meant literally.
     OrderVector CommitShare(Fixed share, Fixed span)
     {
         const Fixed h = Heat();
-        return emitEventGiven(h, h.IsPositive() ? h * share : Fixed::Zero(), span);
+        Fixed q = h.IsPositive() ? h * share : Fixed::Zero();
+        if (h.IsPositive() && share.IsPositive() && !q.IsPositive()) q = h;
+        return emitEventGiven(h, q, span);
+    }
+
+    /*
+     * A CONTACT CROSSING: the part of this point's ordered energy that is
+     * headed along n (toward the thing it touched) leaves, as an emission
+     * that carries that direction -- all of it ordered, |O| = 1 -- for the
+     * other side to absorb as an impulse. What stays is the rest of the
+     * kinetic energy, along what was perpendicular to n. With v the velocity
+     * and c = cos of the angle between v and n: KE * c^2 crosses, KE * (1 -
+     * c^2) stays, so a head-on contact hands everything over and a glancing
+     * one almost nothing. Nothing crosses when the motion is away from n.
+     *
+     * This is transmission, not restitution: the energy along the line goes
+     * to the other body entirely (Newton's cradle for equal masses). It is
+     * exact in the ledger -- E falls by what the event carries, |K| falls by
+     * at least what the absorber's |K| can rise by -- and it is the same
+     * crossing a member's heat makes into its container, with a direction.
+     * A coefficient of restitution is a later parameter on this one
+     * operation, not a second one.
+     */
+    OrderVector CrossToward(Fixed nx, Fixed ny, Fixed nz, Fixed span)
+    {
+        OrderVector e;
+        e.x = x; e.y = y; e.z = z;
+        e.id = id;
+        e.interval = span;
+        const Fixed m  = KineticFraction();
+        const Fixed ke = KineticEnergy();
+        const Fixed nl = Fixed::Length(nx, ny, nz);
+        if (!ke.IsPositive() || !nl.IsPositive()) return e;
+        const Fixed ux = nx / nl, uy = ny / nl, uz = nz / nl;      // n, unit
+        const Fixed c  = (ox * ux + oy * uy + oz * uz) / m;         // v^ . n^
+        if (!c.IsPositive()) return e;                              // not toward it
+        const Fixed a  = Fixed::Min(ke * c * c, ke);                // what crosses
+        // What stays, along the perpendicular of v^ to n^.
+        const Fixed px = ox / m - c * ux, py = oy / m - c * uy, pz = oz / m - c * uz;
+        const Fixed pl = Fixed::Length(px, py, pz);
+        const Fixed rest = ke - a;
+        Fixed kx, ky, kz;
+        if (rest.IsPositive() && pl.IsPositive()) { kx = (px / pl) * rest; ky = (py / pl) * rest; kz = (pz / pl) * rest; }
+        energy -= a;
+        setKinetic(kx, ky, kz);
+        e.energy = a;
+        e.ox = ux; e.oy = uy; e.oz = uz;
+        e.uncertainty = derive_uncertainty(e);
+        return e;
     }
 
     // Heat in, motion untouched: an environment absorbing its contents'
@@ -240,11 +315,17 @@ struct OrderVector
     // Absorb a whole crossing: its heat lands as heat, its ordered part as an
     // impulse (radiation pressure, with no new operation). The crossing's
     // meta is NOT copied -- that step was somebody else's clock.
+    //
+    // EXACTLY ITS ENERGY, by construction: the ordered part is read once and
+    // capped at the whole, and the heat is the remainder, so the two adds
+    // sum to q.energy to the bit -- the ledger (etcs_causal_constraints.md
+    // §3) does not depend on |K| of a unit direction being exactly 1.
     void Absorb(const OrderVector& q)
     {
-        const Fixed heat = q.Heat();
+        if (!q.energy.IsPositive()) return;
+        const Fixed ke   = Fixed::Min(q.KineticEnergy(), q.energy);
+        const Fixed heat = q.energy - ke;
         if (heat.IsPositive()) Absorb(heat);
-        const Fixed ke = q.KineticEnergy();
         if (ke.IsPositive())
         {
             Fixed dx, dy, dz;
@@ -411,16 +492,27 @@ struct OrderVector
     {
         return Fixed::Length(other.x - x, other.y - y, other.z - z) - radius - other.radius;
     }
-    bool MayInteractWith(const OrderVector& other) const { return GapTo(other).raw <= 0; }
+    // GapTo <= 0 without the root: the gate is asked of every pair of a
+    // container's members every interaction, and squares compare the same.
+    bool MayInteractWith(const OrderVector& other) const
+    {
+        const Fixed dx = other.x - x, dy = other.y - y, dz = other.z - z;
+        const Fixed reach = radius + other.radius;
+        return dx * dx + dy * dy + dz * dz <= reach * reach;
+    }
 
     // The uncertainty a crossing carries, derived from the crossing itself:
-    // identity, quantity and span through a finaliser. A hash, not a
-    // generator -- no state to advance. Quantity and span go in as the
-    // integers they are, so two crossings that differ at all differ
-    // everywhere, and the same on every platform.
+    // where it left, from what, how much, which way, and over what span,
+    // through a finaliser. A hash, not a generator -- no state to advance.
+    // Everything goes in as the integers they are, so two crossings that
+    // differ at all differ everywhere, and the same on every platform. No
+    // creation order anywhere in it (row 0's identity is the state hash).
     static uint64_t derive_uncertainty(const OrderVector& e)
     {
-        uint64_t h = fixed_mix(e.rid, e.energy.raw);
+        uint64_t h = fixed_mix(e.id, e.x.raw);
+        h = fixed_mix(h, e.y.raw);  h = fixed_mix(h, e.z.raw);
+        h = fixed_mix(h, e.ox.raw); h = fixed_mix(h, e.oy.raw); h = fixed_mix(h, e.oz.raw);
+        h = fixed_mix(h, e.energy.raw);
         return fixed_mix(h, e.interval.raw);
     }
 
@@ -429,13 +521,33 @@ struct OrderVector
     uint64_t Hash() const
     {
         uint64_t h = 0x243f6a8885a308d3ull;
-        const int64_t words[] = { x.raw, y.raw, z.raw, static_cast<int64_t>(rid),
+        const int64_t words[] = { x.raw, y.raw, z.raw, static_cast<int64_t>(id),
                                   ox.raw, oy.raw, oz.raw, energy.raw,
                                   fx.raw, fy.raw, fz.raw, radius.raw,
                                   qx.raw, qy.raw, qz.raw, qw.raw,
                                   interval.raw, static_cast<int64_t>(uncertainty) };
         for (int64_t w : words) h = fixed_mix(h, w);
         return h;
+    }
+
+    /*
+     * THE ROW INVARIANTS AS ONE PREDICATE, with the slack the arithmetic
+     * needs: E and the reach non-negative, |O| <= 1, row 3 a unit quaternion.
+     * The slack is a few bits of Q32.32 (2^-16): a truncating normalisation
+     * can put |O| or |q| over 1 by the last bits of a divide, and a predicate
+     * without the slack would fail on arithmetic the operations are meant to
+     * do. Checked by the tester over fuzzed operation sequences, and by any
+     * caller that wants to assert a state rather than trust the comment.
+     */
+    static constexpr int64_t kSlackRaw = int64_t(1) << 16;
+    bool Holds() const
+    {
+        if (energy.raw < 0 || radius.raw < 0) return false;
+        const Fixed o2 = ox * ox + oy * oy + oz * oz;
+        if (o2.raw > Fixed::One().raw + kSlackRaw) return false;
+        const Fixed q2 = qw * qw + qx * qx + qy * qy + qz * qz;
+        if (q2.raw > Fixed::One().raw + kSlackRaw || q2.raw < Fixed::One().raw - kSlackRaw) return false;
+        return true;
     }
 
 private:
@@ -488,7 +600,7 @@ private:
     {
         OrderVector e;
         e.x = x; e.y = y; e.z = z;
-        e.rid      = rid;
+        e.id       = id;
         e.interval = span;
         e.energy   = emitGiven(h, joules);
         e.ox = e.oy = e.oz = Fixed::Zero();

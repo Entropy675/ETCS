@@ -1991,18 +1991,18 @@ int main()
               "...with the product actually computed");
 
         // The OrderVector -> 4x4 function: DERIVED, not reinterpreted. Row 0's
-        // fourth slot is a RID and no product may touch it, which is why this
-        // is a function rather than a cast.
+        // fourth slot is an identity and no product may touch it, which is
+        // why this is a function rather than a cast.
         OrderVector ov;
         ov.PlaceAt(Fixed::FromInt(3), Fixed::FromInt(4), Fixed::FromInt(5));
-        ov.rid = 12345;
+        ov.id = 12345;
         const Matrix4 om = ov.ToMatrix4();
         check(om.at(0,3)==3.0f && om.at(1,3)==4.0f && om.at(2,3)==5.0f,
               "an OrderVector's position becomes the translation column");
         check(om.at(3,3)==1.0f && om.at(3,0)==0.0f,
-              "and the bottom row is affine -- the RID is nowhere in the matrix, "
+              "and the bottom row is affine -- the identity is nowhere in the matrix, "
               "which is the whole reason this is built rather than cast");
-        check(ov.rid == 12345, "...and the vector still knows who it is");
+        check(ov.id == 12345, "...and the vector still knows what it is");
 
         // Now the family: stages, their values, and the chain rule.
         Xform* first  = ETCS::MemoryArena::getInstance().allocate<Xform>();

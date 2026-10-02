@@ -14,6 +14,10 @@
 //   3. Row 3 composes as a rotation: quarter turns, and the matrix built from
 //      it agrees with the vector it rotates.
 //   4. Reduce and Cover: the aggregate encloses its members, GapTo is a proof.
+//   4b. The invariants as PREDICATES (OrderVector::Holds), fuzzed over the
+//      operation set; a contact crossing (CrossToward/Absorb) moves energy
+//      exactly and never raises ordered energy; the last quantum of heat
+//      leaves whole. See ontology/etcs_causal_constraints.md.
 //   5. DETERMINISM, the reason for all of it: the same sequence run twice
 //      lands on the same rows bit for bit and the same Hash; the sequence's
 //      hash is printed so the same script in a browser can be compared.
@@ -110,7 +114,7 @@ int main(int, char**)
 
     std::printf("\n-- the invariants ---------------------------------------------------\n");
     {
-        OrderVector p; p.rid = 7;
+        OrderVector p; p.id = 7;
         p.Impulse(Fixed::One(), Fixed::Zero(), Fixed::Zero(), Fixed::FromInt(10));
         check(p.energy == Fixed::FromInt(10), "an impulse of 10 J puts 10 J on the point");
         check(close(p.KineticFraction().ToDouble(), 1.0, 1e-9), "all of it kinetic: |O| = 1");
@@ -125,7 +129,7 @@ int main(int, char**)
         check(close(p.KineticEnergy().ToDouble(), k_before.ToDouble() * 0.5, 1e-6), "...by exactly the factor");
         // |O| <= 1 through a storm of impulses in every direction
         bool bounded = true;
-        OrderVector q; q.rid = 8;
+        OrderVector q; q.id = 8;
         for (int i = 0; i < 200; ++i)
         {
             q.Impulse(Fixed::From(std::sin(i * 0.7)), Fixed::From(std::cos(i * 1.3)), Fixed::From(std::sin(i * 0.2)), Fixed::From(0.5 + (i % 7)));
@@ -134,7 +138,7 @@ int main(int, char**)
         }
         check(bounded, "|O| <= 1 through 200 impulses in every direction");
         // Emit / Absorb: one number moves
-        OrderVector env; env.rid = 1; env.energy = Fixed::FromInt(100);
+        OrderVector env; env.id = 1; env.energy = Fixed::FromInt(100);
         const Fixed e_total = p.energy + env.energy;
         const Fixed k_held = p.KineticEnergy();
         const OrderVector crossing = p.EmitEvent(Fixed::FromInt(4), Fixed::From(0.5));
@@ -143,7 +147,7 @@ int main(int, char**)
         check(p.energy + env.energy == e_total, "...and the total is conserved to the bit");
         check(close(p.KineticEnergy().ToDouble(), k_held.ToDouble(), 1e-6), "|K| is held through the emission: |O| rose");
         check(crossing.uncertainty != 0 && crossing.uncertainty == OrderVector::derive_uncertainty(crossing), "the crossing's uncertainty is a function of the crossing");
-        OrderVector cold; cold.rid = 9; cold.energy = Fixed::FromInt(3);
+        OrderVector cold; cold.id = 9; cold.energy = Fixed::FromInt(3);
         cold.Impulse(Fixed::One(), Fixed::Zero(), Fixed::Zero(), Fixed::FromInt(3));   // E=6, K=3
         const Fixed took = cold.Emit(Fixed::FromInt(100));
         check(close(took.ToDouble(), 3.0, 1e-6), "Emit is capped at the heat there is");
@@ -185,11 +189,11 @@ int main(int, char**)
     std::printf("\n-- aggregation ------------------------------------------------------\n");
     {
         OrderVector m[3];
-        for (int i = 0; i < 3; ++i) { m[i].rid = 10 + i; m[i].energy = Fixed::FromInt(1); }
+        for (int i = 0; i < 3; ++i) { m[i].id = 10 + i; m[i].energy = Fixed::FromInt(1); }
         m[0].PlaceAt(Fixed::FromInt(-2), Fixed::Zero(), Fixed::Zero());
         m[2].PlaceAt(Fixed::FromInt(2), Fixed::Zero(), Fixed::Zero());
         m[2].radius = Fixed::One();
-        OrderVector agg; agg.rid = 99;
+        OrderVector agg; agg.id = 99;
         agg.Reduce(m, 3);
         check(agg.IsAggregate() && agg.x.IsZero(), "the reduction is an aggregate at the energy-weighted centre");
         check(agg.radius == Fixed::FromInt(3), "its reach covers the farthest member plus that member's own radius: 2 + 1");
@@ -202,10 +206,110 @@ int main(int, char**)
         check(!m[0].Encloses(m[0].x, m[0].y, m[0].z), "a leaf encloses nothing, itself included");
     }
 
+    std::printf("\n-- the invariants, as predicates, fuzzed ----------------------------\n");
+    {
+        /*
+         * WHAT THE HEADER CALLS STRUCTURAL IS CHECKED HERE: Holds() (E and the
+         * reach non-negative, |O| <= 1, row 3 unit, with the stated slack)
+         * through random sequences of every operation; |K| never rises
+         * except through Impulse; a crossing between two points moves one
+         * number exactly and never raises their ordered energy together.
+         * The constraints and their checks: ontology/etcs_causal_constraints.md.
+         */
+        uint64_t st = 0x5851f42d4c957f2dull;
+        auto next = [&st]() { st += 0x9e3779b97f4a7c15ull; uint64_t z = st; z ^= z >> 30; z *= 0xbf58476d1ce4e5b9ull; z ^= z >> 27; z *= 0x94d049bb133111ebull; return z ^ (z >> 31); };
+        auto unit = [&next]() { return Fixed::From(static_cast<double>(next() % 20001) / 10000.0 - 1.0); };   // [-1, 1]
+        auto pos  = [&next](double hi) { return Fixed::From(static_cast<double>(next() % 10001) / 10000.0 * hi); };
+        bool holds = true, arrow = true, ledger = true, cradle_ok = true;
+        int crossings = 0;
+        OrderVector a, b;
+        a.id = 1; b.id = 2;
+        b.PlaceAt(Fixed::FromInt(3), Fixed::Zero(), Fixed::Zero());
+        for (int i = 0; i < 20000 && holds && arrow && ledger; ++i)
+        {
+            const Fixed k_before = a.KineticEnergy() + b.KineticEnergy();
+            bool impulse = false;
+            const int op = static_cast<int>(next() % 7);
+            switch (op)
+            {
+            case 0: a.Impulse(unit(), unit(), unit(), pos(5.0)); impulse = true; break;
+            case 1: a.Dissipate(pos(1.2)); break;
+            case 2: { OrderVector e = a.EmitEvent(a.EmissionOver(pos(0.5), pos(2.0)), pos(0.5)); b.Absorb(e); break; }
+            case 3: a.RotateBy(unit(), unit(), unit(), unit()); break;
+            case 4: a.Advance(pos(0.1), Fixed::FromInt(2)); break;
+            case 5: b.Impulse(unit(), unit(), unit(), pos(5.0)); impulse = true; break;
+            case 6: {   // a contact: a toward b and b toward a, from the same instant
+                const Fixed nx = b.x - a.x, ny = b.y - a.y, nz = b.z - a.z;
+                OrderVector ab = a.CrossToward(nx, ny, nz, pos(0.1));
+                OrderVector ba = b.CrossToward(-nx, -ny, -nz, pos(0.1));
+                if (ab.energy.IsPositive()) { b.Absorb(ab); ++crossings; }
+                if (ba.energy.IsPositive()) { a.Absorb(ba); ++crossings; }
+                break; }
+            }
+            if (!a.Holds() || !b.Holds()) holds = false;
+            const Fixed k_after = a.KineticEnergy() + b.KineticEnergy();
+            if (!impulse && k_after.raw > k_before.raw + OrderVector::kSlackRaw)
+            {
+                if (arrow) std::printf("        (first rise at step %d, op %d: %.9f -> %.9f, E %.3f/%.3f, |O| %.9f/%.9f)\n", i, op, k_before.ToDouble(), k_after.ToDouble(), a.energy.ToDouble(), b.energy.ToDouble(), a.KineticFraction().ToDouble(), b.KineticFraction().ToDouble());
+                arrow = false;
+            }
+        }
+        check(holds,  "Holds() through 20,000 random operations on two points");
+        check(arrow,  "...and their ordered energy together never rose except through Impulse");
+        std::printf("        (%d contact crossings in the walk)\n", crossings);
+
+        // The ledger across a crossing, exactly: what leaves one lands in the other.
+        {
+            OrderVector p, q; p.id = 3; q.id = 4;
+            q.PlaceAt(Fixed::FromInt(2), Fixed::One(), Fixed::Zero());
+            p.Impulse(Fixed::One(), Fixed::Half(), Fixed::Zero(), Fixed::FromInt(7));
+            q.Impulse(Fixed::From(-0.3), Fixed::One(), Fixed::Zero(), Fixed::FromInt(5));
+            const Fixed before = p.energy + q.energy;
+            const Fixed k0 = p.KineticEnergy() + q.KineticEnergy();
+            OrderVector pq = p.CrossToward(q.x - p.x, q.y - p.y, q.z - p.z, Fixed::From(0.016));
+            OrderVector qp = q.CrossToward(p.x - q.x, p.y - q.y, p.z - q.z, Fixed::From(0.016));
+            q.Absorb(pq); p.Absorb(qp);
+            ledger = (p.energy + q.energy) == before;
+            check(ledger, "a contact moves energy exactly: the pair's total is unchanged to the bit");
+            check((p.KineticEnergy() + q.KineticEnergy()).raw <= k0.raw + OrderVector::kSlackRaw, "...and the pair's ordered energy did not rise");
+            check(pq.uncertainty != 0 && pq.uncertainty != qp.uncertainty, "each crossing carries its own uncertainty");
+        }
+
+        // Newton's cradle: head-on, equal masses, everything crosses.
+        {
+            OrderVector p, q; p.id = 5; q.id = 6;
+            q.PlaceAt(Fixed::FromInt(1), Fixed::Zero(), Fixed::Zero());
+            p.Impulse(Fixed::One(), Fixed::Zero(), Fixed::Zero(), Fixed::FromInt(10));
+            OrderVector e = p.CrossToward(Fixed::One(), Fixed::Zero(), Fixed::Zero(), Fixed::From(0.016));
+            q.Absorb(e);
+            cradle_ok = e.energy == Fixed::FromInt(10) && p.energy.IsZero() && q.KineticEnergy() == Fixed::FromInt(10) && q.ox.IsPositive();
+            check(cradle_ok, "head-on: the mover stops and the other carries all of it, along the line");
+            // Glancing at 45 degrees: half crosses, half stays, perpendicular.
+            OrderVector r, t; r.id = 7; t.id = 8;
+            t.PlaceAt(Fixed::FromInt(1), Fixed::Zero(), Fixed::Zero());
+            r.Impulse(Fixed::One(), Fixed::One(), Fixed::Zero(), Fixed::FromInt(8));
+            OrderVector g = r.CrossToward(Fixed::One(), Fixed::Zero(), Fixed::Zero(), Fixed::From(0.016));
+            check(close(g.energy.ToDouble(), 4.0, 1e-6) && close(r.KineticEnergy().ToDouble(), 4.0, 1e-6) && r.ox.IsZero() && r.oy.IsPositive(),
+                  "glancing at 45 degrees: half crosses along the line, half stays along the perpendicular");
+            OrderVector away = t.CrossToward(Fixed::One(), Fixed::Zero(), Fixed::Zero(), Fixed::From(0.016));
+            check(away.energy.IsZero(), "a body at rest, or moving away, hands over nothing");
+        }
+
+        // The last quantum leaves whole: a cooling body reaches exactly no heat.
+        {
+            OrderVector c; c.id = 9;
+            c.Absorb(Fixed::From(0.001));
+            const Fixed share = OrderVector::EmissionShare(Fixed::From(0.016), Fixed::Half());
+            int steps = 0;
+            while (c.Heat().IsPositive() && steps < 100000) { c.CommitShare(share, Fixed::From(0.016)); ++steps; }
+            check(c.Heat().IsZero() && steps < 100000, "committing a share of a shrinking heat ends at exactly zero, not a residual");
+        }
+    }
+
     std::printf("\n-- determinism ------------------------------------------------------\n");
     {
         auto run = [](OrderVector& p) {
-            p.rid = 42;
+            p.id = 42;
             for (int i = 0; i < 500; ++i)
             {
                 p.Impulse(Fixed::From(std::sin(i * 0.31)), Fixed::From(0.2), Fixed::From(std::cos(i * 0.17)), Fixed::From(1.0 + (i % 5)));

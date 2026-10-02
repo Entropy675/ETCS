@@ -269,8 +269,31 @@ struct Fixed
     Fixed Sin() const { Fixed s, c; SinCos(s, c); return s; }
     Fixed Cos() const { Fixed s, c; SinCos(s, c); return c; }
 
-    // The length of a three-vector, once, where every reader here wants it.
-    static Fixed Length(Fixed x, Fixed y, Fixed z) { return (x * x + y * y + z * z).Sqrt(); }
+    /*
+     * The length of a three-vector, once, where every reader here wants it.
+     *
+     * THE SQUARES ARE TAKEN AT A SCALE THAT KEEPS THEIR BITS. Squared as
+     * they come, a component below 2^-16 has no square at all in Q32.32 (it
+     * is the last bits of a kinetic vector of a nearly cooled body, and the
+     * root of nothing read its ordered energy as 2^-16 -- |O| over 1 by a
+     * part in 250), and one above 2^15 overflows the sum. So the largest
+     * component is brought to [2^12, 2^13) by a shift, which is exact, the
+     * root is taken there, and shifted back. Every magnitude reads to the
+     * last bit; a vector longer than 2^14 loses the bits the shift drops,
+     * where it did not read at all before.
+     */
+    static Fixed Length(Fixed x, Fixed y, Fixed z)
+    {
+        const uint64_t ax = mag(x.raw), ay = mag(y.raw), az = mag(z.raw);
+        const uint64_t m  = ax > ay ? (ax > az ? ax : az) : (ay > az ? ay : az);
+        if (m == 0) return Zero();
+        const int bits = 64 - __builtin_clzll(m);
+        const int k    = 45 - bits;                       // m << k lands in [2^44, 2^45) raw
+        auto scaled = [k](uint64_t a) { return FromRaw(static_cast<int64_t>(k >= 0 ? a << k : a >> -k)); };   // magnitudes: the squares do not care
+        const Fixed sx = scaled(ax), sy = scaled(ay), sz = scaled(az);
+        const Fixed r  = (sx * sx + sy * sy + sz * sz).Sqrt();
+        return FromRaw(k >= 0 ? r.raw >> k : r.raw << -k);
+    }
 };
 
 // The rows of a causal record, mixed into one number: a splitmix finaliser
