@@ -301,6 +301,14 @@ int main()
         constexpr uint32_t DEPTH = 20000;
         auto t0 = std::chrono::steady_clock::now();
         auto ms = [&t0]() { const auto now = std::chrono::steady_clock::now(); const double v = std::chrono::duration<double, std::milli>(now - t0).count(); t0 = now; return v; };
+        // The same count attached flat first: what an attach costs by itself
+        // (the loader stream's round trip, mostly), so the chain's line below
+        // reads as the price of depth and not of attaching.
+        Node* flat = arena.allocate<Node>();
+        for (uint32_t i = 0; i < DEPTH; ++i) flat->addTag<Node>();
+        std::printf("        (attached %u flat in %.0f ms)\n", DEPTH, ms());
+        arena.deleteEntity(flat, true);
+        std::printf("        (cascade-deleted %u flat in %.0f ms)\n", DEPTH, ms());
         Node* root = arena.allocate<Node>();
         Node* tip  = root;
         for (uint32_t i = 0; i < DEPTH; ++i) tip = tip->addTag<Node>();
@@ -327,8 +335,11 @@ int main()
         // over an explicit stack (MemoryArena::cascade), so a branch this
         // deep goes without a frame per level -- a depth that overflowed
         // the recursive teardown before. (Forty thousand ran too: 0.9 s to
-        // delete; what bounds this tester is the BUILD, since every attach
-        // bumps every ancestor's hash epoch -- a chain's quadratic.)
+        // delete; what bounds this tester is the BUILD: every attach climbs
+        // to the root twice -- the epoch-and-observer mark on the loader's
+        // thread, the provenance anchor on the caller's -- and over a chain
+        // each level is a cache miss, ~130 ns per level per attach. The
+        // flat line above is the same count with nothing to climb.)
         (void)ms();
         arena.deleteEntity(root, true);
         std::printf("        (cascade-deleted %u levels in %.0f ms)\n", DEPTH, ms());

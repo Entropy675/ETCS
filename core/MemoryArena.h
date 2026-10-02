@@ -86,6 +86,14 @@ bool etcs_retire_entity(Entity* e);
 // of N.
 inline thread_local int etcs_cascade_depth = 0;
 
+// The entity whose record destructor is running on this thread, if any
+// (MemoryArena::runRecordDtor): its record is already out of the chain, or
+// in a chain the loop running it is about to drop, so a search for it from
+// its own ~Entity (forget) can only come back empty -- and it was a walk of
+// every live sibling per delete. Set while the object is still whole, since
+// a record's own pointer is not comparable with an Entity* once it is not.
+inline thread_local Entity* etcs_destructing_entity = nullptr;
+
 /*
  * NO DESTRUCTIBLE STATIC IN HERE, and that is a hard requirement rather than
  * a style preference -- this function is called from memoryTeardown(), which
@@ -352,7 +360,7 @@ private:
     {
         void*             ptr;
         void            (*dtor)(void*);
-        DestructorRecord* prev;
+        DestructorRecord* prev;                 // the older record, toward the tail
         Entity*         (*as_entity)(void*) = nullptr;
         // The full "properly delete this entity" logic -- election
         // search + promote/vacate for a global-scope entity (evoking
@@ -376,6 +384,9 @@ private:
         // Set when the record IS a nested arena, so a teardown can walk
         // into it instead of recursing through its destructor.
         MemoryArena*    (*as_arena)(void*) = nullptr;
+        // The newer record, toward the head: the tail's way up (see dtorTail_).
+        // Last, so the positional initialisation in registerDtorLocked holds.
+        DestructorRecord* next = nullptr;
     };
 
     // -------------------------------------------------------------------
@@ -595,7 +606,19 @@ private:
     long long           hugePageSize_;            // 0 if unavailable
     long long           chunkSize_;               // chunk granularity
     bool                useHugePages_;
-    DestructorRecord*   dtorHead_     = nullptr;
+    DestructorRecord*   dtorHead_     = nullptr;   // newest
+    /*
+     * BOTH ENDS, AND BOTH LINKS. The chain is a LIFO through `prev`, and
+     * the cascade takes it oldest-first (oldestEntity): reached by walking
+     * to the tail, that was a walk of every live sibling per delete, and
+     * reclaiming the oldest (unlinkRecord, from the head) was another --
+     * twenty thousand children under one node took 84 s to cascade, where a
+     * chain of twenty thousand took 0.4. The tail and `next` make each of
+     * those one read and one splice. `next` lives in the arena-side
+     * DestructorRecord, not in the record's ptr, so nothing an entity holds
+     * changed.
+     */
+    DestructorRecord*   dtorTail_     = nullptr;   // oldest
     bool                isTeardown_   = false;
     bool                pagesReleased_ = false;   // releasePages ran (memoryTeardown runs it once)
 
@@ -877,7 +900,9 @@ private:
             ETCS_ARENA_DEBUG_LOG("MemoryArena", "registerDtorLocked: [" << scope_tag_
                      << "] free-list MISS for DestructorRecord -- bump-allocating fresh, mem=" << recMem);
         }
-        dtorHead_ = new (recMem) DestructorRecord{ptr, dtor, dtorHead_, as_entity, run_entity_delete, as_arena};
+        DestructorRecord* rec = new (recMem) DestructorRecord{ptr, dtor, dtorHead_, as_entity, run_entity_delete, as_arena};
+        if (dtorHead_) dtorHead_->next = rec; else dtorTail_ = rec;
+        dtorHead_ = rec;
     }
 
     // Chunk granularity: huge page size if available, else OS page size,
@@ -1405,6 +1430,14 @@ public:
         }
     }
  
+    // Out of the chain, both links, either end. Under allocationMutex_.
+    void spliceOut(DestructorRecord* rec)
+    {
+        if (rec->next) rec->next->prev = rec->prev; else dtorHead_ = rec->prev;
+        if (rec->prev) rec->prev->next = rec->next; else dtorTail_ = rec->next;
+        rec->next = nullptr;
+    }
+
     // Entity*-aware overload: compares via the stored as_entity
     // conversion, never the raw record pointer. Required for correctness
     // under virtual inheritance — several ontology leaf types inherit
@@ -1417,20 +1450,19 @@ public:
     // callers (Module*, MemoryArena*), which are never polymorphic.
     DestructorRecord* unlinkRecord(Entity* target)
     {
+        if (target && target == etcs_destructing_entity) return nullptr;   // see etcs_destructing_entity
         ::std::lock_guard<::std::mutex> lock(allocationMutex_);
         if (isTeardown_) return nullptr;
-        DestructorRecord* prevRec = nullptr;
-        DestructorRecord* cur = dtorHead_;
+        // From the tail: a cascade reclaims the oldest, which is the tail.
+        DestructorRecord* cur = dtorTail_;
         while (cur)
         {
             if (cur->as_entity && cur->as_entity(cur->ptr) == target)
             {
-                if (prevRec) prevRec->prev = cur->prev;
-                else         dtorHead_    = cur->prev;
+                spliceOut(cur);
                 return cur;
             }
-            prevRec = cur;
-            cur = cur->prev;
+            cur = cur->next;
         }
         return nullptr;
     }
@@ -1439,18 +1471,15 @@ public:
     {
         ::std::lock_guard<::std::mutex> lock(allocationMutex_);
         if (isTeardown_) return nullptr;
-        DestructorRecord* prevRec = nullptr;
-        DestructorRecord* cur = dtorHead_;
+        DestructorRecord* cur = dtorTail_;
         while (cur)
         {
             if (cur->ptr == target)
             {
-                if (prevRec) prevRec->prev = cur->prev;
-                else         dtorHead_    = cur->prev;
+                spliceOut(cur);
                 return cur;
             }
-            prevRec = cur;
-            cur = cur->prev;
+            cur = cur->next;
         }
         return nullptr;
     }
@@ -1608,8 +1637,12 @@ public:
     static void runRecordDtor(DestructorRecord* rec)
     {
         if (!rec) return;
-        if (rec->as_entity) etcs_retire_entity(rec->as_entity(rec->ptr));
+        Entity* e = rec->as_entity ? rec->as_entity(rec->ptr) : nullptr;
+        if (e) etcs_retire_entity(e);
+        Entity* const outer = etcs_destructing_entity;   // a destructor may run another record's
+        etcs_destructing_entity = e;
         rec->dtor(rec->ptr);
+        etcs_destructing_entity = outer;
     }
 
     // deleteEntity — THE entry point for properly deleting an arena-
@@ -1669,7 +1702,7 @@ public:
  *
  * Oldest first, and deterministic. dtorHead_ is a LIFO stack, so taking the
  * head would destroy siblings newest-first -- an order nothing chose and
- * nothing can rely on. Walking to the tail destroys them in the order they
+ * nothing can rely on. The tail (dtorTail_) destroys them in the order they
  * were attached, which is what "first in, first out" says and what a reader
  * of the script that spawned them expects.
  *
@@ -1697,12 +1730,13 @@ private:
     {
         ::std::lock_guard<::std::mutex> lock(allocationMutex_);
         callback = nullptr; rawPtr = nullptr; to_entity = nullptr;
-        for (DestructorRecord* rec = dtorHead_; rec; rec = rec->prev)
+        for (DestructorRecord* rec = dtorTail_; rec; rec = rec->next)   // oldest first
             if (rec->as_entity && rec->run_entity_delete)
             {
-                callback  = rec->run_entity_delete;  // keep walking:
-                rawPtr    = rec->ptr;                // the tail is the
-                to_entity = rec->as_entity;          // oldest record
+                callback  = rec->run_entity_delete;
+                rawPtr    = rec->ptr;
+                to_entity = rec->as_entity;
+                break;
             }
         return callback != nullptr;
     }
@@ -1822,7 +1856,7 @@ public:
  
         DestructorRecord* rec = dtorHead_;
         while (rec) { runRecordDtor(rec); rec = rec->prev; }
-        dtorHead_ = nullptr;
+        dtorHead_ = dtorTail_ = nullptr;
     }
  
     void reset()
@@ -1832,7 +1866,7 @@ public:
             ::std::lock_guard<::std::mutex> lock(allocationMutex_);
             if (isTeardown_) return;
             rec = dtorHead_;
-            dtorHead_ = nullptr;
+            dtorHead_ = dtorTail_ = nullptr;
         }
  
         // Runs UNLOCKED -- see allocate<T>()'s own "constructor runs
@@ -1939,7 +1973,7 @@ public:
         if (isTeardown_) return nullptr;
         isTeardown_ = true;
         DestructorRecord* rec = dtorHead_;
-        dtorHead_ = nullptr;
+        dtorHead_ = dtorTail_ = nullptr;
         return rec;
     }
 

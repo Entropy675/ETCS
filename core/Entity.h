@@ -311,6 +311,18 @@ private:
  */
     ArenaMap<ETCS::Buffer, void*>       interface_pointers_;
     /*
+ * THE TWO FAMILIES THE MARK WALK ASKS EVERY ANCESTOR ABOUT, kept as plain
+ * pointers beside the map. markStateChange climbs to the root on every
+ * state transition, and asked each level the map (a lock and a string-keyed
+ * find) whether it was Observable -- which made an attach into a chain of
+ * N cost N such lookups, and a chain of 20,000 take a minute to build. The
+ * map is written once per family at construction (ETCS_MAKE_INSTANCE), so
+ * these two are set at the same moment and never move: the walk is an
+ * atomic increment and a pointer read per level, as its comment promises.
+ */
+    void*                               observable_wire_ = nullptr;   // the IWireObservable half, if composed
+    bool                                is_orderable_    = false;
+    /*
  * Typed children - addTag<T>(tag, ...). One RIDList<T*> per distinct
  * tag string, type-erased via RIDListHandle so a single map can hold
  * heterogeneous T's. Lives in local_arena_, so it's torn down with the
@@ -686,7 +698,10 @@ public:
  * Idempotent by construction: forget() on an already-unlinked record
  * returns false and does nothing, so the reclaim paths (which unlink
  * via unlinkRecord before ever running ~T()) are unaffected -- they
- * simply find nothing left to remove.
+ * simply find nothing left to remove. And find it without looking: the
+ * arena names the entity whose record it is destroying
+ * (etcs_destructing_entity, MemoryArena.h), so this is one compare on
+ * those paths rather than a walk of every sibling's record.
  */
         if (parent_ != nullptr && owning_arena_ != nullptr)
             owning_arena_->forget(this);
@@ -1708,6 +1723,8 @@ public:
     {
         ::std::lock_guard<::std::mutex> lock(m_tagMutex);
         interface_pointers_[family] = ptr;
+        if (family == ETCS::Buffer("Observable")) observable_wire_ = ptr;
+        if (family == ETCS::Buffer("Orderable"))  is_orderable_    = ptr != nullptr;
     }
     void* getInterfacePointer(const ETCS::Buffer& family) const
     {
@@ -1715,6 +1732,9 @@ public:
         auto it = interface_pointers_.find(family);
         return it != interface_pointers_.end() ? it->second : nullptr;
     }
+    // getInterfacePointer("Observable"), without the lock or the lookup: what
+    // the mark walks ask of every ancestor (see observable_wire_).
+    void* observableWire() const { return observable_wire_; }
     /*
  * The families this entity actually fulfills. Read off
  * interface_pointers_ rather than the tags map on purpose: this map is
@@ -2770,16 +2790,16 @@ private:
  * what changed, and MarkObserved excludes only the edge whose observer IS the
  * origin -- which is how a node's own write stays out of its own self-edge.
  *
- * Nearest claimant only, then stop: MarkObserved bubbles upward itself
- * (ontology/ObservableBase.h), so walking past the first one would mark the
- * ancestors twice.
+ * Every Observable ancestor, one hop each (ontology/ObservableBase.h,
+ * MarkObservedHop): the same statement MarkObserved would make by climbing
+ * from the nearest claimant, made from this climb instead.
  *
  * isDestructed stops the walk rather than skipping the link -- past a
  * half-destroyed ancestor there is nothing trustworthy left to climb. Only
  * reachable under arena teardown, which is the one context tag modification
  * never sees.
  *
- * Callers hold no lock here. MarkObserved takes its own and walks parents.
+ * Callers hold no lock here.
  */
     /*
  * AND THE ONE PLACE A STATE CHANGE BECOMES A STALE HASH. The two walks differ
@@ -2800,22 +2820,24 @@ public:
  * never sorts: a burst of changes costs one rebuild, at the next ordered read.
  * `from` only -- an ancestor's subtree moved, not its key.
  */
-        if (from && !from->isDestructed()
-            && from->getInterfacePointer(ETCS::Buffer("Orderable")))
+        if (from && !from->isDestructed() && from->is_orderable_)
             if (Entity* p = from->getParent(); p && !p->isDestructed())
                 p->reorderTypedChild(from->getRID());
 
-        bool told = false;
-        const ETCS::Buffer family("Observable");
+        // ONE CLIMB. The Observable statement hops through every Observable
+        // ancestor (ObservableBase::MarkObservedHop: its own edges, and
+        // whether the statement travels on -- a batch in progress holds it),
+        // which is the same path this walk takes for the epochs; made here,
+        // level by level, rather than handed to the nearest claimant to
+        // climb again. Over a deep tree each climb is a cache miss per
+        // level, and this was two of them.
+        bool travels = true;
         for (Entity* n = from; n; n = n->getParent())
         {
             if (n->isDestructed()) return;
             n->hash_epoch_.fetch_add(1, ::std::memory_order_acq_rel);
-            if (told) continue;
-            void* p = n->getInterfacePointer(family);
-            if (!p) continue;
-            static_cast<ETCS::IWireObservable*>(p)->MarkObserved(origin);
-            told = true;
+            if (travels && n->observable_wire_)
+                travels = static_cast<ETCS::IWireObservable*>(n->observable_wire_)->MarkObservedHop(origin);
         }
     }
 private:

@@ -88,12 +88,13 @@ public:
 };
 
 // This entity's Observable half, or null if it never claimed the family.
-// Reached by family name like every other cross-family hop -- a caller holding
-// a Pixels_* or a Resizable_* has no static route to it, by design.
+// A cross-family hop like any other -- a caller holding a Pixels_* or a
+// Resizable_* has no static route to it, by design -- answered from the one
+// pointer Entity keeps for this family (observableWire) rather than the map.
 inline ETCS::IWireObservable* etcs_observable_of(ETCS::Entity* e)
 {
     if (!e) return nullptr;
-    void* p = e->getInterfacePointer(ETCS::Buffer("Observable"));
+    void* p = e->observableWire();
     return p ? static_cast<ETCS::IWireObservable*>(p) : nullptr;
 }
 
