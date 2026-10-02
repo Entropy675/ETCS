@@ -361,6 +361,29 @@ int main()
         bool same = a.size() == b.size();
         for (size_t i = 0; same && i < a.size(); ++i) same = (a[i].first == b[i].first);
         check(same && parent->getHash() == twin->getHash(), "the same tree built twice reads and hashes the same");
+
+        // Members leaving keep the survivors' order, through the tombstones
+        // and across the compaction that follows once most have gone
+        // (RIDList::forget_arrival); one arriving after that goes last.
+        std::vector<ETCS::RID> expect = made;
+        const ETCS::Buffer node_tag = a.front().first;
+        auto leave = [&](size_t i) {
+            ETCS::EntityUnloadEvent{parent->getTypedChild(node_tag, expect[i])}();
+            ETCS::PendingUnloadRegistry::getInstance().join_all();
+            expect.erase(expect.begin() + i);
+        };
+        leave(3); leave(0); leave(expect.size() - 1);           // three tombstones
+        for (int i = 0; i < 12; ++i) leave(1);                    // past the half: compacted
+        expect.push_back(parent->addTag<Node>()->getRID());
+        kids.clear(); seen.clear();
+        parent->getOrderedTypedChildren(kids);
+        for (auto const& k : kids) seen.push_back(k.second);
+        check(seen == expect, "members leaving keep the survivors' order; a late arrival goes last");
+        kids.clear(); seen.clear();
+        parent->getTypedChildren(kids);
+        for (auto const& k : kids) seen.push_back(k.second);
+        check(seen == expect, "...on the plain read as well");
+
         arena.deleteEntity(parent, true);
         arena.deleteEntity(twin, true);
     }

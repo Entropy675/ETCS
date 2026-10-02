@@ -206,7 +206,7 @@ struct RIDList {
     MapType entities;
 
     /*
-     * WHEN EACH MEMBER ARRIVED, and the one order every read of this list
+     * THE ORDER THEY ARRIVED IN, and the one order every read of this list
      * starts from. `entities` is a hash map, and a hash map's walk order is
      * the hash function's and the bucket count's -- the standard library's
      * business, not the program's, and libstdc++ and libc++ do not agree. A
@@ -214,19 +214,30 @@ struct RIDList {
      * "the order they already had", was handing the runtime an order that
      * could differ between a native build and a browser for the same script:
      * siblings a Causal container interacts in turn, members whose RIDs feed a
-     * hash. The arrival number is the program's own fact -- the order the
-     * script attached them -- and it is total, so every enumeration below is
-     * a function of what was inserted and in what order, nothing else.
+     * hash. Arrival is the program's own fact -- the order the script attached
+     * them -- and it is total, so every enumeration below is a function of
+     * what was inserted and in what order, nothing else.
+     *
+     * KEPT AS THE SEQUENCE ITSELF: `arrival_` is the RIDs in the order they
+     * came, so a read is one walk of a vector -- not a sort of (number, RID)
+     * pairs, which made every plain read n log n for an order that was
+     * already known. A remove leaves a tombstone (RID 0, the null RID
+     * everywhere here) rather than closing the gap, so it is O(1) through
+     * `slot_`; the walk skips tombstones, and once the dead outnumber the
+     * live the sequence is compacted in place. Arena-allocated like the map
+     * and never shrunk, for the same reason `ordered_` is not.
      */
-    using SeqMap = ::std::unordered_map<
+    using OrderVec = ::std::vector<RID, ArenaAllocator<RID>>;
+    using SlotMap  = ::std::unordered_map<
         RID,
-        uint64_t,
+        size_t,
         ::std::hash<RID>,
         ::std::equal_to<RID>,
-        ArenaAllocator<::std::pair<const RID, uint64_t>>
+        ArenaAllocator<::std::pair<const RID, size_t>>
     >;
-    SeqMap   arrived_;
-    uint64_t next_arrival_ = 0;
+    OrderVec arrival_;      // RIDs in arrival order; 0 where one has left
+    SlotMap  slot_;         // RID -> its index in arrival_
+    size_t   dead_ = 0;     // tombstones in arrival_
 
     /*
  * THE ORDERED VIEW -- a cache, and everything about it follows from that.
@@ -253,7 +264,6 @@ struct RIDList {
  * matters, because a bump arena does not reclaim, and a view that
  * reallocated on every rebuild would grow the arena forever.
  */
-    using OrderVec = ::std::vector<RID, ArenaAllocator<RID>>;
     mutable OrderVec ordered_;
     mutable OrderVec scratch_;      // the merge's other half, kept like ordered_
     mutable bool     ordered_stale_ = true;
@@ -261,7 +271,8 @@ struct RIDList {
     // Initialize the map with the singleton arena
     RIDList()
         : entities(ArenaAllocator<::std::pair<const RID, T>>(&MemoryArena::getInstance()))
-        , arrived_(ArenaAllocator<::std::pair<const RID, uint64_t>>(&MemoryArena::getInstance()))
+        , arrival_(ArenaAllocator<RID>(&MemoryArena::getInstance()))
+        , slot_(ArenaAllocator<::std::pair<const RID, size_t>>(&MemoryArena::getInstance()))
         , ordered_(ArenaAllocator<RID>(&MemoryArena::getInstance()))
         , scratch_(ArenaAllocator<RID>(&MemoryArena::getInstance())) {}
     // Entity-local variant — used by Entity::addTag<T> so typed children are
@@ -269,31 +280,45 @@ struct RIDList {
     // singleton, and get torn down with it.
     explicit RIDList(MemoryArena& arena)
         : entities(ArenaAllocator<::std::pair<const RID, T>>(&arena))
-        , arrived_(ArenaAllocator<::std::pair<const RID, uint64_t>>(&arena))
+        , arrival_(ArenaAllocator<RID>(&arena))
+        , slot_(ArenaAllocator<::std::pair<const RID, size_t>>(&arena))
         , ordered_(ArenaAllocator<RID>(&arena))
         , scratch_(ArenaAllocator<RID>(&arena)) {}
     void insert(RID rid, T entity) {
         entities[rid] = entity;
-        arrived_.try_emplace(rid, next_arrival_++);   // a re-insert keeps its place
+        if (slot_.try_emplace(rid, arrival_.size()).second)   // a re-insert keeps its place
+            arrival_.push_back(rid);
         ordered_stale_ = true;
     }
     void remove(RID rid) {
         entities.erase(rid);
-        arrived_.erase(rid);
+        forget_arrival(rid);
         ordered_stale_ = true;
     }
 
     // The members in arrival order: the enumeration every read starts from.
-    void collect_arrived(::std::vector<RID>& out) const {
-        ::std::vector<::std::pair<uint64_t, RID>> by_arrival;
-        by_arrival.reserve(entities.size());
-        for (auto const& kv : entities) {
-            auto a = arrived_.find(kv.first);
-            by_arrival.emplace_back(a != arrived_.end() ? a->second : ~uint64_t(0), kv.first);
-        }
-        ::std::sort(by_arrival.begin(), by_arrival.end());
-        for (auto const& [seq, rid] : by_arrival) out.push_back(rid);
+    template<typename Out>
+    void collect_arrived(Out& out) const {
+        for (RID r : arrival_) if (r != 0) out.push_back(r);
     }
+
+private:
+    // Leave a tombstone where rid stood; close the gaps once they are most
+    // of the sequence. A RID not in the sequence (never inserted through
+    // insert) is nothing to forget.
+    void forget_arrival(RID rid) {
+        auto s = slot_.find(rid);
+        if (s == slot_.end()) return;
+        arrival_[s->second] = 0;
+        slot_.erase(s);
+        if (++dead_ > slot_.size()) {
+            size_t live = 0;
+            for (RID r : arrival_) if (r != 0) { slot_[r] = live; arrival_[live++] = r; }
+            arrival_.resize(live);
+            dead_ = 0;
+        }
+    }
+public:
 
     // The explicit seam. Marks, never sorts -- a burst of reorders before
     // one ordered read costs exactly one rebuild.
@@ -303,7 +328,7 @@ struct RIDList {
  * Ordered enumeration. The relation is the pointee's own operator<, so a
  * list of BoxNode* orders by what BoxNode means by less-than, and a list
  * whose pointee declares nothing gets its entries in the order they
- * arrived (arrived_) -- a defined order, since the map's own is nobody's.
+ * arrived (arrival_) -- a defined order, since the map's own is nobody's.
  *
  * stable_sort, so entries the relation calls equivalent keep the order
  * they already had instead of permuting between rebuilds for no reason.
@@ -333,11 +358,7 @@ struct RIDList {
                 // equivalent members is the order the script attached them.
                 ordered_.clear();
                 ordered_.reserve(entities.size());
-                {
-                    ::std::vector<RID> arrived;
-                    collect_arrived(arrived);
-                    ordered_.insert(ordered_.end(), arrived.begin(), arrived.end());
-                }
+                collect_arrived(ordered_);
                 auto less = [this](RID a, RID b) {
                     T ea = get_typed(a);
                     T eb = get_typed(b);
@@ -463,7 +484,7 @@ struct RIDList {
             h.remove = [](void* self, RID r) -> bool {
                 auto* list = static_cast<RIDList<T>*>(self);
                 const bool erased = list->entities.erase(r) > 0;
-                list->arrived_.erase(r);
+                list->forget_arrival(r);
                 // The erased path is a seam too -- destroyImpl pulls RIDs out
                 // through this slot, not through remove() above.
                 if (erased) list->reorder();
