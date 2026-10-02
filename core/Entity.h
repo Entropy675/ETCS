@@ -1254,8 +1254,15 @@ public:
         {   // both locks end before the mark below, which takes them again
         ::std::lock_guard<::std::mutex> self_lock(m_tagMutex);
         ::std::lock_guard<::std::mutex> dest_lock(newParent->m_tagMutex);
-        for (auto& [tag, handle] : typed_children_)
+        // In THIS entity's first-seen tag order, not the map's: a tag new to
+        // newParent is appended to its typed_child_order_ as it is met here,
+        // and that order is state (computeNodeHash composes children by it),
+        // so it has to be the program's order and not a hash map's walk.
+        for (const ETCS::Buffer& tag : typed_child_order_)
         {
+            auto handle_it = typed_children_.find(tag);
+            if (handle_it == typed_children_.end()) continue;
+            RIDListHandle& handle = handle_it->second;
             /*
  * Snapshot first. invoke_remove below erases from the very map
  * a live iterator would be walking, so the RIDs have to be

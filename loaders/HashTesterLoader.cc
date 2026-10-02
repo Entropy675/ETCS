@@ -337,6 +337,34 @@ int main()
         arena.deleteEntity(again, true);
     }
 
+    // -- 10. ties are the attach order, not the map's ----------------------------
+    {
+        std::cout << "\n-- 10. equal keys keep the order they arrived in --\n";
+        Node* parent = arena.allocate<Node>();
+        std::vector<ETCS::RID> made;
+        for (int i = 0; i < 24; ++i) made.push_back(parent->addTag<Node>()->getRID());   // all compare equal
+        std::vector<std::pair<ETCS::Buffer, ETCS::RID>> kids;
+        parent->getOrderedTypedChildren(kids);
+        std::vector<ETCS::RID> seen;
+        for (auto const& k : kids) seen.push_back(k.second);
+        check(seen == made, "an ordered read of equivalent children is the attach order");
+        kids.clear(); seen.clear();
+        parent->getTypedChildren(kids);
+        for (auto const& k : kids) seen.push_back(k.second);
+        check(seen == made, "...and so is the plain read: the hash map's walk is nobody's order");
+        // Build the same tree again and the ordered reads agree child for
+        // child -- what a native run and a browser run of one script see.
+        Node* twin = arena.allocate<Node>();
+        for (int i = 0; i < 24; ++i) twin->addTag<Node>();
+        std::vector<std::pair<ETCS::Buffer, ETCS::RID>> a, b;
+        parent->getOrderedTypedChildren(a); twin->getOrderedTypedChildren(b);
+        bool same = a.size() == b.size();
+        for (size_t i = 0; same && i < a.size(); ++i) same = (a[i].first == b[i].first);
+        check(same && parent->getHash() == twin->getHash(), "the same tree built twice reads and hashes the same");
+        arena.deleteEntity(parent, true);
+        arena.deleteEntity(twin, true);
+    }
+
     std::printf("\n%s (%d failure%s)\n", g_fail ? "FAILED" : "PASSED",
                 g_fail, g_fail == 1 ? "" : "s");
     return g_fail ? 1 : 0;

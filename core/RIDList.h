@@ -206,6 +206,29 @@ struct RIDList {
     MapType entities;
 
     /*
+     * WHEN EACH MEMBER ARRIVED, and the one order every read of this list
+     * starts from. `entities` is a hash map, and a hash map's walk order is
+     * the hash function's and the bucket count's -- the standard library's
+     * business, not the program's, and libstdc++ and libc++ do not agree. A
+     * read that enumerated it directly, or sorted from it and let ties keep
+     * "the order they already had", was handing the runtime an order that
+     * could differ between a native build and a browser for the same script:
+     * siblings a Causal container interacts in turn, members whose RIDs feed a
+     * hash. The arrival number is the program's own fact -- the order the
+     * script attached them -- and it is total, so every enumeration below is
+     * a function of what was inserted and in what order, nothing else.
+     */
+    using SeqMap = ::std::unordered_map<
+        RID,
+        uint64_t,
+        ::std::hash<RID>,
+        ::std::equal_to<RID>,
+        ArenaAllocator<::std::pair<const RID, uint64_t>>
+    >;
+    SeqMap   arrived_;
+    uint64_t next_arrival_ = 0;
+
+    /*
  * THE ORDERED VIEW -- a cache, and everything about it follows from that.
  *
  * Rebuilt on read, only when stale. A tree that is drawn every frame and
@@ -238,6 +261,7 @@ struct RIDList {
     // Initialize the map with the singleton arena
     RIDList()
         : entities(ArenaAllocator<::std::pair<const RID, T>>(&MemoryArena::getInstance()))
+        , arrived_(ArenaAllocator<::std::pair<const RID, uint64_t>>(&MemoryArena::getInstance()))
         , ordered_(ArenaAllocator<RID>(&MemoryArena::getInstance()))
         , scratch_(ArenaAllocator<RID>(&MemoryArena::getInstance())) {}
     // Entity-local variant — used by Entity::addTag<T> so typed children are
@@ -245,15 +269,30 @@ struct RIDList {
     // singleton, and get torn down with it.
     explicit RIDList(MemoryArena& arena)
         : entities(ArenaAllocator<::std::pair<const RID, T>>(&arena))
+        , arrived_(ArenaAllocator<::std::pair<const RID, uint64_t>>(&arena))
         , ordered_(ArenaAllocator<RID>(&arena))
         , scratch_(ArenaAllocator<RID>(&arena)) {}
     void insert(RID rid, T entity) {
         entities[rid] = entity;
+        arrived_.try_emplace(rid, next_arrival_++);   // a re-insert keeps its place
         ordered_stale_ = true;
     }
     void remove(RID rid) {
         entities.erase(rid);
+        arrived_.erase(rid);
         ordered_stale_ = true;
+    }
+
+    // The members in arrival order: the enumeration every read starts from.
+    void collect_arrived(::std::vector<RID>& out) const {
+        ::std::vector<::std::pair<uint64_t, RID>> by_arrival;
+        by_arrival.reserve(entities.size());
+        for (auto const& kv : entities) {
+            auto a = arrived_.find(kv.first);
+            by_arrival.emplace_back(a != arrived_.end() ? a->second : ~uint64_t(0), kv.first);
+        }
+        ::std::sort(by_arrival.begin(), by_arrival.end());
+        for (auto const& [seq, rid] : by_arrival) out.push_back(rid);
     }
 
     // The explicit seam. Marks, never sorts -- a burst of reorders before
@@ -263,9 +302,8 @@ struct RIDList {
     /*
  * Ordered enumeration. The relation is the pointee's own operator<, so a
  * list of BoxNode* orders by what BoxNode means by less-than, and a list
- * whose pointee declares nothing gets its entries in whatever order the
- * map has -- honestly reported rather than refused, since "no defined
- * order" is the normal state for most lists here.
+ * whose pointee declares nothing gets its entries in the order they
+ * arrived (arrived_) -- a defined order, since the map's own is nobody's.
  *
  * stable_sort, so entries the relation calls equivalent keep the order
  * they already had instead of permuting between rebuilds for no reason.
@@ -291,9 +329,15 @@ struct RIDList {
     void collect_ordered(::std::vector<RID>& out) const {
         if constexpr (detail::has_ordered_pointee_v<T>) {
             if (ordered_stale_) {
+                // From arrival order, so what the stable sort keeps for
+                // equivalent members is the order the script attached them.
                 ordered_.clear();
                 ordered_.reserve(entities.size());
-                for (auto const& kv : entities) ordered_.push_back(kv.first);
+                {
+                    ::std::vector<RID> arrived;
+                    collect_arrived(arrived);
+                    ordered_.insert(ordered_.end(), arrived.begin(), arrived.end());
+                }
                 auto less = [this](RID a, RID b) {
                     T ea = get_typed(a);
                     T eb = get_typed(b);
@@ -317,7 +361,7 @@ struct RIDList {
             }
             out.insert(out.end(), ordered_.begin(), ordered_.end());
         } else {
-            for (auto const& kv : entities) out.push_back(kv.first);
+            collect_arrived(out);   // no relation: the order they arrived in
         }
     }
     /*
@@ -419,6 +463,7 @@ struct RIDList {
             h.remove = [](void* self, RID r) -> bool {
                 auto* list = static_cast<RIDList<T>*>(self);
                 const bool erased = list->entities.erase(r) > 0;
+                list->arrived_.erase(r);
                 // The erased path is a seam too -- destroyImpl pulls RIDs out
                 // through this slot, not through remove() above.
                 if (erased) list->reorder();
@@ -428,10 +473,7 @@ struct RIDList {
                 return static_cast<RIDList<T>*>(self)->get(r);
             };
             h.collect_rids = [](void* self, ::std::vector<RID>& out) {
-                auto* list = static_cast<RIDList<T>*>(self);
-                for (auto const& [rid, entity] : list->entities) {
-                    out.push_back(rid);
-                }
+                static_cast<RIDList<T>*>(self)->collect_arrived(out);
             };
             h.collect_rids_ordered = [](void* self, ::std::vector<RID>& out) {
                 static_cast<RIDList<T>*>(self)->collect_ordered(out);
