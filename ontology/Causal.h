@@ -4,6 +4,8 @@
 #include "../core_defs.h"
 #include "OrderVector.h"
 
+#include <mutex>
+
 /*
  * ── CAUSAL ───────────────────────────────────────────────────────────────
  *
@@ -57,6 +59,20 @@ public:
 
     // One interaction over `dt` seconds, here and below.
     virtual void Interact(Fixed dt) = 0;
+
+    /*
+     * THE TREE'S LOCK, AND THE HOP THAT RUNS UNDER IT. Every write to any
+     * rows in a tree of Causal entities is made under the one mutex its
+     * topmost Causal entity holds (CausalBase::TreeMutex): a driver stepping
+     * the world and a camera observing it take turns on the tree rather
+     * than interleaving inside a step, which would be a history nobody ran.
+     * Interact takes it; InteractUnder is the same interaction for a
+     * container that already holds it, walking its members -- one lock per
+     * tick of a tree, not one per member.
+     */
+    virtual ::std::recursive_mutex& TreeMutex() = 0;
+    virtual void InteractUnder(Fixed dt) = 0;
+    virtual void AbsorbUnder(const OrderVector& crossing) = 0;   // a member's crossing, from under the lock
 
     // Energy in, along a direction.
     virtual void Impulse(Fixed dx, Fixed dy, Fixed dz, Fixed joules) = 0;

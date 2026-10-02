@@ -1,6 +1,8 @@
 #ifndef BASE_Causal_H__
 #define BASE_Causal_H__
 #include "Causal.h"
+#include <memory>
+#include <mutex>
 #include <vector>
 
 /*
@@ -48,32 +50,66 @@ ETCS_SUPERTYPE_BASE(Causal)
     void Interact(Fixed dt) override final
     {
         if (!dt.IsPositive()) return;
-        CommitEntropy(dt);
+        ::std::lock_guard<::std::recursive_mutex> lk(TreeMutex());
+        InteractUnder(dt);
+    }
+
+    // The interaction, for a caller holding the tree's lock: commit, step,
+    // then the members through the same hop.
+    void InteractUnder(Fixed dt) override final
+    {
+        if (!dt.IsPositive()) return;
+        OrderVector e;
+        if (commitLocked(dt, e)) deliverLocked(e);
         static_cast<Derived*>(this)->StepConcrete(dt);
-        for (Causal_* c : causalChildren()) c->Interact(dt);
+        for (Causal_* c : *kidsLocked()) c->InteractUnder(dt);   // the tree lock is held: no copy out
+    }
+
+    /*
+     * ONE LOCK PER TREE. The mutex is the topmost Causal entity's; every
+     * public entry here (Interact, Run, CommitEntropy, Impulse, Absorb, the
+     * hash) takes it, and a leaf's own writers take it too (Scene3D's
+     * verbs and its observed step). Recursive, because a member's crossing
+     * is absorbed by its container inside the same interaction, and a leaf
+     * calls family verbs from under it. Found by walking the containers
+     * once per entry -- a Run of ten thousand ticks walks once.
+     */
+    ::std::recursive_mutex& TreeMutex() override final
+    {
+        Causal_* top = this;
+        for (Causal_* env = container(); env; env = containerOf(env)) top = env;
+        return top == this ? m_tree_mtx : top->TreeMutex();
     }
 
     // The driver: `ticks` interactions of `dt` each, no clock read. What a
     // headless run does instead of being looked at.
     void Run(uint32_t ticks, Fixed dt)
     {
-        for (uint32_t i = 0; i < ticks; ++i) Interact(dt);
+        if (!dt.IsPositive()) return;
+        ::std::lock_guard<::std::recursive_mutex> lk(TreeMutex());
+        for (uint32_t i = 0; i < ticks; ++i) InteractUnder(dt);
     }
 
     void Impulse(Fixed dx, Fixed dy, Fixed dz, Fixed joules) override final
     {
+        ::std::lock_guard<::std::recursive_mutex> lk(TreeMutex());
         m_ov.Impulse(dx, dy, dz, joules);
     }
 
-    void Absorb(const OrderVector& crossing) override final { m_ov.Absorb(crossing); }
+    void Absorb(const OrderVector& crossing) override final
+    {
+        ::std::lock_guard<::std::recursive_mutex> lk(TreeMutex());
+        m_ov.Absorb(crossing);
+    }
+    void AbsorbUnder(const OrderVector& crossing) override final { m_ov.Absorb(crossing); }
 
     uint64_t CausalTicks() const override final { return m_ticks; }
 
     uint64_t CausalHash() override final
     {
-        uint64_t h = m_ov.Hash();
-        h = fixed_mix(h, static_cast<int64_t>(m_ticks));
-        for (Causal_* c : causalChildren()) h = fixed_mix(h, static_cast<int64_t>(c->CausalHash()));
+        ::std::lock_guard<::std::recursive_mutex> lk(TreeMutex());   // a whole state, not one mid-step
+        uint64_t h = fixed_mix(m_ov.Hash(), static_cast<int64_t>(m_ticks));
+        for (Causal_* c : *kidsLocked()) h = fixed_mix(h, static_cast<int64_t>(c->CausalHash()));
         return h;
     }
 
@@ -101,19 +137,9 @@ ETCS_SUPERTYPE_BASE(Causal)
     void CommitEntropy(Fixed dt)
     {
         if (!dt.IsPositive()) return;
-        if (dt != m_share_dt || m_emissivity != m_share_k)
-        {
-            m_share_dt = dt; m_share_k = m_emissivity;
-            m_share = OrderVector::EmissionShare(dt, m_emissivity);
-        }
-        const OrderVector e = m_ov.CommitShare(m_share, dt);
-        if (!e.energy.IsPositive()) return;
-        m_last_emission  = e;
-        m_ov.interval    = e.interval;
-        m_ov.uncertainty = e.uncertainty;
-        ++m_ticks;
-        if (Causal_* env = container()) env->Absorb(e);
-        else                            m_emitted_out += e.energy;
+        ::std::lock_guard<::std::recursive_mutex> lk(TreeMutex());
+        OrderVector e;
+        if (commitLocked(dt, e)) deliverLocked(e);
     }
 
     /*
@@ -125,11 +151,23 @@ ETCS_SUPERTYPE_BASE(Causal)
      * and the walk was most of a tick. Same list, same order, as the walk
      * would give now.
      */
-    const ::std::vector<Causal_*>& causalChildren()
+    //
+    // A SNAPSHOT GOES OUT, shared: the walker iterates a list nobody will
+    // rebuild under it, and takes it with one reference count rather than a
+    // copy -- a copy per interaction was the cost of a tick.
+    ::std::shared_ptr<const ::std::vector<Causal_*>> causalChildren()
+    {
+        ::std::lock_guard<::std::recursive_mutex> lk(TreeMutex());
+        return kidsLocked();
+    }
+
+private:
+    // The list, for a caller holding the tree's lock.
+    const ::std::shared_ptr<const ::std::vector<Causal_*>>& kidsLocked()
     {
         const uint32_t epoch = this->hashEpoch();
-        if (m_kids_epoch == epoch) return m_kids;
-        m_kids.clear();
+        if (m_kids && m_kids_epoch == epoch) return m_kids;
+        auto fresh = ::std::make_shared<::std::vector<Causal_*>>();
         ::std::vector<::std::pair<ETCS::Buffer, ETCS::RID>> kids;
         this->getOrderedTypedChildren(kids);
         for (const auto& entry : kids)
@@ -137,23 +175,72 @@ ETCS_SUPERTYPE_BASE(Causal)
             ETCS::Entity* child = this->getTypedChild(entry.first, entry.second);
             if (!child) continue;
             if (void* c = child->getInterfacePointer(ETCS::Buffer("Causal")))
-                m_kids.push_back(static_cast<Causal_*>(c));
+                fresh->push_back(static_cast<Causal_*>(c));
         }
+        m_kids       = ::std::move(fresh);
         m_kids_epoch = epoch;
         return m_kids;
     }
 
-private:
+    // The emission owed for dt, taken out of the rows. Under the tree lock.
+    bool commitLocked(Fixed dt, OrderVector& e)
+    {
+        if (!dt.IsPositive()) return false;
+        if (dt != m_share_dt || m_emissivity != m_share_k)
+        {
+            m_share_dt = dt; m_share_k = m_emissivity;
+            m_share = OrderVector::EmissionShare(dt, m_emissivity);
+        }
+        e = m_ov.CommitShare(m_share, dt);
+        if (!e.energy.IsPositive()) return false;
+        m_last_emission  = e;
+        m_ov.interval    = e.interval;
+        m_ov.uncertainty = e.uncertainty;
+        ++m_ticks;
+        return true;
+    }
+
+    // The crossing, into the container's rows (the tree's lock is held) or
+    // counted out at the edge of the model.
+    void deliverLocked(const OrderVector& e)
+    {
+        if (Causal_* env = container()) env->AbsorbUnder(e);
+        else                            m_emitted_out += e.energy;
+    }
+
+    // The parent, while it is one. Under an arena teardown an ancestor has
+    // run ~Entity() before this entity's retire reaches it (the same stop
+    // Entity::markStateChange makes): a destructed parent has no Causal
+    // half to ask for -- its vtable is gone -- so it is the edge of the model.
+    static ETCS::Entity* liveParent(const ETCS::Entity* e)
+    {
+        ETCS::Entity* p = e->getParent();
+        return (p && !p->isDestructed()) ? p : nullptr;
+    }
+
+    static Causal_* containerOf(Causal_* c)
+    {
+        ETCS::Entity* p = liveParent(c);
+        if (!p) return nullptr;
+        void* raw = p->getInterfacePointer(ETCS::Buffer("Causal"));
+        return raw ? static_cast<Causal_*>(raw) : nullptr;
+    }
+
     // The parent's Causal half, looked up again only when the parent is a
     // different entity from last time.
+    // Keyed on the parent's RID as well as its address: an arena hands a
+    // dead entity's bytes to the next allocation of that size, so the same
+    // address can be a different entity -- never the same RID.
     Causal_* container()
     {
-        ETCS::Entity* p = this->getParent();
-        if (p != m_container_of)
+        ETCS::Entity* p = liveParent(this);
+        const ETCS::RID prid = p ? p->getRID() : 0;
+        if (p != m_container_of || prid != m_container_rid)
         {
-            m_container_of = p;
+            m_container_of  = p;
+            m_container_rid = prid;
             void* c = p ? p->getInterfacePointer(ETCS::Buffer("Causal")) : nullptr;
-            m_container    = c ? static_cast<Causal_*>(c) : nullptr;
+            m_container     = c ? static_cast<Causal_*>(c) : nullptr;
         }
         return m_container;
     }
@@ -163,12 +250,14 @@ private:
     Fixed       m_emissivity = Fixed::Half();
     Fixed       m_emitted_out;
     uint64_t    m_ticks = 0;
+    ::std::recursive_mutex m_tree_mtx;   // the tree's, when this is its top (TreeMutex)
 
     Fixed       m_share_dt, m_share_k, m_share;   // 1 - exp(-k dt) for the last (dt, k) seen
 
-    ::std::vector<Causal_*> m_kids;
+    ::std::shared_ptr<const ::std::vector<Causal_*>> m_kids;
     uint32_t                m_kids_epoch = 0;          // hash_epoch_ starts at 1: the first ask walks
     ETCS::Entity*           m_container_of = nullptr;
+    ETCS::RID               m_container_rid = 0;
     Causal_*                m_container    = nullptr;
 };
 
