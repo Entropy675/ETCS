@@ -29,7 +29,8 @@
  *   9. A move is its own action: an entity that changes parents
  *      (Entity::moveTo) is recorded as `<to>.Contain(@<it>)` whatever was
  *      running around it, a replay keeps the last move only, and its
- *      lifetime goes with it (its token, not its bytes).
+ *      lifetime goes with it (its token, not its bytes) -- a move's, and a
+ *      deleted parent's handing its children up.
  *
  *   ./Run_ProvenanceTesterLoader
  */
@@ -445,7 +446,18 @@ int main()
         check(Mover::s_alive == alive, "deleting where it was made leaves it");
         right->getOwningArena().deleteEntity(right, true);
         check(Mover::s_alive == alive - 1, "deleting where it is takes it");
+        // A parent deleted without its children (reparentChildrenTo) hands a
+        // movable child up with its token, so nothing keeps its arena alive.
+        Plain* holder = nullptr;
+        Mover* m2     = nullptr;
+        { ETCS::ActionScope s(line(g, "spawn", P)); holder = g->addTag<Plain>(); }
+        { ETCS::ActionScope s(line(holder, "spawn", M)); m2 = holder->addTag<Mover>(); }
+        const int alive2 = Mover::s_alive;
+        holder->getOwningArena().deleteEntity(holder, false);
+        check(m2->getParent() == g && &m2->getOwningArena() == &g->getArena() && Mover::s_alive == alive2,
+              "a parent deleted without its children hands a movable one up, its lifetime with it");
         arena.deleteEntity(g, true);
+        check(Mover::s_alive == alive2 - 1, "...and deleting where it went takes it");
     }
 
     std::printf("\n%s (%d failure%s)\n", g_fail ? "FAILED" : "PASSED",

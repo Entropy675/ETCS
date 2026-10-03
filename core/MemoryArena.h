@@ -1390,38 +1390,27 @@ public:
                             // "Coyote time" -- keeping this entity's own arena
                             // alive after the entity itself is gone -- exists
                             // for exactly ONE reason: reparented children whose
-                            // storage still physically lives in it. An entity
-                            // with no typed children has nothing to preserve it
-                            // for, and preserving it anyway leaks the arena
-                            // storage: reparentChildrenTo rewrites parent_ and
-                            // mints a fresh RIDList in newParent's arena, but
-                            // every child's own shell and local_arena_ stay
-                            // physically here -- which is the entire reason that
-                            // method's own comment says this arena "does survive
-                            // as coyote time".
+                            // storage still physically lives in it.
+                            // reparentChildrenTo rewrites parent_ and mints a
+                            // fresh RIDList in newParent's arena, but a child's
+                            // shell and local_arena_ stay physically here, and
+                            // so does its lifetime token -- its record in this
+                            // chain. A movable child's token is handed on with
+                            // it (its bytes were never here: MemoryArena::
+                            // adoptToken), so it holds nothing.
                             //
-                            // Asking AFTER inverted it. A SUCCESSFUL migration
-                            // empties typed_children_, so the arena hosting those
-                            // now-migrated children was reclaimed out from under
-                            // them (their shells destructed with it -- a live
-                            // grandparent left holding RIDs into freed memory).
-                            // A migration that FAILED left its children behind
-                            // and kept the arena -- alive for the one case that
-                            // no longer needed reachable children. Exactly
-                            // backwards, and reachable from any
-                            // deleteEntity(middle, false) on a three-level tree.
-                            //
-                            // Before the reparent, "had children at all" answers
-                            // it for both kinds at once: migrated and orphaned
-                            // children are hosted here alike. The children == 0
-                            // case this check exists for (SocketConnectionState,
-                            // which never addTag<T>s anything) is untouched --
-                            // it has nothing hosted here either way.
-                            ::std::vector<::std::pair<ETCS::Buffer, ETCS_RID_SIZE>> hosted;
-                            e->getTypedChildren(hosted);
+                            // ASKED OF THE CHAIN, AFTER. Asking the child lists
+                            // after inverted it once: a successful migration
+                            // empties them, and the arena was reclaimed out
+                            // from under the children it still hosted. The
+                            // chain does not empty on a migration -- only a
+                            // token handed on leaves it -- so after the reparent
+                            // it answers for every kind at once: migrated or
+                            // orphaned children hosted here keep it; nothing,
+                            // or only movable children, and it goes now.
                             e->reparentChildrenTo(e->getParent());
                             parentArena.reclaimEntity(e, sizeof(T), alignof(T));
-                            if (hosted.empty())
+                            if (!own_arena->holdsEntities())
                                 parentArena.reclaimArena(own_arena);
                             return nullptr;
                         });
@@ -1800,29 +1789,62 @@ public:
     /*
      * THE LIFETIME TOKEN MOVES; THE BYTES STAY HOME. Whose chain holds an
      * entity's records -- its own and its arena's -- is whose cascade destroys
-     * it and where deleteEntity finds it. This splices both out of `from`'s
-     * chain into this one's, newest, in the order they were made. The bytes
-     * stay where they were allocated, and a reclaim returns them there
-     * (DestructorRecord::home). Meant for bytes with a stable home (a module's
-     * root arena: Entity::addTag<T> for a movable type), which outlives every
-     * chain the token visits; Entity::moveTo is the other caller.
+     * it and where deleteEntity finds it: those two records are its lifetime
+     * token. adoptToken finds them in `from` (newest first: they were just
+     * made) and moves them here; moveToken moves a token already in hand.
+     * The bytes stay where they were allocated, and a reclaim returns them
+     * there (DestructorRecord::home). Meant for bytes with a stable home (a
+     * module's root arena: Entity::addTag<T> for a movable type), which
+     * outlives every chain the token visits.
      */
-    bool adoptToken(Entity* e, MemoryArena* e_arena, MemoryArena& from)
+    struct Token
     {
+        DestructorRecord* entity = nullptr;
+        DestructorRecord* arena  = nullptr;
+        explicit operator bool() const { return entity && arena; }
+    };
+    bool adoptToken(Token& t, Entity* e, MemoryArena* e_arena, MemoryArena& from)
+    {
+        if (&from == this) return false;
+        ::std::scoped_lock lock(allocationMutex_, from.allocationMutex_);
+        if (isTeardown_ || from.isTeardown_) return false;
+        Token found;
+        for (DestructorRecord* r = from.dtorHead_; r && !found; r = r->prev)
+        {
+            if (!found.entity && r->as_entity && r->as_entity(r->ptr) == e) found.entity = r;
+            else if (!found.arena && r->ptr == static_cast<void*>(e_arena)) found.arena = r;
+        }
+        if (!found) return false;
+        relinkLocked(found, from);
+        t = found;
+        return true;
+    }
+    bool moveToken(const Token& t, MemoryArena& from)
+    {
+        if (!t) return false;
         if (&from == this) return true;
         ::std::scoped_lock lock(allocationMutex_, from.allocationMutex_);
         if (isTeardown_ || from.isTeardown_) return false;
-        DestructorRecord* re = nullptr;
-        DestructorRecord* ra = nullptr;
-        for (DestructorRecord* r = from.dtorTail_; r && !(re && ra); r = r->next)
-        {
-            if (!re && r->as_entity && r->as_entity(r->ptr) == e) re = r;
-            else if (!ra && r->ptr == static_cast<void*>(e_arena)) ra = r;
-        }
-        if (!re || !ra) return false;
-        from.spliceOut(ra);
-        from.spliceOut(re);
-        for (DestructorRecord* r : { ra, re })   // the arena was made first, in the entity's constructor
+        relinkLocked(t, from);
+        return true;
+    }
+    // Whether any entity's lifetime is still in this arena's chain: a child
+    // made here and not handed on (a movable one's token goes with it).
+    bool holdsEntities() const
+    {
+        ::std::lock_guard<::std::mutex> lock(allocationMutex_);
+        for (DestructorRecord* r = dtorHead_; r; r = r->prev) if (r->as_entity) return true;
+        return false;
+    }
+
+private:
+    // Both records out of `from`, onto this chain's head, in the order they
+    // were made (the arena first, in the entity's constructor). Both locks held.
+    void relinkLocked(const Token& t, MemoryArena& from)
+    {
+        from.spliceOut(t.arena);
+        from.spliceOut(t.entity);
+        for (DestructorRecord* r : { t.arena, t.entity })
         {
             if (!r->home) r->home = &from;
             r->prev = dtorHead_;
@@ -1830,9 +1852,9 @@ public:
             if (dtorHead_) dtorHead_->next = r; else dtorTail_ = r;
             dtorHead_ = r;
         }
-        return true;
     }
- 
+
+public:
     // -------------------------------------------------------------------
     // evokeDestructor(void*) — explicitly runs AND unlinks a single
     // record ahead of the arena's own full teardown, identified by its

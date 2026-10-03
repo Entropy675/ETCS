@@ -194,8 +194,9 @@ operation on the child and both parents), recorded as its own action,
 never credited to the line that ran the step. Its lifetime goes with it: a
 Causal child's bytes live in its module's root arena, and only its lifetime
 token -- its destructor record and its arena's -- sits in its parent's
-chain (`MemoryArena::adoptToken`); deleting where it came from leaves it,
-deleting where it went takes it.
+chain (`MemoryArena::adoptToken`, then `moveToken` on every move); deleting
+where it came from leaves it, deleting where it went takes it, and a parent
+deleted without its children hands them up with their tokens.
 
 **The environment answers.** `Environment` (its container), `Basis` (where
 its frame sits in the topmost one's), `Near` (members within reach of a point
@@ -207,8 +208,10 @@ place; the pen leaves the pocket into the person, then the world; the ball
 rolls into a hollow box's space and out the far side; the ledger every tick;
 `Contain` keeps the world position to the bit and refuses a cycle; the same
 lines twice, the same moves and hash; deleting the old parent leaves it, the
-new one takes it). A persistence round trip of a scene with a move comes back
-as it was.
+new one takes it). `ProvenanceTester` §9 for the move itself (its own
+recorded action; the last move kept; a parent deleted without its children
+hands a movable one up, its token with it). A persistence round trip of a
+scene with a move comes back as it was.
 
 ---
 

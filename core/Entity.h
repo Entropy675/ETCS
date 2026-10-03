@@ -282,8 +282,9 @@ private:
  * object and this arena's object live in its module's root arena -- a home
  * that outlives every parent it will have -- and only their two destructor
  * records, its lifetime token, sit in the parent's arena. The parent's
- * cascade still reaches it through them; a move hands them on
- * (MemoryArena::adoptToken). Everything it holds is still in here.
+ * cascade still reaches it through them; a move hands them on, and so does a
+ * parent deleted without its children (MemoryArena::moveToken: moveTo,
+ * reparentChildrenTo). Everything it holds is still in here.
  *
  * It is ALSO independently resettable at any time via getArena().reset(),
  * which only touches this entity's own chunks.
@@ -599,10 +600,11 @@ private:
     /*
  * MADE TO MOVE (etcs_movable): its bytes are in its module's root arena and
  * only its lifetime token -- its record and its arena's -- is in its parent's
- * chain, so moveTo can hand the token to another parent and leave the bytes
- * where they are. Set once, by addTag<T>, before the AddTagEvent.
+ * chain, held here so a move (moveTo, reparentChildrenTo) hands it on without
+ * looking for it. Set once, by addTag<T>, before the AddTagEvent; empty for
+ * every other entity.
  */
-    bool    movable_ = false;
+    MemoryArena::Token token_;
     /*
  * Set by addTagTrampoline<T>() (via AddTagEvent, on the loader's
  * ordering thread) iff T's type-provider module registered a
@@ -1176,11 +1178,8 @@ public:
         T* child = home.allocate<T>(::std::forward<Args>(args)...);
         s_pending_parent_arena_ = saved;
         child->module_root_ = boundary;
-        if (movable && getArena().adoptToken(child, child->local_arena_, home))
-        {
+        if (movable && getArena().adoptToken(child->token_, child, child->local_arena_, home))
             child->owning_arena_ = &getArena();
-            child->movable_      = true;
-        }
         child->getArena().setScopeTag(T::CONTRACT_TAG);   /*
  * CONTRACT_TAG -- not getSourceTag(), still empty here (setModuleSource
  * runs later, inside addTagImpl, as part of this same blocking call),
@@ -1504,33 +1503,19 @@ public:
  * is public, so it's checked rather than assumed.
  */
         if (!newParent || newParent == this) return;
-        bool moved = false;
+        ::std::vector<Entity*> moved;
         /*
- * BOTH locks, held together for the whole migration. The old body
- * only took this entity's own, which was sufficient only because it
- * never touched newParent's state at all -- it just rewrote
- * child->parent_ and left the child sitting in a typed_children_
- * list belonging to an entity that was about to be destructed. Now
- * that the child genuinely moves between two maps, a single lock
- * can't cover it.
+ * BOTH locks, held together for the whole migration: the child moves between
+ * two maps, and holding both is what keeps it from ever being observable in
+ * NEITHER parent's list by a concurrent getTypedChild on another thread.
  *
- * Nested acquisition is safe here because this is the ONLY site in
- * this class that ever holds two entity locks at once -- a lock
- * cycle requires two sites that disagree about ordering, and there
- * is no second site to disagree with. addTagTrampoline<T> holds only
- * the PARENT's lock and reaches into the child by direct field
- * access; ~Entity() closes its own lock scope before calling
- * parent_->removeTypedChild(); tagModifyImpl fires EntityUnloadEvent
- * outside the lock; every scope_/tags/flags_ accessor takes exactly
- * one lock and never calls outward. Holding both (rather than a
- * plan-then-apply split across two disjoint critical sections) is
- * also what keeps a child from ever being observable in NEITHER
- * parent's list by a concurrent getTypedChildren()/getTypedChild()
- * on some other thread.
+ * TWO SITES hold two entity locks -- this and moveImpl -- and both take them
+ * with scoped_lock (std::lock), which never waits on one while holding the
+ * other, so the two need no order to agree on. Every other accessor takes
+ * exactly one lock and never calls outward.
  */
-        {   // both locks end before the mark below, which takes them again
-        ::std::lock_guard<::std::mutex> self_lock(m_tagMutex);
-        ::std::lock_guard<::std::mutex> dest_lock(newParent->m_tagMutex);
+        {   // both locks end before the marks below, which take them again
+        ::std::scoped_lock both(m_tagMutex, newParent->m_tagMutex);
         // In THIS entity's first-seen tag order, not the map's: a tag new to
         // newParent is appended to its typed_child_order_ as it is met here,
         // and that order is state (computeNodeHash composes children by it),
@@ -1548,88 +1533,20 @@ public:
             ::std::vector<ETCS::RID> child_rids;
             handle.invoke_collect_rids(child_rids);
             if (child_rids.empty()) continue;
-            /*
- * Pointer into newParent's own map, not an iterator: emplace()
- * below can rehash, which invalidates iterators but NOT
- * references or pointers to elements (::std::unordered_map is
- * node-based, and ArenaMap only changes where those nodes are
- * allocated from, not that guarantee).
- */
+            if (!handle.make_in)
+            {
+                ETCS_LOG("Entity", "reparentChildrenTo: tag '" << tag
+                         << "' has no make_in factory -- cannot migrate its "
+                         << child_rids.size() << " child(ren) to newParent; "
+                         << "they will be orphaned in this entity's arena.");
+                continue;
+            }
             RIDListHandle* dest = nullptr;
-            auto dit = newParent->typed_children_.find(tag);
-            if (dit != newParent->typed_children_.end())
-                dest = &dit->second;
             for (ETCS::RID rid : child_rids)
             {
                 Entity* child = handle.invoke_get(rid);
-                if (!child || child->parent_ != this) continue;
-                if (!dest)
-                {
-                    /*
- * Lazily minted on the first child that actually
- * migrates under this tag -- deliberately inside the
- * inner loop, not above it, so a tag whose entries all
- * fail the parent_ == this check doesn't leave an empty
- * list (and a spurious typed_child_order_ entry) behind
- * on newParent.
- *
- * Cannot copy `handle` across: the RIDList<T*> object it
- * points at was allocated from THIS entity's own
- * local_arena_ (addTagTrampoline<T>, below), and while
- * that arena does survive as coyote time, it is not
- * newParent's to depend on -- newParent can outlive this
- * entity's arena by an arbitrary margin. invoke_make_in
- * mints a fresh, correctly-typed list in newParent's own
- * arena instead, from the factory captured back when T
- * was still known (RIDList.h).
- */
-                    if (!handle.make_in)
-                    {
-                        ETCS_LOG("Entity", "reparentChildrenTo: tag '" << tag
-                                 << "' has no make_in factory -- cannot migrate its "
-                                 << child_rids.size() << " child(ren) to newParent; "
-                                 << "they will be orphaned in this entity's arena.");
-                        break;
-                    }
-                    RIDListHandle fresh =
-                        handle.invoke_make_in(*newParent->local_arena_, tag.c_str());
-                    dest = &newParent->typed_children_.emplace(tag, fresh).first->second;
-                    /*
- * Mirrors addTagTrampoline<T>'s own first-seen-tag
- * branch exactly -- typed_child_order_ is a type-level
- * record appended only when a tag is genuinely new to
- * that entity, and we only reach here when find() missed.
- */
-                    newParent->typed_child_order_.push_back(tag);
-                }
-                /*
- * Insert BEFORE remove: with both locks held nothing can
- * observe either state, but ordering it this way means an
- * exception from invoke_insert leaves the child still owned
- * by its original list rather than by nothing.
- */
-                dest->invoke_insert(rid, child);
-                handle.invoke_remove(rid);
-                child->parent_ = newParent;
-                child->depth_  = newParent->depth_ + 1;   // its own subtree: renumberDepth, below the locks
-                /*
- * parent_rid_ deliberately untouched -- addTagTrampoline<T>
- * sets it to child->getRID(), which is the same value in any
- * parent's list, so ~Entity()'s own
- * parent_->removeTypedChild(parent_rid_) resolves correctly
- * against newParent without any rewrite here.
- */
-
-                /*
- * Passive edge follows the ownership edge, always. THIS is
- * the load-bearing half: child->parent_ going stale is a
- * lookup miss, but ctx_.provider going stale is a pointer
- * into the dying entity's outer shell, which reclaimEntity
- * is about to zero and hand to the next same-type
- * allocation -- see SignalContext::provider's own comment.
- */
-                child->ctx_.setProvider(&newParent->ctx_);
-                moved = true;
+                if (child && child->parent_ == this && relistLocked(child, rid, handle, tag, newParent, dest))
+                    moved.push_back(child);
             }
         }
         }
@@ -1640,12 +1557,13 @@ public:
  * needs nothing -- its retire path marks its own parent. Outside the locks,
  * because markStateChange walks parents and takes their mutexes.
  */
-        if (moved)
+        if (!moved.empty())
         {
             markStateChange(newParent, getRID());
-            // Everything under the moved children is one level nearer the
-            // root now. Outside the locks: the walk takes each entity's own.
-            renumberDepth(newParent);
+            // Everything under the moved children is one level nearer the root
+            // now -- theirs, not newParent's whole subtree. Outside the locks:
+            // the walk takes each entity's own.
+            for (Entity* c : moved) renumberDepth(c);
         }
     }
 
@@ -1667,8 +1585,8 @@ public:
     bool moveTo(Entity* to)
     {
         Entity* from = getParent();
-        if (!to || !from || to == from || !movable_ || to->isDestructed()) return false;
-        if (to->getSourceModule().toString() != getSourceModule().toString()) return false;   // one module's tokens and bytes
+        if (!to || !from || to == from || !token_ || to->isDestructed()) return false;
+        if (!(to->getSourceModule() == getSourceModule())) return false;   // one module's tokens and bytes
         TagModifyEvent evt{ this, ETCS::Buffer("p:"), false, nullptr, to->myTagMask() | from->myTagMask() };
         evt.move_to   = to;
         evt.move_impl = &Entity::moveImpl;
@@ -1684,7 +1602,7 @@ public:
         recordEffectIn(this, placeKey(getRID()), true, &f);
         return true;
     }
-    bool isMovable() const { return movable_; }
+    bool isMovable() const { return static_cast<bool>(token_); }
 
 private:
     /*
@@ -1697,7 +1615,7 @@ private:
     static bool moveImpl(Entity* child, Entity* to)
     {
         Entity* from = child->parent_;
-        if (!from || from == to || !child->movable_) return false;
+        if (!from || from == to || !child->token_) return false;
         for (Entity* a = to; a; a = a->parent_) if (a == child) return false;   // into its own subtree
         const RID rid = child->getRID();
         {
@@ -1705,33 +1623,15 @@ private:
             if (from->isDestructed() || to->isDestructed() || from->isRetiring() || to->isRetiring()
                 || child->parent_ != from)
                 return false;
-            RIDListHandle*      src  = nullptr;
-            const ETCS::Buffer* tagp = nullptr;
             for (const ETCS::Buffer& tag : from->typed_child_order_)
             {
                 auto it = from->typed_children_.find(tag);
-                if (it != from->typed_children_.end() && it->second.invoke_get(rid) == child)
-                { src = &it->second; tagp = &it->first; break; }
+                if (it == from->typed_children_.end() || it->second.invoke_get(rid) != child) continue;
+                RIDListHandle* dest = nullptr;
+                if (!it->second.make_in || !relistLocked(child, rid, it->second, it->first, to, dest)) return false;
+                break;
             }
-            if (!src || !src->make_in) return false;
-            if (!to->local_arena_->adoptToken(child, child->local_arena_, *child->owning_arena_)) return false;
-            child->owning_arena_ = to->local_arena_;
-            RIDListHandle* dest = nullptr;
-            auto dit = to->typed_children_.find(*tagp);
-            if (dit != to->typed_children_.end()) dest = &dit->second;
-            else
-            {
-                // A fresh list in `to`'s own arena, as reparentChildrenTo mints one;
-                // a tag new to `to` joins its first-seen order (that order is state).
-                RIDListHandle fresh = src->invoke_make_in(*to->local_arena_, tagp->c_str());
-                dest = &to->typed_children_.emplace(*tagp, fresh).first->second;
-                to->typed_child_order_.push_back(*tagp);
-            }
-            dest->invoke_insert(rid, child);   // insert before remove, as reparentChildrenTo
-            src->invoke_remove(rid);
-            child->parent_ = to;
-            child->depth_  = to->depth_ + 1;
-            child->ctx_.setProvider(&to->ctx_);   // the passive edge follows the ownership edge
+            if (child->parent_ != to) return false;
         }
         const ETCS::TagMask cm = child->myTagMask();
         if (cm.any()) { to->noteAcquires(cm); child->noteAcquires(to->myTagMask()); }
@@ -1739,6 +1639,49 @@ private:
         markStateChange(from, rid);
         markStateChange(child, rid);
         renumberDepth(child);
+        return true;
+    }
+
+    /*
+     * ONE CHILD FROM ONE PARENT'S LIST TO ANOTHER'S, both entity locks held
+     * (reparentChildrenTo, moveImpl). `dest` caches `to`'s list for `tag`
+     * across calls -- a pointer, not an iterator: an emplace can rehash, and
+     * only pointers into a node map survive it. A list new to `to` is minted
+     * lazily, on the first child that actually moves, in `to`'s own arena --
+     * never copied, the old one is the old parent's arena's -- and the tag
+     * joins `to`'s first-seen order (that order is state). A movable child's
+     * lifetime token goes first, so the old parent's cascade cannot take it
+     * once it is listed elsewhere; when the token cannot move, nothing does.
+     *
+     * parent_rid_ is untouched: it is the child's own RID, the same in any
+     * parent's list. The passive edge (ctx_ provider) follows the ownership
+     * edge always -- left stale it would point into a shell about to be
+     * reclaimed and handed to the next same-type allocation.
+     */
+    static bool relistLocked(Entity* child, RID rid, RIDListHandle& src, const ETCS::Buffer& tag,
+                             Entity* to, RIDListHandle*& dest)
+    {
+        if (child->token_)
+        {
+            if (!to->local_arena_->moveToken(child->token_, *child->owning_arena_)) return false;
+            child->owning_arena_ = to->local_arena_;
+        }
+        if (!dest)
+        {
+            auto dit = to->typed_children_.find(tag);
+            if (dit != to->typed_children_.end()) dest = &dit->second;
+            else
+            {
+                RIDListHandle fresh = src.invoke_make_in(*to->local_arena_, tag.c_str());
+                dest = &to->typed_children_.emplace(tag, fresh).first->second;
+                to->typed_child_order_.push_back(tag);
+            }
+        }
+        dest->invoke_insert(rid, child);   // insert before remove: an exception leaves it where it was
+        src.invoke_remove(rid);
+        child->parent_ = to;
+        child->depth_  = to->depth_ + 1;   // its own subtree: renumberDepth, below the locks
+        child->ctx_.setProvider(&to->ctx_);
         return true;
     }
 
