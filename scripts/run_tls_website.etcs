@@ -23,6 +23,7 @@ web.spawn(NetworkProvider::FileHtmlPage tree)
 # runtime's own on the same hub (/link/hall, /link/table1).
 web.spawn(NetworkProvider::LinkHub links)
 tree.LoadFromDisk(ACE_ROOT/scripts/www)
+run site_pages.etcs tree=tree
 tree.SetDefaultExtension(.html)
 tree.ListPaths()
 
@@ -55,8 +56,7 @@ tree.SetMountPrefix()
 # runtime, and its hall -- who is hosting, which ranked table has a seat -- is
 # a listing over the link, read from the two services this site runs below
 # (chess_service.etcs, after Start). The server-played page it replaced is at
-# /chess-classic, and /chess.html forwards there (or here) so old links still
-# land.
+# /chess-classic (site_pages.etcs).
 tree.SetMountPrefix(chess/play)
 run ChessProvider/scripts/chess_mounts.etcs tree=tree
 tree.SetMountPrefix()

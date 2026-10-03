@@ -47,9 +47,11 @@ web.AddHeader(Cross-Origin-Embedder-Policy require-corp)
 web.spawn(NetworkProvider::StaticHtmlPage landing)
 landing.SetHtmlFromFile(ACE_ROOT/scripts/www/index.html)
 
-# Everything else is disk layout as url layout: /chess.html, /forum.html,
-# /whitepaper.html. One page type, no per-document entity, and adding a
-# document is copying a file rather than editing this script.
+# Everything else is disk layout as url layout: /whitepaper.html,
+# /philosophy.html. One page type, no per-document entity, and adding a
+# document is copying a file rather than editing this script. A page that is a
+# module's front (the forum, server-played chess) is mounted from the module
+# (site_pages.etcs) rather than copied here.
 web.spawn(NetworkProvider::FileHtmlPage tree)
 # THE LINK HUB, for a shared canvas and for a game of chess. A page hosts a
 # Room in its own runtime through this hub (PaintShare, paint_host.etcs;
@@ -59,6 +61,10 @@ web.spawn(NetworkProvider::FileHtmlPage tree)
 # runtime's own on the same hub (/link/hall, /link/table1).
 web.spawn(NetworkProvider::LinkHub links)
 tree.LoadFromDisk(ACE_ROOT/scripts/www)
+run site_pages.etcs tree=tree
+# The pages link without the extension (/chess/'s "/chess-classic"), as the
+# TLS spelling of this site already answers.
+tree.SetDefaultExtension(.html)
 tree.ListPaths()
 
 # ── /paint ───────────────────────────────────────────────────────────────────
@@ -104,8 +110,7 @@ tree.SetMountPrefix()
 # runtime, and its hall -- who is hosting, which ranked table has a seat -- is
 # a listing over the link, read from the two services this site runs below
 # (chess_service.etcs, after Start). The server-played page it replaced is at
-# /chess-classic, and /chess.html forwards there (or here) so old links still
-# land.
+# /chess-classic (site_pages.etcs).
 tree.SetMountPrefix(chess/play)
 run ChessProvider/scripts/chess_mounts.etcs tree=tree
 tree.SetMountPrefix()
