@@ -119,8 +119,21 @@ energy headed along the line between the two (`CrossToward`: KE·cos²θ), and
 both crossings are taken before either lands, so the exchange is simultaneous
 and does not depend on which member is walked first.
 
+**How the pairs are found is free; which pairs, and in what order, is not.**
+A pair's crossings change energy the later pairs read, so the contacts are
+the n² loop's pairs in its (i, j) order. A large container finds them with a
+kd-tree over the members' positions (`CausalBase::Broadphase`, nanoflann in
+`libs/`): a superset, padded past what doubles and the gate's floored squares
+can differ by, which the exact gate then decides. The gate itself compares
+without wrapping (`OrderVector::MayInteractWith`: each square floored as a
+Fixed product, summed wide), so a pair far apart never passes.
+
 **Check.** `CausalTester` §5 (head-on, equal masses: the mover stops and the
 other carries all of it, where the reaches met; the emitter's clock ticked);
+§9 (crowds of 400 and 1,000 stepped through the kd-tree and pair by pair:
+the same rows to the bit; contacts moved bodies nothing pushed);
+`OrderVectorTester` §4 (two reaches 65,536 apart do not touch; 200,000 pairs
+where nothing wraps answer as the Fixed squares did);
 `OrderVectorTester` §4b (45°: half crosses, half stays, perpendicular; a body
 moving away hands over nothing). §4's forward/reversed build covers the walk
 order.
@@ -169,9 +182,6 @@ itself.
 - **Angular rate.** Row 3 is a facing; the share of E that is rotational is
   not carried, so contacts transfer no spin and `Reduce` does not sum orbital
   motion.
-- **Broadphase.** Contacts are every pair of members, n² per interaction. The
-  gate (`GapTo`) is the constraint; a cheaper way to ask it is an
-  implementation choice.
 - **Replay between captures.** The observed spans are not kept; a resumed
   scene continues from its last captured rows, it does not re-run the
   frames between that capture and the close.

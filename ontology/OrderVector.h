@@ -494,12 +494,59 @@ struct OrderVector
     }
     // GapTo <= 0 without the root: the gate is asked of every pair of a
     // container's members every interaction, and squares compare the same.
+    // Each square is floored to Fixed as a Fixed product is, then summed in
+    // 96+ bits: in Fixed the squares wrapped past ~46k units apart and a far
+    // pair could pass. Where nothing wrapped, the same answer to the bit.
     bool MayInteractWith(const OrderVector& other) const
     {
-        const Fixed dx = other.x - x, dy = other.y - y, dz = other.z - z;
-        const Fixed reach = radius + other.radius;
-        return dx * dx + dy * dy + dz * dz <= reach * reach;
+        Wide s = Wide::SquareOf(Diff(other.x.raw, x.raw));
+        s += Wide::SquareOf(Diff(other.y.raw, y.raw));
+        s += Wide::SquareOf(Diff(other.z.raw, z.raw));
+        return s <= Wide::SquareOf(Sum(radius.raw, other.radius.raw));
     }
+
+private:
+    // An unsigned 128-bit number in halves (no __int128 on every target, as
+    // Fixed's own arithmetic). Only what the gate needs.
+    struct Wide
+    {
+        uint64_t hi = 0, lo = 0;
+        // floor(m^2 / 2^32): what Fixed's product keeps of a square.
+        static Wide SquareOf(uint64_t m)
+        {
+            uint64_t h, l;
+            fixed_detail::umul(m, m, h, l);
+            return Wide{ h >> 32, (h << 32) | (l >> 32) };
+        }
+        Wide& operator+=(const Wide& o)
+        {
+            const uint64_t l = lo + o.lo;
+            hi += o.hi + (l < lo ? 1 : 0);
+            lo = l;
+            return *this;
+        }
+        bool operator<=(const Wide& o) const { return hi != o.hi ? hi < o.hi : lo <= o.lo; }
+    };
+    // |a - b| and |a + b| without wrapping: both fit 64 bits unsigned (the
+    // sum's one exception, two minima, saturates).
+    static uint64_t Diff(int64_t a, int64_t b)
+    {
+        return a >= b ? static_cast<uint64_t>(a) - static_cast<uint64_t>(b)
+                      : static_cast<uint64_t>(b) - static_cast<uint64_t>(a);
+    }
+    static uint64_t Sum(int64_t a, int64_t b)
+    {
+        if ((a < 0) != (b < 0))
+        {
+            const int64_t s = a + b;   // opposite signs: cannot overflow
+            return s < 0 ? 0 - static_cast<uint64_t>(s) : static_cast<uint64_t>(s);
+        }
+        const uint64_t ma = a < 0 ? 0 - static_cast<uint64_t>(a) : static_cast<uint64_t>(a);
+        const uint64_t mb = b < 0 ? 0 - static_cast<uint64_t>(b) : static_cast<uint64_t>(b);
+        return ma > ~mb ? ~uint64_t{0} : ma + mb;
+    }
+
+public:
 
     // The uncertainty a crossing carries, derived from the crossing itself:
     // where it left, from what, how much, which way, and over what span,

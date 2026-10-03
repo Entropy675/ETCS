@@ -29,11 +29,16 @@
 //   7. ONE HISTORY. A reader under the tree's lock sees one state while a
 //      driver runs on another thread.
 //   8. THE CLOCK. Ticks count crossings; a body with no heat has no time.
+//   9. THE BROADPHASE PRUNES ONLY. A crowded container stepped through the
+//      kd-tree lands on the rows it lands on pair by pair, to the bit.
 //
 //   ./Run_CausalTesterLoader
 //
 #include "../ETCS.h"
 #include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
 #include <functional>
 #include <cstdio>
 #include <thread>
@@ -348,6 +353,58 @@ int main()
         check(cold->Order4().Heat().IsZero() && cold->CausalTicks() < 100100 && cold->CausalTicks() > warm,
               "it cools to exactly no heat (the last quantum leaves whole) and its clock stops there");
         arena.deleteEntity(world, true);
+    }
+
+    // -- 9: the broadphase ----------------------------------------------------
+    {
+        std::cout << "\n-- 9. the broadphase prunes, the gate decides --\n";
+        // A crowd: members packed so contacts are many, a third of them pushed.
+        // The same lines stepped once through the kd-tree and once pair by
+        // pair (BroadphaseFrom out of reach) must land on the same rows.
+        auto crowd = [&](int n, double side, int ticks, size_t from, double* ms) -> uint64_t {
+            CausalBase<Body>::BroadphaseFrom() = from;
+            Body* world = arena.allocate<Body>();
+            world->SetEmissivity(Fixed::From(0.2));
+            uint64_t st = 0x2545f4914f6cdd1dull ^ static_cast<uint64_t>(n);
+            auto next = [&st]() { st ^= st << 13; st ^= st >> 7; st ^= st << 17; return st; };
+            auto unit = [&]() { return static_cast<double>(next() % 1000000) / 1000000.0; };
+            std::vector<Body*> still;
+            for (int i = 0; i < n; ++i)
+            {
+                Body* b = world->addTag<Body>();
+                b->Place((unit() * 2 - 1) * side, 0, (unit() * 2 - 1) * side);
+                b->Reach(0.4 + unit() * 0.6);
+                b->damping = Fixed::From(0.2);
+                if (i % 3 == 0) b->Impulse(Fixed::From(unit() * 2 - 1), Fixed::Zero(), Fixed::From(unit() * 2 - 1), Fixed::FromInt(4 + static_cast<int64_t>(i % 5)));
+                else            still.push_back(b);
+            }
+            const auto t0 = std::chrono::steady_clock::now();
+            world->Run(static_cast<uint32_t>(ticks), dt);
+            if (ms) *ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / ticks;
+            bool pushed = false;   // a body never pushed that moves was moved by a contact
+            for (Body* b : still) if (b->Order4().energy.IsPositive()) pushed = true;
+            const uint64_t h = pushed ? world->CausalHash() : 0;
+            arena.deleteEntity(world, true);
+            return h;
+        };
+        const size_t kFrom = CausalBase<Body>::BroadphaseFrom();
+        const uint64_t kd = crowd(400, 16, 400, 2, nullptr);
+        const uint64_t nn = crowd(400, 16, 400, SIZE_MAX, nullptr);
+        check(kd != 0 && nn != 0, "400 members in a crowd: contacts moved bodies nothing pushed");
+        check(kd == nn, "...and the kd-tree's pairs land on the same rows as every pair, to the bit");
+        const uint64_t kd2 = crowd(1000, 40, 200, 2, nullptr);
+        const uint64_t nn2 = crowd(1000, 40, 200, SIZE_MAX, nullptr);
+        check(kd2 != 0 && kd2 == nn2, "...and 1,000 sparser ones");
+        std::printf("        (ms per tick, kd-tree / every pair:");
+        for (int n : {8, 16, 24, 32, 48, 64, 128, 1000})
+        {
+            double a = 0, b = 0;
+            crowd(n, std::sqrt(static_cast<double>(n)) * 1.2, n >= 1000 ? 50 : 2000, 2, &a);
+            crowd(n, std::sqrt(static_cast<double>(n)) * 1.2, n >= 1000 ? 50 : 2000, SIZE_MAX, &b);
+            std::printf(" n=%d %.4f/%.4f", n, a, b);
+        }
+        std::printf(")\n");
+        CausalBase<Body>::BroadphaseFrom() = kFrom;
     }
 
     std::printf("\n%s (%d failure%s)\n", g_fail ? "FAILED" : "PASSED", g_fail, g_fail == 1 ? "" : "s");

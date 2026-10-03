@@ -13,7 +13,9 @@
 //      |K| never rises except through Impulse, Emit/Absorb move one number.
 //   3. Row 3 composes as a rotation: quarter turns, and the matrix built from
 //      it agrees with the vector it rotates.
-//   4. Reduce and Cover: the aggregate encloses its members, GapTo is a proof.
+//   4. Reduce and Cover: the aggregate encloses its members, GapTo is a proof;
+//      the contact gate compares without wrapping, and where nothing wrapped
+//      answers as the Fixed squares did.
 //   4b. The invariants as PREDICATES (OrderVector::Holds), fuzzed over the
 //      operation set; a contact crossing (CrossToward/Absorb) moves energy
 //      exactly and never raises ordered energy; the last quantum of heat
@@ -204,6 +206,37 @@ int main(int, char**)
         far.PlaceAt(Fixed::FromInt(4), Fixed::Zero(), Fixed::Zero());
         check(agg.MayInteractWith(far), "touching reaches refer the question to the members");
         check(!m[0].Encloses(m[0].x, m[0].y, m[0].z), "a leaf encloses nothing, itself included");
+
+        // The gate's squares no longer wrap: in Fixed, 65,536 units squared
+        // is 2^64 and read as zero, so a pair that far apart passed.
+        OrderVector p, q;
+        p.radius = Fixed::One(); q.radius = Fixed::One();
+        q.PlaceAt(Fixed::FromInt(65536), Fixed::Zero(), Fixed::Zero());
+        check(!p.MayInteractWith(q) && !q.MayInteractWith(p), "two reaches 65,536 apart do not touch (the Fixed squares wrapped to zero)");
+        q.PlaceAt(Fixed::FromInt(-1000000000), Fixed::FromInt(1000000000), Fixed::FromInt(1000000000));
+        p.PlaceAt(Fixed::FromInt( 1000000000), Fixed::FromInt(-1000000000), Fixed::FromInt(-1000000000));
+        check(!p.MayInteractWith(q), "...nor two at opposite corners of the range");
+        // Where nothing wrapped, the old answer to the bit: every square
+        // floored as a Fixed product, summed, compared.
+        uint64_t st = 0x9e3779b97f4a7c15ull;
+        auto next = [&st]() { st ^= st << 13; st ^= st >> 7; st ^= st << 17; return st; };
+        auto coord = [&]() { return Fixed::FromRaw(static_cast<int64_t>(next() % (1ull << 46)) - (1ll << 45)); };   // +-8192 units
+        int agree = 0, touching = 0;
+        for (int i = 0; i < 200000; ++i)
+        {
+            OrderVector a, b;
+            a.PlaceAt(coord(), coord(), coord());
+            b.PlaceAt(a.x + Fixed::FromRaw(static_cast<int64_t>(next() % (1ull << 36)) - (1ll << 35)),
+                      a.y + Fixed::FromRaw(static_cast<int64_t>(next() % (1ull << 36)) - (1ll << 35)),
+                      a.z + Fixed::FromRaw(static_cast<int64_t>(next() % (1ull << 36)) - (1ll << 35)));   // within +-8 units
+            a.radius = Fixed::FromRaw(static_cast<int64_t>(next() % (1ull << 35)));
+            b.radius = Fixed::FromRaw(static_cast<int64_t>(next() % (1ull << 35)));
+            const Fixed dx = b.x - a.x, dy = b.y - a.y, dz = b.z - a.z, reach = a.radius + b.radius;
+            const bool old = dx * dx + dy * dy + dz * dz <= reach * reach;
+            if (old == a.MayInteractWith(b)) ++agree;
+            if (old) ++touching;
+        }
+        check(agree == 200000 && touching > 1000 && touching < 199000, "200,000 pairs within reach of wrapping nothing: the same answer as the Fixed squares");
     }
 
     std::printf("\n-- the invariants, as predicates, fuzzed ----------------------------\n");

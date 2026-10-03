@@ -6,6 +6,7 @@
 #include <mutex>
 #include <utility>
 #include <vector>
+#include "../libs/nanoflann.h"   // the contacts' broadphase
 
 /*
  * THE ROWS LIVE HERE, and so does everything that is true of them whatever
@@ -227,6 +228,11 @@ ETCS_SUPERTYPE_BASE(Causal)
         return kidsLocked();
     }
 
+    // The member count from which the contacts ask the kd-tree rather than
+    // every pair (contactsLocked). Per leaf type; a test sets it out of reach
+    // to step the same tree pair by pair and compare.
+    static size_t& BroadphaseFrom() { static size_t n = 16; return n; }   // measured: the tree wins from ~16 (CausalTester §9)
+
 private:
     /*
      * CANONICAL ORDER: tags in first-attachment order (that order is state;
@@ -324,27 +330,98 @@ private:
      * THE CONTACTS AMONG THE MEMBERS: every pair whose reaches touch, in the
      * container's frame, from the rows the step left. Both crossings are
      * taken before either lands, so the exchange is simultaneous and does
-     * not depend on which of the pair is walked first. Every pair, which is
-     * n^2 over the members -- a broadphase is an implementation choice this
-     * does not make yet; the gate (GapTo) is the constraint.
+     * not depend on which of the pair is walked first.
+     *
+     * THE ORDER OF THE PAIRS IS PART OF THE RESULT: a pair's crossings change
+     * energy rows the later pairs read. Positions and reaches do not move in
+     * the pass (CrossToward and Absorb touch energy and the kinetic row only),
+     * so which pairs may touch is fixed before it starts. A small container
+     * asks every pair; a large one asks a kd-tree for a superset (Broadphase)
+     * and the same gate decides -- the same pairs, in the same (i, j) order,
+     * the same rows to the bit.
      */
     void contactsLocked(const ::std::vector<Causal_*>& kids, Fixed span)
     {
         const size_t n = kids.size();
-        for (size_t i = 0; i + 1 < n; ++i)
-            for (size_t j = i + 1; j < n; ++j)
+        if (n < BroadphaseFrom())
+        {
+            for (size_t i = 0; i + 1 < n; ++i)
+                for (size_t j = i + 1; j < n; ++j) contactLocked(kids[i], kids[j], span);
+            return;
+        }
+        if (!m_broad) m_broad.reset(new Broadphase);
+        for (const auto& [i, j] : m_broad->pairs(kids)) contactLocked(kids[i], kids[j], span);
+    }
+
+    static void contactLocked(Causal_* ka, Causal_* kb, Fixed span)
+    {
+        const OrderVector& a = ka->Order4();
+        const OrderVector& b = kb->Order4();
+        if (!a.MayInteractWith(b)) return;
+        const Fixed nx = b.x - a.x, ny = b.y - a.y, nz = b.z - a.z;
+        if (nx.IsZero() && ny.IsZero() && nz.IsZero()) return;   // no line between them
+        const OrderVector ab = ka->CrossTowardUnder( nx,  ny,  nz, span);
+        const OrderVector ba = kb->CrossTowardUnder(-nx, -ny, -nz, span);
+        if (ab.energy.IsPositive()) kb->AbsorbUnder(ab);
+        if (ba.energy.IsPositive()) ka->AbsorbUnder(ba);
+    }
+
+    /*
+     * The pairs that MAY touch, from a kd-tree over the members' positions
+     * (nanoflann, libs/), rebuilt each pass: they all moved. Each pair is
+     * found from its larger reach (distance <= ri + rj <= 2 max), padded past
+     * what the doubles and the gate's floored squares can differ by. Pruning
+     * only -- the gate keeps the n^2 loop's pairs, and a pair it drops costs a
+     * gate call, never a wrong row. Allocated by the first large pass, so a
+     * box carries one pointer.
+     */
+    struct Broadphase
+    {
+        struct Cloud
+        {
+            ::std::vector<double> xyz;
+            size_t kdtree_get_point_count() const { return xyz.size() / 3; }
+            double kdtree_get_pt(size_t i, size_t d) const { return xyz[i * 3 + d]; }
+            template <class B> bool kdtree_get_bbox(B&) const { return false; }
+        };
+        using Tree = nanoflann::KDTreeSingleIndexAdaptor<nanoflann::L2_Simple_Adaptor<double, Cloud>, Cloud, 3, uint32_t>;
+
+        Cloud cloud;
+        ::std::vector<double> reach;
+        ::std::vector<nanoflann::ResultItem<uint32_t, double>> hits;
+        ::std::vector<::std::pair<uint32_t, uint32_t>> out;
+        Tree tree{ 3, cloud, nanoflann::KDTreeSingleIndexAdaptorParams(16, nanoflann::KDTreeSingleIndexAdaptorFlags::SkipInitialBuildIndex) };
+
+        const ::std::vector<::std::pair<uint32_t, uint32_t>>& pairs(const ::std::vector<Causal_*>& kids)
+        {
+            const size_t n = kids.size();
+            cloud.xyz.resize(n * 3);
+            reach.resize(n);
+            for (size_t i = 0; i < n; ++i)
             {
                 const OrderVector& a = kids[i]->Order4();
-                const OrderVector& b = kids[j]->Order4();
-                if (!a.MayInteractWith(b)) continue;
-                const Fixed nx = b.x - a.x, ny = b.y - a.y, nz = b.z - a.z;
-                if (nx.IsZero() && ny.IsZero() && nz.IsZero()) continue;   // no line between them
-                const OrderVector ab = kids[i]->CrossTowardUnder( nx,  ny,  nz, span);
-                const OrderVector ba = kids[j]->CrossTowardUnder(-nx, -ny, -nz, span);
-                if (ab.energy.IsPositive()) kids[j]->AbsorbUnder(ab);
-                if (ba.energy.IsPositive()) kids[i]->AbsorbUnder(ba);
+                cloud.xyz[i * 3] = a.x.ToDouble(); cloud.xyz[i * 3 + 1] = a.y.ToDouble(); cloud.xyz[i * 3 + 2] = a.z.ToDouble();
+                reach[i] = a.radius.ToDouble();
             }
-    }
+            tree.buildIndex();
+            out.clear();
+            for (size_t i = 0; i < n; ++i)
+            {
+                const double r = 2.0 * reach[i] * (1.0 + 1e-9) + 1e-3;
+                hits.clear();
+                (void)tree.radiusSearch(&cloud.xyz[i * 3], r * r, hits, nanoflann::SearchParameters(0, false));
+                for (const auto& h : hits)
+                {
+                    const size_t j = h.first;
+                    // Once per pair: from the larger reach, the lower index on a tie.
+                    if (j == i || reach[j] > reach[i] || (reach[j] == reach[i] && j < i)) continue;
+                    out.emplace_back(static_cast<uint32_t>(i < j ? i : j), static_cast<uint32_t>(i < j ? j : i));
+                }
+            }
+            ::std::sort(out.begin(), out.end());
+            return out;
+        }
+    };
 
     // The parent, while it is one. Under an arena teardown an ancestor has
     // run ~Entity() before this entity's retire reaches it (the same stop
@@ -397,6 +474,7 @@ private:
     Fixed       m_share_dt, m_share_k, m_share;   // 1 - exp(-k dt) for the last (dt, k) seen
 
     ::std::shared_ptr<const ::std::vector<Causal_*>> m_kids;
+    ::std::unique_ptr<Broadphase> m_broad;   // contactsLocked, once a pass is large
     uint32_t                m_kids_epoch = 0;          // hash_epoch_ starts at 1: the first ask walks
     uint32_t                m_id_epoch   = 0;
     uint32_t                m_id_pepoch  = 0;
