@@ -289,6 +289,41 @@ int main()
         arena.deleteEntity(world, true);
     }
 
+    // -- 7b: what a store reads -------------------------------------------------
+    {
+        std::cout << "\n-- 7b. a frozen read under a driver --\n";
+        // A save reads a tree that is moving; etcs_freeze holds it for the
+        // copy. Every read, given to a tree built by the same lines (what a
+        // resume does), must balance and hash as the read said.
+        Body* world = build();
+        const Fixed put_in = Fixed::FromInt(12 + 12 + 4);
+        std::atomic<bool> stop{false};
+        std::thread driver([&]() { while (!stop.load(std::memory_order_acquire)) world->Run(1, dt); });
+        int reads = 0, unbalanced = 0, unhashed = 0, unsettled = 0;
+        for (int i = 0; i < 200; ++i)
+        {
+            FrozenTree t;
+            if (!etcs_freeze(world, t)) ++unsettled;
+            Body* fresh = build();
+            FrozenTree ft; etcs_freeze(fresh, ft);
+            for (size_t k = 0; k < t.nodes.size() && k < ft.nodes.size(); ++k)
+            { ETCS::EnvironmentState st; for (auto& [key, v] : t.nodes[k].kv) st.set(key, v); etcs_restore_values(ft.nodes[k].e, st); }
+            Totals tt; totals(fresh, tt);
+            if (tt.energy + fresh->EmittedOut() != put_in) ++unbalanced;
+            if (fresh->getHash() != t.state_hash) ++unhashed;
+            ++reads;
+            arena.deleteEntity(fresh, true);
+        }
+        stop.store(true, std::memory_order_release);
+        driver.join();
+        check(reads == 200 && unbalanced == 0, "every frozen read of a driven tree is one tick: its energy balances to the bit");
+        check(unhashed == 0, "...and a tree given its values hashes as the read said");
+        check(unsettled == 0, "...and each read settled");
+        std::printf("        (%d reads, %d unbalanced, %d unhashed, ticks %llu)\n", reads, unbalanced, unhashed,
+                    static_cast<unsigned long long>(world->CausalTicks()));
+        arena.deleteEntity(world, true);
+    }
+
     // -- 8: the clock ---------------------------------------------------------
     {
         std::cout << "\n-- 8. emission is the clock --\n";

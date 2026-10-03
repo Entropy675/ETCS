@@ -35,6 +35,7 @@
 #endif
 #include "../ETCS.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <iostream>
 #include <map>
@@ -63,11 +64,12 @@ class Env : public EnvironmentalBase<Env>, public DeletableBase<Env>
 public:
     WIRE_TYPE_IDENTITY(Env)
     int value = 0;
+    bool drift = false;   // the adversary of a read: the value moves on every one (§7c)
     Env()
     {
         bindValue(ETCS::Buffer("value"), ETCS::Entity::ValueBinding{
             this,
-            [](void* self, std::string& out) { out = std::to_string(static_cast<Env*>(self)->value); },
+            [](void* self, std::string& out) { Env* me = static_cast<Env*>(self); out = std::to_string(me->drift ? me->value++ : me->value); },
             [](void* self, const std::string& in) { static_cast<Env*>(self)->value = std::stoi(in); return true; } });
     }
     bool RebuildLocalConcrete(const ETCS::EnvironmentState&) override { return true; }
@@ -296,6 +298,41 @@ int main()
         check(w->getHash() == v->getHash(), "the two now have one state hash");
         ETCS::EnvironmentState stray; stray.set("nowhere", "1");
         check(etcs_restore_values(w, stray) == 0, "a key the surface has no place for is skipped, and counted out");
+    }
+
+    // -- 7c. one state per read ---------------------------------------------------
+    {
+        std::cout << "\n-- 7c. one state per read --\n";
+        // A tree whose child's value moves between any two reads -- what a
+        // live scene does to a save -- and the same tree, still.
+        Env* d = arena.allocate<Env>(); ETCS::etcs_supertype_fanout(d);
+        Env* dc = d->addTag<Env>(); dc->drift = true;
+        Env* f = arena.allocate<Env>(); ETCS::etcs_supertype_fanout(f);
+        Env* fc = f->addTag<Env>();
+        auto onto = [](const FrozenTree& from, ETCS::Entity* root) {
+            FrozenTree to; etcs_freeze(root, to);
+            for (size_t i = 0; i < from.nodes.size() && i < to.nodes.size(); ++i)
+            { ETCS::EnvironmentState st; for (auto& [k, v] : from.nodes[i].kv) st.set(k, v); etcs_restore_values(to.nodes[i].e, st); }
+        };
+
+        const uint64_t live = d->getHash();
+        ETCS::EnvironmentState kv; etcs_capture_values(dc, kv);
+        etcs_restore_values(fc, kv);
+        check(f->getHash() != live, "read live, a moving tree's hash and its values are two states");
+
+        FrozenTree t;
+        check(etcs_freeze(d, t), "a frozen read of it settles");
+        onto(t, f);
+        check(f->getHash() == t.state_hash, "frozen, the hash kept is the hash of the values kept");
+
+        int calls = 0;
+        FrozenTree t2;
+        const bool ok = etcs_freeze(f, t2, [&]() { if (calls++ == 0) f->addTag(ETCS::Buffer("moved")); });
+        check(ok && calls == 2, "a change through the funnel during the read moves the root's hash epoch, and the read is made again");
+        check(std::find(t2.nodes[0].flags.begin(), t2.nodes[0].flags.end(), "moved") != t2.nodes[0].flags.end()
+              && t2.state_hash == f->getHash(), "...and the second read is the state after it");
+        arena.deleteEntity(d, true);
+        arena.deleteEntity(f, true);
     }
 
     // -- 8. carried across a call -------------------------------------------------

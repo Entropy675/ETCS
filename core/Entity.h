@@ -1851,6 +1851,22 @@ public:
     // The value surfaces under this node, in the walk's order, as one
     // number. Live: O(subtree) per call, no cache.
     uint64_t subtreeValueHash() const;
+    /*
+ * THE SAME RULE, OVER VALUES ALREADY READ -- what a frozen read composes its
+ * state hash with (etcs_freeze, ontology/Environmental.h), so the number it
+ * keeps describes exactly the values it kept, whatever moved after. One rule:
+ * the live forms above are these over a live read.
+ *
+ *   valueHashOf         one node's sorted (key, value) list (values())
+ *   subtreeValueHashOf  those, one per node in the walk's order
+ *   stateHashWith       this node's state hash given its subtree's values;
+ *                       the identity half is read live, so a caller holds it
+ *                       still (the hash epoch) for the pair to be one state
+ */
+    static uint64_t valueHashOf(const ::std::vector<::std::pair<::std::string, ::std::string>>& kv);
+    static uint64_t subtreeValueHashOf(const ::std::vector<uint64_t>& per_node);
+    uint64_t stateHashWith(uint64_t subtree_values) const;
+    void     stateDigestWith(uint64_t subtree_values, unsigned char out[32]) const;
 
     /*
  * WHERE THIS ENTITY STANDS AMONG ITS TWINS: the index, in attach order,
@@ -4584,8 +4600,8 @@ namespace etcs_hash_detail
      * a stable sort) -- creation order as the last key, and only there. No
      * RID decides anything, so the same state made at other RIDs walks the
      * same. Every walk whose order is part of its output walks in it: the
-     * values in the state hash (subtreeValueHash), a store's record order
-     * (Persistence).
+     * values in the state hash (subtreeValueHash), a frozen read
+     * (etcs_freeze), a store's record order (Persistence).
      */
     inline void order_canonical(const Entity* parent, ::std::vector<::std::pair<ETCS::Buffer, RID>>& kids)
     {
@@ -4608,16 +4624,28 @@ namespace etcs_hash_detail
     }
 }
 
-inline uint64_t Entity::valueHash() const
+inline uint64_t Entity::valueHashOf(const ::std::vector<::std::pair<::std::string, ::std::string>>& kv)
 {
-    ::std::vector<::std::pair<::std::string, ::std::string>> kv;
-    values(kv);
     ::std::string in;
     for (auto& [k, v] : kv)
     {
         etcs_hash_detail::put(in, 'V', k.data(), k.size());
         etcs_hash_detail::put(in, 'v', v.data(), v.size());
     }
+    return XXH3_64bits(in.data(), in.size());
+}
+
+inline uint64_t Entity::valueHash() const
+{
+    ::std::vector<::std::pair<::std::string, ::std::string>> kv;
+    values(kv);
+    return valueHashOf(kv);
+}
+
+inline uint64_t Entity::subtreeValueHashOf(const ::std::vector<uint64_t>& per_node)
+{
+    ::std::string in;
+    for (uint64_t h : per_node) etcs_hash_detail::put_u64(in, h);
     return XXH3_64bits(in.data(), in.size());
 }
 
@@ -4882,10 +4910,10 @@ inline uint64_t Entity::subtreeValueHash() const
     // vector, each child held for the visit as the identity walk holds it.
     struct Frame { const Entity* node = nullptr; ::std::vector<::std::pair<ETCS::Buffer, RID>> kids; size_t next = 0; LifetimeHold hold; };
     ::std::vector<Frame> stack;
-    ::std::string in;
-    auto open = [&in](const Entity* n, LifetimeHold&& hold) {
+    ::std::vector<uint64_t> per_node;
+    auto open = [&per_node](const Entity* n, LifetimeHold&& hold) {
         Frame f; f.node = n; f.hold = ::std::move(hold);
-        etcs_hash_detail::put_u64(in, n->valueHash());
+        per_node.push_back(n->valueHash());
         n->getTypedChildren(f.kids);
         etcs_hash_detail::order_canonical(n, f.kids);
         return f;
@@ -4905,10 +4933,10 @@ inline uint64_t Entity::subtreeValueHash() const
         }
         stack.pop_back();
     }
-    return XXH3_64bits(in.data(), in.size());
+    return subtreeValueHashOf(per_node);
 }
 
-inline void Entity::getDigest(unsigned char out[32]) const
+inline void Entity::stateDigestWith(uint64_t subtree_values, unsigned char out[32]) const
 {
     // The identity half's digest, then the values: one input, SHA-256.
     unsigned char id[32];
@@ -4916,19 +4944,19 @@ inline void Entity::getDigest(unsigned char out[32]) const
     ::std::string in;
     in.push_back('\x02');                               // a state: identity and values
     in.append(reinterpret_cast<const char*>(id), 32);
-    etcs_hash_detail::put_u64(in, subtreeValueHash());
+    etcs_hash_detail::put_u64(in, subtree_values);
     picohash_ctx_t ctx;
     picohash_init_sha256(&ctx);
     picohash_update(&ctx, in.data(), in.size());
     picohash_final(&ctx, out);
 }
 
-inline uint64_t Entity::getHash() const
+inline uint64_t Entity::stateHashWith(uint64_t subtree_values) const
 {
     if (isGlobalScope())
     {
         unsigned char d[32];
-        getDigest(d);
+        stateDigestWith(subtree_values, d);
         uint64_t first = 0;
         ::std::memcpy(&first, d, sizeof(first));
         return first;
@@ -4936,9 +4964,12 @@ inline uint64_t Entity::getHash() const
     ::std::string in;
     in.push_back('\x02');
     etcs_hash_detail::put_u64(in, identityHash());
-    etcs_hash_detail::put_u64(in, subtreeValueHash());
+    etcs_hash_detail::put_u64(in, subtree_values);
     return XXH3_64bits(in.data(), in.size());
 }
+
+inline void Entity::getDigest(unsigned char out[32]) const { stateDigestWith(subtreeValueHash(), out); }
+inline uint64_t Entity::getHash() const { return stateHashWith(subtreeValueHash()); }
 
 inline uint32_t Entity::siblingIndex() const
 {

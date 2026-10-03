@@ -3,7 +3,11 @@
 
 
 #include "../core_defs.h"
+#include "Causal.h"
+#include <algorithm>
 #include <cstring>
+#include <functional>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -144,6 +148,121 @@ inline void etcs_capture_values(const ETCS::Entity* e, ETCS::EnvironmentState& o
     e->values(kv);
     for (auto& [k, v] : kv) out.set(k, std::move(v));
 }
+/*
+ * A FROZEN READ of a tree: what a store keeps, all of it from one state.
+ *
+ * A save reads a moving thing. Read live, node by node, a body can step
+ * between two reads and a ledger can take a line between the hash and the
+ * values, and what is kept is a state that never was -- with a hash that
+ * does not describe it. So the read is a copy, made in one window:
+ *
+ *   - every Causal tree under the root is held by its lock (TreeMutex), in
+ *     address order, so its rows are one tick -- they move under that lock
+ *     and nowhere else;
+ *   - the funnel is not stopped but WATCHED: every flag or value change under
+ *     the root bumps the root's hash epoch (markStateChange walks up), so an
+ *     epoch that moved across the window means the copy may be torn, and it
+ *     is made again (a seqlock on a counter the funnel already keeps);
+ *   - the state hash is composed FROM THE COPY (Entity::stateHashWith over
+ *     subtreeValueHashOf), never read live beside it, so the number kept is
+ *     the values kept -- a bound value that moves without either (a ledger's
+ *     line) cannot come between them.
+ *
+ * Everything after the window -- packing, keys, the database -- reads the
+ * copy with nothing held. `inside` runs in the window too: a caller whose
+ * other half must be the same state (the replay capture) does it there.
+ * `stable` is false when the epoch kept moving through every try.
+ */
+struct FrozenNode
+{
+    ETCS::Entity* e = nullptr;            // identity only: not held once the window closes
+    std::string   module, tag;            // what it is, read in the window (getSourceModule/Tag)
+    uint64_t      identity = 0;
+    bool          environmental = false;
+    std::vector<std::string>                         flags;   // state flags, sorted
+    std::vector<std::pair<std::string, std::string>> kv;      // the value surface, sorted
+    std::vector<size_t>                              kids;    // indices, in the walk's order
+};
+struct FrozenTree
+{
+    std::vector<FrozenNode> nodes;        // the hash's walk: pre-order, nodes[0] the root
+    uint64_t state_hash = 0;
+    bool     stable = false;
+};
+
+inline bool etcs_freeze(ETCS::Entity* root, FrozenTree& out,
+                        const std::function<void()>& inside = {}, int tries = 4)
+{
+    // The walk subtreeValueHash makes (order_canonical), so the per-node
+    // order is the hash's.
+    auto visit = [](ETCS::Entity* top, const std::function<void(ETCS::Entity*, size_t parent)>& at) {
+        struct Frame { ETCS::Entity* n; size_t idx; std::vector<std::pair<ETCS::Buffer, ETCS::RID>> kids; size_t next = 0; ETCS::LifetimeHold hold; };
+        std::vector<Frame> stack;
+        size_t count = 0;
+        auto open = [&](ETCS::Entity* n, size_t parent, ETCS::LifetimeHold&& hold) {
+            Frame f; f.n = n; f.idx = count++; f.hold = std::move(hold);
+            at(n, parent);
+            n->getTypedChildren(f.kids);
+            ETCS::etcs_hash_detail::order_canonical(n, f.kids);
+            return f;
+        };
+        stack.push_back(open(top, SIZE_MAX, ETCS::LifetimeHold()));
+        while (!stack.empty())
+        {
+            Frame& f = stack.back();
+            if (f.next < f.kids.size())
+            {
+                const auto [tag, rid] = f.kids[f.next++];
+                ETCS::Entity* child = f.n->getTypedChild(tag, rid);
+                ETCS::LifetimeHold hold(child);
+                if (!hold) continue;
+                const size_t parent = f.idx;
+                stack.push_back(open(child, parent, std::move(hold)));
+                continue;
+            }
+            stack.pop_back();
+        }
+    };
+    for (int attempt = 0; attempt < tries; ++attempt)
+    {
+        const uint32_t epoch = root->hashEpoch();
+        // The trees to hold: found outside the window (a tree that appears
+        // after this bumps the epoch, and the copy is made again).
+        std::vector<std::recursive_mutex*> locks;
+        visit(root, [&locks](ETCS::Entity* n, size_t) {
+            if (void* c = n->getInterfacePointer(ETCS::Buffer("Causal")))
+                locks.push_back(&static_cast<Causal_*>(c)->TreeMutex());
+        });
+        std::sort(locks.begin(), locks.end());
+        locks.erase(std::unique(locks.begin(), locks.end()), locks.end());
+        for (auto* m : locks) m->lock();
+
+        out.nodes.clear();
+        std::vector<uint64_t> per_node;
+        visit(root, [&out, &per_node](ETCS::Entity* n, size_t parent) {
+            FrozenNode fn;
+            fn.e = n;
+            fn.module = n->getSourceModule().toString();
+            fn.tag    = n->getSourceTag().toString();
+            fn.identity = n->identityHash();
+            fn.environmental = n->isEnvironmental();
+            n->stateFlags(fn.flags);
+            std::sort(fn.flags.begin(), fn.flags.end());
+            n->values(fn.kv);
+            per_node.push_back(ETCS::Entity::valueHashOf(fn.kv));
+            if (parent != SIZE_MAX) out.nodes[parent].kids.push_back(out.nodes.size());
+            out.nodes.push_back(std::move(fn));
+        });
+        out.state_hash = root->stateHashWith(ETCS::Entity::subtreeValueHashOf(per_node));
+        if (inside) inside();
+
+        for (auto it = locks.rbegin(); it != locks.rend(); ++it) (*it)->unlock();
+        out.stable = (root->hashEpoch() == epoch);
+        if (out.stable) return true;
+    }
+    return false;
+}
+
 // The values back onto the surface; how many landed. A key the surface has
 // no place for (a flag the script did not put back, a binding this build
 // does not have) is skipped, and the count says so.
