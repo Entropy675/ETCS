@@ -244,15 +244,15 @@ private:
         const uint32_t epoch = this->hashEpoch();
         if (m_kids && m_kids_epoch == epoch) return m_kids;
         auto fresh = ::std::make_shared<::std::vector<Causal_*>>();
-        ::std::vector<::std::pair<ETCS::Buffer, ETCS::RID>> kids;
-        this->getTypedChildren(kids);
-        struct Member { ETCS::Buffer tag; uint64_t hash; Causal_* c; };
+        ::std::vector<ETCS::Entity::ChildRef> kids;
+        this->getTypedChildRefs(kids);
+        struct Member { const ETCS::Buffer* tag; uint64_t hash; Causal_* c; };   // a tag is its key's address
         ::std::vector<Member> members;
         for (const auto& entry : kids)
         {
-            ETCS::Entity* child = this->getTypedChild(entry.first, entry.second);
+            ETCS::Entity* child = this->getTypedChild(*entry.first, entry.second);
             if (!child) continue;
-            if (void* c = child->getInterfacePointer(ETCS::Buffer("Causal")))
+            if (void* c = child->getInterfacePointer(causalKey()))
                 members.push_back(Member{ entry.first, child->identityHash(), static_cast<Causal_*>(c) });
         }
         for (auto lo = members.begin(); lo != members.end(); )
@@ -356,11 +356,15 @@ private:
         return (p && !p->isDestructed()) ? p : nullptr;
     }
 
+    // The family's interface name, made once: a Buffer is 256 bytes zeroed on
+    // construction, and TreeMutex() asks for it on every entry.
+    static const ETCS::Buffer& causalKey() { static const ETCS::Buffer k("Causal"); return k; }
+
     static Causal_* containerOf(Causal_* c)
     {
         ETCS::Entity* p = liveParent(c);
         if (!p) return nullptr;
-        void* raw = p->getInterfacePointer(ETCS::Buffer("Causal"));
+        void* raw = p->getInterfacePointer(causalKey());
         return raw ? static_cast<Causal_*>(raw) : nullptr;
     }
 
@@ -377,7 +381,7 @@ private:
         {
             m_container_of  = p;
             m_container_rid = prid;
-            void* c = p ? p->getInterfacePointer(ETCS::Buffer("Causal")) : nullptr;
+            void* c = p ? p->getInterfacePointer(causalKey()) : nullptr;
             m_container     = c ? static_cast<Causal_*>(c) : nullptr;
         }
         return m_container;

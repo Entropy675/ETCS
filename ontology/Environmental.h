@@ -216,13 +216,13 @@ inline bool etcs_freeze(ETCS::Entity* root, FrozenTree& out,
     // The walk subtreeValueHash makes (order_canonical), so the per-node
     // order is the hash's.
     auto visit = [](ETCS::Entity* top, bool canonical, const std::function<void(ETCS::Entity*, size_t parent)>& at) {
-        struct Frame { ETCS::Entity* n; size_t idx; std::vector<std::pair<ETCS::Buffer, ETCS::RID>> kids; size_t next = 0; ETCS::LifetimeHold hold; };
+        struct Frame { ETCS::Entity* n; size_t idx; std::vector<ETCS::Entity::ChildRef> kids; size_t next = 0; ETCS::LifetimeHold hold; };
         std::vector<Frame> stack;
         size_t count = 0;
         auto open = [&](ETCS::Entity* n, size_t parent, ETCS::LifetimeHold&& hold) {
             Frame f; f.n = n; f.idx = count++; f.hold = std::move(hold);
             at(n, parent);
-            n->getTypedChildren(f.kids);
+            n->getTypedChildRefs(f.kids);
             if (canonical) ETCS::etcs_hash_detail::order_canonical(n, f.kids);
             return f;
         };
@@ -233,7 +233,7 @@ inline bool etcs_freeze(ETCS::Entity* root, FrozenTree& out,
             if (f.next < f.kids.size())
             {
                 const auto [tag, rid] = f.kids[f.next++];
-                ETCS::Entity* child = f.n->getTypedChild(tag, rid);
+                ETCS::Entity* child = f.n->getTypedChild(*tag, rid);
                 ETCS::LifetimeHold hold(child);
                 if (!hold) continue;
                 const size_t parent = f.idx;
@@ -250,7 +250,8 @@ inline bool etcs_freeze(ETCS::Entity* root, FrozenTree& out,
         // after this bumps the epoch, and the copy is made again).
         std::vector<std::recursive_mutex*> locks;
         visit(root, false, [&locks](ETCS::Entity* n, size_t) {   // which trees: any order
-            if (void* c = n->getInterfacePointer(ETCS::Buffer("Causal")))
+            static const ETCS::Buffer kCausal("Causal");   // 256 bytes, made once
+            if (void* c = n->getInterfacePointer(kCausal))
                 locks.push_back(&static_cast<Causal_*>(c)->TreeMutex());
         });
         std::sort(locks.begin(), locks.end());

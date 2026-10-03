@@ -1256,6 +1256,30 @@ public:
         }
     }
     /*
+ * getTypedChildRefs(out) - the same enumeration, without copying a tag per
+ * child: each entry points at the tag as typed_children_ keeps it. A key
+ * there is never erased and an unordered_map's elements do not move when
+ * it grows, so the pointer is good for as long as this entity lives -- a
+ * walk that holds this entity holds its tags. A child that is gone by the
+ * time it is resolved (getTypedChild answers null) is simply skipped.
+ * Every walk that visits whole subtrees uses this one; getTypedChildren
+ * copies a 256-byte Buffer per child.
+ */
+    using ChildRef = ::std::pair<const ETCS::Buffer*, RID>;
+    void getTypedChildRefs(::std::vector<ChildRef>& out) const
+    {
+        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
+        ::std::vector<RID> rids;
+        for (const auto& tag : typed_child_order_)
+        {
+            auto it = typed_children_.find(tag);
+            if (it == typed_children_.end()) continue;
+            rids.clear();
+            it->second.invoke_collect_rids(rids);
+            for (RID r : rids) out.emplace_back(&it->first, r);
+        }
+    }
+    /*
  * getTypedChild(tag, rid) - resolves a single live child by exactly
  * the (tag, RID) pair getTypedChildren() above reports it under.
  * nullptr if the tag was never attached, or the RID is no longer live.
@@ -4623,20 +4647,18 @@ namespace etcs_hash_detail
     // composes each tag's children as a multiset (finish sorts them by hash),
     // so no RID reaches its number. A walk whose order is part of what it
     // produces walks in order_canonical instead.
-    inline void order_children(::std::vector<::std::pair<ETCS::Buffer, RID>>& kids)
+    inline void order_children(::std::vector<Entity::ChildRef>& kids)
     {
+        // A group is one tag: the same key, so the same pointer.
         auto lo = kids.begin();
         while (lo != kids.end())
         {
             auto hi = lo + 1;
             while (hi != kids.end() && hi->first == lo->first) ++hi;
-            ::std::sort(lo, hi, [](const ::std::pair<ETCS::Buffer, RID>& a,
-                                   const ::std::pair<ETCS::Buffer, RID>& b)
-                                { return a.second < b.second; });
+            ::std::sort(lo, hi, [](const Entity::ChildRef& a, const Entity::ChildRef& b) { return a.second < b.second; });
             lo = hi;
         }
     }
-
     /*
      * THE CANONICAL ORDER of a node's children -- the one CausalHash walks
      * (P54): tag groups in first-attachment order; within a tag, by identity
@@ -4648,12 +4670,10 @@ namespace etcs_hash_detail
      * values in the state hash (subtreeValueHash), a frozen read
      * (etcs_freeze), a store's record order (Persistence).
      */
-    inline void order_canonical(const Entity* parent, ::std::vector<::std::pair<ETCS::Buffer, RID>>& kids)
+    inline void order_canonical(const Entity* parent, ::std::vector<Entity::ChildRef>& kids)
     {
-        // Sorted as indices, then moved once: an entry carries its tag as a
-        // whole Buffer, and moving those through a sort cost more than the
-        // sort. The group is the tag's run (getTypedChildren keeps them
-        // together, in first-attachment order).
+        // Sorted as indices; a group is one tag (one key, one pointer, kept
+        // together in first-attachment order by getTypedChildRefs).
         const size_t n = kids.size();
         if (n < 2) return;
         ::std::vector<uint32_t> group(n), idx(n);
@@ -4661,21 +4681,18 @@ namespace etcs_hash_detail
         uint32_t g = 0;
         for (size_t i = 0; i < n; ++i)
         {
-            if (i && !(kids[i].first == kids[i - 1].first)) ++g;
+            if (i && kids[i].first != kids[i - 1].first) ++g;
             group[i] = g;
             idx[i] = static_cast<uint32_t>(i);
-            Entity* c = parent->getTypedChild(kids[i].first, kids[i].second);
+            Entity* c = parent->getTypedChild(*kids[i].first, kids[i].second);
             LifetimeHold hold(c);
             id[i] = hold ? c->identityHash() : 0;
         }
         ::std::stable_sort(idx.begin(), idx.end(), [&](uint32_t a, uint32_t b) {
             return group[a] != group[b] ? group[a] < group[b] : id[a] < id[b]; });
-        bool moved = false;
-        for (size_t i = 0; i < n && !moved; ++i) moved = idx[i] != i;
-        if (!moved) return;
-        ::std::vector<::std::pair<ETCS::Buffer, RID>> out;
+        ::std::vector<Entity::ChildRef> out;
         out.reserve(n);
-        for (uint32_t i : idx) out.push_back(::std::move(kids[i]));
+        for (uint32_t i : idx) out.push_back(kids[i]);
         kids.swap(out);
     }
 }
@@ -4775,15 +4792,15 @@ inline uint64_t Entity::surfaceHash() const
 struct EntityHashFrame
 {
     const Entity*  node = nullptr;
-    ETCS::Buffer   tag;                 // under which the parent composes it
+    const ETCS::Buffer* tag = nullptr;  // under which the parent composes it (its key in the parent)
     RID            rid  = 0;
     uint32_t       epoch = 0;           // read before, stamped after
     bool           was_current = false; // audit: what the cache claimed
     uint64_t       was = 0;
     LifetimeHold   hold;                // the parent's hold on this child, for the whole subtree
-    ::std::vector<::std::pair<ETCS::Buffer, RID>>           kids;
+    ::std::vector<Entity::ChildRef>                         kids;
     size_t                                                  next = 0;
-    ::std::vector<::std::pair<::std::string, uint64_t>>     composed;
+    ::std::vector<::std::pair<const ETCS::Buffer*, uint64_t>> composed;   // (tag, hash): a group is one tag
 };
 
 inline uint64_t Entity::computeNodeHash(HashAudit* audit, unsigned char* digest) const
@@ -4803,9 +4820,9 @@ inline uint64_t Entity::computeNodeHash(HashAudit* audit, unsigned char* digest)
             ::std::sort(lo, hi);
             lo = hi;
         }
-        for (auto const& [tagstr, h] : f.composed)
+        for (auto const& [tag, h] : f.composed)
         {
-            etcs_hash_detail::put(in, 'C', tagstr.data(), tagstr.size());
+            etcs_hash_detail::put(in, 'C', tag->buf, tag->written);   // the tag's bytes, as toString() gives them
             etcs_hash_detail::put_u64(in, h);
         }
         /*
@@ -4842,7 +4859,7 @@ inline uint64_t Entity::computeNodeHash(HashAudit* audit, unsigned char* digest)
     // RIDs hash the same (surfaceHash).
     auto open = [](EntityHashFrame& f)
     {
-        f.node->getTypedChildren(f.kids);
+        f.node->getTypedChildRefs(f.kids);
         etcs_hash_detail::order_children(f.kids);
     };
 
@@ -4859,7 +4876,7 @@ inline uint64_t Entity::computeNodeHash(HashAudit* audit, unsigned char* digest)
         if (f.next < f.kids.size())
         {
             const auto [tag, rid] = f.kids[f.next++];
-            Entity* child = f.node->getTypedChild(tag, rid);
+            Entity* child = f.node->getTypedChild(*tag, rid);
             LifetimeHold hold(child);
             if (!hold) { if (audit) ++audit->skipped; continue; }
 
@@ -4867,7 +4884,7 @@ inline uint64_t Entity::computeNodeHash(HashAudit* audit, unsigned char* digest)
             // subtree is not walked.
             if (!audit && child->hashCurrent())
             {
-                f.composed.emplace_back(tag.toString(), child->hashCached());
+                f.composed.emplace_back(tag, child->hashCached());
                 continue;
             }
             // Down a level. `f` may move when the vector grows; nothing
@@ -4910,7 +4927,7 @@ inline uint64_t Entity::computeNodeHash(HashAudit* audit, unsigned char* digest)
              * recomputes once more, cheaply, from the state just verified.
              */
             ++audit->diverged;
-            ETCS_LOG("Hash", "DIVERGENCE at RID:" << f.rid << " (" << f.tag
+            ETCS_LOG("Hash", "DIVERGENCE at RID:" << f.rid << " (" << *f.tag
                      << "): cached 0x" << ::std::hex << f.was << " but the state hashes to 0x"
                      << h << ::std::dec << " -- a change that never went through a funnel.");
             markStateChange(const_cast<Entity*>(f.node), f.rid);
@@ -4919,9 +4936,9 @@ inline uint64_t Entity::computeNodeHash(HashAudit* audit, unsigned char* digest)
         // before its subtree was hashed. A child is never global, so its
         // digest is kept only by an audit.
         f.node->stampHash(h, f.epoch, audit ? cd : nullptr);
-        const ::std::string tagstr = f.tag.toString();
+        const ETCS::Buffer* const tagp = f.tag;
         frames.pop_back();
-        frames.back().composed.emplace_back(tagstr, h);
+        frames.back().composed.emplace_back(tagp, h);
     }
 }
 
@@ -4964,13 +4981,13 @@ inline uint64_t Entity::subtreeValueHash() const
     // The canonical walk (order_canonical): which value comes first is part
     // of the number, so no RID may decide it. One frame per level on this
     // vector, each child held for the visit as the identity walk holds it.
-    struct Frame { const Entity* node = nullptr; ::std::vector<::std::pair<ETCS::Buffer, RID>> kids; size_t next = 0; LifetimeHold hold; };
+    struct Frame { const Entity* node = nullptr; ::std::vector<ChildRef> kids; size_t next = 0; LifetimeHold hold; };
     ::std::vector<Frame> stack;
     ::std::vector<uint64_t> per_node;
     auto open = [&per_node](const Entity* n, LifetimeHold&& hold) {
         Frame f; f.node = n; f.hold = ::std::move(hold);
         per_node.push_back(n->valueHash());
-        n->getTypedChildren(f.kids);
+        n->getTypedChildRefs(f.kids);
         etcs_hash_detail::order_canonical(n, f.kids);
         return f;
     };
@@ -4981,7 +4998,7 @@ inline uint64_t Entity::subtreeValueHash() const
         if (f.next < f.kids.size())
         {
             const auto [tag, rid] = f.kids[f.next++];
-            Entity* child = f.node->getTypedChild(tag, rid);
+            Entity* child = f.node->getTypedChild(*tag, rid);
             LifetimeHold hold(child);
             if (!hold) continue;
             stack.push_back(open(child, ::std::move(hold)));
@@ -5044,16 +5061,16 @@ inline uint32_t Entity::siblingIndex() const
     {
         // Tag groups in first-attachment order, attach order within
         // (getTypedChildren): count each (tag, identity) as it comes.
-        ::std::vector<::std::pair<ETCS::Buffer, RID>> kids;
-        p->getTypedChildren(kids);
-        ::std::map<::std::pair<::std::string, uint64_t>, uint32_t> seen;
+        ::std::vector<ChildRef> kids;
+        p->getTypedChildRefs(kids);
+        ::std::map<::std::pair<const ETCS::Buffer*, uint64_t>, uint32_t> seen;   // a tag is its key's address
         t->index.clear();
         for (auto const& [tag, rid] : kids)
         {
-            Entity* c = p->getTypedChild(tag, rid);
+            Entity* c = p->getTypedChild(*tag, rid);
             LifetimeHold hold(c);
             if (!hold) continue;
-            t->index[rid] = seen[{ tag.toString(), c->identityHash() }]++;
+            t->index[rid] = seen[{ tag, c->identityHash() }]++;
         }
         t->epoch = epoch;   // read before the walk: a change during it makes the next ask walk again
     }
@@ -5229,11 +5246,11 @@ inline void etcs_replay_gather(Entity* e, ReplayGather& g)
         ::std::vector<::std::string> fl;
         x->stateFlags(fl);
         for (auto& f : fl) g.live.insert(Entity::flagKey(x, f));
-        ::std::vector<::std::pair<ETCS::Buffer, RID>> kids;
-        x->getTypedChildren(kids);
+        ::std::vector<Entity::ChildRef> kids;
+        x->getTypedChildRefs(kids);
         for (auto& [tag, rid] : kids)
         {
-            Entity* c = x->getTypedChild(tag, rid);
+            Entity* c = x->getTypedChild(*tag, rid);
             if (!c) continue;
             g.live.insert(Entity::childKey(rid));
             g.parent_of[rid] = x->getRID();
