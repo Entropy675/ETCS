@@ -14,14 +14,18 @@
 //      impulses -- through drag, through emission, through contact.
 //   3. THE ROWS HOLD. Every body satisfies OrderVector::Holds after every
 //      interaction.
-//   4. IDENTITY AND ORDER. The same scene built with its members attached
-//      in another order is the same scene: same CausalHash, same rows per
-//      member, same draws. Row 0's identity is the state hash, not a RID.
+//   4. IDENTITY AND ORDER. Row 0 carries the identity tuple -- the identity
+//      hash, then the index among twins (creation order, the last key); the
+//      step and the hash walk members in canonical order. The same lines
+//      give the same hash; a distinguishable member attached elsewhere gives
+//      the same hash; twins swapped give another.
 //   5. CONTACT. Two members whose reaches touch exchange along the line
 //      between them; a head-on contact hands everything over; the
 //      exchange does not depend on which is walked first.
-//   6. THE RECORD. An observed history -- spans a clock measured -- replays
-//      from the tape onto the same rows.
+//   6. THE RECORD. The observed spans are inputs: the same spans into a
+//      fresh tree land on the same rows. What is KEPT is the rows, as the
+//      value behind the Causal tag on the surface: captured off one tree,
+//      handed to another built by the same lines, same hash, same clock.
 //   7. ONE HISTORY. A reader under the tree's lock sees one state while a
 //      driver runs on another thread.
 //   8. THE CLOCK. Ticks count crossings; a body with no heat has no time.
@@ -30,6 +34,7 @@
 //
 #include "../ETCS.h"
 #include <atomic>
+#include <functional>
 #include <cstdio>
 #include <thread>
 #include <vector>
@@ -86,7 +91,10 @@ int main()
 
     // A world with a room in it, and three bodies in the room: two that will
     // meet, one that drifts.
-    auto build = [&](bool reversed) -> Body* {
+    // Three members under a room: two movers (twins: the same type and
+    // tags) and a drifter that may be made distinguishable by a flag.
+    // `order` says which to attach when: 0 and 1 the movers, 2 the drifter.
+    auto build = [&](std::vector<int> order = {0, 1, 2}, bool odd_drifter = false) -> Body* {
         Body* world = arena.allocate<Body>();
         world->SetEmissivity(Fixed::From(0.2));
         Body* room  = world->addTag<Body>();
@@ -97,17 +105,11 @@ int main()
             b->Impulse(Fixed::From(dx), Fixed::From(dy), Fixed::From(dz), Fixed::From(j));
             return b;
         };
-        if (!reversed)
+        for (int which : order)
         {
-            make(-3, 0, 0, 0.5,  1, 0, 0, 12, 0.1);    // toward +x: will meet the second
-            make( 3, 0, 0, 0.5, -1, 0, 0, 12, 0.1);    // toward -x
-            make( 0, 5, 0, 0.5,  0, 0, 1,  4, 1.0);    // drifts off alone
-        }
-        else
-        {
-            make( 0, 5, 0, 0.5,  0, 0, 1,  4, 1.0);
-            make( 3, 0, 0, 0.5, -1, 0, 0, 12, 0.1);
-            make(-3, 0, 0, 0.5,  1, 0, 0, 12, 0.1);
+            if (which == 0) make(-3, 0, 0, 0.5,  1, 0, 0, 12, 0.1);    // toward +x: will meet the other
+            if (which == 1) make( 3, 0, 0, 0.5, -1, 0, 0, 12, 0.1);    // toward -x
+            if (which == 2) { Body* d = make(0, 5, 0, 0.5, 0, 0, 1, 4, 1.0); if (odd_drifter) d->addTag(ETCS::Buffer("odd")); }
         }
         return world;
     };
@@ -115,7 +117,7 @@ int main()
     // -- 1, 2, 3: the ledger, the arrow, the rows ------------------------------
     {
         std::cout << "\n-- 1-3. the ledger, the arrow, the rows --\n";
-        Body* world = build(false);
+        Body* world = build();
         Totals t0; totals(world, t0);
         const Fixed put_in = Fixed::FromInt(12 + 12 + 4);
         check(t0.bodies == 5 && t0.energy == put_in, "what Impulse put in is what the tree holds, to the bit");
@@ -141,20 +143,35 @@ int main()
     // -- 4: identity and order -------------------------------------------------
     uint64_t forward_hash = 0;
     {
-        std::cout << "\n-- 4. the same scene in another order --\n";
-        Body* a = build(false);
-        Body* b = build(true);
-        a->Run(1500, dt); b->Run(1500, dt);
+        std::cout << "\n-- 4. identity and order --\n";
+        // THE IDENTITY TUPLE: what it is (the identity hash), then which of
+        // the indistinguishable ones (the index among twins, in creation
+        // order). The step and the hash walk the members in canonical order:
+        // by what they are, then creation order between twins.
+        Body* a = build({0, 1, 2}, true);     // movers, then an odd drifter
+        Body* b = build({2, 0, 1}, true);     // the odd drifter first: distinguishable, so its place is by what it is
+        Body* c = build({1, 0, 2}, true);     // the twins swapped: creation order is the last key, and it moved
+        Body* d = build({0, 1, 2}, true);     // the same lines again
+        a->Run(1500, dt); b->Run(1500, dt); c->Run(1500, dt); d->Run(1500, dt);
         forward_hash = a->CausalHash();
-        check(a->CausalHash() == b->CausalHash(), "members attached in another order: the same CausalHash after 1500 ticks");
-        // The identity on the rows is the state hash, and the two worlds
-        // agree on it; the members' identities are their own.
-        bool ids = a->Order4().id == b->Order4().id && a->Order4().id != 0;
-        for (Causal_* c : *a->causalChildren()) if (c->Order4().id == a->Order4().id) ids = false;
-        check(ids, "row 0's identity is the state hash: equal across the two builds, and a member's is not its container's");
+        check(a->CausalHash() == d->CausalHash(), "the same lines twice: the same CausalHash after 1500 ticks");
+        check(a->CausalHash() == b->CausalHash(), "a distinguishable member attached in another place: the same hash -- its place is by what it is");
+        check(a->CausalHash() != c->CausalHash(), "twins attached in the other order: a different hash -- creation order is the last key");
+        // The identities on the rows: the world's is its own (no twin: index
+        // 0); the two movers are one identity hash apart only by the index.
+        std::vector<Causal_*> ma, mc;
+        for (Causal_* r : *a->causalChildren()) for (Causal_* m : *static_cast<Body*>(r)->causalChildren()) ma.push_back(m);
+        for (Causal_* r : *c->causalChildren()) for (Causal_* m : *static_cast<Body*>(r)->causalChildren()) mc.push_back(m);
+        bool tuple = ma.size() == 3 && mc.size() == 3
+                  && ma[0]->Order4().id != ma[1]->Order4().id                        // twins: different indices
+                  && ma[0]->Order4().id == mc[0]->Order4().id                        // the first twin is "the first twin" in both
+                  && ma[0]->Order4().x  != mc[0]->Order4().x                         // ...but it is the other body
+                  && ma[2]->Order4().id != ma[0]->Order4().id && ma[2]->Order4().id != ma[1]->Order4().id
+                  && a->Order4().id != 0 && a->Order4().id != ma[0]->Order4().id;
+        check(tuple, "row 0 carries the tuple: twins differ by index, the odd one by hash, and the first twin is whichever came first");
         std::printf("        (hash %016llx)\n", static_cast<unsigned long long>(forward_hash));
-        arena.deleteEntity(a, true);
-        arena.deleteEntity(b, true);
+        arena.deleteEntity(a, true); arena.deleteEntity(b, true);
+        arena.deleteEntity(c, true); arena.deleteEntity(d, true);
     }
 
     // -- 5: contact ------------------------------------------------------------
@@ -187,29 +204,56 @@ int main()
 
     // -- 6: the record --------------------------------------------------------
     {
-        std::cout << "\n-- 6. an observed history replays --\n";
-        Body* live = build(false);
+        std::cout << "\n-- 6. the observed spans are the input; the rows are what is kept --\n";
+        Body* live = build();
         uint64_t st = 0x2545f4914f6cdd1dull;
         auto next = [&st]() { st ^= st << 13; st ^= st >> 7; st ^= st << 17; return st; };
+        std::vector<std::pair<Fixed, Fixed>> spans;
         for (int i = 0; i < 600; ++i)
         {
             const Fixed commit = Fixed::From(static_cast<double>(next() % 1200 + 1) / 1000.0);   // up to 1.2 s, as an entropy clock would
             const Fixed step   = Fixed::From(static_cast<double>(next() % 100) / 1000.0);        // up to 0.1 s, as a motion clock would; sometimes none
+            spans.emplace_back(commit, step);
             live->InteractObserved(commit, step);
         }
-        check(live->ObservedTape().size() == 600 && !live->ObservedTapeFull(), "every observed interaction is on the tape");
-        Body* again = build(false);
-        again->Replay(live->ObservedTape());
-        check(again->CausalHash() == live->CausalHash(), "a fresh tree replaying the tape lands on the same hash");
+        // The property: the same spans into a fresh tree land on the same
+        // rows. (No tape in the base -- the rows are the fixed point.)
+        Body* again = build();
+        for (auto& [c, m] : spans) again->InteractObserved(c, m);
+        check(again->CausalHash() == live->CausalHash(), "a fresh tree given the same observed spans lands on the same hash");
         check(again->CausalTicks() == live->CausalTicks(), "...and the same clock");
+
+        // What is kept: the "Causal" value on each entity's surface. Captured
+        // off the live tree, handed to a fresh tree built by the same lines
+        // (what a Persistence resume does), it hashes the same.
+        std::vector<std::string> kept;
+        std::function<void(Body*)> capture = [&](Body* b) {
+            std::string v; check(b->valueOf(ETCS::Buffer("Causal"), v) && v.size() > 1, "the rows read off the surface as the value behind the Causal tag");
+            kept.push_back(v);
+            for (Causal_* c : *b->causalChildren()) capture(static_cast<Body*>(c));
+        };
+        capture(live);
+        Body* fresh = build();
+        size_t at = 0;
+        std::function<void(Body*)> restore = [&](Body* b) {
+            check(b->restoreValue(ETCS::Buffer("Causal"), kept[at++]), "...and back onto a fresh entity's surface");
+            for (Causal_* c : *b->causalChildren()) restore(static_cast<Body*>(c));
+        };
+        restore(fresh);
+        check(fresh->CausalHash() == live->CausalHash() && fresh->CausalTicks() == live->CausalTicks(),
+              "a tree rebuilt by the lines and given the captured values is the live tree: same hash, same clock");
+        fresh->Run(100, dt); live->Run(100, dt);
+        check(fresh->CausalHash() == live->CausalHash(), "...and goes on the same way");
+        check(!fresh->restoreValue(ETCS::Buffer("Causal"), std::string("\x09garbage")), "a value of another version is refused");
         arena.deleteEntity(live, true);
         arena.deleteEntity(again, true);
+        arena.deleteEntity(fresh, true);
     }
 
     // -- 7: one history --------------------------------------------------------
     {
         std::cout << "\n-- 7. one history under a driver and a reader --\n";
-        Body* world = build(false);
+        Body* world = build();
         std::atomic<bool> stop{false};
         std::atomic<int>  torn{0}, unheld{0}, reads{0};
         std::thread reader([&]() {

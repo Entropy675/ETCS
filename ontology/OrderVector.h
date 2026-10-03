@@ -28,16 +28,16 @@
 // is something a runtime can decline to make and still run all of the logic,
 // faster, with nothing on screen. That is what the split is for.
 //
-// ROW 0'S FOURTH SLOT IS WHAT THE THING IS, NOT WHEN IT WAS MADE. It is the
-// entity's state hash (core/Entity.h, surfaceHash and the merkle over the
-// children: tags, relations, dispatch -- no RIDs), set by the family base
-// whenever that hash moves. A RID is the order types happened to be created
-// in, and a scene rebuilt in another order is the same scene; an identity
-// that changed with it would make every crossing's uncertainty, and so every
-// draw, a function of creation order (ontology/Environmental.h says the same
-// of the state hash). Two things of one state are then one identity, and it
-// is the ROWS that tell them apart -- two indistinguishable units at the
-// same place with the same energy are, for the physics, the same unit twice.
+// ROW 0'S FOURTH SLOT IS THE IDENTITY TUPLE: what the thing is, then which
+// of the indistinguishable ones. The entity's identity hash (core/Entity.h,
+// identityHash: the merkle over tags, relations, dispatch and children -- no
+// RIDs, no values) mixed with its index among its twins (siblingIndex: the
+// parent's children of the same tag and the same identity hash, in attach
+// order), set by the family base whenever either moves. A RID is the order
+// types happened to be created in; the tuple's last key is creation order
+// too, but only between twins, where it is the one fact left -- the same two
+// keys a persistence record is looked up by (ontology/Environmental.h). Two
+// units at the same position are still two units.
 //
 // ROW 1 IS A DIRECTION AND A FRACTION AT THE SAME TIME. O is not a velocity:
 // |O| lies in [0,1] and is the SHARE of E that is kinetic along O/|O|.

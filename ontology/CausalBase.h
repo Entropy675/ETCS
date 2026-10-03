@@ -38,6 +38,19 @@ ETCS_SUPERTYPE_BASE(Causal)
 {
     ETCS_MAKE_INSTANCE(Causal)
 
+    /*
+     * THE ROWS ARE ON THE TAG SURFACE, behind the family's own tag: the
+     * value of "Causal" is this entity's rows, clock, emissivity and what it
+     * has shed at the boundary, read when the surface is captured and handed
+     * back when it is restored (Entity::bindValue). Bound, not written --
+     * the rows move on every interaction and the funnel is an ordered
+     * event; what the surface holds is the way to read them. This is the
+     * one place the physics is kept: a Persistence under the root stores
+     * it, and a resume puts it back, with no store of the family's own.
+     */
+    // (The family's constructor is the macro's; the binding is made by a
+    // member built after the Entity base is, which is all it needs.)
+
     // ── the leaf's answers ──────────────────────────────────────────────
 
     // The step: apply whatever pushes and slows this thing over dt, and
@@ -62,30 +75,19 @@ ETCS_SUPERTYPE_BASE(Causal)
     }
 
     /*
-     * THE OBSERVED INTERACTION, and the record of it. An observer measures
-     * its two intervals (entropy and motion, with different ceilings --
-     * StepClock.h) and hands them here as the Fixed values the rows will
-     * see; those two numbers are the whole of what the wall clock
-     * contributed, so they go on this entity's tape, and a run of the tape
-     * through Replay lands on the same rows. Taken at the observed root
-     * only: the hop under it steps the members with the same spans.
+     * THE OBSERVED INTERACTION. An observer measures its two intervals
+     * (entropy and motion, with different ceilings -- StepClock.h) and hands
+     * them here as the Fixed values the rows will see: those two numbers
+     * are the whole of what the wall clock contributed, and the rows after
+     * it are their fixed point -- which is what the surface keeps (the
+     * "Causal" value), not the spans. Taken at the observed root only: the
+     * hop under it steps the members with the same spans.
      */
-    struct Span { int64_t commit, step; };
-    using Tape = ::std::vector<Span>;
     void InteractObserved(Fixed commit_dt, Fixed step_dt)
     {
         if (!commit_dt.IsPositive() && !step_dt.IsPositive()) return;
         ::std::lock_guard<::std::recursive_mutex> lk(TreeMutex());
-        if (m_tape.size() < kTapeMax) m_tape.push_back(Span{ commit_dt.raw, step_dt.raw });
-        else                          m_tape_full = true;
         InteractUnder(commit_dt, step_dt);
-    }
-    const Tape& ObservedTape() const { return m_tape; }
-    bool        ObservedTapeFull() const { return m_tape_full; }   // the record stopped; a replay from it is partial
-    void Replay(const Tape& tape)
-    {
-        ::std::lock_guard<::std::recursive_mutex> lk(TreeMutex());
-        for (const Span& s : tape) InteractUnder(Fixed::FromRaw(s.commit), Fixed::FromRaw(s.step));
     }
 
     // The driver: `ticks` interactions of `dt` each, no clock read. What a
@@ -145,18 +147,16 @@ ETCS_SUPERTYPE_BASE(Causal)
 
     uint64_t CausalTicks() const override final { return m_ticks; }
 
-    // A multiset over the members: their hashes sorted, so the number does
-    // not depend on the order they were attached in -- only on what they are
-    // and where their rows stand.
+    // The members in canonical order (kidsLocked): the number depends on
+    // what they are, where their rows stand, and the order they stand in --
+    // which is the order the step walks them. Distinguishable members order
+    // by what they are; twins by creation order, the last key.
     uint64_t CausalHash() override final
     {
         ::std::lock_guard<::std::recursive_mutex> lk(TreeMutex());   // a whole state, not one mid-step
         refreshIdentityLocked();
         uint64_t h = fixed_mix(m_ov.Hash(), static_cast<int64_t>(m_ticks));
-        ::std::vector<uint64_t> kids;
-        for (Causal_* c : *kidsLocked()) kids.push_back(c->CausalHash());
-        ::std::sort(kids.begin(), kids.end());
-        for (uint64_t k : kids) h = fixed_mix(h, static_cast<int64_t>(k));
+        for (Causal_* c : *kidsLocked()) h = fixed_mix(h, static_cast<int64_t>(c->CausalHash()));
         return h;
     }
 
@@ -210,13 +210,14 @@ ETCS_SUPERTYPE_BASE(Causal)
 private:
     /*
      * CANONICAL ORDER: tags in first-attachment order (that order is state;
-     * the merkle hash composes by it), and within a tag by the member's
-     * state hash -- what it is -- with attach order only between members of
-     * one state, which the physics cannot tell apart anyway (two such
-     * members are one identity, Causal.h). Never the hash map's order and
-     * never the RID's, so the same script in another runtime, or the same
-     * scene rebuilt in another order, walks its members the same way. The
-     * same order the contacts pair in.
+     * the merkle hash composes by it), within a tag by the member's identity
+     * hash -- what it is -- and between twins by attach order: creation
+     * order, the last key, the same one the identity tuple and a persistence
+     * record end on. Never the hash map's order and never the RID's. The
+     * same script in another runtime walks its members the same way; a
+     * scene rebuilt with its distinguishable members in another order walks
+     * them the same way too; twins swapped are twins swapped. The same order
+     * the hash composes in and the contacts pair in.
      */
     const ::std::shared_ptr<const ::std::vector<Causal_*>>& kidsLocked()
     {
@@ -232,7 +233,7 @@ private:
             ETCS::Entity* child = this->getTypedChild(entry.first, entry.second);
             if (!child) continue;
             if (void* c = child->getInterfacePointer(ETCS::Buffer("Causal")))
-                members.push_back(Member{ entry.first, child->getHash(), static_cast<Causal_*>(c) });
+                members.push_back(Member{ entry.first, child->identityHash(), static_cast<Causal_*>(c) });
         }
         for (auto lo = members.begin(); lo != members.end(); )
         {
@@ -247,16 +248,23 @@ private:
         return m_kids;
     }
 
-    // Row 0's identity is this entity's state hash (OrderVector.h): refreshed
-    // when the hash epoch says the state moved, which is the only time the
-    // hash can differ. The hash is lazy and cached, so this is one load and
-    // a compare per interaction.
+    // Row 0's identity is this entity's identity tuple (OrderVector.h): the
+    // identity hash, and where it stands among its twins (Entity::
+    // siblingIndex) -- what it is, then which of the indistinguishable ones.
+    // Refreshed when the hash epoch says the surface moved, which is the only
+    // time either can differ (a twin arriving or leaving bumps the parent and
+    // every ancestor, not this entity -- so the parent's epoch is read too).
+    // Both halves are cached on their side, so this is two loads and two
+    // compares per interaction.
     void refreshIdentityLocked()
     {
         const uint32_t epoch = this->hashEpoch();
-        if (m_id_epoch == epoch) return;
-        m_ov.id    = this->getHash();
-        m_id_epoch = epoch;
+        ETCS::Entity* p = liveParent(this);
+        const uint32_t pepoch = p ? p->hashEpoch() : 0;
+        if (m_id_epoch == epoch && m_id_pepoch == pepoch) return;
+        m_ov.id     = fixed_mix(this->identityHash(), static_cast<int64_t>(this->siblingIndex()));
+        m_id_epoch  = epoch;
+        m_id_pepoch = pepoch;
     }
 
     // The emission owed for dt, taken out of the rows. Under the tree lock.
@@ -367,15 +375,87 @@ private:
     ::std::shared_ptr<const ::std::vector<Causal_*>> m_kids;
     uint32_t                m_kids_epoch = 0;          // hash_epoch_ starts at 1: the first ask walks
     uint32_t                m_id_epoch   = 0;
+    uint32_t                m_id_pepoch  = 0;
     ETCS::Entity*           m_container_of = nullptr;
     ETCS::RID               m_container_rid = 0;
     Causal_*                m_container    = nullptr;
 
-    // The observed spans, oldest first; bounded, and the bound is announced
-    // (ObservedTapeFull) rather than the record silently wrapping.
-    static constexpr size_t kTapeMax = size_t(1) << 20;   // ~4.6 hours at 60 Hz
-    Tape m_tape;
-    bool m_tape_full = false;
+    /*
+     * THE "Causal" VALUE: a version byte, then the words as they are --
+     * the eighteen of the rows, the clock, the emissivity, what left at the
+     * boundary, and the eighteen of the last crossing. Everything
+     * CausalHash reads and everything a reader of this entity can ask for,
+     * so a restored entity hashes and answers as the captured one did.
+     * Little-endian raw words; the same bytes on every platform the rows
+     * are the same on.
+     */
+    static constexpr unsigned char kStateVersion = 1;
+    static void putWords(::std::string& out, const OrderVector& o)
+    {
+        const int64_t w[] = { o.x.raw, o.y.raw, o.z.raw, static_cast<int64_t>(o.id),
+                              o.ox.raw, o.oy.raw, o.oz.raw, o.energy.raw,
+                              o.fx.raw, o.fy.raw, o.fz.raw, o.radius.raw,
+                              o.qx.raw, o.qy.raw, o.qz.raw, o.qw.raw,
+                              o.interval.raw, static_cast<int64_t>(o.uncertainty) };
+        for (int64_t v : w) for (int i = 0; i < 8; ++i) out.push_back(static_cast<char>((static_cast<uint64_t>(v) >> (8 * i)) & 0xff));
+    }
+    static bool getWords(const ::std::string& in, size_t& at, OrderVector& o)
+    {
+        int64_t w[18];
+        for (int64_t& v : w)
+        {
+            if (at + 8 > in.size()) return false;
+            uint64_t u = 0;
+            for (int i = 0; i < 8; ++i) u |= static_cast<uint64_t>(static_cast<unsigned char>(in[at + i])) << (8 * i);
+            v = static_cast<int64_t>(u); at += 8;
+        }
+        o.x = Fixed::FromRaw(w[0]); o.y = Fixed::FromRaw(w[1]); o.z = Fixed::FromRaw(w[2]); o.id = static_cast<uint64_t>(w[3]);
+        o.ox = Fixed::FromRaw(w[4]); o.oy = Fixed::FromRaw(w[5]); o.oz = Fixed::FromRaw(w[6]); o.energy = Fixed::FromRaw(w[7]);
+        o.fx = Fixed::FromRaw(w[8]); o.fy = Fixed::FromRaw(w[9]); o.fz = Fixed::FromRaw(w[10]); o.radius = Fixed::FromRaw(w[11]);
+        o.qx = Fixed::FromRaw(w[12]); o.qy = Fixed::FromRaw(w[13]); o.qz = Fixed::FromRaw(w[14]); o.qw = Fixed::FromRaw(w[15]);
+        o.interval = Fixed::FromRaw(w[16]); o.uncertainty = static_cast<uint64_t>(w[17]);
+        return true;
+    }
+    void packState(::std::string& out)
+    {
+        ::std::lock_guard<::std::recursive_mutex> lk(TreeMutex());
+        refreshIdentityLocked();
+        out.push_back(static_cast<char>(kStateVersion));
+        putWords(out, m_ov);
+        OrderVector meta;   // three scalars, carried in a row's slots
+        meta.x = Fixed::FromRaw(static_cast<int64_t>(m_ticks)); meta.y = m_emissivity; meta.z = m_emitted_out;
+        putWords(out, meta);
+        putWords(out, m_last_emission);
+    }
+    bool unpackState(const ::std::string& in)
+    {
+        if (in.empty() || static_cast<unsigned char>(in[0]) != kStateVersion) return false;
+        size_t at = 1;
+        OrderVector rows, meta, last;
+        if (!getWords(in, at, rows) || !getWords(in, at, meta) || !getWords(in, at, last)) return false;
+        ::std::lock_guard<::std::recursive_mutex> lk(TreeMutex());
+        m_ov            = rows;
+        m_ticks         = static_cast<uint64_t>(meta.x.raw);
+        m_emissivity    = meta.y;
+        m_emitted_out   = meta.z;
+        m_last_emission = last;
+        m_share_dt = Fixed::Zero(); m_share_k = Fixed::Zero();   // the share cache keys on (dt, k): recompute
+        m_id_epoch = 0; m_id_pepoch = 0;                        // the identity is this entity's, not the record's
+        refreshIdentityLocked();
+        return true;
+    }
+
+    struct Binder
+    {
+        explicit Binder(CausalBase* b)
+        {
+            b->bindValue(ETCS::Buffer("Causal"), ETCS::Entity::ValueBinding{
+                b,
+                [](void* self, ::std::string& out) { static_cast<CausalBase*>(self)->packState(out); },
+                [](void* self, const ::std::string& in) { return static_cast<CausalBase*>(self)->unpackState(in); } });
+        }
+    };
+    Binder m_binder{ this };
 };
 
 #endif

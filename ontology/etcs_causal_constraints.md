@@ -26,24 +26,33 @@ the bit across both spellings (`__int128`, halves); §5 runs one sequence
 twice to the same hash. `scene3d_run.etcs` prints a hash a browser must
 repeat (the reference is in `claude/order-vector-device.md`).
 
-## 2. Same lines, same rows -- on every runtime, in any creation order
+## 2. Same lines, same rows -- on every runtime
 
 **Constraint.** Two runtimes replaying the same lines reach the same rows bit
-for bit. The same scene built with its members attached in another order is
-the same scene: same `CausalHash`, same rows per member, same draws. No
-creation-order value (a RID, a map's walk order, a hash table's bucket) is
-an input to the physics or to the hash.
+for bit. No runtime fact (a RID's value, a map's walk order, a hash table's
+bucket, a pointer) is an input to the physics or to the hash. What IS an
+input, besides the lines, is one thing only: between twins -- members of one
+container, one tag, one identity -- creation order, the last key, the same
+one a persistence record is looked up by.
 
-**How.** Row 0's identity is the entity's state hash (`core/Entity.h`,
-no RIDs); a crossing's uncertainty is derived from the crossing's rows and
-span alone; members are walked in canonical order (tag first-attachment
-order, then state hash, then -- only between members of one state, which the
-physics cannot tell apart -- attach order); `CausalHash` composes the members
-as a sorted multiset. `RIDList` enumerates in arrival order, never the map's.
+**How.** Row 0's identity is the identity TUPLE: the entity's identity hash
+(`Entity::identityHash` -- the merkle over tags, relations, dispatch and
+children; no RIDs, no values) mixed with its index among its twins
+(`Entity::siblingIndex`, attach order). A crossing's uncertainty is derived
+from the crossing's rows and span. Members are walked, and the hash
+composed, in canonical order: tag first-attachment order, then identity
+hash, then attach order between twins. `RIDList` enumerates in arrival
+order, never the map's.
 
-**Check.** `CausalTester` §4: the same world built forward and reversed, run
-1500 ticks, one hash; the identities on the rows agree across the builds.
-`HashTester` §10: arrival order on every read.
+**What that means for a rebuilt scene.** The same lines in the same order:
+the same hash. A distinguishable member attached in another place: the same
+hash -- its place is by what it is. Twins attached in the other order: a
+different hash, because the first twin is whichever came first, and that is
+the one fact the lines carry about them.
+
+**Check.** `CausalTester` §4 (the same lines twice; a distinguishable member
+moved; twins swapped; the tuple on the rows). `HashTester` §10: arrival
+order on every read.
 
 ## 3. Energy is conserved, exactly
 
@@ -127,17 +136,26 @@ interleaving inside a step. A read of the rows is of one state only under
 **Check.** `CausalTester` §7 (a reader under the lock, a driver on another
 thread, 10,000 ticks: every read one state, every row holding).
 
-## 10. Every input that reaches the rows is recorded
+## 10. The rows are what is kept, and they are on the surface
 
 **Constraint.** A driver's spans are in the script. An observer's spans --
 the wall clock, capped, made Fixed -- are the whole of what the clock
-contributed, and they go on the observed root's tape (`InteractObserved`,
-`ObservedTape`); a fresh tree replaying the tape lands on the same rows. The
-tape is bounded and says when it stopped (`ObservedTapeFull`) rather than
-wrapping.
+contributed, and the rows after them are their fixed point: the same spans
+into a fresh tree land on the same rows. What is kept is the rows, as the
+value behind the `Causal` tag on the entity's own surface (`Entity::
+bindValue`; `CausalBase::packState`/`unpackState`): every word `CausalHash`
+reads and every reading the family offers, so a tree rebuilt by its lines
+and handed the captured values is the live tree -- same hash, same clock,
+and it goes on the same way. The family keeps no record of its own; the one
+store (Persistence) keeps the surface, and the one state hash
+(`Entity::getHash`: the identity half and every value under the node) is
+what says a resumed scene is the saved one.
 
-**Check.** `CausalTester` §6 (600 observed interactions with random spans,
-replayed onto a fresh tree: same hash, same clock).
+**Check.** `CausalTester` §6 (600 observed interactions with random spans
+into two trees: same hash; the values captured off one and restored onto a
+third built by the same lines: same hash, same clock, same next 100 ticks;
+a value of another version refused). `ProvenanceTester` §7b for the surface
+itself.
 
 ---
 
@@ -154,6 +172,9 @@ replayed onto a fresh tree: same hash, same clock).
 - **Broadphase.** Contacts are every pair of members, n² per interaction. The
   gate (`GapTo`) is the constraint; a cheaper way to ask it is an
   implementation choice.
+- **Replay between captures.** The observed spans are not kept; a resumed
+  scene continues from its last captured rows, it does not re-run the
+  frames between that capture and the close.
 - **Reach of a container on the driver path.** A member's reach is set where
   it is made (Scene3D: at `Create`); a container's reach over its members is
   recomputed on the observed path (`coverRows`) and not by the driver.

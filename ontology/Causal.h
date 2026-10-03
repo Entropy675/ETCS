@@ -73,8 +73,10 @@
  * the intervals since it last looked (being observed is an interaction), and
  * a driver stepping a world calls it with a fixed span, a thousand times,
  * with no clock read. The arithmetic is the same; only what the spans ARE
- * differs -- and an observed span, once measured and made Fixed, is a
- * recorded input (CausalBase::ObservedTape), so an observed history replays.
+ * differs. What is KEPT of either history is the rows: they are on the tag
+ * surface as the value behind "Causal" (CausalBase, Entity::bindValue), so
+ * a store keeps them and a resume puts them back -- the family has no
+ * record of its own.
  *
  * THE PROTOCOL BELOW THE LINE is the base's, not the family's vocabulary: how
  * one history is kept (one lock per tree, taken at every entry) and how a
@@ -105,8 +107,9 @@ public:
     virtual uint64_t CausalTicks() const = 0;
 
     // The rows of this entity and everything Causal under it, as one number:
-    // what two runtimes compare. The members compose as a multiset of their
-    // own hashes, so the same tree built in another order is the same number.
+    // what two runtimes compare. The members compose in canonical order --
+    // by what they are, then creation order between twins -- which is the
+    // order the step walks them (CausalBase::kidsLocked).
     virtual uint64_t CausalHash() = 0;
 
     // ── the protocol (see above) ────────────────────────────────────────
