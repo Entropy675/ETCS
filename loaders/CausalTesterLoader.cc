@@ -31,6 +31,11 @@
 //   8. THE CLOCK. Ticks count crossings; a body with no heat has no time.
 //   9. THE BROADPHASE PRUNES ONLY. A crowded container stepped through the
 //      kd-tree lands on the rows it lands on pair by pair, to the bit.
+//  10. WHAT HOLDS A THING IS WHAT IT FITS IN. A member leaving its
+//      container's space moves up, one entering a sibling's moves in, a solid
+//      one holds nothing; where it is in the world does not change, nor does
+//      the ledger; the lifetime goes with it (deleting where it came from
+//      leaves it, deleting where it went takes it).
 //
 //   ./Run_CausalTesterLoader
 //
@@ -59,6 +64,9 @@ public:
     WIRE_TYPE_IDENTITY(Body)
     Fixed mass    = Fixed::One();
     Fixed damping = Fixed::From(0.5);
+    static inline int s_alive = 0;   // section 10: whose cascade took whom
+    Body()  { ++s_alive; }
+    ~Body() { --s_alive; }
 
     void AdvanceConcrete(Fixed dt) override
     {
@@ -104,6 +112,7 @@ int main()
         world->SetEmissivity(Fixed::From(0.2));
         Body* room  = world->addTag<Body>();
         room->Place(0, 0, 0); room->SetEmissivity(Fixed::From(0.3));
+        room->SetSpace(Fixed::FromInt(1000));   // the bodies stay in it however far they go
         auto make = [&](double x, double y, double z, double r, double dx, double dy, double dz, double j, double damp) {
             Body* b = room->addTag<Body>();
             b->Place(x, y, z); b->Reach(r); b->damping = Fixed::From(damp);
@@ -405,6 +414,91 @@ int main()
         }
         std::printf(")\n");
         CausalBase<Body>::BroadphaseFrom() = kFrom;
+    }
+
+    // -- 10: fitness ----------------------------------------------------------
+    {
+        std::cout << "\n-- 10. what holds a thing is what it fits in --\n";
+        auto where = [](Body* b, Fixed& x, Fixed& y, Fixed& z) {   // its place in the world
+            b->Basis(x, y, z);
+            x += b->Order4().x; y += b->Order4().y; z += b->Order4().z;
+        };
+        // A pen in a pocket in a person in a world, the pen heading out.
+        struct Scene { Body *world, *person, *pocket, *pen, *box, *ball, *lump, *chip, *far, *far2; };
+        auto scene = [&]() {
+            Scene s{};
+            s.world  = arena.allocate<Body>();                s.world->SetSpace(Fixed::FromInt(1000));
+            s.person = s.world->addTag<Body>();               s.person->SetSpace(Fixed::FromInt(10));
+            s.pocket = s.person->addTag<Body>();              s.pocket->Place(2, 0, 0); s.pocket->SetSpace(Fixed::One());
+            s.pen    = s.pocket->addTag<Body>();              s.pen->Place(0.5, 0, 0); s.pen->Reach(0.1); s.pen->damping = Fixed::Zero();
+            s.pen->Impulse(Fixed::One(), Fixed::Zero(), Fixed::Zero(), Fixed::FromInt(2));
+            // A hollow box, and a ball rolling into it (a point reach: no contact first).
+            s.box    = s.world->addTag<Body>();               s.box->Place(20, 0, 0); s.box->SetSpace(Fixed::FromInt(3));
+            s.ball   = s.world->addTag<Body>();               s.ball->Place(10, 0, 0); s.ball->Reach(0.2); s.ball->damping = Fixed::Zero();
+            s.ball->Impulse(Fixed::One(), Fixed::Zero(), Fixed::Zero(), Fixed::FromInt(8));
+            // Something solid with something in it; something past the world's space.
+            s.lump   = s.world->addTag<Body>();               s.lump->Place(-20, 0, 0);
+            s.chip   = s.lump->addTag<Body>();                s.chip->Place(0.1, 0, 0);
+            s.far    = s.world->addTag<Body>();               s.far->Place(5000, 0, 0); s.far->Reach(1);
+            s.far2   = s.world->addTag<Body>();               s.far2->Place(5001.5, 0, 0); s.far2->Reach(1);
+            return s;
+        };
+        Scene a = scene();
+        Fixed cx, cy, cz; where(a.chip, cx, cy, cz);
+        const Fixed put_in = Fixed::FromInt(2 + 8);
+        a.world->Interact(dt);
+        Fixed cx2, cy2, cz2; where(a.chip, cx2, cy2, cz2);
+        check(a.chip->getParent() == a.world && cx2 == cx && cy2 == cy && cz2 == cz,
+              "a solid thing holds nothing: its member moved up, to the same place in the world");
+        check(a.far->getParent() == a.world, "the open boundary keeps what fits nowhere");
+        // Each move as it happens: the pen out of the pocket into the person,
+        // then out of the person into the world; the ball into the box, then
+        // out through the far side.
+        int pen_out = -1, pen_up = -1, ball_in = -1, ball_out = -1;
+        ETCS::Entity* pen_first = nullptr;
+        bool ball_in_frame = false, ledger = true;
+        for (int i = 0; i < 400; ++i)
+        {
+            a.world->Interact(dt);
+            Totals t; totals(a.world, t);
+            if (t.energy + a.world->EmittedOut() != put_in) ledger = false;
+            if (pen_out < 0 && a.pen->getParent() != a.pocket) { pen_out = i; pen_first = a.pen->getParent(); }
+            if (pen_out >= 0 && pen_up < 0 && a.pen->getParent() == a.world) pen_up = i;
+            if (ball_in < 0 && a.ball->getParent() == a.box) { ball_in = i; ball_in_frame = a.ball->Order4().x.ToDouble() < 0; }
+            if (ball_in >= 0 && ball_out < 0 && a.ball->getParent() == a.world) ball_out = i;
+        }
+        check(pen_out > 0 && pen_first == a.person && pen_up > pen_out,
+              "the pen left the pocket's space into the person, then the person's into the world");
+        check(ball_in > 0 && ball_in_frame && ball_out > ball_in,
+              "the ball rolled into the box's space -- its position now the box's frame -- and out the far side");
+        check(ledger, "...and no move changed the ledger: tree plus boundary is what was put in, every tick");
+        std::printf("        (pen: out at tick %d, up at %d; ball: in at %d, out at %d)\n", pen_out, pen_up, ball_in, ball_out);
+        // Contain keeps where a thing is, exactly; it will not put a thing inside itself.
+        Fixed px, py, pz; where(a.pen, px, py, pz);
+        check(a.box->Contain(a.pen), "Contain moves a member in from another environment");
+        Fixed qx, qy, qz; where(a.pen, qx, qy, qz);
+        check(px == qx && py == qy && pz == qz, "...and it is where it was in the world, to the bit");
+        check(!a.pocket->Contain(a.person), "nothing goes inside what is inside it");
+        std::vector<Causal_*> nearby; a.world->Near(Fixed::FromInt(20), Fixed::Zero(), Fixed::Zero(), Fixed::One(), nearby);
+        std::vector<Causal_*> adj; a.far->Adjacent(adj);
+        check(adj.size() == 1 && adj[0] == static_cast<Causal_*>(a.far2), "Adjacent: what shares its environment and touches its reach");
+        check(nearby.size() == 1 && nearby[0] == static_cast<Causal_*>(a.box), "Near: the members within reach of a point of the frame");
+        // The same lines again: the same tree, the same places.
+        Scene b = scene();
+        for (int i = 0; i < 401; ++i) b.world->Interact(dt);
+        b.box->Contain(b.pen);
+        check(b.world->CausalHash() == a.world->CausalHash() && b.pen->getParent() == b.box && b.ball->getParent() == b.world,
+              "the same lines twice: the same moves, the same hash");
+        // The lifetime went with it.
+        const int before = Body::s_alive;
+        a.pocket->getOwningArena().deleteEntity(a.pocket, true);
+        check(Body::s_alive == before - 1 && a.pen->Order4().radius == Fixed::From(0.1),
+              "deleting where the pen came from leaves the pen");
+        const int before2 = Body::s_alive;
+        a.box->getOwningArena().deleteEntity(a.box, true);
+        check(Body::s_alive == before2 - 2, "deleting where it went takes it with it");
+        arena.deleteEntity(a.world, true);
+        arena.deleteEntity(b.world, true);
     }
 
     std::printf("\n%s (%d failure%s)\n", g_fail ? "FAILED" : "PASSED", g_fail, g_fail == 1 ? "" : "s");

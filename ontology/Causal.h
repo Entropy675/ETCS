@@ -5,6 +5,7 @@
 #include "OrderVector.h"
 
 #include <mutex>
+#include <vector>
 
 /*
  * ── CAUSAL ───────────────────────────────────────────────────────────────
@@ -112,6 +113,40 @@ public:
     // order the step walks them (CausalBase::kidsLocked).
     virtual uint64_t CausalHash() = 0;
 
+    // ── the environment ─────────────────────────────────────────────────
+    //
+    // EVERY CAUSAL THING IS AN ENVIRONMENT for what fits in it, and what holds
+    // a thing is decided by fit, not by who made it: the universe holds the
+    // earth, which holds the person, which holds the pen in their pocket. A
+    // member is in its container while its reach lies inside the space the
+    // container provides (Space; zero, solid, holds nothing); after the
+    // contacts each interaction, a member that no longer fits moves to its
+    // container's container, and one that fits inside a sibling's space
+    // moves into the smallest such sibling (CausalBase::fitLocked). A move
+    // is the entity changing parents (Entity::moveTo), its position restated
+    // in the new frame -- frames are translations: a member's position is
+    // relative to its container's.
+
+    // The environment this one is in: its container, or null at the open
+    // boundary.
+    virtual Causal_* Environment() = 0;
+    // The origin of the frame this entity's rows are stated in, in the
+    // topmost environment's frame: every container's position, summed. A
+    // member's place in the world is Basis + its own position.
+    virtual void Basis(Fixed& x, Fixed& y, Fixed& z) = 0;
+    // The interior this provides, as a radius about its own position.
+    virtual Fixed Space() const = 0;
+    // The closeness check: this environment's members whose reach comes
+    // within `r` of a point of its frame, in canonical order.
+    virtual void Near(Fixed x, Fixed y, Fixed z, Fixed r, ::std::vector<Causal_*>& out) = 0;
+    // The members of this one's environment whose reach touches this one's
+    // (the contact gate), in canonical order.
+    virtual void Adjacent(::std::vector<Causal_*>& out) = 0;
+    // Take `member` in, from wherever it is: a move, its position restated
+    // in this frame. False when it cannot move (not movable, a module
+    // apart, or this is inside it).
+    virtual bool Contain(Causal_* member) = 0;
+
     // ── the protocol (see above) ────────────────────────────────────────
     virtual ::std::recursive_mutex& TreeMutex() = 0;
     // The interaction for a caller holding the tree's lock: the entropy owed
@@ -125,6 +160,9 @@ public:
     // the lock: OrderVector::CrossToward, with this entity's clock ticked for
     // it. Zero energy when nothing was headed that way.
     virtual OrderVector CrossTowardUnder(Fixed nx, Fixed ny, Fixed nz, Fixed span) = 0;
+    // Row 0's position, set from under the lock: a move's restatement in the
+    // new frame (Contain).
+    virtual void PlaceUnder(Fixed x, Fixed y, Fixed z) = 0;
 };
 
 #endif // SUPERTYPE_CAUSAL_H__

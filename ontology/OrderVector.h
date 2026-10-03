@@ -505,6 +505,20 @@ struct OrderVector
         return s <= Wide::SquareOf(Sum(radius.raw, other.radius.raw));
     }
 
+    // Does this vector's reach lie inside a sphere of radius `space` about
+    // (cx, cy, cz)? |p - c| + reach <= space, exactly as the gate compares:
+    // floored squares, summed wide. What a container's fitness asks of a
+    // member (CausalBase::fitLocked): whether it is in the space provided.
+    bool InsideOf(Fixed cx, Fixed cy, Fixed cz, Fixed space) const
+    {
+        const Fixed room = space - radius;
+        if (room.raw < 0) return false;
+        Wide s = Wide::SquareOf(Diff(x.raw, cx.raw));
+        s += Wide::SquareOf(Diff(y.raw, cy.raw));
+        s += Wide::SquareOf(Diff(z.raw, cz.raw));
+        return s <= Wide::SquareOf(static_cast<uint64_t>(room.raw));
+    }
+
 private:
     // An unsigned 128-bit number in halves (no __int128 on every target, as
     // Fixed's own arithmetic). Only what the gate needs.

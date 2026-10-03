@@ -95,13 +95,14 @@ it goes (`CommitShare`).
 
 **Check.** `CausalTester` §8; `OrderVectorTester` §4b (last quantum).
 
-## 7. The lazy commit is exact, and the order is commit, step, members, contacts
+## 7. The lazy commit is exact, and the order is commit, step, members, contacts, fit
 
 **Constraint.** Emission over an interval is `h·(1 − e^(−k·dt))`, so one
 commit over T equals N commits across T while nothing else touches the heat
 -- which is why the commit is the first thing an interaction does, before the
 step adds the next interval's heat. Then the members (each the same way),
-then the contacts among them, from the rows the steps left.
+then the contacts among them, from the rows the steps left, then what each
+member is in (§11), from the rows the contacts left.
 
 **Check.** `OrderVectorTester` §2 (emission over T equals emission in parts);
 the order is in `CausalBase::InteractUnder` and nowhere else.
@@ -170,9 +171,55 @@ third built by the same lines: same hash, same clock, same next 100 ticks;
 a value of another version refused). `ProvenanceTester` §7b for the surface
 itself.
 
+## 11. What holds a thing is what it fits in
+
+**Constraint.** Every Causal thing is an environment for what fits in it: the
+universe holds the earth, which holds the person, which holds the pen in
+their pocket. A member is in its container while its reach lies inside the
+space the container provides (`Space`, a radius about its position, set by
+`SetSpace` through the funnel; zero is solid and holds nothing). After the
+contacts, every interaction, from the rows alone: a member inside a
+sibling's space moves into the smallest such sibling; one outside its
+container's space moves up to the container's container; the open boundary
+keeps what fits nowhere. Decided before anything moves, applied in canonical
+order, and a member something moves into stays put that time. A move keeps
+where the thing is in the world exactly (frames are translations: a member's
+position is relative to its container's) and touches no energy, so §3 holds
+across it.
+
+**What a move is.** The entity changes parents (`Entity::moveTo`): the
+funnel's own event (a TagModify carrying the move, ordered against every tag
+operation on the child and both parents), recorded as its own action,
+`<to>.Contain(@<it>)`, so a replay keeps the last move and a step's moves are
+never credited to the line that ran the step. Its lifetime goes with it: a
+Causal child's bytes live in its module's root arena, and only its lifetime
+token -- its destructor record and its arena's -- sits in its parent's
+chain (`MemoryArena::adoptToken`); deleting where it came from leaves it,
+deleting where it went takes it.
+
+**The environment answers.** `Environment` (its container), `Basis` (where
+its frame sits in the topmost one's), `Near` (members within reach of a point
+of the frame), `Adjacent` (what shares its environment and touches its
+reach).
+
+**Check.** `CausalTester` §10 (a solid thing's member moves up to the same
+place; the pen leaves the pocket into the person, then the world; the ball
+rolls into a hollow box's space and out the far side; the ledger every tick;
+`Contain` keeps the world position to the bit and refuses a cycle; the same
+lines twice, the same moves and hash; deleting the old parent leaves it, the
+new one takes it). A persistence round trip of a scene with a move comes back
+as it was.
+
 ---
 
 ## Not promised (yet)
+
+- **Moving frames.** A member's position is relative to its container's, so
+  it goes where the container goes; its motion is not. A move restates the
+  position, never the velocity -- doing so would change kinetic energy, and
+  §3 is exact.
+- **Moves between modules.** A thing moves only under parents of its own
+  module (its bytes and token live in that module's arenas).
 
 - **Restitution.** A contact is transmission: the energy along the line goes
   to the other body entirely. A coefficient of restitution is a parameter on

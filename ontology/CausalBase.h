@@ -106,9 +106,13 @@ ETCS_SUPERTYPE_BASE(Causal)
         OrderVector e;
         if (commitLocked(commit_dt, e)) crossTo(container(), e);
         if (step_dt.IsPositive()) static_cast<Derived*>(this)->AdvanceConcrete(step_dt);
-        const auto& kids = *kidsLocked();   // the tree lock is held: no copy out
+        // The tree lock is held: the list is not copied, only kept -- a move
+        // below changes the membership, and the list in hand must outlive it.
+        const auto held = kidsLocked();
+        const auto& kids = *held;
         for (Causal_* c : kids) c->InteractUnder(commit_dt, step_dt);
         contactsLocked(kids, step_dt.IsPositive() ? step_dt : commit_dt);
+        fitLocked(kids);
     }
 
     /*
@@ -146,6 +150,8 @@ ETCS_SUPERTYPE_BASE(Causal)
         return e;
     }
 
+    void PlaceUnder(Fixed x, Fixed y, Fixed z) override final { m_ov.PlaceAt(x, y, z); }
+
     uint64_t CausalTicks() const override final { return m_ticks; }
 
     // The members in canonical order (kidsLocked): the number depends on
@@ -159,6 +165,86 @@ ETCS_SUPERTYPE_BASE(Causal)
         uint64_t h = fixed_mix(m_ov.Hash(), static_cast<int64_t>(m_ticks));
         for (Causal_* c : *kidsLocked()) h = fixed_mix(h, static_cast<int64_t>(c->CausalHash()));
         return h;
+    }
+
+    // ── the environment (Causal.h) ──────────────────────────────────────
+
+    // A Causal thing changes parents as it changes what it fits in, so the
+    // family's leaves are made movable (core/Entity.h, etcs_movable).
+    static constexpr bool kEtcsMovable = true;
+
+    Causal_* Environment() override final
+    {
+        ::std::lock_guard<::std::recursive_mutex> lk(TreeMutex());
+        return container();
+    }
+
+    void Basis(Fixed& x, Fixed& y, Fixed& z) override final
+    {
+        ::std::lock_guard<::std::recursive_mutex> lk(TreeMutex());   // one whole chain, not a mid-step one
+        x = y = z = Fixed::Zero();
+        for (Causal_* env = container(); env; env = containerOf(env))
+        {
+            const OrderVector& o = env->Order4();
+            x += o.x; y += o.y; z += o.z;
+        }
+    }
+
+    // The space this provides: a verb's state, so the value behind "space"
+    // (through the funnel, recorded and kept); m_space is the step's copy.
+    void SetSpace(Fixed radius)
+    {
+        if (radius.raw < 0) return;
+        ::std::string v;
+        ETCS::Entity::putWord(v, radius.raw);
+        this->addTag("space", v);
+    }
+    Fixed Space() const override final { return m_space; }
+
+    void Near(Fixed x, Fixed y, Fixed z, Fixed r, ::std::vector<Causal_*>& out) override final
+    {
+        ::std::lock_guard<::std::recursive_mutex> lk(TreeMutex());
+        OrderVector probe;
+        probe.PlaceAt(x, y, z);
+        probe.radius = r;
+        for (Causal_* c : *kidsLocked()) if (probe.MayInteractWith(c->Order4())) out.push_back(c);
+    }
+
+    void Adjacent(::std::vector<Causal_*>& out) override final
+    {
+        ::std::lock_guard<::std::recursive_mutex> lk(TreeMutex());
+        Causal_* env = container();
+        if (!env) return;
+        const size_t from = out.size();
+        env->Near(m_ov.x, m_ov.y, m_ov.z, m_ov.radius, out);
+        out.erase(::std::remove(out.begin() + static_cast<ptrdiff_t>(from), out.end(), static_cast<Causal_*>(this)), out.end());
+    }
+
+    /*
+     * A MOVE: the member changes parents (Entity::moveTo -- the funnel's
+     * event, its own recorded action) and its position is restated in this
+     * frame, so where it is in the world does not change. Under both trees'
+     * locks when it comes from another tree (std::lock: no order to agree
+     * on), so no step sees it half moved. Its other rows are not restated:
+     * frames are translations and carry no motion of their own.
+     */
+    bool Contain(Causal_* member) override final
+    {
+        if (!member || member == static_cast<Causal_*>(this)) return false;
+        ::std::recursive_mutex& mine   = TreeMutex();
+        ::std::recursive_mutex& theirs = member->TreeMutex();
+        ::std::unique_lock<::std::recursive_mutex> a(mine, ::std::defer_lock), b(theirs, ::std::defer_lock);
+        if (&mine == &theirs) a.lock(); else ::std::lock(a, b);
+        Fixed mx, my, mz, tx, ty, tz;
+        member->Basis(mx, my, mz);
+        Basis(tx, ty, tz);
+        const OrderVector& m = member->Order4();
+        const Fixed nx = mx + m.x - (tx + m_ov.x);
+        const Fixed ny = my + m.y - (ty + m_ov.y);
+        const Fixed nz = mz + m.z - (tz + m_ov.z);
+        if (!member->moveTo(this)) return false;
+        member->PlaceUnder(nx, ny, nz);
+        return true;
     }
 
     // ── what the base keeps beside the rows ─────────────────────────────
@@ -185,6 +271,14 @@ ETCS_SUPERTYPE_BASE(Causal)
             if (value && !ETCS::Entity::getWord(*value, at, raw)) return;
             ::std::lock_guard<::std::recursive_mutex> lk(TreeMutex());
             m_emissivity = Fixed::FromRaw(raw);
+        }
+        else if (key == ETCS::Buffer("space"))
+        {
+            int64_t raw = 0;   // gone with its flag: solid again
+            size_t at = 0;
+            if (value && !ETCS::Entity::getWord(*value, at, raw)) return;
+            ::std::lock_guard<::std::recursive_mutex> lk(TreeMutex());
+            m_space = Fixed::FromRaw(raw);
         }
     }
 
@@ -367,6 +461,51 @@ private:
     }
 
     /*
+     * FITNESS, after the contacts, from the rows they left: what each member
+     * is in. A member inside the space of a sibling (InsideOf) moves into the
+     * smallest such sibling -- the most local environment that holds it; one
+     * outside this entity's own space moves up to this entity's container
+     * (the open boundary keeps what fits nowhere). Decided from the rows
+     * before anything moves, applied in canonical order; a member something
+     * is moving into stays put this time, so no pair can swap into each
+     * other. One level per interaction: a member still outside goes on up at
+     * its new container's next one.
+     */
+    void fitLocked(const ::std::vector<Causal_*>& kids)
+    {
+        const size_t n = kids.size();
+        if (n == 0) return;
+        Causal_* up = container();
+        const bool broad = m_broad && n >= BroadphaseFrom();   // contactsLocked built it from these rows
+        ::std::vector<size_t> into;
+        ::std::vector<Fixed>  room;
+        for (size_t b = 0; b < n; ++b)
+        {
+            const Fixed sp = kids[b]->Space();
+            if (!sp.IsPositive()) continue;
+            if (into.empty()) { into.assign(n, n); room.assign(n, Fixed::Zero()); }
+            const OrderVector& B = kids[b]->Order4();
+            auto consider = [&](size_t a) {
+                if (a == b || !kids[a]->Order4().InsideOf(B.x, B.y, B.z, sp)) return;
+                if (into[a] == n || sp < room[a]) { into[a] = b; room[a] = sp; }   // ties: the first in canonical order
+            };
+            if (broad) for (uint32_t a : m_broad->within(b, sp)) consider(a);
+            else       for (size_t a = 0; a < n; ++a) consider(a);
+        }
+        ::std::vector<::std::pair<size_t, Causal_*>> moves;
+        for (size_t a = 0; a < n; ++a)
+        {
+            if (!into.empty() && into[a] != n) moves.emplace_back(a, kids[into[a]]);
+            else if (up && !kids[a]->Order4().InsideOf(Fixed::Zero(), Fixed::Zero(), Fixed::Zero(), m_space))
+                moves.emplace_back(a, up);
+        }
+        if (moves.empty()) return;
+        ::std::vector<bool> target(n, false);
+        for (const auto& mv : moves) if (mv.second != up) target[into[mv.first]] = true;
+        for (const auto& [a, to] : moves) if (!target[a]) to->Contain(kids[a]);
+    }
+
+    /*
      * The pairs that MAY touch, from a kd-tree over the members' positions
      * (nanoflann, libs/), rebuilt each pass: they all moved. Each pair is
      * found from its larger reach (distance <= ri + rj <= 2 max), padded past
@@ -421,6 +560,20 @@ private:
             ::std::sort(out.begin(), out.end());
             return out;
         }
+
+        // The members whose position is within `r` of member b's, from the tree
+        // the last pairs() built: fitness's candidates, the exact test after.
+        const ::std::vector<uint32_t>& within(size_t b, Fixed r)
+        {
+            const double d = r.ToDouble() * (1.0 + 1e-9) + 1e-3;
+            hits.clear();
+            (void)tree.radiusSearch(&cloud.xyz[b * 3], d * d, hits, nanoflann::SearchParameters(0, false));
+            near.clear();
+            for (const auto& h : hits) near.push_back(h.first);
+            ::std::sort(near.begin(), near.end());
+            return near;
+        }
+        ::std::vector<uint32_t> near;
     };
 
     // The parent, while it is one. Under an arena teardown an ancestor has
@@ -467,6 +620,7 @@ private:
     OrderVector m_ov;
     OrderVector m_last_emission{};
     Fixed       m_emissivity = Fixed::Half();
+    Fixed       m_space;   // zero: solid, holds nothing by fit (SetSpace)
     Fixed       m_emitted_out;
     uint64_t    m_ticks = 0;
     ::std::recursive_mutex m_tree_mtx;   // the tree's, when this is its top (TreeMutex)
