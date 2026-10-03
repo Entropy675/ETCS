@@ -35,17 +35,21 @@
 // nothing, and can be neither persisted nor reflected: the small fast
 // types that live purely in the functional realm stay that way.
 //
-// WHAT THE SCRIPT CANNOT SAY -- state held in members rather than on
-// the tag surface -- goes in the EnvironmentState a type captures:
-// named values, and ONLY that: the script puts the tags back, these
-// put the rest. Replaying ETCS actions is deterministic by the rules
-// of ETCS scripts, so anything that was not (the clock, input, a far
-// node's answer) belongs here as its result.
+// WHAT THE SCRIPT CANNOT SAY -- the result of anything that was not an
+// action: the clock, input, a far node's answer, a body's rows after a
+// thousand interactions -- is ON THE TAG SURFACE TOO, as the value behind
+// the tag that names that state (Entity::values_: stored through the
+// funnel, or bound by a family and read on demand). The script puts the
+// tags back; the values, captured off the surface (etcs_capture_values)
+// and handed back to it (etcs_restore_values), put the rest. One surface,
+// one capture, one store -- a type keeps nothing in a place of its own.
 //
-//   CaptureState   the named values, now.
-//   RebuildLocal   after this entity's script has run HERE: put them back.
-//   ReflectRemote  after the far node's script has built this reflection:
-//                  put back what a reflection should show.
+//   RebuildLocal   after this entity's script has run HERE and its values
+//                  are back on its surface: anything the type does with
+//                  them (most types: nothing).
+//   ReflectRemote  after the far node's script has built this reflection
+//                  and handed it the values: what a reflection does with
+//                  them.
 //   MigrateTo      how earlier builds' keys map to this build's, oldest
 //                  first: "old=new" per line. The ETCS surface only ever
 //                  grows, so an old script still replays; only the named
@@ -126,10 +130,28 @@ class Environmental_ : public ETCS::IWireEnvironmental, virtual public ETCS::Ent
 public:
     virtual ~Environmental_() = default;
 
-    virtual void        CaptureState(ETCS::EnvironmentState& out) const = 0;
     virtual bool        RebuildLocal(const ETCS::EnvironmentState& state) = 0;
     virtual bool        ReflectRemote(const ETCS::EnvironmentState& state) = 0;
     virtual std::string MigrateTo() const = 0;
 };
+
+// The value surface of any entity, as the state a store or a reflection
+// carries -- not only an Environmental one: a body under an Environmental
+// root has rows, and they come back with it.
+inline void etcs_capture_values(const ETCS::Entity* e, ETCS::EnvironmentState& out)
+{
+    std::vector<std::pair<std::string, std::string>> kv;
+    e->values(kv);
+    for (auto& [k, v] : kv) out.set(k, std::move(v));
+}
+// The values back onto the surface; how many landed. A key the surface has
+// no place for (a flag the script did not put back, a binding this build
+// does not have) is skipped, and the count says so.
+inline size_t etcs_restore_values(ETCS::Entity* e, const ETCS::EnvironmentState& st)
+{
+    size_t n = 0;
+    for (auto& [k, v] : st.kv) if (e->restoreValue(ETCS::Buffer(k.c_str()), v)) ++n;
+    return n;
+}
 
 #endif // SUPERTYPE_ENVIRONMENTAL_H__

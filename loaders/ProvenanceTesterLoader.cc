@@ -56,16 +56,22 @@ public:
     bool DeleteConcrete() override { return true; }
 };
 
-// An Environmental one, with one value off its surface.
+// An Environmental one, with one value of its own BOUND to its surface
+// (Entity::bindValue): read off it when captured, handed back on restore.
 class Env : public EnvironmentalBase<Env>, public DeletableBase<Env>
 {
 public:
     WIRE_TYPE_IDENTITY(Env)
     int value = 0;
-    void CaptureStateConcrete(ETCS::EnvironmentState& out) const { out.set("value", std::to_string(value)); }
-    bool RebuildLocalConcrete(const ETCS::EnvironmentState& st) override
-    { if (auto v = st.get("value")) value = std::stoi(*v); return true; }
-    bool ReflectRemoteConcrete(const ETCS::EnvironmentState& st) override { return RebuildLocalConcrete(st); }
+    Env()
+    {
+        bindValue(ETCS::Buffer("value"), ETCS::Entity::ValueBinding{
+            this,
+            [](void* self, std::string& out) { out = std::to_string(static_cast<Env*>(self)->value); },
+            [](void* self, const std::string& in) { static_cast<Env*>(self)->value = std::stoi(in); return true; } });
+    }
+    bool RebuildLocalConcrete(const ETCS::EnvironmentState&) override { return true; }
+    bool ReflectRemoteConcrete(const ETCS::EnvironmentState&) override { return true; }
     bool DeleteConcrete() override { return true; }
 };
 
@@ -218,6 +224,45 @@ int main()
         back.migrate("old=mid\nmid=new\n");
         check(back.get("new") && !back.get("old"), "migration applies its renames oldest first");
         check(!back.unpack(std::string("\x05\x00\x00\x00ab", 6)), "a truncated state is refused");
+    }
+
+    // -- 7b. the value surface ----------------------------------------------------
+    {
+        std::cout << "\n-- 7b. values behind tags --\n";
+        Env* v = arena.allocate<Env>();
+        ETCS::etcs_supertype_fanout(v);
+        const uint64_t id0 = v->identityHash(), s0 = v->getHash();
+        v->value = 41;
+        ETCS::EnvironmentState st;
+        etcs_capture_values(v, st);
+        check(st.get("value") && *st.get("value") == "41", "a bound value is read off the surface by the capture");
+        check(v->identityHash() == id0, "...and is not in the identity hash: what it is did not change");
+        check(v->getHash() != s0, "...and is in the state hash: what is so did");
+        const uint64_t s1 = v->getHash();
+        v->value = 42;
+        check(v->getHash() != s1 && v->identityHash() == id0, "every move of the value moves the state hash and not the identity");
+
+        size_t before = logOf(v).size();
+        { ETCS::ActionScope s(line(v, "Set", "k")); v->addTag(ETCS::Buffer("limit"), "7"); }
+        std::string got;
+        check(v->valueOf(ETCS::Buffer("limit"), got) && got == "7", "a stored value goes on through the funnel and reads back");
+        check(logOf(v).size() == before + 1, "...recorded as the action that set it");
+        { ETCS::ActionScope s(line(v, "Set", "k")); check(!v->addTag(ETCS::Buffer("limit"), "7"), "setting the same value again is no transition"); }
+        { ETCS::ActionScope s(line(v, "Set", "k")); check(v->addTag(ETCS::Buffer("limit"), "8"), "a different value is one"); }
+        v->removeTag(ETCS::Buffer("limit"));
+        check(!v->valueOf(ETCS::Buffer("limit"), got), "the flag off takes its value with it");
+
+        Env* w = arena.allocate<Env>();
+        ETCS::etcs_supertype_fanout(w);
+        w->addTag(ETCS::Buffer("limit"), "0");
+        ETCS::EnvironmentState keep;
+        v->addTag(ETCS::Buffer("limit"), "9");
+        etcs_capture_values(v, keep);
+        check(etcs_restore_values(w, keep) == 2 && w->value == 42, "a capture restores onto another of the kind: the binding read it back...");
+        check(w->valueOf(ETCS::Buffer("limit"), got) && got == "9", "...and the stored value landed");
+        check(w->getHash() == v->getHash(), "the two now have one state hash");
+        ETCS::EnvironmentState stray; stray.set("nowhere", "1");
+        check(etcs_restore_values(w, stray) == 0, "a key the surface has no place for is skipped, and counted out");
     }
 
     // -- 8. carried across a call -------------------------------------------------

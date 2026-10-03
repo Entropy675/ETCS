@@ -1514,7 +1514,7 @@ ETCS::DispatchResult ETCS::EventNode::LoaderStream::on_event(
  */
             ETCS::Entity* live = etcs_tagmodify_target(evt);
             evt.release_value = (live && evt.tagmodify_impl(live, evt.conjugate_key,
-                                                             evt.tagmodify_is_remove)) ? 1 : 0;
+                                                             evt.tagmodify_is_remove, evt.tagmodify_value)) ? 1 : 0;
             return {ETCS::DispatchKind::Inline, &evt};
         }
         case DLInEvent::Kind::PairMask:
@@ -2699,7 +2699,7 @@ ETCS::DispatchResult ETCS::EventNode::ModuleProxy::on_event(
  */
         ETCS::Entity* live = etcs_tagmodify_target(evt);
         evt.release_value = (live && evt.tagmodify_impl(live, evt.conjugate_key,
-                                                         evt.tagmodify_is_remove)) ? 1 : 0;
+                                                         evt.tagmodify_is_remove, evt.tagmodify_value)) ? 1 : 0;
         return {ETCS::DispatchKind::Inline, &evt};
     }
  
@@ -3334,6 +3334,7 @@ inline bool ETCS::TagModifyEvent::operator()()
     evt.tagmodify_target    = target;
     evt.tagmodify_is_remove = is_remove;
     evt.tagmodify_impl      = impl;
+    evt.tagmodify_value     = value;
     evt.tagmodify_done      = &done;
     evt.tagmodify_changed   = &changed;
     /*

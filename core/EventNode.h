@@ -69,7 +69,8 @@ struct DLInEvent
     // Returns whether the surface actually moved -- see Entity::tagModifyImpl.
     // The answer rides home in release_value and is published by on_emit, the
     // same read-then-publish split AddTag uses for rid_out.
-    bool              (*tagmodify_impl)(ETCS::Entity*, const ETCS::Buffer&, bool) = nullptr;
+    bool              (*tagmodify_impl)(ETCS::Entity*, const ETCS::Buffer&, bool, const ::std::string*) = nullptr;
+    const ::std::string* tagmodify_value = nullptr;   // the value behind the flag, when the add carries one (Entity::values_)
     ::std::atomic<bool>* tagmodify_done = nullptr;
     ::std::atomic<bool>* tagmodify_changed = nullptr;
     // TagModify only — the emitting entity's own TYPE bit, stamped at the
@@ -352,11 +353,12 @@ struct AddTagEvent : Event
 // state) — only the DECISION to remove the tag stays local here.
 struct TagModifyEvent : Event
 {
-    using Impl = bool(*)(ETCS::Entity*, const ETCS::Buffer&, bool);
+    using Impl = bool(*)(ETCS::Entity*, const ETCS::Buffer&, bool, const ::std::string*);
     ETCS::Entity*     target;
     bool              is_remove;
     Impl              impl;
     ETCS::TagMask     extra_mask;
+    const ::std::string* value = nullptr;   // a value behind the flag (Entity::addTag(flag, value)); null for presence alone
     ::std::atomic<bool> done{false};
     ::std::atomic<bool> changed{false};
     // The fail-shut substitution an empty mask needs — a type with no tag

@@ -298,6 +298,48 @@ private:
  */
     ArenaMap<ETCS::Buffer, bool>        flags_;
     /*
+ * THE VALUE BEHIND A TAG. A flag is a presence -- the tag surface has
+ * always said "this is so" -- and a tag can also carry WHAT is so: the
+ * state-altering variables behind the name that names the state, kept on
+ * the one surface the funnel orders, the record keeps, and the store
+ * persists, rather than in a third place beside it. Two kinds of value,
+ * one key space:
+ *
+ *   STORED   set through the funnel like a flag (addTag(key, value)) --
+ *            ordered, marked, recorded as the action that set it, so a
+ *            replay sets it again. Bytes, binary-safe.
+ *   BOUND    a family's own state read on demand (bindValue): the Causal
+ *            rows behind "Causal", a Ledger's lines behind "lines". Set
+ *            once at construction like an interface pointer, and never
+ *            written per change -- the rows move on every interaction,
+ *            and the funnel is an ordered event; what the surface holds is
+ *            the way to READ them, and a restore hands the bytes back to
+ *            the same binding.
+ *
+ * NOT IN THE MERKLE HASH, deliberately. The node hash is the identity of
+ * the tag surface, funnel-covered, and the audit's meaning is "a change
+ * that never went through a funnel"; a bound value changes without one by
+ * design, so hashing it there would make every moving body a divergence
+ * and the Causal identity (row 0 is this entity's hash) circular. The
+ * value surface has its own number (valueHash), and the same-state check
+ * a resume makes is the node hash AND the values (Persistence.h).
+ *
+ * Read with the tag mutex released: a binding takes its family's own lock
+ * (the Causal tree's), and refreshIdentityLocked already goes tree-lock
+ * then getHash, so tag-mutex-then-tree-lock anywhere would be the other
+ * half of a deadlock.
+ */
+public:
+    struct ValueBinding
+    {
+        void* self = nullptr;
+        void (*write)(void*, ::std::string&)       = nullptr;   // the value, now
+        bool (*read)(void*, const ::std::string&)  = nullptr;   // the value, back; false if unreadable
+    };
+private:
+    ArenaMap<ETCS::Buffer, ::std::string>  values_;     // stored values, by key
+    ArenaMap<ETCS::Buffer, ValueBinding>   bindings_;   // bound values, by key
+    /*
  * One type-erased pointer per composed family, keyed by family name.
  * Populated by ETCS_MAKE_INSTANCE's own constructor (ETCS_API.h) via
  * static_cast<Name##_*>(this) -- always a legal, ordinary upcast
@@ -612,6 +654,8 @@ public:
               DEFAULT_ARENA_START_PAGE, /* performance */ false))
         , tags(ArenaAllocator<::std::pair<const ETCS::Buffer, TagEntry>>(local_arena_))
         , flags_(ArenaAllocator<::std::pair<const ETCS::Buffer, bool>>(local_arena_))
+        , values_(ArenaAllocator<::std::pair<const ETCS::Buffer, ::std::string>>(local_arena_))
+        , bindings_(ArenaAllocator<::std::pair<const ETCS::Buffer, ValueBinding>>(local_arena_))
         , interface_pointers_(ArenaAllocator<::std::pair<const ETCS::Buffer, void*>>(local_arena_))
         , typed_children_(ArenaAllocator<::std::pair<const ETCS::Buffer, RIDListHandle>>(local_arena_))
     {}
@@ -891,6 +935,94 @@ public:
                 + (s ? s : ""));
         return ETCS::TagModifyEvent{this, flag, false, &Entity::tagModifyImpl, extra}();
     }
+
+    // ── the value surface (see values_) ─────────────────────────────────
+
+    // The flag, with a value behind it, through the funnel: true when this
+    // call put the flag on or changed what it says. Recorded as the action
+    // that set it, so a replay sets it again.
+    bool addTag(const ETCS::Buffer& flag, const ::std::string& value)
+    {
+        const char* s = flag.c_str();
+        if (!s || !s[0] || s[0] < 'a' || s[0] > 'z')
+            throw ::std::invalid_argument(
+                ::std::string("addTag: flag must start with a lowercase letter: ")
+                + (s ? s : ""));
+        ETCS::TagModifyEvent ev{this, flag, false, &Entity::tagModifyImpl};
+        ev.value = &value;
+        const bool changed = ev();
+        if (changed) recordEffect(this, flagKey(this, flag.toString()), true);
+        return changed;
+    }
+
+    // A family's state, readable behind a key. At construction, once, like
+    // registerInterfacePointer; a second binding of a key replaces the first.
+    void bindValue(const ETCS::Buffer& key, ValueBinding b)
+    {
+        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
+        bindings_[key] = b;
+    }
+
+    // The value behind `key`, stored or bound: false when there is none.
+    bool valueOf(const ETCS::Buffer& key, ::std::string& out) const
+    {
+        ValueBinding b;
+        {
+            ::std::lock_guard<::std::mutex> lock(m_tagMutex);
+            auto v = values_.find(key);
+            if (v != values_.end()) { out = v->second; return true; }
+            auto it = bindings_.find(key);
+            if (it == bindings_.end()) return false;
+            b = it->second;
+        }
+        if (!b.write) return false;
+        out.clear();
+        b.write(b.self, out);      // outside the tag mutex: the binding takes its own lock
+        return true;
+    }
+
+    // The whole value surface, by key: what a capture keeps and a hash reads.
+    void values(::std::vector<::std::pair<::std::string, ::std::string>>& out) const
+    {
+        ::std::vector<::std::pair<::std::string, ValueBinding>> bound;
+        {
+            ::std::lock_guard<::std::mutex> lock(m_tagMutex);
+            for (auto const& [key, v] : values_) out.emplace_back(key.toString(), v);
+            for (auto const& [key, b] : bindings_)
+                if (values_.find(key) == values_.end()) bound.emplace_back(key.toString(), b);
+        }
+        for (auto& [key, b] : bound)
+        {
+            ::std::string v;
+            if (b.write) b.write(b.self, v);
+            out.emplace_back(::std::move(key), ::std::move(v));
+        }
+        ::std::sort(out.begin(), out.end());
+    }
+
+    // A record's value, back: a stored value is set, a bound one is handed
+    // to its binding. No funnel and no record -- this is a value the capture
+    // kept as WHAT, coming back as what. False when the key has no place
+    // here, or the binding refused it.
+    bool restoreValue(const ETCS::Buffer& key, const ::std::string& v)
+    {
+        ValueBinding b;
+        {
+            ::std::lock_guard<::std::mutex> lock(m_tagMutex);
+            auto it = bindings_.find(key);
+            if (it == bindings_.end())
+            {
+                if (flags_.find(key) == flags_.end()) return false;
+                values_[key] = v;
+                return true;
+            }
+            b = it->second;
+        }
+        return b.read && b.read(b.self, v);
+    }
+
+    // The value surface as one number. Not part of the node hash (values_).
+    uint64_t valueHash() const;
     /*
  * -----------------------------------------------------------------------
  * addTag<T>(args...) - typed child, module-side. Returns T*, not RID.
@@ -1671,11 +1803,45 @@ public:
  * changes slowly and is read rarely costs nothing between reads. Nothing is
  * recomputed on a schedule.
  */
-    uint64_t getHash() const;
+    uint64_t identityHash() const;
 
-    // Whether a pull would answer from the cache. What an audit compares
-    // against: a current cache that disagrees with a recompute is a change
-    // that never went through a funnel.
+    /*
+ * THE STATE HASH: what it is AND what is so -- the identity half above,
+ * and the value surface of every node under this one (values_), as one
+ * number. The identity half is the cached merkle, funnel-covered, audited;
+ * the value half is read live off the surfaces (a bound value moves without
+ * a funnel, so it is never cached and never audited -- there is no cache to
+ * disagree). One number to compare for "the same state": a resume, a
+ * reflection, a signature. The identity half alone is what a RECORD is
+ * keyed by (a box that moved is the same box) and what the Causal rows
+ * carry as their identity, so it keeps its own name.
+ *
+ * The level rule holds for this pair as for the identity's: a parentless
+ * entity's state hash is the first word of its state digest (SHA-256), a
+ * child's is XXH3 over the same input.
+ */
+    uint64_t getHash() const;
+    void     getDigest(unsigned char out[32]) const;
+    // The value surfaces under this node, in the walk's order, as one
+    // number. Live: O(subtree) per call, no cache.
+    uint64_t subtreeValueHash() const;
+
+    /*
+ * WHERE THIS ENTITY STANDS AMONG ITS TWINS: the index, in attach order,
+ * among the parent's children of the same tag whose identity hash equals
+ * this one's. Zero for the first, for a parentless entity, and for an
+ * entity with no twin. With the identity hash it is the identity TUPLE --
+ * what it is, then which of the indistinguishable ones -- the same two
+ * keys a persistence record is looked up by (type and hash, then emergent
+ * creation order), and what the Causal rows carry in row 0. A scene
+ * rebuilt in another order gives its twins other indices: creation order
+ * is the last key, by design, never a stored RID.
+ */
+    uint32_t siblingIndex() const;
+
+    // Whether a pull of the identity half would answer from the cache. What
+    // an audit compares against: a current cache that disagrees with a
+    // recompute is a change that never went through a funnel.
     bool hashCurrent() const
     {
         return hash_valid_epoch_.load(::std::memory_order_acquire)
@@ -1688,11 +1854,11 @@ public:
     // has to make the tree above it recompute.
     void markHashStale() const { hash_epoch_.fetch_add(1, ::std::memory_order_acq_rel); }
 
-    // The 32-byte form. For a parentless entity this is its node hash in
-    // full (SHA-256); for a child it is SHA-256 over the same input its XXH3
-    // node hash was taken from -- what an audit of a subtree reports as its
-    // root. Same laziness as getHash.
-    void getDigest(unsigned char out[32]) const;
+    // The identity half's 32-byte form. For a parentless entity this is its
+    // identity hash in full (SHA-256); for a child it is SHA-256 over the
+    // same input its XXH3 identity hash was taken from -- what an audit of a
+    // subtree reports as its root. Same laziness as identityHash.
+    void identityDigest(unsigned char out[32]) const;
     bool isGlobalScope() const { return parent_ == nullptr; }
 
     // Parents above this entity: 0 at the top of a branch. See depth_.
@@ -2842,20 +3008,27 @@ public:
     }
 private:
 
-    static bool tagModifyImpl(Entity* target, const ETCS::Buffer& key, bool is_remove)
+    static bool tagModifyImpl(Entity* target, const ETCS::Buffer& key, bool is_remove, const ::std::string* value)
     {
-        const bool changed = tagModifyBody(target, key, is_remove);
+        const bool changed = tagModifyBody(target, key, is_remove, value);
         if (!changed || !target) return changed;
         markStateChange(target, target->getRID());
         return changed;
     }
 
-    static bool tagModifyBody(Entity* target, const ETCS::Buffer& key, bool is_remove)
+    static bool tagModifyBody(Entity* target, const ETCS::Buffer& key, bool is_remove, const ::std::string* value)
     {
         if (!is_remove)
         {
             ::std::lock_guard<::std::mutex> lock(target->m_tagMutex);
-            return target->flags_.emplace(key, true).second;
+            bool changed = target->flags_.emplace(key, true).second;
+            if (value)
+            {
+                auto v = target->values_.find(key);
+                if (v == target->values_.end()) { target->values_.emplace(key, *value); changed = true; }
+                else if (v->second != *value)   { v->second = *value;                  changed = true; }
+            }
+            return changed;
         }
  
         /*
@@ -2952,6 +3125,7 @@ private:
             else
             {
                 changed = (target->flags_.erase(key) > 0);
+                target->values_.erase(key);
             }
         }
  
@@ -4336,8 +4510,8 @@ struct Entity::HashAudit
     size_t   nodes      = 0;   // entities visited
     size_t   diverged   = 0;   // current caches that did not match their state
     size_t   skipped    = 0;   // children retiring during the walk, not hashed
-    uint64_t top_hash   = 0;   // the top's own node hash, as the walk computed it
-    unsigned char root[32] = {};   // the top's digest (getDigest), as the walk computed it
+    uint64_t top_hash   = 0;   // the top's own identity hash, as the walk computed it
+    unsigned char root[32] = {};   // the top's identity digest (identityDigest), as the walk computed it
 };
 
 namespace etcs_hash_detail
@@ -4373,6 +4547,19 @@ namespace etcs_hash_detail
             lo = hi;
         }
     }
+}
+
+inline uint64_t Entity::valueHash() const
+{
+    ::std::vector<::std::pair<::std::string, ::std::string>> kv;
+    values(kv);
+    ::std::string in;
+    for (auto& [k, v] : kv)
+    {
+        etcs_hash_detail::put(in, 'V', k.data(), k.size());
+        etcs_hash_detail::put(in, 'v', v.data(), v.size());
+    }
+    return XXH3_64bits(in.data(), in.size());
 }
 
 inline uint64_t Entity::surfaceHash() const
@@ -4595,7 +4782,7 @@ inline uint64_t Entity::computeNodeHash(HashAudit* audit, unsigned char* digest)
     }
 }
 
-inline uint64_t Entity::getHash() const
+inline uint64_t Entity::identityHash() const
 {
     const uint32_t epoch = hash_epoch_.load(::std::memory_order_acquire);
     if (hash_valid_epoch_.load(::std::memory_order_acquire) == epoch)
@@ -4609,7 +4796,7 @@ inline uint64_t Entity::getHash() const
     return h;
 }
 
-inline void Entity::getDigest(unsigned char out[32]) const
+inline void Entity::identityDigest(unsigned char out[32]) const
 {
     if (isGlobalScope())
     {
@@ -4617,7 +4804,7 @@ inline void Entity::getDigest(unsigned char out[32]) const
         {
             const uint32_t epoch = hash_epoch_.load(::std::memory_order_acquire);
             if (hash_valid_epoch_.load(::std::memory_order_acquire) != epoch)
-            { (void)getHash(); continue; }          // fills the digest, then re-read
+            { (void)identityHash(); continue; }     // fills the digest, then re-read
             ::std::memcpy(out, hash_digest_, 32);
             // Same epoch after the copy: the copy was of one stamp, not two.
             if (hash_valid_epoch_.load(::std::memory_order_acquire) == epoch
@@ -4627,6 +4814,94 @@ inline void Entity::getDigest(unsigned char out[32]) const
     // A child: not cached, because nothing composes over a child's digest --
     // it is asked for by an audit of a subtree and answered from the input.
     (void)computeNodeHash(nullptr, out);
+}
+
+inline uint64_t Entity::subtreeValueHash() const
+{
+    // The walk is the hash's (order_children), one frame per level on this
+    // vector, each child held for the visit as the identity walk holds it.
+    struct Frame { const Entity* node = nullptr; ::std::vector<::std::pair<ETCS::Buffer, RID>> kids; size_t next = 0; LifetimeHold hold; };
+    ::std::vector<Frame> stack;
+    ::std::string in;
+    auto open = [&in](const Entity* n, LifetimeHold&& hold) {
+        Frame f; f.node = n; f.hold = ::std::move(hold);
+        etcs_hash_detail::put_u64(in, n->valueHash());
+        n->getTypedChildren(f.kids);
+        etcs_hash_detail::order_children(f.kids);
+        return f;
+    };
+    stack.push_back(open(this, LifetimeHold()));
+    while (!stack.empty())
+    {
+        Frame& f = stack.back();
+        if (f.next < f.kids.size())
+        {
+            const auto [tag, rid] = f.kids[f.next++];
+            Entity* child = f.node->getTypedChild(tag, rid);
+            LifetimeHold hold(child);
+            if (!hold) continue;
+            stack.push_back(open(child, ::std::move(hold)));
+            continue;
+        }
+        stack.pop_back();
+    }
+    return XXH3_64bits(in.data(), in.size());
+}
+
+inline void Entity::getDigest(unsigned char out[32]) const
+{
+    // The identity half's digest, then the values: one input, SHA-256.
+    unsigned char id[32];
+    identityDigest(id);
+    ::std::string in;
+    in.push_back('\x02');                               // a state: identity and values
+    in.append(reinterpret_cast<const char*>(id), 32);
+    etcs_hash_detail::put_u64(in, subtreeValueHash());
+    picohash_ctx_t ctx;
+    picohash_init_sha256(&ctx);
+    picohash_update(&ctx, in.data(), in.size());
+    picohash_final(&ctx, out);
+}
+
+inline uint64_t Entity::getHash() const
+{
+    if (isGlobalScope())
+    {
+        unsigned char d[32];
+        getDigest(d);
+        uint64_t first = 0;
+        ::std::memcpy(&first, d, sizeof(first));
+        return first;
+    }
+    ::std::string in;
+    in.push_back('\x02');
+    etcs_hash_detail::put_u64(in, identityHash());
+    etcs_hash_detail::put_u64(in, subtreeValueHash());
+    return XXH3_64bits(in.data(), in.size());
+}
+
+inline uint32_t Entity::siblingIndex() const
+{
+    const Entity* p = getParent();
+    if (!p || p->isDestructed()) return 0;
+    const uint64_t mine = identityHash();
+    ::std::vector<::std::pair<ETCS::Buffer, RID>> kids;
+    p->getTypedChildren(kids);                          // tag groups in first-attachment order, attach order within
+    // The tag the parent lists this entity under is the one its own entry
+    // carries (parent_rid_); the twins are the equal-hash entries before it
+    // under that tag.
+    const ETCS::Buffer* tag = nullptr;
+    for (auto const& [t, rid] : kids) if (rid == parent_rid_) { tag = &t; break; }
+    if (!tag) return 0;
+    uint32_t index = 0;
+    for (auto const& [t, rid] : kids)
+    {
+        if (!(t == *tag)) continue;
+        if (rid == parent_rid_) return index;
+        if (Entity* c = p->getTypedChild(t, rid))
+            if (c->identityHash() == mine) ++index;
+    }
+    return index;
 }
 
 /*

@@ -101,35 +101,53 @@ int main()
     Node* leaf  = mid->addTag<Node>();
     (void)leaf;
 
+    // TWO HALVES, ONE HASH. identityHash is the cached merkle over the tag
+    // surface -- what the laziness, the audit and the digest rule below are
+    // about; getHash is the state hash, that and every value under the node
+    // (Entity.h, values_), read live. A node with nothing on its value
+    // surface has a state hash that is a function of its identity alone.
     check(!top->hashCurrent(), "a fresh node has no current hash");
-    const uint64_t h0 = top->getHash();
+    const uint64_t h0 = top->identityHash();
     check(top->hashCurrent(), "one pull makes it current");
     check(mid->hashCurrent() && leaf->hashCurrent(), "...and every node the pull passed");
-    check(top->getHash() == h0, "a second pull with nothing moved answers the same value");
+    check(top->identityHash() == h0, "a second pull with nothing moved answers the same value");
     check(h0 != 0, "and the value is not the empty hash");
+    const uint64_t s0 = top->getHash();
+    check(s0 != h0 && top->getHash() == s0, "the state hash is another number, and steady while nothing moves");
 
     // -- 2. the surface is the state ------------------------------------------
     leaf->local_value = 40;
     check(top->hashCurrent(), "a type-local variable moving is not a transition");
-    check(top->getHash() == h0, "...so the hash does not move");
+    check(top->identityHash() == h0 && top->getHash() == s0, "...so neither hash moves (it is on no surface)");
 
     leaf->addTag(ETCS::Buffer("falling"));
     check(!leaf->hashCurrent(), "a flag going on makes the leaf stale");
     check(!mid->hashCurrent() && !top->hashCurrent(), "...and every ancestor");
-    const uint64_t h1 = top->getHash();
+    const uint64_t h1 = top->identityHash();
     check(h1 != h0, "the root hash moved");
+    check(top->getHash() != s0, "...and the state hash with it");
 
     leaf->removeTag(ETCS::Buffer("falling"));
-    check(top->getHash() == h0, "taking the flag off restores the exact value (A-B-A)");
+    check(top->identityHash() == h0 && top->getHash() == s0, "taking the flag off restores the exact values (A-B-A)");
+
+    // A VALUE behind a flag moves the state hash and not the identity.
+    leaf->addTag(ETCS::Buffer("weight"), "3");
+    const uint64_t hw = top->identityHash(), sw = top->getHash();
+    check(hw != h0 && sw != s0, "a flag with a value: both move (the flag is identity)");
+    leaf->addTag(ETCS::Buffer("weight"), "4");
+    check(top->identityHash() == hw, "a different value behind the same flag: the identity stands...");
+    check(top->getHash() != sw, "...and the state hash moves -- values are state, read off the surface");
+    leaf->removeTag(ETCS::Buffer("weight"));
+    check(top->identityHash() == h0 && top->getHash() == s0, "the flag off takes its value with it (A-B-A)");
 
     // -- 3. only the path that moved recomputes --------------------------------
     Node* side = top->addTag<Node>();          // a second branch under root
-    top->getHash();
-    const uint64_t side_h = side->getHash();
+    top->identityHash();
+    const uint64_t side_h = side->identityHash();
     leaf->addTag(ETCS::Buffer("x"));
     check(side->hashCurrent(), "a transition on one branch leaves the other current");
-    top->getHash();
-    check(side->getHash() == side_h, "...and its value unchanged after the root pull");
+    top->identityHash();
+    check(side->identityHash() == side_h, "...and its value unchanged after the root pull");
     leaf->removeTag(ETCS::Buffer("x"));
 
     // -- 4. order --------------------------------------------------------------
@@ -174,7 +192,7 @@ int main()
 
     // -- 6. the root pull and divergence ---------------------------------------
     {
-        const uint64_t lazy = top->getHash();
+        const uint64_t lazy = top->identityHash();
         ETCS::Entity::HashAudit a = etcs_root_hash(top);
         check(a.nodes == 3, "the audit visited the top and every node under it");
         std::printf("        (nodes %zu, diverged %zu, skipped %zu)\n", a.nodes, a.diverged, a.skipped);
@@ -192,7 +210,7 @@ int main()
         // -- the only way to produce "current cache, different state" from
         // here, since every real mutator bumps. This is what an unrecorded
         // write looks like to the audit.
-        leaf->getHash();
+        leaf->identityHash();
         const uint32_t e = leaf->hashEpoch();
         leaf->addTag(ETCS::Buffer("unseen"));
         leaf->stampHash(leaf->hashCached(), leaf->hashEpoch());   // forge: claim current
@@ -200,7 +218,7 @@ int main()
         check(leaf->hashCurrent(), "(setup) the leaf claims a current cache over a moved surface");
         // The ancestors WERE bumped by the flag; roll them so the audit's own
         // marking is what makes them stale, not the setup.
-        mid->getHash(); top->getHash();
+        mid->identityHash(); top->identityHash();
         check(top->hashCurrent() && mid->hashCurrent(), "(setup) the tree above is current");
 
         ETCS::Entity::HashAudit d = etcs_root_hash(top);
@@ -210,9 +228,9 @@ int main()
         // the deepest node on it is where the write happened.
         check(d.diverged == 3, "the audit reports the diverged path: leaf, mid, top");
         check(!leaf->hashCurrent(), "...and leaves each diverged node stale, so the next pull recomputes");
-        check(leaf->getHash() == leaf->computeNodeHash(nullptr, nullptr), "...to its true hash");
+        check(leaf->identityHash() == leaf->computeNodeHash(nullptr, nullptr), "...to its true hash");
         check(!std::equal(a.root, a.root + 32, d.root), "...and the root digest moved");
-        check(top->getHash() == d.top_hash, "the lazy pull after an audit agrees with it");
+        check(top->identityHash() == d.top_hash, "the lazy pull after an audit agrees with it");
 
         leaf->removeTag(ETCS::Buffer("unseen"));
         ETCS::Entity::HashAudit r = etcs_root_hash(top);
@@ -225,21 +243,23 @@ int main()
     {
         check(top->isGlobalScope() && !mid->isGlobalScope(), "top is parentless, mid is not");
         unsigned char d[32], d2[32];
-        top->getDigest(d);
+        top->identityDigest(d);
         uint64_t first = 0; std::memcpy(&first, d, sizeof(first));
-        check(top->getHash() == first, "a parentless node's hash is the first word of its digest");
+        check(top->identityHash() == first, "a parentless node's identity hash is the first word of its identity digest");
         ETCS::Entity::HashAudit a = etcs_root_hash(top);
         check(std::equal(d, d + 32, a.root), "...and the audit's root of it is that digest");
-        mid->getDigest(d2);
+        mid->identityDigest(d2);
         uint64_t mfirst = 0; std::memcpy(&mfirst, d2, sizeof(mfirst));
-        check(mid->getHash() != mfirst, "a child's hash is not its digest's first word (XXH3, not SHA)");
-        top->getDigest(d2);
+        check(mid->identityHash() != mfirst, "a child's hash is not its digest's first word (XXH3, not SHA)");
+        { unsigned char sd[32]; top->getDigest(sd); uint64_t sfirst = 0; std::memcpy(&sfirst, sd, sizeof(sfirst));
+          check(top->getHash() == sfirst && !std::equal(sd, sd + 32, d), "the state digest obeys the same level rule, and is not the identity's"); }
+        top->identityDigest(d2);
         check(std::equal(d, d + 32, d2), "a second digest pull with nothing moved is identical");
         leaf->addTag(ETCS::Buffer("deep"));
-        top->getDigest(d2);
+        top->identityDigest(d2);
         check(!std::equal(d, d + 32, d2), "a flag three levels down moves the top's digest");
         leaf->removeTag(ETCS::Buffer("deep"));
-        top->getDigest(d2);
+        top->identityDigest(d2);
         check(std::equal(d, d + 32, d2), "...and taking it off restores it (A-B-A)");
     }
 
@@ -315,7 +335,7 @@ int main()
         std::printf("        (built %u levels in %.0f ms)\n", DEPTH, ms());
         check(root->depth() == 0 && tip->depth() == DEPTH, "every level knows its depth");
 
-        const uint64_t deep0 = root->getHash();
+        const uint64_t deep0 = root->identityHash();
         std::printf("        (pulled in %.0f ms)\n", ms());
         check(root->hashCurrent() && tip->hashCurrent(), "a pull through the whole chain fills every cache");
         ETCS::Entity::HashAudit a = etcs_root_hash(root);
@@ -327,9 +347,9 @@ int main()
         tip->addTag(ETCS::Buffer("deep"));
         check(!root->hashCurrent(), "a flag at the tip reaches the root's epoch");
         check(root->TakeObserved(edge), "...and its observer, through every level between");
-        check(root->getHash() != deep0, "and the root hash moved");
+        check(root->identityHash() != deep0, "and the root hash moved");
         tip->removeTag(ETCS::Buffer("deep"));
-        check(root->getHash() == deep0, "A-B-A at depth");
+        check(root->identityHash() == deep0, "A-B-A at depth");
 
         // And down again: the cascade delete of the whole chain is a loop
         // over an explicit stack (MemoryArena::cascade), so a branch this
