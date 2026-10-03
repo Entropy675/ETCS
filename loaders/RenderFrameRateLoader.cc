@@ -120,8 +120,7 @@ int main(int argc, char** argv)
 
     ETCS::Entity* surface = ETCS::make_typed_child("RenderProvider", "Surface", window, loader);
     if (!surface) { std::cerr << "Failed to attach RenderProvider:Surface\n"; return 1; }
-    surface->call("Surface.Create",
-                   (std::to_string(instance->getRID()) + " modules/RenderProvider/shaders/").c_str(), ctx);
+    surface->call("Surface.Create", std::to_string(instance->getRID()).c_str(), ctx);
 
     ETCS::Entity* layer = ETCS::spawn_entity("RenderProvider", "ImageSurface", env, loader);
     if (!layer) { std::cerr << "Failed to spawn RenderProvider:ImageSurface\n"; return 1; }

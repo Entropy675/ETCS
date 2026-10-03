@@ -48,7 +48,7 @@ main.Create(800, 600, 'ETCS RenderProvider')
 # and the window it draws into. Surface.Create walks getParent() for both
 # the Window and the Resizable interface pointers.
 main.spawn(RenderProvider::Surface view)
-view.Create(@gpu, modules/RenderProvider/shaders/)
+view.Create(@gpu)
 
 # The layer stack. Root spawns: a layer has no owner in the scene-graph
 # sense, it is just an addressable region of pixels whose RID the thing

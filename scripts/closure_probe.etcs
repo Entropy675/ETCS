@@ -9,7 +9,7 @@ spawn WindowProvider::Window main
 main.Create(400, 300, 'closure probe')
 
 main.spawn(RenderProvider::Surface view)
-view.Create(@gpu, ../modules/RenderProvider/shaders/)
+view.Create(@gpu)
 view.Clear(0.1, 0.1, 0.2, 1.0)
 
 detach RenderProvider/scripts/render_frames.etcs view=view

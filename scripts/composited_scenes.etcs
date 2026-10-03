@@ -29,7 +29,7 @@ spawn WindowProvider::Window main
 main.Create(1024, 768, 'ETCS composited scenes')
 
 main.spawn(RenderProvider::Surface view)
-view.Create(@gpu, modules/RenderProvider/shaders/)
+view.Create(@gpu)
 
 # The stage is a compositor too, and at the root it is the one that matters
 # most: everything in the scene merges into this one buffer, so a settled
