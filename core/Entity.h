@@ -337,6 +337,10 @@ public:
         void* self = nullptr;
         void (*write)(void*, ::std::string&)       = nullptr;   // the value, now
         bool (*read)(void*, const ::std::string&)  = nullptr;   // the value, back; false if unreadable
+        // A cheap number that changes when the value does (equality only),
+        // for a reader asking whether it MOVED without reading it (a frozen
+        // read reusing what it read last). Null: unknown -- always read it.
+        uint64_t (*digest)(void*)                  = nullptr;
     };
 private:
     ArenaMap<ETCS::Buffer, ::std::string>  values_;     // stored values, by key
@@ -408,6 +412,22 @@ private:
  * ---------------------------------------------------------------------
  */
     mutable ::std::atomic<uint32_t> hash_epoch_{1};
+    /*
+     * THE TWINS AMONG THIS ENTITY'S CHILDREN, as a parent knows them: each
+     * child's index among the same-tag children with its identity hash, in
+     * attach order (siblingIndex), all made in one pass and kept until this
+     * entity's hash epoch moves -- which every change under it does. Asked
+     * child by child it was a walk of all the siblings per child: n squared
+     * per parent, paid by every member's next tick after any one of them
+     * changed. Made on first use; a childless entity carries the pointer.
+     */
+    struct TwinIndex
+    {
+        ::std::mutex                         mu;
+        uint32_t                             epoch = 0;   // 0: never made (hash_epoch_ starts at 1)
+        ::std::unordered_map<RID, uint32_t>  index;
+    };
+    mutable ::std::atomic<TwinIndex*> twins_{ nullptr };
     mutable ::std::atomic<uint32_t> hash_valid_epoch_{0};
     mutable ::std::atomic<uint64_t> hash_cached_{0};
     /*
@@ -689,6 +709,7 @@ public:
  */
     virtual ~Entity()
     {
+        delete twins_.exchange(nullptr);
         /*
  * Signal every currently-in-flight stream call's own
  * SignalContext FIRST, before anything else -- see Scope::
@@ -1006,6 +1027,30 @@ public:
         if (!b.write) return false;
         out.clear();
         b.write(b.self, out);      // outside the tag mutex: the binding takes its own lock
+        return true;
+    }
+
+    // Whether the bound values moved, without reading them: their digests
+    // folded together. False when one has none (then only reading tells).
+    // Stored values need no digest -- a change to one moves the hash epoch.
+    bool valueDigest(uint64_t& out) const
+    {
+        // Bindings are few (one per family that has one): copied to the
+        // stack, read with the tag mutex released.
+        ValueBinding bound[8];
+        size_t n = 0;
+        {
+            ::std::lock_guard<::std::mutex> lock(m_tagMutex);
+            if (bindings_.size() > 8) return false;
+            for (auto const& [key, b] : bindings_) bound[n++] = b;
+        }
+        uint64_t h = 0x9e3779b97f4a7c15ULL;
+        for (size_t i = 0; i < n; ++i)
+        {
+            if (!bound[i].digest) return false;
+            h = (h ^ bound[i].digest(bound[i].self)) * 0x100000001b3ULL;
+        }
+        out = h;
         return true;
     }
 
@@ -4605,22 +4650,33 @@ namespace etcs_hash_detail
      */
     inline void order_canonical(const Entity* parent, ::std::vector<::std::pair<ETCS::Buffer, RID>>& kids)
     {
-        ::std::vector<::std::pair<uint64_t, ::std::pair<ETCS::Buffer, RID>>> keyed;
-        keyed.reserve(kids.size());
-        for (auto& k : kids)
+        // Sorted as indices, then moved once: an entry carries its tag as a
+        // whole Buffer, and moving those through a sort cost more than the
+        // sort. The group is the tag's run (getTypedChildren keeps them
+        // together, in first-attachment order).
+        const size_t n = kids.size();
+        if (n < 2) return;
+        ::std::vector<uint32_t> group(n), idx(n);
+        ::std::vector<uint64_t> id(n);
+        uint32_t g = 0;
+        for (size_t i = 0; i < n; ++i)
         {
-            Entity* c = parent->getTypedChild(k.first, k.second);
+            if (i && !(kids[i].first == kids[i - 1].first)) ++g;
+            group[i] = g;
+            idx[i] = static_cast<uint32_t>(i);
+            Entity* c = parent->getTypedChild(kids[i].first, kids[i].second);
             LifetimeHold hold(c);
-            keyed.emplace_back(hold ? c->identityHash() : 0, k);
+            id[i] = hold ? c->identityHash() : 0;
         }
-        for (auto lo = keyed.begin(); lo != keyed.end(); )
-        {
-            auto hi = lo + 1;
-            while (hi != keyed.end() && hi->second.first == lo->second.first) ++hi;
-            ::std::stable_sort(lo, hi, [](const auto& a, const auto& b) { return a.first < b.first; });
-            lo = hi;
-        }
-        for (size_t i = 0; i < kids.size(); ++i) kids[i] = keyed[i].second;
+        ::std::stable_sort(idx.begin(), idx.end(), [&](uint32_t a, uint32_t b) {
+            return group[a] != group[b] ? group[a] < group[b] : id[a] < id[b]; });
+        bool moved = false;
+        for (size_t i = 0; i < n && !moved; ++i) moved = idx[i] != i;
+        if (!moved) return;
+        ::std::vector<::std::pair<ETCS::Buffer, RID>> out;
+        out.reserve(n);
+        for (uint32_t i : idx) out.push_back(::std::move(kids[i]));
+        kids.swap(out);
     }
 }
 
@@ -4975,24 +5031,34 @@ inline uint32_t Entity::siblingIndex() const
 {
     const Entity* p = getParent();
     if (!p || p->isDestructed()) return 0;
-    const uint64_t mine = identityHash();
-    ::std::vector<::std::pair<ETCS::Buffer, RID>> kids;
-    p->getTypedChildren(kids);                          // tag groups in first-attachment order, attach order within
-    // The tag the parent lists this entity under is the one its own entry
-    // carries (parent_rid_); the twins are the equal-hash entries before it
-    // under that tag.
-    const ETCS::Buffer* tag = nullptr;
-    for (auto const& [t, rid] : kids) if (rid == parent_rid_) { tag = &t; break; }
-    if (!tag) return 0;
-    uint32_t index = 0;
-    for (auto const& [t, rid] : kids)
+    TwinIndex* t = p->twins_.load(::std::memory_order_acquire);
+    if (!t)
     {
-        if (!(t == *tag)) continue;
-        if (rid == parent_rid_) return index;
-        if (Entity* c = p->getTypedChild(t, rid))
-            if (c->identityHash() == mine) ++index;
+        TwinIndex* fresh = new TwinIndex();
+        if (p->twins_.compare_exchange_strong(t, fresh, ::std::memory_order_acq_rel)) t = fresh;
+        else delete fresh;   // another made it first; `t` is theirs
     }
-    return index;
+    ::std::lock_guard<::std::mutex> lock(t->mu);
+    const uint32_t epoch = p->hashEpoch();
+    if (t->epoch != epoch)
+    {
+        // Tag groups in first-attachment order, attach order within
+        // (getTypedChildren): count each (tag, identity) as it comes.
+        ::std::vector<::std::pair<ETCS::Buffer, RID>> kids;
+        p->getTypedChildren(kids);
+        ::std::map<::std::pair<::std::string, uint64_t>, uint32_t> seen;
+        t->index.clear();
+        for (auto const& [tag, rid] : kids)
+        {
+            Entity* c = p->getTypedChild(tag, rid);
+            LifetimeHold hold(c);
+            if (!hold) continue;
+            t->index[rid] = seen[{ tag.toString(), c->identityHash() }]++;
+        }
+        t->epoch = epoch;   // read before the walk: a change during it makes the next ask walk again
+    }
+    auto it = t->index.find(parent_rid_);
+    return it == t->index.end() ? 0 : it->second;
 }
 
 /*
@@ -5064,9 +5130,10 @@ inline Entity::HashAudit etcs_root_hash(Entity* top)
  * this runtime's own store, or on the far side of a MirrorBuffer to build a
  * reflection.
  *
- * WHAT IS KEPT. Every action that put on something still there; then every
+ * WHAT IS KEPT. For every key still there, the LAST action that put it on (a
+ * value set again replaces the set before; etcs_replay_compose); then every
  * later action that took off something a kept action put on -- or replaying
- * the first would bring it back -- to a fixed point. In the order they ran.
+ * the first would bring it back. In the order they ran.
  * Nothing else: an action whose every effect was later undone is history the
  * surface no longer shows, and the record drops it here too (KeepActions).
  *
@@ -5126,45 +5193,72 @@ namespace etcs_replay_detail
     }
 }
 
-inline void etcs_replay_capture(Entity* e, const ::std::string& name,
-                                ::std::map<RID, ::std::string>& names, ReplayCapture& out,
-                                uint64_t born = 0)
+/*
+ * IN TWO HALVES, so a frozen read holds the graph only for the reading:
+ * etcs_replay_gather takes what the capture needs off the live graph (the
+ * region's live keys and parents, each record, the Environmental entities
+ * below), and etcs_replay_compose writes the script from that alone, with
+ * nothing held -- then trims each record to what it kept (KeepActions, up to
+ * the record the gather saw, so a line recorded since is untouched).
+ */
+struct ReplayGather
 {
-    ETCS::IWireEnvironmental* wire = e ? e->environmentalWire() : nullptr;
-    if (!wire) return;
-    names[e->getRID()] = name;
-    out.environmental.emplace_back(name, e);
-    const size_t at = out.environmental.size() - 1, begin = out.script.size();
-    out.spans.emplace_back(begin, begin);
+    Entity*                     e = nullptr;     // identity only (ReplayCapture::environmental)
+    RID                         rid = 0;
+    ::std::string               tag;             // its source tag, for a warning
+    IWireEnvironmental*         wire = nullptr;
+    ::std::set<::std::string>   live;
+    ::std::map<RID, RID>        parent_of;       // a child in the region -> its parent
+    ::std::vector<ActionRecord> log;
+    uint64_t                    upto = 0;
+    ::std::vector<ReplayGather> below;           // the Environmental ones under it
+};
 
+inline void etcs_replay_gather(Entity* e, ReplayGather& g)
+{
+    g.e = e;
+    g.wire = e ? e->environmentalWire() : nullptr;
+    if (!g.wire) return;
+    g.rid = e->getRID();
+    g.tag = e->getSourceTag().toString();
     // The region and what is live in it.
-    ::std::set<::std::string> live;
-    ::std::vector<Entity*> region{ e }, env_children;
-    ::std::map<RID, Entity*> parent_of;
+    ::std::vector<Entity*> region{ e };
     for (size_t i = 0; i < region.size(); ++i)
     {
         Entity* x = region[i];
         ::std::vector<::std::string> fl;
         x->stateFlags(fl);
-        for (auto& f : fl) live.insert(Entity::flagKey(x, f));
+        for (auto& f : fl) g.live.insert(Entity::flagKey(x, f));
         ::std::vector<::std::pair<ETCS::Buffer, RID>> kids;
         x->getTypedChildren(kids);
         for (auto& [tag, rid] : kids)
         {
             Entity* c = x->getTypedChild(tag, rid);
             if (!c) continue;
-            live.insert(Entity::childKey(rid));
-            parent_of[rid] = x;
-            if (c->isEnvironmental()) env_children.push_back(c);
+            g.live.insert(Entity::childKey(rid));
+            g.parent_of[rid] = x->getRID();
+            if (c->isEnvironmental()) { g.below.emplace_back(); etcs_replay_gather(c, g.below.back()); }
             else                      region.push_back(c);
         }
     }
+    g.log  = g.wire->ActionLog();
+    g.upto = g.log.empty() ? 0 : g.log.back().seq;
+}
+
+inline void etcs_replay_compose(ReplayGather& g, const ::std::string& name,
+                                ::std::map<RID, ::std::string>& names, ReplayCapture& out,
+                                uint64_t born = 0)
+{
+    if (!g.wire) return;
+    names[g.rid] = name;
+    out.environmental.emplace_back(name, g.e);
+    const size_t at = out.environmental.size() - 1, begin = out.script.size();
+    out.spans.emplace_back(begin, begin);
 
     // What to keep: see the banner.
     // `born`: the action that made this entity. Whatever else it did to it is
     // its making -- the parent's line does it again -- not its own record.
-    ::std::vector<ActionRecord> log = wire->ActionLog();
-    const uint64_t upto = log.empty() ? 0 : log.back().seq;
+    ::std::vector<ActionRecord>& log = g.log;
     if (born) log.erase(::std::remove_if(log.begin(), log.end(),
                                          [born](const ActionRecord& r) { return r.frame == born; }),
                         log.end());
@@ -5172,23 +5266,28 @@ inline void etcs_replay_capture(Entity* e, const ::std::string& name,
     for (auto& r : log)
         for (auto& k : r.created)
             if (k.compare(0, 2, "c:") == 0) made_in[::std::strtoull(k.c_str() + 2, nullptr, 10)] = r.frame;
-    ::std::vector<bool> keep(log.size(), false);
+    /*
+     * THE LAST SETTER WINS. A key still live is kept by the LAST action that
+     * put it on: a value set again replaces the one before (the funnel records
+     * each set), and a flag put on, taken off and put on again is the last put.
+     * Every earlier one is superseded -- kept only for another key it alone
+     * still holds.
+     */
+    ::std::map<::std::string, size_t> last;
     for (size_t i = 0; i < log.size(); ++i)
-        for (auto& k : log[i].created) if (live.count(k)) { keep[i] = true; break; }
-    for (bool grew = true; grew; )
+        for (auto& k : log[i].created) if (g.live.count(k)) last[k] = i;
+    ::std::vector<bool> keep(log.size(), false);
+    for (auto& [k, i] : last) keep[i] = true;
+    // Then every later action that took off something a kept action put on --
+    // or replaying the first would bring it back. A removal only ever answers
+    // an EARLIER put, so one forward pass is the fixed point.
+    ::std::set<::std::string> put_by_kept;
+    for (size_t j = 0; j < log.size(); ++j)
     {
-        grew = false;
-        for (size_t j = 0; j < log.size(); ++j)
-        {
-            if (keep[j]) continue;
-            for (size_t i = 0; i < j && !keep[j]; ++i)
-            {
-                if (!keep[i]) continue;
-                for (auto& rk : log[j].removed)
-                    if (::std::find(log[i].created.begin(), log[i].created.end(), rk) != log[i].created.end())
-                    { keep[j] = true; grew = true; break; }
-            }
-        }
+        if (!keep[j])
+            for (auto& rk : log[j].removed)
+                if (put_by_kept.count(rk)) { keep[j] = true; break; }
+        if (keep[j]) for (auto& k : log[j].created) put_by_kept.insert(k);
     }
 
     ::std::map<::std::string, int> made;   // per type, for the names children get
@@ -5218,8 +5317,8 @@ inline void etcs_replay_capture(Entity* e, const ::std::string& name,
             {
                 if (k.compare(0, 2, "c:") != 0) continue;
                 const RID c = ::std::strtoull(k.c_str() + 2, nullptr, 10);
-                auto p = parent_of.find(c);
-                if (!child || (p != parent_of.end() && p->second->getRID() == r.line.receiver)) child = c;
+                auto p = g.parent_of.find(c);
+                if (!child || (p != g.parent_of.end() && p->second == r.line.receiver)) child = c;
             }
             if (!child) continue;
             const ::std::string tag = r.line.payload.substr(r.line.payload.rfind(':') + 1);
@@ -5251,21 +5350,30 @@ inline void etcs_replay_capture(Entity* e, const ::std::string& name,
         }
         out.script += line + "\n";
     }
-    wire->KeepActions(kept, upto);
+    g.wire->KeepActions(kept, g.upto);
     out.spans[at].second = out.script.size();
 
-    for (Entity* c : env_children)
+    for (ReplayGather& c : g.below)
     {
-        auto it = names.find(c->getRID());
+        auto it = names.find(c.rid);
         if (it == names.end())
         {
-            out.warnings.push_back(name + ": a " + c->getSourceTag().toString()
+            out.warnings.push_back(name + ": a " + c.tag
                                    + " under it was not made by a script line and cannot be named");
             continue;
         }
-        auto m = made_in.find(c->getRID());
-        etcs_replay_capture(c, it->second, names, out, m == made_in.end() ? 0 : m->second);
+        auto m = made_in.find(c.rid);
+        etcs_replay_compose(c, it->second, names, out, m == made_in.end() ? 0 : m->second);
     }
+}
+
+inline void etcs_replay_capture(Entity* e, const ::std::string& name,
+                                ::std::map<RID, ::std::string>& names, ReplayCapture& out,
+                                uint64_t born = 0)
+{
+    ReplayGather g;
+    etcs_replay_gather(e, g);
+    etcs_replay_compose(g, name, names, out, born);
 }
 
 inline void etcs_module_root_hash(const ::std::vector<const RIDListHandle*>& rows,

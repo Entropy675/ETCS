@@ -439,6 +439,17 @@ private:
         ETCS::Entity::putWord(out, m_emitted_out.raw);
         putWords(out, m_last_emission);
     }
+    // The "Causal" value's digest: what it packs, hashed instead of written
+    // -- a reader asking only whether it moved. Under the tree's lock, so a
+    // whole tick or none.
+    uint64_t stateDigest()
+    {
+        ::std::lock_guard<::std::recursive_mutex> lk(TreeMutex());
+        refreshIdentityLocked();
+        uint64_t h = fixed_mix(m_ov.Hash(), static_cast<int64_t>(m_ticks));
+        h = fixed_mix(h, m_emitted_out.raw);
+        return fixed_mix(h, static_cast<int64_t>(m_last_emission.Hash()));
+    }
     bool unpackState(const ::std::string& in)
     {
         if (in.empty() || static_cast<unsigned char>(in[0]) != kStateVersion) return false;
@@ -465,7 +476,8 @@ private:
             b->bindValue(ETCS::Buffer("Causal"), ETCS::Entity::ValueBinding{
                 b,
                 [](void* self, ::std::string& out) { static_cast<CausalBase*>(self)->packState(out); },
-                [](void* self, const ::std::string& in) { return static_cast<CausalBase*>(self)->unpackState(in); } });
+                [](void* self, const ::std::string& in) { return static_cast<CausalBase*>(self)->unpackState(in); },
+                [](void* self) { return static_cast<CausalBase*>(self)->stateDigest(); } });
         }
     };
     Binder m_binder{ this };

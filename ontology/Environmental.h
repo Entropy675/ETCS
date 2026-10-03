@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <cstring>
 #include <functional>
+#include <map>
+#include <unordered_map>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -172,10 +174,21 @@ inline void etcs_capture_values(const ETCS::Entity* e, ETCS::EnvironmentState& o
  * copy with nothing held. `inside` runs in the window too: a caller whose
  * other half must be the same state (the replay capture) does it there.
  * `stable` is false when the epoch kept moving through every try.
+ *
+ * ONLY WHAT MOVED IS READ. Given the last read (`prev`), a node whose hash
+ * epoch (every flag or stored value under it) and value digest (its bound
+ * values, Entity::valueDigest) both stand where they stood is taken from it,
+ * not read again -- the walk still visits it, the copy does not. `copied`
+ * counts the nodes read this time; zero means the read is the last one.
  */
 struct FrozenNode
 {
     ETCS::Entity* e = nullptr;            // identity only: not held once the window closes
+    ETCS::RID     rid = 0;
+    uint32_t      epoch = 0;              // what it was read at (hashEpoch, valueDigest)
+    uint64_t      digest = 0;
+    bool          digestible = false;
+    uint64_t      vhash = 0;              // Entity::valueHashOf(kv)
     std::string   module, tag;            // what it is, read in the window (getSourceModule/Tag)
     uint64_t      identity = 0;
     bool          environmental = false;
@@ -188,14 +201,21 @@ struct FrozenTree
     std::vector<FrozenNode> nodes;        // the hash's walk: pre-order, nodes[0] the root
     uint64_t state_hash = 0;
     bool     stable = false;
+    size_t   copied = 0;                  // nodes read this time; the rest came from `prev`
 };
 
 inline bool etcs_freeze(ETCS::Entity* root, FrozenTree& out,
-                        const std::function<void()>& inside = {}, int tries = 4)
+                        const std::function<void()>& inside = {}, int tries = 4,
+                        FrozenTree* prev = nullptr)
 {
+    // The last read is consumed: a node that stood still is moved out of it,
+    // and handed back if the attempt does not settle, so a retry reads again
+    // only what moved.
+    std::unordered_map<ETCS::RID, FrozenNode*> last;
+    if (prev) { last.reserve(prev->nodes.size()); for (FrozenNode& n : prev->nodes) last[n.rid] = &n; }
     // The walk subtreeValueHash makes (order_canonical), so the per-node
     // order is the hash's.
-    auto visit = [](ETCS::Entity* top, const std::function<void(ETCS::Entity*, size_t parent)>& at) {
+    auto visit = [](ETCS::Entity* top, bool canonical, const std::function<void(ETCS::Entity*, size_t parent)>& at) {
         struct Frame { ETCS::Entity* n; size_t idx; std::vector<std::pair<ETCS::Buffer, ETCS::RID>> kids; size_t next = 0; ETCS::LifetimeHold hold; };
         std::vector<Frame> stack;
         size_t count = 0;
@@ -203,7 +223,7 @@ inline bool etcs_freeze(ETCS::Entity* root, FrozenTree& out,
             Frame f; f.n = n; f.idx = count++; f.hold = std::move(hold);
             at(n, parent);
             n->getTypedChildren(f.kids);
-            ETCS::etcs_hash_detail::order_canonical(n, f.kids);
+            if (canonical) ETCS::etcs_hash_detail::order_canonical(n, f.kids);
             return f;
         };
         stack.push_back(open(top, SIZE_MAX, ETCS::LifetimeHold()));
@@ -229,7 +249,7 @@ inline bool etcs_freeze(ETCS::Entity* root, FrozenTree& out,
         // The trees to hold: found outside the window (a tree that appears
         // after this bumps the epoch, and the copy is made again).
         std::vector<std::recursive_mutex*> locks;
-        visit(root, [&locks](ETCS::Entity* n, size_t) {
+        visit(root, false, [&locks](ETCS::Entity* n, size_t) {   // which trees: any order
             if (void* c = n->getInterfacePointer(ETCS::Buffer("Causal")))
                 locks.push_back(&static_cast<Causal_*>(c)->TreeMutex());
         });
@@ -238,18 +258,41 @@ inline bool etcs_freeze(ETCS::Entity* root, FrozenTree& out,
         for (auto* m : locks) m->lock();
 
         out.nodes.clear();
+        out.copied = 0;
         std::vector<uint64_t> per_node;
-        visit(root, [&out, &per_node](ETCS::Entity* n, size_t parent) {
+        std::vector<std::pair<size_t, FrozenNode*>> taken;   // (index in out, where it came from)
+        visit(root, true, [&out, &per_node, &last, &taken](ETCS::Entity* n, size_t parent) {
             FrozenNode fn;
-            fn.e = n;
-            fn.module = n->getSourceModule().toString();
-            fn.tag    = n->getSourceTag().toString();
-            fn.identity = n->identityHash();
-            fn.environmental = n->isEnvironmental();
-            n->stateFlags(fn.flags);
-            std::sort(fn.flags.begin(), fn.flags.end());
-            n->values(fn.kv);
-            per_node.push_back(ETCS::Entity::valueHashOf(fn.kv));
+            const uint32_t ep = n->hashEpoch();
+            uint64_t dg = 0;
+            const bool digestible = n->valueDigest(dg);
+            auto was = last.find(n->getRID());
+            if (was != last.end() && was->second->e == n && was->second->rid == n->getRID()
+                && was->second->epoch == ep && digestible && was->second->digestible && was->second->digest == dg)
+            {
+                fn = std::move(*was->second);   // stood still: the last read is this one
+                was->second->rid = 0;           // spent, until handed back
+                fn.kids.clear();
+                taken.emplace_back(out.nodes.size(), was->second);
+            }
+            else
+            {
+                fn.e = n;
+                fn.rid = n->getRID();
+                fn.epoch = ep;
+                fn.digest = dg;
+                fn.digestible = digestible;
+                fn.module = n->getSourceModule().toString();
+                fn.tag    = n->getSourceTag().toString();
+                fn.identity = n->identityHash();
+                fn.environmental = n->isEnvironmental();
+                n->stateFlags(fn.flags);
+                std::sort(fn.flags.begin(), fn.flags.end());
+                n->values(fn.kv);
+                fn.vhash = ETCS::Entity::valueHashOf(fn.kv);
+                ++out.copied;
+            }
+            per_node.push_back(fn.vhash);
             if (parent != SIZE_MAX) out.nodes[parent].kids.push_back(out.nodes.size());
             out.nodes.push_back(std::move(fn));
         });
@@ -259,6 +302,7 @@ inline bool etcs_freeze(ETCS::Entity* root, FrozenTree& out,
         for (auto it = locks.rbegin(); it != locks.rend(); ++it) (*it)->unlock();
         out.stable = (root->hashEpoch() == epoch);
         if (out.stable) return true;
+        for (auto& [i, from] : taken) { *from = std::move(out.nodes[i]); from->kids.clear(); }
     }
     return false;
 }

@@ -316,6 +316,15 @@ int main()
         }
         stop.store(true, std::memory_order_release);
         driver.join();
+        // At rest between two reads, the rows' digests stand still: nothing is
+        // read again. A step moves some of them: those are.
+        FrozenTree a, b, c;
+        etcs_freeze(world, a);
+        etcs_freeze(world, b, {}, 4, &a);
+        world->Run(5, dt);
+        etcs_freeze(world, c, {}, 4, &b);
+        check(b.copied == 0 && c.copied > 0 && c.copied <= c.nodes.size(),
+              "the rows' digest: a tree at rest is not read again, a stepped one is read where it moved");
         check(reads == 200 && unbalanced == 0, "every frozen read of a driven tree is one tick: its energy balances to the bit");
         check(unhashed == 0, "...and a tree given its values hashes as the read said");
         check(unsettled == 0, "...and each read settled");

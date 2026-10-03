@@ -70,7 +70,8 @@ public:
         bindValue(ETCS::Buffer("value"), ETCS::Entity::ValueBinding{
             this,
             [](void* self, std::string& out) { Env* me = static_cast<Env*>(self); out = std::to_string(me->drift ? me->value++ : me->value); },
-            [](void* self, const std::string& in) { static_cast<Env*>(self)->value = std::stoi(in); return true; } });
+            [](void* self, const std::string& in) { static_cast<Env*>(self)->value = std::stoi(in); return true; },
+            [](void* self) { return static_cast<uint64_t>(static_cast<Env*>(self)->value); } });
     }
     bool RebuildLocalConcrete(const ETCS::EnvironmentState&) override { return true; }
     bool ReflectRemoteConcrete(const ETCS::EnvironmentState&) override { return true; }
@@ -143,6 +144,12 @@ int main()
     { ETCS::ActionScope s(line(kid, "Warm", "again")); kid->addTag(ETCS::Buffer("hot")); }
     { ETCS::ActionScope s(line(kid, "Blink", "")); kid->addTag(ETCS::Buffer("flash")); }
     { ETCS::ActionScope s(line(kid, "Unblink", "")); kid->removeTag(ETCS::Buffer("flash")); }
+    // A kept line that put on two things, one of which a later line took off.
+    { ETCS::ActionScope s(line(kid, "Light", "")); kid->addTag(ETCS::Buffer("glow")); kid->addTag(ETCS::Buffer("spark")); }
+    { ETCS::ActionScope s(line(kid, "Dim", "")); kid->removeTag(ETCS::Buffer("spark")); }
+    // A value set three times.
+    for (int lv = 1; lv <= 3; ++lv)
+    { ETCS::ActionScope s(line(kid, "SetLevel", std::to_string(lv))); kid->addTag(ETCS::Buffer("level"), std::to_string(lv)); }
 
     // -- 4. names ---------------------------------------------------------------
     { ETCS::ActionScope s(line(e, "Link", "to @k", { { "k", kid->getRID() } })); e->addTag(ETCS::Buffer("linked")); }
@@ -174,8 +181,13 @@ int main()
     check(!has(cap.script, "e_Plain2") && !has(cap.script, "Delete"),
           "a child made and deleted leaves no line");
     check(!has(cap.script, "Blink"), "a flag put on and taken off, and nothing else, leaves neither line");
-    check(has(cap.script, "e_Plain1.Warm()\ne_Plain1.Cool()\ne_Plain1.unflag(hot)\ne_Plain1.Warm(again)"),
+    check(has(cap.script, "e_Plain1.Warm(again)") && !has(cap.script, "e_Plain1.Warm()")
+          && !has(cap.script, "Cool") && !has(cap.script, "unflag(hot)"),
+          "a flag put on again is kept by its last setter: what the first put on is all undone or set again");
+    check(has(cap.script, "e_Plain1.Light()\ne_Plain1.Dim()"),
           "what takes off something a kept line puts on is kept too, in order");
+    check(has(cap.script, "e_Plain1.SetLevel(3)") && !has(cap.script, "SetLevel(1)") && !has(cap.script, "SetLevel(2)"),
+          "a value set again: only the last set is kept -- the record does not grow with a value that moves");
     check(has(cap.script, "e.Link(to @e_Plain1)"), "an @name in a payload is renamed to the rebuilt child");
     check(has(cap.script, "e_Plain1.Produce(x) -> e.Consume()"), "a stream line keeps both halves");
     check(has(cap.script, "e.spawn(" + E + " e_Env1)\n"), "an Environmental child is made by its parent's line");
@@ -195,7 +207,7 @@ int main()
     {
         size_t kept = 0;
         for (auto& r : logOf(e)) (void)r, ++kept;
-        check(kept == 9, "the log keeps only what the capture kept (9 of 13)");
+        check(kept == 9, "the log keeps only what the capture kept (9 of 18)");
     }
 
     // -- 6. the same tree at other RIDs --------------------------------------------
@@ -203,6 +215,8 @@ int main()
         Env* f = arena.allocate<Env>();
         Plain* k2 = f->addTag<Plain>();
         k2->addTag(ETCS::Buffer("hot"));
+        k2->addTag(ETCS::Buffer("glow"));
+        k2->addTag(ETCS::Buffer("level"), "3");
         f->addTag(ETCS::Buffer("linked"));
         f->addTag(ETCS::Buffer("fed"));
         Env* i2 = f->addTag<Env>();
@@ -333,6 +347,25 @@ int main()
               && t2.state_hash == f->getHash(), "...and the second read is the state after it");
         arena.deleteEntity(d, true);
         arena.deleteEntity(f, true);
+
+        // Only what moved is read again (the last read given as `prev`).
+        Env* g = arena.allocate<Env>(); ETCS::etcs_supertype_fanout(g);
+        Env* g1 = g->addTag<Env>();
+        Env* g2 = g->addTag<Env>();
+        FrozenTree r0; etcs_freeze(g, r0);
+        const uint64_t h0 = r0.state_hash;
+        FrozenTree r1; etcs_freeze(g, r1, {}, 4, &r0);
+        check(r0.copied == 3 && r1.copied == 0 && r1.state_hash == h0,
+              "given the last read, with nothing moved, a read reads nothing again -- and is the same state");
+        g2->value = 9;
+        FrozenTree r2; etcs_freeze(g, r2, {}, 4, &r1);
+        check(r2.copied == 1 && r2.state_hash == g->getHash(),
+              "a bound value that moved (its digest says so; no epoch did): that node alone is read again");
+        g1->addTag(ETCS::Buffer("set"), "x");
+        FrozenTree r3; etcs_freeze(g, r3, {}, 4, &r2);
+        check(r3.copied == 2 && r3.state_hash == g->getHash(),
+              "a stored value set (the epoch moves up its path): the node and the path above it");
+        arena.deleteEntity(g, true);
     }
 
     // -- 8. carried across a call -------------------------------------------------
