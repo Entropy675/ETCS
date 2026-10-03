@@ -164,6 +164,17 @@ inline ETCS::TagMask resolvePairModuleMask(const ETCS::Buffer& tag_a,
 class Entity;
 inline void etcs_supertype_fanout(Entity* e);
 
+/*
+ * A MOVABLE TYPE can change parents while it lives (Entity::moveTo): a family
+ * whose containment is a fact that changes -- the Causal family, where what
+ * holds a thing is what it fits in -- says so with a static kEtcsMovable.
+ * Its children are made with their bytes in a stable home (addTag<T>), so a
+ * move is a lifetime-token move and nothing else.
+ */
+template<class T, class = void> struct etcs_movable : ::std::false_type {};
+template<class T> struct etcs_movable<T, ::std::void_t<decltype(T::kEtcsMovable)>>
+    : ::std::bool_constant<T::kEtcsMovable> {};
+
 class Entity
 {
     /*
@@ -266,6 +277,13 @@ private:
  * footprint - its own outer object AND this local_arena_ - lives
  * inside its parent's arena, so evoking the parent's arena tree
  * reaches everything in one place.
+ *
+ * A MOVABLE CHILD (etcs_movable) is the one exception, by design: its outer
+ * object and this arena's object live in its module's root arena -- a home
+ * that outlives every parent it will have -- and only their two destructor
+ * records, its lifetime token, sit in the parent's arena. The parent's
+ * cascade still reaches it through them; a move hands them on
+ * (MemoryArena::adoptToken). Everything it holds is still in here.
  *
  * It is ALSO independently resettable at any time via getArena().reset(),
  * which only touches this entity's own chunks.
@@ -578,6 +596,13 @@ private:
  * graph is its parent's. Set once, before the AddTagEvent.
  */
     bool    module_root_ = false;
+    /*
+ * MADE TO MOVE (etcs_movable): its bytes are in its module's root arena and
+ * only its lifetime token -- its record and its arena's -- is in its parent's
+ * chain, so moveTo can hand the token to another parent and leave the bytes
+ * where they are. Set once, by addTag<T>, before the AddTagEvent.
+ */
+    bool    movable_ = false;
     /*
  * Set by addTagTrampoline<T>() (via AddTagEvent, on the loader's
  * ordering thread) iff T's type-provider module registered a
@@ -1139,13 +1164,23 @@ public:
         // MemoryArena::getInstance() names in the binary compiling this),
         // which lives exactly as long as the module does -- not in the
         // parent's, which the module owning the parent tears down.
+        // A movable child (etcs_movable) is made there too, for another reason:
+        // a stable home for its bytes, while its lifetime token -- its record
+        // and its arena's -- goes in this entity's chain, so this entity's
+        // cascade still takes it and a move can hand the token on.
         const bool   boundary = crossesModule();
-        MemoryArena& home     = boundary ? MemoryArena::getInstance() : getArena();
+        const bool   movable  = !boundary && etcs_movable<T>::value;
+        MemoryArena& home     = (boundary || movable) ? MemoryArena::getInstance() : getArena();
         MemoryArena* saved = s_pending_parent_arena_;
         s_pending_parent_arena_ = &home;
         T* child = home.allocate<T>(::std::forward<Args>(args)...);
         s_pending_parent_arena_ = saved;
         child->module_root_ = boundary;
+        if (movable && getArena().adoptToken(child, child->local_arena_, home))
+        {
+            child->owning_arena_ = &getArena();
+            child->movable_      = true;
+        }
         child->getArena().setScopeTag(T::CONTRACT_TAG);   /*
  * CONTRACT_TAG -- not getSourceTag(), still empty here (setModuleSource
  * runs later, inside addTagImpl, as part of this same blocking call),
@@ -1614,6 +1649,100 @@ public:
         }
     }
 
+    /*
+     * moveTo(to) - THIS ENTITY CHANGES PARENTS, keeping its RID, its subtree
+     * and its rows. Only a movable entity (etcs_movable, made by addTag<T>
+     * with its bytes in a stable home), and never into its own subtree.
+     *
+     * THE FUNNEL'S OWN EVENT: a TagModify on this entity carrying the move,
+     * with both parents' bits added, so the move orders against every tag
+     * operation on any of the three; moveImpl runs it on the ordering thread.
+     *
+     * ITS OWN ACTION. Recorded as `<to>.Contain(@<this>)` against a frame of
+     * its own, whatever is running around it: a move made inside a step must
+     * not be credited to the line that ran the step (replaying `Run` would run
+     * the physics again). The key is placeKey, so a replay keeps the last move
+     * only, and the spawn that made this entity keeps its own key (childKey).
+     */
+    bool moveTo(Entity* to)
+    {
+        Entity* from = getParent();
+        if (!to || !from || to == from || !movable_ || to->isDestructed()) return false;
+        if (to->getSourceModule().toString() != getSourceModule().toString()) return false;   // one module's tokens and bytes
+        TagModifyEvent evt{ this, ETCS::Buffer("p:"), false, nullptr, to->myTagMask() | from->myTagMask() };
+        evt.move_to   = to;
+        evt.move_impl = &Entity::moveImpl;
+        if (!evt()) return false;
+        const ETCS::TagMask edge = myTagMask() | to->myTagMask();
+        if (edge.any()) ETCS::NoteCausalEdge(edge);
+        ETCS::ActionFrame f;
+        f.id               = ETCS::next_action_frame_id();
+        f.line.receiver    = to->getRID();
+        f.line.verb        = "Contain";
+        f.line.payload     = "@m";
+        f.line.refs.emplace_back("m", getRID());
+        recordEffectIn(this, placeKey(getRID()), true, &f);
+        return true;
+    }
+    bool isMovable() const { return movable_; }
+
+private:
+    /*
+     * The move, on the ordering thread: the token first, then the lists. Both
+     * entity locks are held across both (scoped_lock: no order to agree on with
+     * reparentChildrenTo), so a parent that begins to retire during it is seen
+     * before anything moves -- and once the token is in `to`'s chain, `from`'s
+     * cascade can no longer take the child.
+     */
+    static bool moveImpl(Entity* child, Entity* to)
+    {
+        Entity* from = child->parent_;
+        if (!from || from == to || !child->movable_) return false;
+        for (Entity* a = to; a; a = a->parent_) if (a == child) return false;   // into its own subtree
+        const RID rid = child->getRID();
+        {
+            ::std::scoped_lock both(from->m_tagMutex, to->m_tagMutex);
+            if (from->isDestructed() || to->isDestructed() || from->isRetiring() || to->isRetiring()
+                || child->parent_ != from)
+                return false;
+            RIDListHandle*      src  = nullptr;
+            const ETCS::Buffer* tagp = nullptr;
+            for (const ETCS::Buffer& tag : from->typed_child_order_)
+            {
+                auto it = from->typed_children_.find(tag);
+                if (it != from->typed_children_.end() && it->second.invoke_get(rid) == child)
+                { src = &it->second; tagp = &it->first; break; }
+            }
+            if (!src || !src->make_in) return false;
+            if (!to->local_arena_->adoptToken(child, child->local_arena_, *child->owning_arena_)) return false;
+            child->owning_arena_ = to->local_arena_;
+            RIDListHandle* dest = nullptr;
+            auto dit = to->typed_children_.find(*tagp);
+            if (dit != to->typed_children_.end()) dest = &dit->second;
+            else
+            {
+                // A fresh list in `to`'s own arena, as reparentChildrenTo mints one;
+                // a tag new to `to` joins its first-seen order (that order is state).
+                RIDListHandle fresh = src->invoke_make_in(*to->local_arena_, tagp->c_str());
+                dest = &to->typed_children_.emplace(*tagp, fresh).first->second;
+                to->typed_child_order_.push_back(*tagp);
+            }
+            dest->invoke_insert(rid, child);   // insert before remove, as reparentChildrenTo
+            src->invoke_remove(rid);
+            child->parent_ = to;
+            child->depth_  = to->depth_ + 1;
+            child->ctx_.setProvider(&to->ctx_);   // the passive edge follows the ownership edge
+        }
+        const ETCS::TagMask cm = child->myTagMask();
+        if (cm.any()) { to->noteAcquires(cm); child->noteAcquires(to->myTagMask()); }
+        // Both sides' subtrees changed; outside the locks, as markStateChange climbs.
+        markStateChange(from, rid);
+        markStateChange(child, rid);
+        renumberDepth(child);
+        return true;
+    }
+
+public:
     /*
      * depth_ for everything under `top`, from top's own. A loop over an
      * explicit frontier rather than a recursion, for the reason depth_
@@ -2400,6 +2529,15 @@ public:
         if (f) f->settle();
         if (ETCS::IWireEnvironmental* w = env->environmentalWire()) w->RecordEffect(f, key, created);
     }
+    // The same, against a frame the caller made: an effect that is its own
+    // action whatever is running around it (moveTo).
+    static void recordEffectIn(Entity* touched, const ::std::string& key, bool created, ETCS::ActionFrame* f)
+    {
+        Entity* env = touched;
+        while (env && !env->isEnvironmental()) env = env->getParent();
+        if (!env) return;
+        if (ETCS::IWireEnvironmental* w = env->environmentalWire()) w->RecordEffect(f, key, created);
+    }
     // The flags that are state -- not the in-flight scopes (surfaceHash).
     void stateFlags(::std::vector<::std::string>& out) const
     {
@@ -2414,6 +2552,8 @@ public:
     static ::std::string flagKey(const Entity* e, const ::std::string& flag)
     { return "f:" + ::std::to_string(e->getRID()) + ":" + flag; }
     static ::std::string childKey(RID child) { return "c:" + ::std::to_string(child); }
+    // Where a child sits, once it has moved (moveTo): the last move keeps it.
+    static ::std::string placeKey(RID child) { return "p:" + ::std::to_string(child); }
     struct RemoteCallGuard
     {
         const Entity& e;
@@ -5253,6 +5393,7 @@ inline void etcs_replay_gather(Entity* e, ReplayGather& g)
             Entity* c = x->getTypedChild(*tag, rid);
             if (!c) continue;
             g.live.insert(Entity::childKey(rid));
+            g.live.insert(Entity::placeKey(rid));   // set only by a move: the last one keeps it
             g.parent_of[rid] = x->getRID();
             if (c->isEnvironmental()) { g.below.emplace_back(); etcs_replay_gather(c, g.below.back()); }
             else                      region.push_back(c);

@@ -71,6 +71,14 @@ struct DLInEvent
     // same read-then-publish split AddTag uses for rid_out.
     bool              (*tagmodify_impl)(ETCS::Entity*, const ETCS::Buffer&, bool, const ::std::string*) = nullptr;
     const ::std::string* tagmodify_value = nullptr;   // the value behind the flag, when the add carries one (Entity::values_)
+    // A MOVE rides the same event (Entity::moveTo): the child is the target,
+    // the new parent comes by name like it -- RID and published key, the
+    // pointer only for a type with no list -- and move_impl runs in impl's
+    // place. Null move_impl: an ordinary flag.
+    bool              (*tagmodify_move_impl)(ETCS::Entity*, ETCS::Entity*) = nullptr;
+    RID                tagmodify_move_to_rid = 0;
+    ETCS::Buffer       tagmodify_move_to_type;
+    ETCS::Entity*      tagmodify_move_to = nullptr;
     ::std::atomic<bool>* tagmodify_done = nullptr;
     ::std::atomic<bool>* tagmodify_changed = nullptr;
     // TagModify only — the emitting entity's own TYPE bit, stamped at the
@@ -359,6 +367,12 @@ struct TagModifyEvent : Event
     Impl              impl;
     ETCS::TagMask     extra_mask;
     const ::std::string* value = nullptr;   // a value behind the flag (Entity::addTag(flag, value)); null for presence alone
+    // A move instead of a flag (Entity::moveTo): the target is the child, this
+    // its new parent. Both parents' bits ride in extra, so the move orders
+    // against every tag operation on any of the three.
+    using MoveImpl = bool(*)(ETCS::Entity* child, ETCS::Entity* to);
+    ETCS::Entity*     move_to   = nullptr;
+    MoveImpl          move_impl = nullptr;
     ::std::atomic<bool> done{false};
     ::std::atomic<bool> changed{false};
     // The fail-shut substitution an empty mask needs — a type with no tag

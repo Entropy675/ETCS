@@ -26,6 +26,10 @@
  *   7. EnvironmentState packs, unpacks and migrates its keys.
  *   8. A frame crosses a call on its SignalContext: the callee runs inside
  *      the caller's, and a call carrying none opens its own.
+ *   9. A move is its own action: an entity that changes parents
+ *      (Entity::moveTo) is recorded as `<to>.Contain(@<it>)` whatever was
+ *      running around it, a replay keeps the last move only, and its
+ *      lifetime goes with it (its token, not its bytes).
  *
  *   ./Run_ProvenanceTesterLoader
  */
@@ -54,6 +58,19 @@ class Plain : public DeletableBase<Plain>
 {
 public:
     WIRE_TYPE_IDENTITY(Plain)
+    bool DeleteConcrete() override { return true; }
+};
+
+// A movable leaf (etcs_movable): its bytes in a stable home, its lifetime
+// token in its parent's chain, so it can change parents. Counted, for §9.
+class Mover : public DeletableBase<Mover>
+{
+public:
+    WIRE_TYPE_IDENTITY(Mover)
+    static constexpr bool kEtcsMovable = true;
+    static inline int s_alive = 0;
+    Mover()  { ++s_alive; }
+    ~Mover() { --s_alive; }
     bool DeleteConcrete() override { return true; }
 };
 
@@ -389,6 +406,46 @@ int main()
         }
         ETCS::current_action_frame() = here;
         check((ETCS::next_action_frame_id() >> 63) != 0, "frame ids carry their binary's salt");
+    }
+
+    // -- 9. a move ----------------------------------------------------------------
+    {
+        std::cout << "\n-- 9. a move is its own action --\n";
+        const std::string M = std::string(ETCS_MODULE_NAME) + "::Mover";
+        Env* g = arena.allocate<Env>();
+        ETCS::etcs_supertype_fanout(g);
+        Plain* left  = nullptr;
+        Plain* right = nullptr;
+        Mover* m     = nullptr;
+        { ETCS::ActionScope s(line(g, "spawn", P)); left  = g->addTag<Plain>(); }
+        { ETCS::ActionScope s(line(g, "spawn", P)); right = g->addTag<Plain>(); }
+        { ETCS::ActionScope s(line(left, "spawn", M)); m = left->addTag<Mover>(); }
+        check(m->isMovable() && !left->isMovable(), "a movable type's child is made movable; a plain one is not");
+        // Moves made inside another line: a step's moves are not the step's.
+        { ETCS::ActionScope s(line(g, "Run", "1"));
+          check(m->moveTo(right), "an entity changes parents, keeping its RID");
+          m->moveTo(left);
+          m->moveTo(right); }
+        check(m->getParent() == right, "...and is where its last move put it");
+        Plain* deep = nullptr;
+        { ETCS::ActionScope s(line(right, "spawn", P)); deep = right->addTag<Plain>(); }
+        check(!right->moveTo(deep) && !m->moveTo(m), "nothing moves inside itself, and a plain entity does not move");
+        ETCS::ReplayCapture cap;
+        std::map<ETCS::RID, std::string> nm;
+        ETCS::etcs_replay_capture(g, "g", nm, cap);
+        std::printf("%s", cap.script.c_str());
+        size_t contains = 0;
+        for (size_t at = 0; (at = cap.script.find(".Contain(", at)) != std::string::npos; ++at) ++contains;
+        check(has(cap.script, "g_Plain1.spawn(" + M + " g_Mover1)") && has(cap.script, "g_Plain2.Contain(@g_Mover1)"),
+              "the replay makes it where it was made, then moves it where it is");
+        check(contains == 1 && !has(cap.script, "Run(1)"), "...the last move only, and never the line it ran under");
+        // The lifetime went with it.
+        const int alive = Mover::s_alive;
+        left->getOwningArena().deleteEntity(left, true);
+        check(Mover::s_alive == alive, "deleting where it was made leaves it");
+        right->getOwningArena().deleteEntity(right, true);
+        check(Mover::s_alive == alive - 1, "deleting where it is takes it");
+        arena.deleteEntity(g, true);
     }
 
     std::printf("\n%s (%d failure%s)\n", g_fail ? "FAILED" : "PASSED",

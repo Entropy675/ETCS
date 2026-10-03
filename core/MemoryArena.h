@@ -385,8 +385,12 @@ private:
         // into it instead of recursing through its destructor.
         MemoryArena*    (*as_arena)(void*) = nullptr;
         // The newer record, toward the head: the tail's way up (see dtorTail_).
-        // Last, so the positional initialisation in registerDtorLocked holds.
+        // After the positional fields, so registerDtorLocked's initialisation holds.
         DestructorRecord* next = nullptr;
+        // Where the bytes of `ptr` and of this record live, when that is not
+        // the arena whose chain holds the record: a token moved by
+        // adoptToken. A reclaim returns the bytes here. Null: this arena.
+        MemoryArena*      home = nullptr;
     };
 
     // -------------------------------------------------------------------
@@ -1537,6 +1541,7 @@ public:
         //ETCS_LOG("MemoryArena", "reclaimEntity: reclaiming " << (void*)target
         //         << " size=" << size << " align=" << alignment);
         void* raw = rec->ptr;
+        MemoryArena& bytes = rec->home ? *rec->home : *this;   // a moved token's bytes go home
         runRecordDtor(rec);
  
         // rec itself -- unlinkRecord only removed it from dtorHead_'s own
@@ -1562,8 +1567,8 @@ public:
         // call site regardless of what's actually being passed in --
         // -Wclass-memaccess only fires when a properly-typed pointer is
         // passed to memset directly, which this no longer does.
-        releaseToFreeList(raw, size, alignment);
-        releaseToFreeList(rec,
+        bytes.releaseToFreeList(raw, size, alignment);
+        bytes.releaseToFreeList(rec,
             static_cast<long long>(sizeof(DestructorRecord)),
             static_cast<long long>(alignof(DestructorRecord)));
         return true;
@@ -1582,10 +1587,11 @@ public:
         DestructorRecord* rec = unlinkRecord(static_cast<void*>(target));
         if (!rec) return false;
         void* raw = rec->ptr;
+        MemoryArena& bytes = rec->home ? *rec->home : *this;
         runRecordDtor(rec);
-        releaseToFreeList(raw, static_cast<long long>(sizeof(MemoryArena)),
+        bytes.releaseToFreeList(raw, static_cast<long long>(sizeof(MemoryArena)),
                                 static_cast<long long>(alignof(MemoryArena)));
-        releaseToFreeList(rec,
+        bytes.releaseToFreeList(rec,
             static_cast<long long>(sizeof(DestructorRecord)),
             static_cast<long long>(alignof(DestructorRecord)));
         return true;
@@ -1789,6 +1795,42 @@ public:
     bool forget(Entity* target)
     {
         return unlinkRecord(target) != nullptr;
+    }
+
+    /*
+     * THE LIFETIME TOKEN MOVES; THE BYTES STAY HOME. Whose chain holds an
+     * entity's records -- its own and its arena's -- is whose cascade destroys
+     * it and where deleteEntity finds it. This splices both out of `from`'s
+     * chain into this one's, newest, in the order they were made. The bytes
+     * stay where they were allocated, and a reclaim returns them there
+     * (DestructorRecord::home). Meant for bytes with a stable home (a module's
+     * root arena: Entity::addTag<T> for a movable type), which outlives every
+     * chain the token visits; Entity::moveTo is the other caller.
+     */
+    bool adoptToken(Entity* e, MemoryArena* e_arena, MemoryArena& from)
+    {
+        if (&from == this) return true;
+        ::std::scoped_lock lock(allocationMutex_, from.allocationMutex_);
+        if (isTeardown_ || from.isTeardown_) return false;
+        DestructorRecord* re = nullptr;
+        DestructorRecord* ra = nullptr;
+        for (DestructorRecord* r = from.dtorTail_; r && !(re && ra); r = r->next)
+        {
+            if (!re && r->as_entity && r->as_entity(r->ptr) == e) re = r;
+            else if (!ra && r->ptr == static_cast<void*>(e_arena)) ra = r;
+        }
+        if (!re || !ra) return false;
+        from.spliceOut(ra);
+        from.spliceOut(re);
+        for (DestructorRecord* r : { ra, re })   // the arena was made first, in the entity's constructor
+        {
+            if (!r->home) r->home = &from;
+            r->prev = dtorHead_;
+            r->next = nullptr;
+            if (dtorHead_) dtorHead_->next = r; else dtorTail_ = r;
+            dtorHead_ = r;
+        }
+        return true;
     }
  
     // -------------------------------------------------------------------
