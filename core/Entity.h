@@ -1695,16 +1695,16 @@ public:
     static void renumberDepth(Entity* top)
     {
         ::std::vector<Entity*> frontier{ top };
-        ::std::vector<::std::pair<ETCS::Buffer, RID>> kids;
+        ::std::vector<ChildRef> kids;
         while (!frontier.empty())
         {
             Entity* n = frontier.back();
             frontier.pop_back();
             kids.clear();
-            n->getTypedChildren(kids);
+            n->getTypedChildRefs(kids);
             for (const auto& [tag, rid] : kids)
             {
-                Entity* c = n->getTypedChild(tag, rid);
+                Entity* c = n->getTypedChild(*tag, rid);
                 if (!c || c->parent_ != n) continue;
                 c->depth_ = n->depth_ + 1;
                 frontier.push_back(c);
@@ -2464,21 +2464,19 @@ public:
     static void recordEffect(Entity* touched, const ::std::string& key, bool created,
                              bool in_frame_only = false)
     {
-        Entity* env = touched;
-        while (env && !env->isEnvironmental()) env = env->getParent();
-        if (!env) return;
         ETCS::ActionFrame* f = ETCS::current_action_frame();
         if (!f && in_frame_only) return;
-        if (f) f->settle();
-        if (ETCS::IWireEnvironmental* w = env->environmentalWire()) w->RecordEffect(f, key, created);
+        recordEffectIn(touched, key, created, f);
     }
     // The same, against a frame the caller made: an effect that is its own
-    // action whatever is running around it (moveTo).
+    // action whatever is running around it (moveTo). Null: outside any. A
+    // lazy frame is settled only once something is recorded against it.
     static void recordEffectIn(Entity* touched, const ::std::string& key, bool created, ETCS::ActionFrame* f)
     {
         Entity* env = touched;
         while (env && !env->isEnvironmental()) env = env->getParent();
         if (!env) return;
+        if (f) f->settle();
         if (ETCS::IWireEnvironmental* w = env->environmentalWire()) w->RecordEffect(f, key, created);
     }
     // The flags that are state -- not the in-flight scopes (surfaceHash).
@@ -4487,11 +4485,11 @@ inline bool etcs_retire_entity(Entity* e)
  * non-cascade delete) moves them before this runs, and there are none left.
  */
     {
-        ::std::vector<::std::pair<ETCS::Buffer, RID>> kids;
-        e->getTypedChildren(kids);
+        ::std::vector<Entity::ChildRef> kids;
+        e->getTypedChildRefs(kids);
         for (auto& [tag, rid] : kids)
         {
-            Entity* c = e->getTypedChild(tag, rid);
+            Entity* c = e->getTypedChild(*tag, rid);
             if (!c || !c->isModuleRoot()) continue;
             etcs_retire_entity(c);
             c->getOwningArena().deleteEntity(c, true);
@@ -5336,7 +5334,6 @@ inline void etcs_replay_gather(Entity* e, ReplayGather& g)
             Entity* c = x->getTypedChild(*tag, rid);
             if (!c) continue;
             g.live.insert(Entity::childKey(rid));
-            g.live.insert(Entity::placeKey(rid));   // set only by a move: the last one keeps it
             g.parent_of[rid] = x->getRID();
             if (c->isEnvironmental()) { g.below.emplace_back(); etcs_replay_gather(c, g.below.back()); }
             else                      region.push_back(c);
@@ -5374,9 +5371,16 @@ inline void etcs_replay_compose(ReplayGather& g, const ::std::string& name,
      * Every earlier one is superseded -- kept only for another key it alone
      * still holds.
      */
+    // Live: on the surface now. A place key (a move: Entity::placeKey) is
+    // live while its child is in the region, wherever it sits -- asked of
+    // parent_of here rather than added to `live` for every child at gather.
+    auto live = [&g](const ::std::string& k) {
+        if (k.compare(0, 2, "p:") == 0) return g.parent_of.count(::std::strtoull(k.c_str() + 2, nullptr, 10)) != 0;
+        return g.live.count(k) != 0;
+    };
     ::std::map<::std::string, size_t> last;
     for (size_t i = 0; i < log.size(); ++i)
-        for (auto& k : log[i].created) if (g.live.count(k)) last[k] = i;
+        for (auto& k : log[i].created) if (live(k)) last[k] = i;
     ::std::vector<bool> keep(log.size(), false);
     for (auto& [k, i] : last) keep[i] = true;
     // Then every later action that took off something a kept action put on --

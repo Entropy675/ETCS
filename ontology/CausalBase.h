@@ -106,9 +106,11 @@ ETCS_SUPERTYPE_BASE(Causal)
         OrderVector e;
         if (commitLocked(commit_dt, e)) crossTo(container(), e);
         if (step_dt.IsPositive()) static_cast<Derived*>(this)->AdvanceConcrete(step_dt);
+        const auto& now = kidsLocked();
+        if (now->empty()) return;   // a leaf: nothing below to step, touch or fit
         // The tree lock is held: the list is not copied, only kept -- a move
         // below changes the membership, and the list in hand must outlive it.
-        const auto held = kidsLocked();
+        const auto held = now;
         const auto& kids = *held;
         for (Causal_* c : kids) c->InteractUnder(commit_dt, step_dt);
         contactsLocked(kids, step_dt.IsPositive() ? step_dt : commit_dt);
@@ -489,7 +491,7 @@ private:
                 if (a == b || !kids[a]->Order4().InsideOf(B.x, B.y, B.z, sp)) return;
                 if (into[a] == n || sp < room[a]) { into[a] = b; room[a] = sp; }   // ties: the first in canonical order
             };
-            if (broad) for (uint32_t a : m_broad->within(b, sp)) consider(a);
+            if (broad) for (const auto& h : m_broad->within(b, sp)) consider(h.first);
             else       for (size_t a = 0; a < n; ++a) consider(a);
         }
         ::std::vector<::std::pair<size_t, Causal_*>> moves;
@@ -563,17 +565,14 @@ private:
 
         // The members whose position is within `r` of member b's, from the tree
         // the last pairs() built: fitness's candidates, the exact test after.
-        const ::std::vector<uint32_t>& within(size_t b, Fixed r)
+        // In no order: each candidate is judged on its own (fitLocked).
+        const ::std::vector<nanoflann::ResultItem<uint32_t, double>>& within(size_t b, Fixed r)
         {
             const double d = r.ToDouble() * (1.0 + 1e-9) + 1e-3;
             hits.clear();
             (void)tree.radiusSearch(&cloud.xyz[b * 3], d * d, hits, nanoflann::SearchParameters(0, false));
-            near.clear();
-            for (const auto& h : hits) near.push_back(h.first);
-            ::std::sort(near.begin(), near.end());
-            return near;
+            return hits;
         }
-        ::std::vector<uint32_t> near;
     };
 
     // The parent, while it is one. Under an arena teardown an ancestor has
