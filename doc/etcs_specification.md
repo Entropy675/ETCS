@@ -534,26 +534,33 @@ types that live purely in the functional realm never claim it and never record a
 every action that put on something still there, and every later action that took off something
 those put on — and written out as ordinary ETCS lines: the script that makes it again. A child a
 line made is named from its parent's name, its type and the order it was made in
-(`book_Ledger1`); `@names` in payloads become those names; no RID is ever written. What the
-script cannot say — state held in members rather than tags, like a ledger's lines, which came
-from whoever appended them — the type captures as named values (`CaptureState`) and puts back
-after its script has run (`RebuildLocal`). Replay is deterministic by the rules of scripts, so
-anything that was not (a clock, input, a far node's answer) belongs in those values, as its
-result. A type that renames a value later says how, oldest first (`MigrateTo`); the ETCS surface
-only grows, so an old script still replays.
+(`book_Ledger1`); `@names` in payloads become those names; no RID is ever written.
+
+**What is so is a value on the same surface.** A tag can carry a value (`core/Entity.h`, "THE
+VALUE BEHIND A TAG"), and that is where state lives rather than in members beside the tags.
+State a verb sets — a damping, a colour, an emissivity — is a *stored* value set through the
+funnel with its flag, so the line that set it is kept and a replay sets it again. State that moves
+without a verb — the Causal rows, a ledger's lines that came from whoever appended them — is a
+*bound* value, read off the type on demand. The store keeps every value under the root and hands
+them back after the script has run; an Environmental type then finishes (`RebuildLocal`). Replay is
+deterministic by the rules of scripts, so anything that was not (a clock, input, a far node's
+answer) belongs in a value, as its result. A type that renames a value later says how, oldest
+first (`MigrateTo`); the ETCS surface only grows, so an old script still replays.
 
 **The same script in both frames.** Rebuilding an entity here, from this runtime's store, and
 reflecting it on the far side of a link are one operation seen from two sides: `RebuildLocal`
 is the local frame's slot and `ReflectRemote` the far frame's, and a type says how it answers in
 each.
 
-**Looked up by what it is.** Each Environmental entity's record is keyed by its `Module::Tag` and
-its state hash — the merkle hash of its tags down through its children, over the compile-time
+**Looked up by what it is.** Each kept entity's record is keyed by its `Module::Tag` and its
+identity hash — the merkle hash of its tags down through its children, over the compile-time
 hashes of the code behind them and **no RIDs** (a RID is where and when something was made; a
 scene made again in another order is the same scene) — and, among entities equal in both, by the
-order they were made in, which a replay reproduces without storing it. So a replay that did not
-make what was saved finds no record, and says so, rather than handing an entity someone else's
-state; and the resume ends by checking every root's hash against the one saved.
+order they were made in, which a replay reproduces without storing it. A box that moved is the same
+box, so its values do not enter the key. A replay that did not make what was saved finds no
+record, and says so, rather than handing an entity someone else's state; and the resume ends by
+checking every root's state hash — the identity and every value under it, one number — against
+the one saved, naming which half differs if one does.
 
 **This loader's own.** The store is `persistence.db` in `$ETCS_STORE`, else
 `$XDG_DATA_HOME/etcs`, else `~/.local/share/etcs` (`/persist` in a browser, which the page mounts
@@ -732,7 +739,7 @@ and then writes nothing more, so a half torn-down runtime is never what the next
 | RID in a payload | `@name` |
 | Stream | `<a>.Produce(payload) -> <b>.Consume(payload)` — one line, both ends |
 | Entity in another runtime | a local instance of its type with a `NetworkProvider::Remote` child, bound to a published name — its actions and stream halves run there, on one link per pair of runtimes, through the node's `Wrapper` authority layer |
-| Keeping a scene | a `DatabaseProvider::Persistence` child on a global `Environmental` entity — its actions, compacted to a script, plus its named state; offered back at the next start (`--resume` / `--fresh`) |
+| Keeping a scene | a `DatabaseProvider::Persistence` child on a global `Environmental` entity — its actions, compacted to a script, plus its values; offered back at the next start (`--resume` / `--fresh`) |
 | Interrupting work | `<name>.kill(<label> [index])` |
 | Removing a flag | `<name>.unflag(<flag>)` — the mutable set; a `requires` tag is fixed and out of reach |
 | Scope | local closure + the root script's names as globals; no ancestor chain |

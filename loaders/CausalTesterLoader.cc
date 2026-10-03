@@ -245,6 +245,18 @@ int main()
         fresh->Run(100, dt); live->Run(100, dt);
         check(fresh->CausalHash() == live->CausalHash(), "...and goes on the same way");
         check(!fresh->restoreValue(ETCS::Buffer("Causal"), std::string("\x09garbage")), "a value of another version is refused");
+
+        // A verb's state is a stored value, not part of the rows: the
+        // emissivity rides the funnel, and a restore reaches the step's
+        // working copy through onValue.
+        std::string ev;
+        check(fresh->valueOf(ETCS::Buffer("emissivity"), ev) && fresh->Emissivity() == Fixed::From(0.2),
+              "SetEmissivity is the value behind the emissivity flag");
+        std::string w; ETCS::Entity::putWord(w, Fixed::From(0.7).raw);
+        check(fresh->restoreValue(ETCS::Buffer("emissivity"), w) && fresh->Emissivity() == Fixed::From(0.7),
+              "...a restored value reaches the step's copy (onValue)");
+        fresh->removeTag(ETCS::Buffer("emissivity"));
+        check(fresh->Emissivity() == Fixed::Half(), "...and the flag leaving takes the default back");
         arena.deleteEntity(live, true);
         arena.deleteEntity(again, true);
         arena.deleteEntity(fresh, true);

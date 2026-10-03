@@ -303,31 +303,33 @@ private:
  * state-altering variables behind the name that names the state, kept on
  * the one surface the funnel orders, the record keeps, and the store
  * persists, rather than in a third place beside it. Two kinds of value,
- * one key space:
+ * one key space, and which one is not a choice:
  *
- *   STORED   set through the funnel like a flag (addTag(key, value)) --
+ *   STORED   state a verb sets (a damping, a colour, an emissivity): set
+ *            through the funnel like a flag (addTag(key, value)) --
  *            ordered, marked, recorded as the action that set it, so a
- *            replay sets it again. Bytes, binary-safe.
- *   BOUND    a family's own state read on demand (bindValue): the Causal
- *            rows behind "Causal", a Ledger's lines behind "lines". Set
- *            once at construction like an interface pointer, and never
- *            written per change -- the rows move on every interaction,
- *            and the funnel is an ordered event; what the surface holds is
- *            the way to READ them, and a restore hands the bytes back to
- *            the same binding.
+ *            replay sets it again. Bytes, binary-safe (putWord/getWord for
+ *            words). A family that reads one every tick keeps a working
+ *            copy and refreshes it in onValue, so the value is still the
+ *            only writer.
+ *   BOUND    state that moves WITHOUT this script's verb -- the Causal
+ *            rows behind "Causal" move on every interaction, a Ledger's
+ *            lines behind "ledger" arrive from whoever appends over a link
+ *            -- read on demand (bindValue). Set once at
+ *            construction like an interface pointer and never written per
+ *            change; a restore hands the bytes back to the same binding.
  *
- * NOT IN THE MERKLE HASH, deliberately. The node hash is the identity of
- * the tag surface, funnel-covered, and the audit's meaning is "a change
- * that never went through a funnel"; a bound value changes without one by
- * design, so hashing it there would make every moving body a divergence
- * and the Causal identity (row 0 is this entity's hash) circular. The
- * value surface has its own number (valueHash), and the same-state check
- * a resume makes is the node hash AND the values (Persistence.h).
+ * The identity hash (identityHash) covers the flags, not the values; the
+ * state hash (getHash) is both, so one number says "the same state"
+ * (Persistence.h). Values stay out of the identity because a bound value
+ * changes without a funnel -- in the cached merkle it would make every
+ * moving body a divergence and the Causal identity (row 0 carries it)
+ * circular.
  *
  * Read with the tag mutex released: a binding takes its family's own lock
  * (the Causal tree's), and refreshIdentityLocked already goes tree-lock
- * then getHash, so tag-mutex-then-tree-lock anywhere would be the other
- * half of a deadlock.
+ * then the tag mutex, so the other order anywhere would be half of a
+ * deadlock. onValue runs released for the same reason.
  */
 public:
     struct ValueBinding
@@ -951,8 +953,34 @@ public:
         ETCS::TagModifyEvent ev{this, flag, false, &Entity::tagModifyImpl};
         ev.value = &value;
         const bool changed = ev();
-        if (changed) recordEffect(this, flagKey(this, flag.toString()), true);
+        if (changed) { recordEffect(this, flagKey(this, flag.toString()), true); onValue(flag, &value); }
         return changed;
+    }
+
+    /*
+ * A STORED VALUE CHANGED under `key` (null: it left with its flag). Called
+ * on the thread that changed it, once the funnel has applied the change,
+ * and by restoreValue -- never on the ordering thread, and with no mutex of
+ * Entity's held, so a family may take its own locks here. The one place a
+ * family that reads a value every tick refreshes its working copy: the
+ * value stays the only writer, and a replay, a restore and a verb all
+ * arrive the same way.
+ */
+    virtual void onValue(const ETCS::Buffer& key, const ::std::string* value) { (void)key; (void)value; }
+
+    // A word in a value, little-endian, so a store reads the same on every
+    // host. getWord advances `at`; false when the bytes run out.
+    static void putWord(::std::string& out, int64_t v)
+    {
+        for (int i = 0; i < 8; ++i) out.push_back(static_cast<char>((static_cast<uint64_t>(v) >> (8 * i)) & 0xff));
+    }
+    static bool getWord(const ::std::string& in, size_t& at, int64_t& v)
+    {
+        if (at + 8 > in.size()) return false;
+        uint64_t u = 0;
+        for (int i = 0; i < 8; ++i) u |= static_cast<uint64_t>(static_cast<unsigned char>(in[at + i])) << (8 * i);
+        v = static_cast<int64_t>(u); at += 8;
+        return true;
     }
 
     // A family's state, readable behind a key. At construction, once, like
@@ -1007,21 +1035,19 @@ public:
     bool restoreValue(const ETCS::Buffer& key, const ::std::string& v)
     {
         ValueBinding b;
+        bool bound = false;
         {
             ::std::lock_guard<::std::mutex> lock(m_tagMutex);
             auto it = bindings_.find(key);
-            if (it == bindings_.end())
-            {
-                if (flags_.find(key) == flags_.end()) return false;
-                values_[key] = v;
-                return true;
-            }
-            b = it->second;
+            if (it != bindings_.end()) { b = it->second; bound = true; }
+            else if (flags_.find(key) == flags_.end()) return false;
+            else values_[key] = v;
         }
+        if (!bound) { onValue(key, &v); return true; }   // stored: the family's copy follows
         return b.read && b.read(b.self, v);
     }
 
-    // The value surface as one number. Not part of the node hash (values_).
+    // This node's values as one number; getHash composes them over the subtree.
     uint64_t valueHash() const;
     /*
  * -----------------------------------------------------------------------
@@ -1657,7 +1683,7 @@ public:
         }
         const bool off = ETCS::TagModifyEvent{this, tag, true, &Entity::tagModifyImpl}();
         const char c = tag.c_str()[0];
-        if (off && c >= 'a' && c <= 'z') recordEffect(this, flagKey(this, tag.toString()), false);
+        if (off && c >= 'a' && c <= 'z') { recordEffect(this, flagKey(this, tag.toString()), false); onValue(tag, nullptr); }
         if (off && leaving) recordEffect(this, childKey(leaving), false, true);
         return off;
     }

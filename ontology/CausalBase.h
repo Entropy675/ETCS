@@ -163,9 +163,29 @@ ETCS_SUPERTYPE_BASE(Causal)
     // ── what the base keeps beside the rows ─────────────────────────────
 
     // How fast heat leaves this thing into its container, per second. Zero
-    // is a perfect insulator, a legitimate thing to be.
-    void  SetEmissivity(Fixed per_sec) { if (per_sec.raw >= 0) m_emissivity = per_sec; }
-    Fixed Emissivity() const           { return m_emissivity; }
+    // is a perfect insulator, a legitimate thing to be. A verb's state, so
+    // the value behind "emissivity" (through the funnel); m_emissivity is the
+    // step's working copy, refreshed in onValue.
+    void SetEmissivity(Fixed per_sec)
+    {
+        if (per_sec.raw < 0) return;
+        ::std::string v;
+        ETCS::Entity::putWord(v, per_sec.raw);
+        this->addTag("emissivity", v);
+    }
+    Fixed Emissivity() const { return m_emissivity; }
+
+    void onValue(const ETCS::Buffer& key, const ::std::string* value) override
+    {
+        if (key == ETCS::Buffer("emissivity"))
+        {
+            int64_t raw = Fixed::Half().raw;   // gone with its flag: the default again
+            size_t at = 0;
+            if (value && !ETCS::Entity::getWord(*value, at, raw)) return;
+            ::std::lock_guard<::std::recursive_mutex> lk(TreeMutex());
+            m_emissivity = Fixed::FromRaw(raw);
+        }
+    }
 
     // Energy that left the model at this entity (it had no Causal container).
     Fixed EmittedOut() const { return m_emitted_out; }
@@ -382,14 +402,13 @@ private:
 
     /*
      * THE "Causal" VALUE: a version byte, then the words as they are --
-     * the eighteen of the rows, the clock, the emissivity, what left at the
-     * boundary, and the eighteen of the last crossing. Everything
-     * CausalHash reads and everything a reader of this entity can ask for,
-     * so a restored entity hashes and answers as the captured one did.
-     * Little-endian raw words; the same bytes on every platform the rows
-     * are the same on.
+     * the eighteen of the rows, the clock and what left at the boundary,
+     * and the eighteen of the last crossing. Everything CausalHash reads
+     * and everything that moves without a verb; the emissivity is a verb's
+     * and has its own value (SetEmissivity). Little-endian raw words; the
+     * same bytes on every platform the rows are the same on.
      */
-    static constexpr unsigned char kStateVersion = 1;
+    static constexpr unsigned char kStateVersion = 2;
     static void putWords(::std::string& out, const OrderVector& o)
     {
         const int64_t w[] = { o.x.raw, o.y.raw, o.z.raw, static_cast<int64_t>(o.id),
@@ -397,18 +416,12 @@ private:
                               o.fx.raw, o.fy.raw, o.fz.raw, o.radius.raw,
                               o.qx.raw, o.qy.raw, o.qz.raw, o.qw.raw,
                               o.interval.raw, static_cast<int64_t>(o.uncertainty) };
-        for (int64_t v : w) for (int i = 0; i < 8; ++i) out.push_back(static_cast<char>((static_cast<uint64_t>(v) >> (8 * i)) & 0xff));
+        for (int64_t v : w) ETCS::Entity::putWord(out, v);
     }
     static bool getWords(const ::std::string& in, size_t& at, OrderVector& o)
     {
         int64_t w[18];
-        for (int64_t& v : w)
-        {
-            if (at + 8 > in.size()) return false;
-            uint64_t u = 0;
-            for (int i = 0; i < 8; ++i) u |= static_cast<uint64_t>(static_cast<unsigned char>(in[at + i])) << (8 * i);
-            v = static_cast<int64_t>(u); at += 8;
-        }
+        for (int64_t& v : w) if (!ETCS::Entity::getWord(in, at, v)) return false;
         o.x = Fixed::FromRaw(w[0]); o.y = Fixed::FromRaw(w[1]); o.z = Fixed::FromRaw(w[2]); o.id = static_cast<uint64_t>(w[3]);
         o.ox = Fixed::FromRaw(w[4]); o.oy = Fixed::FromRaw(w[5]); o.oz = Fixed::FromRaw(w[6]); o.energy = Fixed::FromRaw(w[7]);
         o.fx = Fixed::FromRaw(w[8]); o.fy = Fixed::FromRaw(w[9]); o.fz = Fixed::FromRaw(w[10]); o.radius = Fixed::FromRaw(w[11]);
@@ -422,22 +435,22 @@ private:
         refreshIdentityLocked();
         out.push_back(static_cast<char>(kStateVersion));
         putWords(out, m_ov);
-        OrderVector meta;   // three scalars, carried in a row's slots
-        meta.x = Fixed::FromRaw(static_cast<int64_t>(m_ticks)); meta.y = m_emissivity; meta.z = m_emitted_out;
-        putWords(out, meta);
+        ETCS::Entity::putWord(out, static_cast<int64_t>(m_ticks));
+        ETCS::Entity::putWord(out, m_emitted_out.raw);
         putWords(out, m_last_emission);
     }
     bool unpackState(const ::std::string& in)
     {
         if (in.empty() || static_cast<unsigned char>(in[0]) != kStateVersion) return false;
         size_t at = 1;
-        OrderVector rows, meta, last;
-        if (!getWords(in, at, rows) || !getWords(in, at, meta) || !getWords(in, at, last)) return false;
+        OrderVector rows, last;
+        int64_t ticks = 0, out = 0;
+        if (!getWords(in, at, rows) || !ETCS::Entity::getWord(in, at, ticks)
+            || !ETCS::Entity::getWord(in, at, out) || !getWords(in, at, last) || at != in.size()) return false;
         ::std::lock_guard<::std::recursive_mutex> lk(TreeMutex());
         m_ov            = rows;
-        m_ticks         = static_cast<uint64_t>(meta.x.raw);
-        m_emissivity    = meta.y;
-        m_emitted_out   = meta.z;
+        m_ticks         = static_cast<uint64_t>(ticks);
+        m_emitted_out   = Fixed::FromRaw(out);
         m_last_emission = last;
         m_share_dt = Fixed::Zero(); m_share_k = Fixed::Zero();   // the share cache keys on (dt, k): recompute
         m_id_epoch = 0; m_id_pepoch = 0;                        // the identity is this entity's, not the record's
