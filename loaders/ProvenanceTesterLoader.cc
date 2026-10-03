@@ -213,6 +213,39 @@ int main()
         check(f->getHash() != e->getHash(), "...and one flag apart, not");
     }
 
+    // -- 6b. twins at other RIDs --------------------------------------------------
+    {
+        std::cout << "\n-- 6b. twins at other RIDs --\n";
+        // Two twins (one type, one surface) holding different values, attached
+        // first-then-second. Made again until the RIDs fall the other way
+        // round: the state hash must not notice -- the values walk in the
+        // canonical order (identity, then attach order), never by RID.
+        auto make = [&arena](Env*& a, Env*& b) {
+            Env* r = arena.allocate<Env>(); ETCS::etcs_supertype_fanout(r);
+            a = r->addTag<Env>(); b = r->addTag<Env>();
+            a->value = 1; b->value = 2;
+            return r;
+        };
+        Env *a0, *b0;
+        Env* first = make(a0, b0);
+        std::vector<Env*> spent;
+        Env* other = nullptr;
+        for (int i = 0; i < 64 && !other; ++i)
+        {
+            Env *a1, *b1;
+            Env* r = make(a1, b1);
+            if ((a1->getRID() < b1->getRID()) != (a0->getRID() < b0->getRID())) other = r;
+            else spent.push_back(r);
+        }
+        check(other != nullptr, "(setup) a second tree whose twins' RIDs fall the other way round");
+        if (other) check(other->getHash() == first->getHash(), "the same state at RIDs in the other order hashes the same");
+        b0->value = 3;
+        if (other) check(other->getHash() != first->getHash(), "...and the twins' values still count");
+        for (Env* r : spent) arena.deleteEntity(r, true);
+        if (other) arena.deleteEntity(other, true);
+        arena.deleteEntity(first, true);
+    }
+
     // -- 7. EnvironmentState -----------------------------------------------------
     {
         ETCS::EnvironmentState st;

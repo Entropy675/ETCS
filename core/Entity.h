@@ -4558,8 +4558,10 @@ namespace etcs_hash_detail
     }
     // getTypedChildren answers grouped by tag, in first-attachment order --
     // that order is state (a wrap chain applies in it) and is kept. Within a
-    // group the list is a hash map with no order of its own, so each group is
-    // put in the one deterministic order there is: ascending RID.
+    // group, ascending RID: a WALK order only, for the identity walk, which
+    // composes each tag's children as a multiset (finish sorts them by hash),
+    // so no RID reaches its number. A walk whose order is part of what it
+    // produces walks in order_canonical instead.
     inline void order_children(::std::vector<::std::pair<ETCS::Buffer, RID>>& kids)
     {
         auto lo = kids.begin();
@@ -4572,6 +4574,37 @@ namespace etcs_hash_detail
                                 { return a.second < b.second; });
             lo = hi;
         }
+    }
+
+    /*
+     * THE CANONICAL ORDER of a node's children -- the one CausalHash walks
+     * (P54): tag groups in first-attachment order; within a tag, by identity
+     * hash, so a distinguishable child stands by what it is; between twins,
+     * the order they were attached (getTypedChildren's arrival order, kept by
+     * a stable sort) -- creation order as the last key, and only there. No
+     * RID decides anything, so the same state made at other RIDs walks the
+     * same. Every walk whose order is part of its output walks in it: the
+     * values in the state hash (subtreeValueHash), a store's record order
+     * (Persistence).
+     */
+    inline void order_canonical(const Entity* parent, ::std::vector<::std::pair<ETCS::Buffer, RID>>& kids)
+    {
+        ::std::vector<::std::pair<uint64_t, ::std::pair<ETCS::Buffer, RID>>> keyed;
+        keyed.reserve(kids.size());
+        for (auto& k : kids)
+        {
+            Entity* c = parent->getTypedChild(k.first, k.second);
+            LifetimeHold hold(c);
+            keyed.emplace_back(hold ? c->identityHash() : 0, k);
+        }
+        for (auto lo = keyed.begin(); lo != keyed.end(); )
+        {
+            auto hi = lo + 1;
+            while (hi != keyed.end() && hi->second.first == lo->second.first) ++hi;
+            ::std::stable_sort(lo, hi, [](const auto& a, const auto& b) { return a.first < b.first; });
+            lo = hi;
+        }
+        for (size_t i = 0; i < kids.size(); ++i) kids[i] = keyed[i].second;
     }
 }
 
@@ -4844,7 +4877,8 @@ inline void Entity::identityDigest(unsigned char out[32]) const
 
 inline uint64_t Entity::subtreeValueHash() const
 {
-    // The walk is the hash's (order_children), one frame per level on this
+    // The canonical walk (order_canonical): which value comes first is part
+    // of the number, so no RID may decide it. One frame per level on this
     // vector, each child held for the visit as the identity walk holds it.
     struct Frame { const Entity* node = nullptr; ::std::vector<::std::pair<ETCS::Buffer, RID>> kids; size_t next = 0; LifetimeHold hold; };
     ::std::vector<Frame> stack;
@@ -4853,7 +4887,7 @@ inline uint64_t Entity::subtreeValueHash() const
         Frame f; f.node = n; f.hold = ::std::move(hold);
         etcs_hash_detail::put_u64(in, n->valueHash());
         n->getTypedChildren(f.kids);
-        etcs_hash_detail::order_children(f.kids);
+        etcs_hash_detail::order_canonical(n, f.kids);
         return f;
     };
     stack.push_back(open(this, LifetimeHold()));
