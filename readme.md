@@ -10,7 +10,7 @@ Tools & Modules
 
 I do not recommend working on this substrate until the below todo's are complete, as they can change the active surface.
 
-To write an ETCS provider, you effectively have to introduce yourself to the ETCS runtime via a thin ontology compliant wrapper. See ChessProvider in ETCS-Commons repo (https://github.com/Entropy675/ETCS-Commons/tree/main/ChessProvider) for a bare bones example. Once your types speak over the ETCS scripting language, you can act across the arbitrary MirrorBuffer boundary, which is the function call boundary for stream functions or streams you negotiate yourself (less recommended unless you know what you are doing - I'll make a tutorials). The stream work function contract is an explicit lifetime: the consume stream function holds open the lifetime of the connection and is blocking; the produce side is non-blocking and expected to output continuously over the MirrorBuffer they share, which wraps/unwraps via the Wrapper_ based types owned by either side. A connection drop or otherwise failure to set up a MirrorBuffer ends the connection, logging it as a failure on both sides. If one side cannot assemble the same Wrapper_ based types required to generate a valid MirrorBuffer to a target type, stream calls fail. Since all scripts are run locally remote connections have to be brokered via a name server equivalent domain (See ChessNode from ChessProvider). MirrorBuffer covers quite literally every physical boundary from LMAX within process local buffers to sockets, the local EventNode's EventStream negotiates the provenience of local memory with the most local loader separately from the identity of the code, all entities' origin is local in every way (RIDs are runtime deterministic sequences). It's maximized for decreasing arbitrary pattern replication via the ontology, the CRTP layer reduces that pattern match to static casts. An ontology compliant wrapper of existing code gains distribution over all platforms ETCS supports, including the ETCS kernel when it releases, unless platform specific types are declared in the modules type contract declaration (the auto generated header via ace tool's module setup, Contract_XXXXXProvider.h where you can typecast unify your types for every supported system).
+To write an ETCS provider, you effectively have to introduce yourself to the ETCS runtime via a thin ontology compliant wrapper. Every module has the same shape (`modules/readme.txt`: which file holds what, and why ace only attests headers in those places). See ChessProvider in ETCS-Commons repo (https://github.com/Entropy675/ETCS-Commons/tree/main/ChessProvider) for a bare bones example. Once your types speak over the ETCS scripting language, you can act across the arbitrary MirrorBuffer boundary, which is the function call boundary for stream functions or streams you negotiate yourself (less recommended unless you know what you are doing - I'll make a tutorials). The stream work function contract is an explicit lifetime: the consume stream function holds open the lifetime of the connection and is blocking; the produce side is non-blocking and expected to output continuously over the MirrorBuffer they share, which wraps/unwraps via the Wrapper_ based types owned by either side. A connection drop or otherwise failure to set up a MirrorBuffer ends the connection, logging it as a failure on both sides. If one side cannot assemble the same Wrapper_ based types required to generate a valid MirrorBuffer to a target type, stream calls fail. Since all scripts are run locally remote connections have to be brokered via a name server equivalent domain (See ChessNode from ChessProvider). MirrorBuffer covers quite literally every physical boundary from LMAX within process local buffers to sockets, the local EventNode's EventStream negotiates the provenience of local memory with the most local loader separately from the identity of the code, all entities' origin is local in every way (RIDs are runtime deterministic sequences). It's maximized for decreasing arbitrary pattern replication via the ontology, the CRTP layer reduces that pattern match to static casts. An ontology compliant wrapper of existing code gains distribution over all platforms ETCS supports, including the ETCS kernel when it releases, unless platform specific types are declared in the modules type contract declaration (the auto generated header via ace tool's module setup, Contract_XXXXXProvider.h where you can typecast unify your types for every supported system).
 
 To build, pull ACE-Build-Tools in one folder. Pull ETCS in another folder. Pull ETCS-Commons as 'modules' folder in the ETCS folder (it's a git sub-project already, you can init subprojects for the same thing). Run:
 
@@ -21,21 +21,24 @@ sudo python3 ace_install.py install
 git submodule update --init --recursive
 ```
 
-The ace tool will install all the required packages, you may have to run it twice or install a missing package for some modules...
-Then you can build the main etcs loader via:
+Every system package a module needs is declared in its ACE manifest (`requires.system`), and the first build on a machine checks them all and offers to install what is missing. That check runs once per machine, so when a pull adds a requirement (RenderProvider's `glslang-tools`, which compiles its shaders), run it yourself:
 
 ```
-ace make loaders
-ace make loader
+ace deps check
+ace deps install
 ```
-Make sure to run 'ace make loader' explicitly if you want the shell, 'ace make loaders' makes etcs without the debug flag.
 
-You can make all the modules or a target module via:
+Then build everything, or a part:
 
 ```
+ace make all                    # modules, then loaders
 ace make modules
 ace make module XxxProvider
+ace make loaders                # etcs and the tester loaders
+ace make loader etcs
 ```
+
+Every loader build is the interactive one (the REPL shell); `ace make loader etcs -UETCS_REPL_SHELL` builds the daemon loader, which runs a script and drains. A module's runtime assets are built with it: RenderProvider's GLSL compiles to `bin/shaders/*.spv` beside the `.so` -- the tree holds sources only.
 
 There are many example scripts in the /scripts/ folder, once you have compiled the modules, run etcs and enter the scripts repo, run them randomly... this side is in active development. You will likely want to use this most often for large modifications:
 ```
@@ -51,12 +54,12 @@ ace ontology
 The same modules build to wasm with the emscripten toolchain on PATH (`source <emsdk>/emsdk_env.sh`):
 
 ```
-ace wasm make module WindowProvider
-ace wasm make module RenderProvider
+ace wasm make all               # every module whose manifest declares Web
 ace wasm make module PaintProvider
-ace wasm make module ShellProvider
 ace wasm make loader etcs
 ```
+
+The wasm loader step clears the native `bin/Run_*` testers; `ace make loaders` puts them back.
 
 Every web artifact -- `etcs.js`, `etcs.wasm` and one `<Provider>.wasm` per module -- lands in **`bin/wasm/`** (`WASM_DIR` in the Makefile, `ARTIFACT_DIR` in the generated `loaders/Makefile`). Native artifacts stay in `bin/`. The two are kept apart so that a script can serve the web directory whole without also publishing the native runtime, the `.so` modules and everything else in `bin/`.
 
@@ -66,31 +69,47 @@ To serve a page locally:
 
 ```
 etcs modules/PaintProvider/scripts/serve_paint.etcs      # https://localhost:8443/
+etcs modules/ChessProvider/scripts/serve_chess.etcs      # https://localhost:8444/
+etcs modules/RenderProvider/scripts/serve_scene3d.etcs   # https://localhost:8443/
 etcs modules/WindowProvider/scripts/serve_web.etcs       # https://localhost:8443/
 etcs scripts/run_tls_website.etcs                        # the whole site, paint at /paint/
 ```
+
+A page belongs to its module, in the module's `scripts/www/`; the site mounts it from there rather than keeping a copy (`scripts/site_pages.etcs`, and each module's `*_mounts.etcs` for a page with files of its own).
 
 A `-pthread` build needs cross-origin isolation for `SharedArrayBuffer`, so every serve script sets `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp`; a plain static server without those headers loads the page and then every Worker dies on `wasmMemory is undefined`.
 
 On the web, every thread is a Worker and every Worker re-instantiates all open side modules, so thread count is the dominant boot cost. Web builds therefore share ONE thread pool across the loader and every module (`ETCS_SHARED_THREAD_POOL`, default on for wasm, off for native -- `core/ETCS_API.h` for why the two want opposite defaults) with the native worker count of 4. Measured on the paint page: 16 Workers and a first frame at 8.8s, against 34 and 12.1s with a pool per module.
 
 
-Every entity carries a runtime hash of its state surface and everything under it
-(`Entity::getHash`, core/Entity.h "THE RUNTIME HASH"): the tags, flags and typed
-children, recomputed lazily on pull and only along the path a transition touched.
-XXH3 under a parent; SHA-256 at every global-scope boundary -- a parentless
-entity's node hash is its digest (`getDigest`), a module's root is SHA-256 over its
-parentless entities (`etcs_module_root_hash`) and the process's over every module
+Every entity carries two hashes (core/Entity.h). The IDENTITY hash
+(`Entity::identityHash`) is what it is: its tags, flags and typed children,
+recomputed lazily on pull and only along the path a transition touched. XXH3
+under a parent; SHA-256 at every global-scope boundary -- a parentless entity's
+hash is its digest, a module's root is SHA-256 over its parentless entities
+(`etcs_module_root_hash`) and the process's over every module
 (`etcs_global_root_hash`), so the chain reaches one root from any node and is
-cryptographic from the first boundary up. `etcs_root_hash(top)` is the audit: it
-recomputes a subtree from its state and reports every cache that disagrees (a
-change that never went through a funnel -- the deepest reported node is where it
-happened, the ones above are its consequences). `bin/Run_HashTesterLoader` is the
-proof.
+cryptographic from the first boundary up. `etcs_root_hash(top)` is the audit:
+it recomputes a subtree and reports every cache that disagrees (a change that
+never went through a funnel -- the deepest reported node is where it happened).
+
+A tag can also carry a VALUE: what is so, behind the name of the state. State a
+verb sets (a damping, a colour) is a stored value set through the funnel, so
+the record keeps the verb and a replay sets it again; state that moves without
+one (the Causal rows) is bound and read on demand. The STATE hash
+(`Entity::getHash`) is the identity and every value under it, as one number:
+what a resume, a reflection and a signature compare. The Persistence tag
+(DatabaseProvider) keeps a scene as its compacted script plus its values, and
+`etcs --resume` brings it back and checks it by that number.
+`bin/Run_HashTesterLoader`, `Run_ProvenanceTesterLoader` and
+`Run_CausalTesterLoader` are the proofs.
 
 TODO:
-- Identity system / binary signage (over the runtime hash)
-- Persistence tag within DatabaseProvider & merge Local/Remote Database ontology types
+- Identity system / binary signage (over the state hash)
+- Merge the Local/Remote Database ontology types
+- Every module's verb-set state on the value surface. Scene3D is done; the
+  other Set* verbs (Paint, Render's 2D types, Network, Chess, Layout, Window)
+  still keep some state in members that a resume does not see.
 
 Example graphical_script.etcs:
 ```
@@ -155,7 +174,7 @@ Replaces:
 - Containers/Docker with capability-typed modules
 - Kubernetes with causal trace orchestration
 - REST/gRPC with MirrorBuffer streams over the ontology
-- React/Vue with declarative scene graphs (the 3D scripts are essentially immediate-mode UI but with persistence atm, persistence todo pending)
+- React/Vue with declarative scene graphs (the 3D scripts are essentially immediate-mode UI with persistence: a scene saved and resumed as it was)
 
 Via one compile time artifact.
 
