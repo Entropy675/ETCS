@@ -2,6 +2,7 @@
 #define BASE_Causal_H__
 #include "Causal.h"
 #include <algorithm>
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <utility>
@@ -63,6 +64,12 @@ ETCS_SUPERTYPE_BASE(Causal)
     // leaf says otherwise.
     virtual Fixed MassConcrete() const { return Fixed::One(); }
 
+    // What a solid of this leaf is shaped as until SetShape says (a box for a
+    // leaf with extents), and its half extents. The base's default is the
+    // reach: a sphere, or the cube about it.
+    virtual CausalSolid::Shape DefaultShapeConcrete() const { return CausalSolid::Sphere; }
+    virtual void ExtentConcrete(Fixed& hx, Fixed& hy, Fixed& hz) const { hx = hy = hz = m_ov.radius; }
+
     // ── the family ──────────────────────────────────────────────────────
 
     const OrderVector& Order4() const override final { return m_ov; }
@@ -105,9 +112,14 @@ ETCS_SUPERTYPE_BASE(Causal)
         refreshIdentityLocked();
         OrderVector e;
         if (commitLocked(commit_dt, e)) crossTo(container(), e);
-        if (step_dt.IsPositive()) static_cast<Derived*>(this)->AdvanceConcrete(step_dt);
+        if (step_dt.IsPositive())
+        {
+            fieldLocked(step_dt);
+            static_cast<Derived*>(this)->AdvanceConcrete(step_dt);
+        }
         const auto& now = kidsLocked();
-        if (now->empty()) return;   // a leaf: nothing below to step, touch or fit
+        bool moving = m_ov.KineticEnergy().IsPositive();
+        if (now->empty()) { m_moving.store(moving, ::std::memory_order_relaxed); return; }   // a leaf: nothing below to step, touch or fit
         // The tree lock is held: the list is not copied, only kept -- a move
         // below changes the membership, and the list in hand must outlive it.
         const auto held = now;
@@ -115,7 +127,13 @@ ETCS_SUPERTYPE_BASE(Causal)
         for (Causal_* c : kids) c->InteractUnder(commit_dt, step_dt);
         contactsLocked(kids, step_dt.IsPositive() ? step_dt : commit_dt);
         fitLocked(kids);
+        // After the contacts: a body they brought to rest is not moving. A
+        // member fit moved elsewhere is its new container's to report.
+        for (Causal_* c : kids) moving = moving || c->Order4().KineticEnergy().IsPositive() || c->Moving();
+        m_moving.store(moving, ::std::memory_order_relaxed);
     }
+
+    bool Moving() const override final { return m_moving.load(::std::memory_order_relaxed); }
 
     /*
      * ONE LOCK PER TREE. The mutex is the topmost Causal entity's; every
@@ -153,6 +171,12 @@ ETCS_SUPERTYPE_BASE(Causal)
     }
 
     void PlaceUnder(Fixed x, Fixed y, Fixed z) override final { m_ov.PlaceAt(x, y, z); }
+    OrderVector& RowsUnder() override final { return m_ov; }
+    Fixed MassUnder() override final { return static_cast<Derived*>(this)->MassConcrete(); }
+    void SupportUnder(bool resting, Fixed nx, Fixed ny, Fixed nz) override final
+    {
+        m_resting = resting; m_snx = nx; m_sny = ny; m_snz = nz;
+    }
 
     uint64_t CausalTicks() const override final { return m_ticks; }
 
@@ -202,6 +226,74 @@ ETCS_SUPERTYPE_BASE(Causal)
         this->addTag("space", v);
     }
     Fixed Space() const override final { return m_space; }
+
+    /*
+     * THE FIELD THIS SPACE HAS, stated (Causal.h, "the space's parameters"): a
+     * verb's state, so the value behind "gravity" (through the funnel,
+     * recorded and kept). Stating it -- zero included -- is what makes it this
+     * space's own; InheritGravity takes the statement back, and the space
+     * passes on its container's field again.
+     */
+    void SetGravity(Fixed gx, Fixed gy, Fixed gz)
+    {
+        ::std::string v;
+        ETCS::Entity::putWord(v, gx.raw); ETCS::Entity::putWord(v, gy.raw); ETCS::Entity::putWord(v, gz.raw);
+        this->addTag("gravity", v);
+    }
+    void InheritGravity() { this->removeTag(ETCS::Buffer("gravity")); }
+    // The work the field this space states has done on what is inside it:
+    // the energy it put in, net of what climbing bodies gave back.
+    Fixed FieldWork() const { return m_field_work; }
+
+    Causal_* FieldUnder(Fixed& gx, Fixed& gy, Fixed& gz) override final
+    {
+        if (m_gravity_set) { gx = m_gx; gy = m_gy; gz = m_gz; return this; }
+        Causal_* up = container();
+        if (up) return up->FieldUnder(gx, gy, gz);
+        gx = gy = gz = Fixed::Zero();
+        return nullptr;
+    }
+    void CountFieldWorkUnder(Fixed joules) override final { m_field_work += joules; }
+
+    /*
+     * MADE SOLID (CausalSolid): restitution and friction in [0,1]; the value
+     * behind "solid", with the shape (SetShape) beside them. Only a pair of
+     * solids meets by shape; anything else touches the way it always has.
+     */
+    void SetSolid(Fixed restitution, Fixed friction)
+    {
+        auto unit = [](Fixed f) { return f.raw < 0 ? Fixed::Zero() : (f > Fixed::One() ? Fixed::One() : f); };
+        putSolid(m_shape_set ? m_shape : static_cast<Derived*>(this)->DefaultShapeConcrete(), unit(restitution), unit(friction));
+    }
+    // A shape outright, solid from then on (Off: not solid any more).
+    void SetShape(CausalSolid::Shape shape)
+    {
+        if (shape == CausalSolid::Off) { this->removeTag(ETCS::Buffer("solid")); return; }
+        putSolid(shape, m_solid.restitution, m_solid.friction);
+    }
+    /*
+     * ANCHORED: held where it is in its container -- the field moves it not,
+     * a contact moves it not, motion handed to it becomes heat. What a place
+     * is, as against a thing: a green, a wall, a cup. A container that is not
+     * anchored is a thing, and falls in its own container's field carrying
+     * what is inside it (frames are translations); its members feel the field
+     * in that frame too. The value behind "anchored".
+     */
+    void SetAnchored(bool on)
+    {
+        if (!on) { this->removeTag(ETCS::Buffer("anchored")); return; }
+        ::std::string v;
+        ETCS::Entity::putWord(v, 1);
+        this->addTag("anchored", v);
+    }
+    bool Anchored() const { return m_anchored; }
+    CausalSolid Solid() override final
+    {
+        CausalSolid c = m_solid;
+        c.anchored = m_anchored;
+        if (c.shape == CausalSolid::Box) static_cast<Derived*>(this)->ExtentConcrete(c.hx, c.hy, c.hz);
+        return c;
+    }
 
     void Near(Fixed x, Fixed y, Fixed z, Fixed r, ::std::vector<Causal_*>& out) override final
     {
@@ -273,6 +365,34 @@ ETCS_SUPERTYPE_BASE(Causal)
             if (value && !ETCS::Entity::getWord(*value, at, raw)) return;
             ::std::lock_guard<::std::recursive_mutex> lk(TreeMutex());
             m_emissivity = Fixed::FromRaw(raw);
+        }
+        else if (key == ETCS::Buffer("gravity"))
+        {
+            int64_t w[3] = { 0, 0, 0 };
+            size_t at = 0;
+            const bool set = value != nullptr;   // gone with its flag: inherited again
+            if (set) for (int64_t& x : w) if (!ETCS::Entity::getWord(*value, at, x)) return;
+            ::std::lock_guard<::std::recursive_mutex> lk(TreeMutex());
+            m_gravity_set = set;
+            m_gx = Fixed::FromRaw(w[0]); m_gy = Fixed::FromRaw(w[1]); m_gz = Fixed::FromRaw(w[2]);
+        }
+        else if (key == ETCS::Buffer("solid"))
+        {
+            int64_t w[3] = { 0, 0, 0 };
+            size_t at = 0;
+            if (value) for (int64_t& x : w) if (!ETCS::Entity::getWord(*value, at, x)) return;
+            ::std::lock_guard<::std::recursive_mutex> lk(TreeMutex());
+            m_solid.shape       = value ? static_cast<CausalSolid::Shape>(w[0] & 3) : CausalSolid::Off;   // gone: not solid
+            m_shape_set         = value != nullptr;
+            m_shape             = m_solid.shape;
+            m_solid.restitution = Fixed::FromRaw(w[1]);
+            m_solid.friction    = Fixed::FromRaw(w[2]);
+            if (!value) m_resting = false;
+        }
+        else if (key == ETCS::Buffer("anchored"))
+        {
+            ::std::lock_guard<::std::recursive_mutex> lk(TreeMutex());
+            m_anchored = value != nullptr;
         }
         else if (key == ETCS::Buffer("space"))
         {
@@ -439,27 +559,259 @@ private:
     void contactsLocked(const ::std::vector<Causal_*>& kids, Fixed span)
     {
         const size_t n = kids.size();
+        // The solids, read once a pass. None (every scene before solids): the
+        // pass is exactly what it was.
+        m_solids.resize(n);
+        bool any = false, plane = false;
+        for (size_t i = 0; i < n; ++i)
+        {
+            m_solids[i] = kids[i]->Solid();
+            any   |= m_solids[i].shape != CausalSolid::Off;
+            plane |= m_solids[i].shape == CausalSolid::HalfSpace;
+        }
+        m_solid_pairs.clear();
+        auto pair = [&](size_t i, size_t j) {
+            if (contactLocked(kids[i], kids[j], any ? &m_solids[i] : nullptr, any ? &m_solids[j] : nullptr, span))
+                m_solid_pairs.emplace_back(static_cast<uint32_t>(i), static_cast<uint32_t>(j));
+        };
         if (n < BroadphaseFrom())
         {
             for (size_t i = 0; i + 1 < n; ++i)
-                for (size_t j = i + 1; j < n; ++j) contactLocked(kids[i], kids[j], span);
-            return;
+                for (size_t j = i + 1; j < n; ++j) pair(i, j);
         }
-        if (!m_broad) m_broad.reset(new Broadphase);
-        for (const auto& [i, j] : m_broad->pairs(kids)) contactLocked(kids[i], kids[j], span);
+        else
+        {
+            if (!m_broad) m_broad.reset(new Broadphase);
+            const auto& found = m_broad->pairs(kids);
+            if (!plane) for (const auto& [i, j] : found) pair(i, j);
+            else
+            {
+                // A half-space has no reach to find it by: it meets every
+                // solid, merged into the tree's pairs in the (i, j) order the
+                // pair-by-pair walk takes.
+                ::std::vector<::std::pair<uint32_t, uint32_t>> all(found.begin(), found.end());
+                for (size_t h = 0; h < n; ++h)
+                    if (m_solids[h].shape == CausalSolid::HalfSpace)
+                        for (size_t k = 0; k < n; ++k)
+                            if (k != h && m_solids[k].shape != CausalSolid::Off)
+                                all.emplace_back(static_cast<uint32_t>(h < k ? h : k), static_cast<uint32_t>(h < k ? k : h));
+                ::std::sort(all.begin(), all.end());
+                all.erase(::std::unique(all.begin(), all.end()), all.end());
+                for (const auto& [i, j] : all) pair(i, j);
+            }
+        }
+        if (!m_solid_pairs.empty() || any) solidPassLocked(kids, span);
     }
 
-    static void contactLocked(Causal_* ka, Causal_* kb, Fixed span)
+    // True when the pair is two solids: they meet by shape (solidPassLocked),
+    // after every transmission of the pass, so which pairs meet is decided
+    // from the rows the pass started with on both walks.
+    static bool contactLocked(Causal_* ka, Causal_* kb, const CausalSolid* sa, const CausalSolid* sb, Fixed span)
     {
         const OrderVector& a = ka->Order4();
         const OrderVector& b = kb->Order4();
-        if (!a.MayInteractWith(b)) return;
+        if (sa && sb)
+        {
+            const bool solidA = sa->shape != CausalSolid::Off, solidB = sb->shape != CausalSolid::Off;
+            if (solidA && solidB)
+                return sa->shape == CausalSolid::HalfSpace || sb->shape == CausalSolid::HalfSpace || a.MayInteractWith(b);
+            // A solid meets only solids: what is not solid passes through it
+            // (a marker, an arrow drawn in the scene), and the two contact
+            // models never meet in one pair.
+            if (solidA || solidB) return false;
+        }
+        if (!a.MayInteractWith(b)) return false;
         const Fixed nx = b.x - a.x, ny = b.y - a.y, nz = b.z - a.z;
-        if (nx.IsZero() && ny.IsZero() && nz.IsZero()) return;   // no line between them
+        if (nx.IsZero() && ny.IsZero() && nz.IsZero()) return false;   // no line between them
         const OrderVector ab = ka->CrossTowardUnder( nx,  ny,  nz, span);
         const OrderVector ba = kb->CrossTowardUnder(-nx, -ny, -nz, span);
         if (ab.energy.IsPositive()) kb->AbsorbUnder(ab);
         if (ba.energy.IsPositive()) ka->AbsorbUnder(ba);
+        return false;
+    }
+
+    /*
+     * THE FIELD, before the step: this body's velocity moves by what its
+     * space's field does over dt (OrderVector::Accelerate), and the work is
+     * counted where the field is stated. A body resting on a surface (the last
+     * solid contact said so) feels only the part along it -- the rest is what
+     * the surface holds up -- so a resting body stays exactly at rest and a
+     * body on a slope slides. An anchored body is held: whatever motion it was
+     * handed becomes heat, and it does not step anywhere.
+     */
+    void putSolid(CausalSolid::Shape shape, Fixed restitution, Fixed friction)
+    {
+        ::std::string v;
+        ETCS::Entity::putWord(v, static_cast<int64_t>(shape));
+        ETCS::Entity::putWord(v, restitution.raw);
+        ETCS::Entity::putWord(v, friction.raw);
+        this->addTag("solid", v);
+    }
+    void fieldLocked(Fixed dt)
+    {
+        if (m_anchored) { m_ov.Rest(); return; }
+        Causal_* up = container();
+        if (!up) return;
+        Fixed gx, gy, gz;
+        Causal_* src = up->FieldUnder(gx, gy, gz);
+        if (!src) return;
+        if (m_resting)
+        {
+            const Fixed gn = gx * m_snx + gy * m_sny + gz * m_snz;
+            if (gn.raw < 0) { gx -= m_snx * gn; gy -= m_sny * gn; gz -= m_snz * gn; }
+        }
+        if (gx.IsZero() && gy.IsZero() && gz.IsZero()) return;
+        src->CountFieldWorkUnder(m_ov.Accelerate(gx, gy, gz, dt, static_cast<Derived*>(this)->MassConcrete()));
+    }
+
+    /*
+     * THE SOLID CONTACTS, after the transmissions, over the pairs of solids the
+     * gate found (contactsLocked), in that order. Each pair, a sphere against
+     * a sphere, a box or a half-space (two boxes do not meet yet):
+     *
+     *   apart     the sphere is pushed out along the contact normal by how deep
+     *             it is (both, by their shares of the motion, when neither is
+     *             anchored) -- positions move here, and only here
+     *   bounce    the motion along the normal, if closing, is turned back times
+     *             the restitution; a closing speed below what the field adds in
+     *             two steps is not a bounce but a landing, and stops
+     *   rub       the motion across the normal loses what the friction takes
+     *             of the load -- the bounce's impulse, or what the field presses
+     *             a resting body in with -- never more than stops it
+     *
+     * Motion lost is heat in the body that lost it (OrderVector::SetVelocity);
+     * motion handed to the other side leaves the giver's heat and arrives in
+     * the taker's first, so the ledger is exact. A body left closing slower
+     * than a landing, with the field pressing it in, is RESTING on the other
+     * (SupportUnder) until the next pass says otherwise.
+     */
+    void solidPassLocked(const ::std::vector<Causal_*>& kids, Fixed span)
+    {
+        for (size_t i = 0; i < kids.size(); ++i)
+            if (m_solids[i].shape != CausalSolid::Off && !m_solids[i].anchored)
+                kids[i]->SupportUnder(false, Fixed::Zero(), Fixed::Zero(), Fixed::Zero());
+        if (m_solid_pairs.empty()) return;
+        Fixed gx, gy, gz;
+        if (!FieldUnder(gx, gy, gz)) gx = gy = gz = Fixed::Zero();
+        for (const auto& [i, j] : m_solid_pairs) solidPairLocked(kids[i], m_solids[i], kids[j], m_solids[j], gx, gy, gz, span);
+    }
+
+    static void solidPairLocked(Causal_* ka, const CausalSolid& sa, Causal_* kb, const CausalSolid& sb,
+                                Fixed gx, Fixed gy, Fixed gz, Fixed dt)
+    {
+        // The sphere is S; the other is O; the normal points out of O into S.
+        Causal_* kS = ka; Causal_* kO = kb;
+        const CausalSolid* cS = &sa; const CausalSolid* cO = &sb;
+        if (sa.shape != CausalSolid::Sphere) { ::std::swap(kS, kO); ::std::swap(cS, cO); }
+        if (cS->shape != CausalSolid::Sphere) return;   // box against box: not yet
+        if (cS->anchored && cO->anchored) return;
+        OrderVector& S = kS->RowsUnder();
+        OrderVector& O = kO->RowsUnder();
+        const Fixed slack = Fixed::FromRaw(Fixed::ONE >> 10);   // ~0.001: a resting body counts at zero depth
+        SolidContact c;
+        if (cO->shape == CausalSolid::Sphere)
+            c = Planes::SphereSphere(S.x, S.y, S.z, S.radius, O.x, O.y, O.z, O.radius, slack);
+        else if (cO->shape == CausalSolid::Box)
+        {
+            Fixed lx = S.x - O.x, ly = S.y - O.y, lz = S.z - O.z;
+            O.UnrotateVector(lx, ly, lz);
+            c = Planes::SphereBox(cO->hx, cO->hy, cO->hz, lx, ly, lz, S.radius, slack);
+            if (c.touching) O.RotateVector(c.nx, c.ny, c.nz);
+        }
+        else
+        {
+            Fixed ux = Fixed::Zero(), uy = Fixed::One(), uz = Fixed::Zero();
+            O.RotateVector(ux, uy, uz);
+            c = Planes::SphereHalfSpace(Plane::FromPointNormal(O.x, O.y, O.z, ux, uy, uz), S.x, S.y, S.z, S.radius, slack);
+        }
+        if (!c.touching) return;
+
+        const Fixed mS = kS->MassUnder(), mO = kO->MassUnder();
+        const Fixed iS = cS->anchored || !mS.IsPositive() ? Fixed::Zero() : Fixed::One() / mS;
+        const Fixed iO = cO->anchored || !mO.IsPositive() ? Fixed::Zero() : Fixed::One() / mO;
+        const Fixed isum = iS + iO;
+        if (!isum.IsPositive()) return;
+
+        // Apart.
+        if (c.depth.IsPositive())
+        {
+            const Fixed ps = c.depth * (iS / isum), po = c.depth * (iO / isum);
+            S.PlaceAt(S.x + c.nx * ps, S.y + c.ny * ps, S.z + c.nz * ps);
+            if (po.IsPositive()) O.PlaceAt(O.x - c.nx * po, O.y - c.ny * po, O.z - c.nz * po);
+        }
+
+        // Bounce and rub, as velocities.
+        Fixed vSx, vSy, vSz, vOx, vOy, vOz;
+        S.Velocity(mS, vSx, vSy, vSz);
+        O.Velocity(mO, vOx, vOy, vOz);
+        const Fixed rx = vSx - vOx, ry = vSy - vOy, rz = vSz - vOz;
+        const Fixed vn = rx * c.nx + ry * c.ny + rz * c.nz;
+        const Fixed gn = gx * c.nx + gy * c.ny + gz * c.nz;           // < 0: the field presses S into O
+        const Fixed fall = (gn.raw < 0 ? -gn : Fixed::Zero()) * dt;   // what the field adds along n in one step
+        const Fixed landing = Fixed::FromInt(2) * fall + Fixed::FromRaw(Fixed::ONE >> 10);
+        Fixed jn;                                                     // the normal impulse (per unit inverse mass)
+        if (vn.raw < 0)
+        {
+            /*
+             * THE BOUNCE IS OF THE APPROACH, NOT OF THE STEP'S OWN FALL. The
+             * closing speed includes what the field added in the step that
+             * carried the body in, and the push back out lands it where it
+             * started that step: bouncing that too returns more than fell, and
+             * a body near rest hops forever. So the restitution is of the
+             * approach less one step of the field, and a bounce smaller than
+             * two steps of it is a landing.
+             */
+            const Fixed e = (cS->restitution + cO->restitution) * Fixed::Half();
+            Fixed back = e * Fixed::Max(Fixed::Zero(), -vn - fall);
+            if (back < landing) back = Fixed::Zero();
+            jn = (back - vn) / isum;
+        }
+        // The load friction works against: the impulse, and what the field
+        // presses a resting body in with over the step.
+        Fixed load = jn;
+        if (gn.raw < 0 && vn < landing) load += (-gn) * dt / isum;
+        const Fixed tx = rx - c.nx * vn, ty = ry - c.ny * vn, tz = rz - c.nz * vn;
+        const Fixed vt = Fixed::Length(tx, ty, tz);
+        Fixed jt;
+        if (vt.IsPositive())
+        {
+            const Fixed mu = (cS->friction + cO->friction) * Fixed::Half();
+            jt = Fixed::Min(mu * load, vt / isum);
+        }
+        if (jn.IsPositive() || jt.IsPositive())
+        {
+            const Fixed ux = vt.IsPositive() ? tx / vt : Fixed::Zero();
+            const Fixed uy = vt.IsPositive() ? ty / vt : Fixed::Zero();
+            const Fixed uz = vt.IsPositive() ? tz / vt : Fixed::Zero();
+            const Fixed px = c.nx * jn - ux * jt, py = c.ny * jn - uy * jt, pz = c.nz * jn - uz * jt;
+            vSx += px * iS; vSy += py * iS; vSz += pz * iS;
+            vOx -= px * iO; vOy -= py * iO; vOz -= pz * iO;
+            // Spend before gaining. Against an anchored body only the free one
+            // moves, and it can only lose (restitution and friction are at
+            // most one). Between two free ones, the one that lost sets its
+            // motion first, and what the other gained leaves that one's heat
+            // and arrives in the other's before its motion is set.
+            if (!iO.IsPositive()) S.SetVelocity(mS, vSx, vSy, vSz);
+            else if (!iS.IsPositive()) O.SetVelocity(mO, vOx, vOy, vOz);
+            else
+            {
+                const Fixed gainS = Fixed::Half() * mS * (vSx * vSx + vSy * vSy + vSz * vSz) - S.KineticEnergy();
+                const Fixed gainO = Fixed::Half() * mO * (vOx * vOx + vOy * vOy + vOz * vOz) - O.KineticEnergy();
+                auto hand = [](OrderVector& giver, Fixed mg, Fixed gx_, Fixed gy_, Fixed gz_,
+                               OrderVector& taker, Fixed mt, Fixed tx_, Fixed ty_, Fixed tz_, Fixed gain) {
+                    giver.SetVelocity(mg, gx_, gy_, gz_);
+                    if (gain.IsPositive()) taker.Absorb(giver.Emit(gain));
+                    taker.SetVelocity(mt, tx_, ty_, tz_);
+                };
+                if (gainS.IsPositive()) hand(O, mO, vOx, vOy, vOz, S, mS, vSx, vSy, vSz, gainS);
+                else                    hand(S, mS, vSx, vSy, vSz, O, mO, vOx, vOy, vOz, gainO);
+            }
+        }
+        // Resting: closing no faster than a landing, the field pressing in.
+        const Fixed after = (vSx - vOx) * c.nx + (vSy - vOy) * c.ny + (vSz - vOz) * c.nz;
+        if (gn.raw < 0 && after < landing && !cS->anchored) kS->SupportUnder(true, c.nx, c.ny, c.nz);
+        if (gn.IsPositive() && after < landing && !cO->anchored && cO->shape == CausalSolid::Sphere)
+            kO->SupportUnder(true, -c.nx, -c.ny, -c.nz);
     }
 
     /*
@@ -621,6 +973,20 @@ private:
     Fixed       m_emissivity = Fixed::Half();
     Fixed       m_space;   // zero: solid, holds nothing by fit (SetSpace)
     Fixed       m_emitted_out;
+    Fixed       m_field_work;   // what the field this space states did (CountFieldWorkUnder)
+    Fixed       m_gx, m_gy, m_gz;   // the stated field (SetGravity), when m_gravity_set
+    bool        m_gravity_set = false;
+    CausalSolid m_solid;        // the step's copy of "solid" (shape Off: not solid)
+    bool        m_anchored = false;   // "anchored"
+    CausalSolid::Shape m_shape = CausalSolid::Off;
+    bool        m_shape_set = false;
+    // The surface this body rested on at the last solid contact (SupportUnder):
+    // transient, re-found by the first contact after a resume.
+    bool        m_resting = false;
+    Fixed       m_snx, m_sny, m_snz;
+    ::std::atomic<bool> m_moving{ false };   // Moving(): written under the lock, read by observers
+    ::std::vector<CausalSolid> m_solids;                      // contactsLocked's per-pass copy
+    ::std::vector<::std::pair<uint32_t, uint32_t>> m_solid_pairs;
     uint64_t    m_ticks = 0;
     ::std::recursive_mutex m_tree_mtx;   // the tree's, when this is its top (TreeMutex)
 
@@ -641,9 +1007,13 @@ private:
      * and the eighteen of the last crossing. Everything CausalHash reads
      * and everything that moves without a verb; the emissivity is a verb's
      * and has its own value (SetEmissivity). Little-endian raw words; the
-     * same bytes on every platform the rows are the same on.
+     * same bytes on every platform the rows are the same on. Version 3 adds
+     * one word, the work this space's field has done (FieldWork), and is
+     * written only when there is some: a space with no field keeps version
+     * 2's bytes and digest.
      */
     static constexpr unsigned char kStateVersion = 2;
+    static constexpr unsigned char kStateVersionField = 3;
     static void putWords(::std::string& out, const OrderVector& o)
     {
         const int64_t w[] = { o.x.raw, o.y.raw, o.z.raw, static_cast<int64_t>(o.id),
@@ -668,11 +1038,13 @@ private:
     {
         ::std::lock_guard<::std::recursive_mutex> lk(TreeMutex());
         refreshIdentityLocked();
-        out.push_back(static_cast<char>(kStateVersion));
+        const bool field = !m_field_work.IsZero();
+        out.push_back(static_cast<char>(field ? kStateVersionField : kStateVersion));
         putWords(out, m_ov);
         ETCS::Entity::putWord(out, static_cast<int64_t>(m_ticks));
         ETCS::Entity::putWord(out, m_emitted_out.raw);
         putWords(out, m_last_emission);
+        if (field) ETCS::Entity::putWord(out, m_field_work.raw);
     }
     // The "Causal" value's digest: what it packs, hashed instead of written
     // -- a reader asking only whether it moved. Under the tree's lock, so a
@@ -683,20 +1055,26 @@ private:
         refreshIdentityLocked();
         uint64_t h = fixed_mix(m_ov.Hash(), static_cast<int64_t>(m_ticks));
         h = fixed_mix(h, m_emitted_out.raw);
-        return fixed_mix(h, static_cast<int64_t>(m_last_emission.Hash()));
+        h = fixed_mix(h, static_cast<int64_t>(m_last_emission.Hash()));
+        return m_field_work.IsZero() ? h : fixed_mix(h, m_field_work.raw);
     }
     bool unpackState(const ::std::string& in)
     {
-        if (in.empty() || static_cast<unsigned char>(in[0]) != kStateVersion) return false;
+        if (in.empty()) return false;
+        const unsigned char version = static_cast<unsigned char>(in[0]);
+        if (version != kStateVersion && version != kStateVersionField) return false;
         size_t at = 1;
         OrderVector rows, last;
-        int64_t ticks = 0, out = 0;
+        int64_t ticks = 0, out = 0, field = 0;
         if (!getWords(in, at, rows) || !ETCS::Entity::getWord(in, at, ticks)
-            || !ETCS::Entity::getWord(in, at, out) || !getWords(in, at, last) || at != in.size()) return false;
+            || !ETCS::Entity::getWord(in, at, out) || !getWords(in, at, last)) return false;
+        if (version == kStateVersionField && !ETCS::Entity::getWord(in, at, field)) return false;
+        if (at != in.size()) return false;
         ::std::lock_guard<::std::recursive_mutex> lk(TreeMutex());
         m_ov            = rows;
         m_ticks         = static_cast<uint64_t>(ticks);
         m_emitted_out   = Fixed::FromRaw(out);
+        m_field_work    = Fixed::FromRaw(field);
         m_last_emission = last;
         m_share_dt = Fixed::Zero(); m_share_k = Fixed::Zero();   // the share cache keys on (dt, k): recompute
         m_id_epoch = 0; m_id_pepoch = 0;                        // the identity is this entity's, not the record's

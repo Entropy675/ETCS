@@ -3,6 +3,7 @@
 
 #include "../core_defs.h"
 #include "OrderVector.h"
+#include "Plane.h"
 
 #include <mutex>
 #include <vector>
@@ -87,6 +88,27 @@
  * write to any rows in a tree is in one total order -- is the invariant;
  * the mutex is one way to have it.
  */
+/*
+ * A SOLID: what a body is when it is not only a reach. Off by default -- a
+ * body is a sphere set that exchanges energy along the line between centres
+ * and passes through what it touches (the contact above). A body made solid
+ * (CausalBase::SetSolid) meets another solid by its shape instead: pushed out
+ * of it, the motion along the contact normal bounced (restitution), the motion
+ * across it rubbed (friction); an anchored one never moves. The shape is a
+ * set of planes (ontology/Plane.h), and a solid meets only solids: what is
+ * not solid passes through it. The shape: a sphere (the reach), a box (six planes
+ * about the centre, row 3 facing it), or a half-space (one plane through the
+ * centre, facing row 3's up; solid below).
+ */
+struct CausalSolid
+{
+    enum Shape : uint8_t { Off = 0, Sphere = 1, Box = 2, HalfSpace = 3 };
+    Shape shape = Off;
+    Fixed hx, hy, hz;              // a box's half extents (the sphere's radius is the reach)
+    Fixed restitution, friction;   // [0,1]: the normal motion kept; the share of the load that rubs
+    bool  anchored = false;        // never moves: holds what lands on it (CausalBase::SetAnchored)
+};
+
 class Causal_ : virtual public ETCS::Entity
 {
 public:
@@ -113,6 +135,11 @@ public:
     // order the step walks them (CausalBase::kidsLocked).
     virtual uint64_t CausalHash() = 0;
 
+    // Was anything in this subtree moving when the last interaction ended?
+    // For an observer deciding whether to look again: a member in flight is
+    // motion the container's own rows do not show. Read without the lock.
+    virtual bool Moving() const = 0;
+
     // ── the environment ─────────────────────────────────────────────────
     //
     // EVERY CAUSAL THING IS AN ENVIRONMENT for what fits in it, and what holds
@@ -136,6 +163,24 @@ public:
     virtual void Basis(Fixed& x, Fixed& y, Fixed& z) = 0;
     // The interior this provides, as a radius about its own position.
     virtual Fixed Space() const = 0;
+
+    // ── the space's parameters ──────────────────────────────────────────
+    //
+    // A CONTAINER STATES WHAT ITS SPACE IS LIKE, and what is inside is subject
+    // to it: the radius above is one parameter (what fits), the field is
+    // another (what everything inside falls along). They are cumulative down
+    // the tree by DEFAULT -- a container that states no field passes on the
+    // one it is in, so the earth's gravity reaches the pen in the pocket --
+    // and only by default: a container may state its own, zero included,
+    // whatever its parent's is, and may provide more room than it takes up in
+    // its parent. A pocket dimension is a parameter, not a contradiction.
+    //
+    // The field this one's members feel, and the container that states it
+    // (null: no field anywhere above). The work it does is counted there.
+    virtual Causal_* FieldUnder(Fixed& gx, Fixed& gy, Fixed& gz) = 0;
+    virtual void CountFieldWorkUnder(Fixed joules) = 0;
+    // What this body is when it touches another solid (CausalSolid).
+    virtual CausalSolid Solid() = 0;
     // The closeness check: this environment's members whose reach comes
     // within `r` of a point of its frame, in canonical order.
     virtual void Near(Fixed x, Fixed y, Fixed z, Fixed r, ::std::vector<Causal_*>& out) = 0;
@@ -163,6 +208,12 @@ public:
     // Row 0's position, set from under the lock: a move's restatement in the
     // new frame (Contain).
     virtual void PlaceUnder(Fixed x, Fixed y, Fixed z) = 0;
+    // A solid contact, from under the container's lock: the rows to move and
+    // the mass that reads them, and the surface this body rests on after it
+    // (a resting body feels only the field's part along that surface).
+    virtual OrderVector& RowsUnder() = 0;
+    virtual Fixed MassUnder() = 0;
+    virtual void SupportUnder(bool resting, Fixed nx, Fixed ny, Fixed nz) = 0;
 };
 
 #endif // SUPERTYPE_CAUSAL_H__

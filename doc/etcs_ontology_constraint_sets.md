@@ -256,6 +256,20 @@ optional: the device path (`RenderProvider/OS/DeviceFrame.h`) is the same
 rows handed to a GPU as a matrix per node, and choosing not to render costs
 the physics nothing.
 
+The containment itself carries constraints, and they run the same way the
+lineage's do: cumulative by default, down the parent/child relation. A
+Causal container states what its space is like -- how much room it provides
+(`SetSpace`, what fits), what field everything inside falls along
+(`SetGravity`) -- and a member is subject to the space it is in. A container
+that states no field passes on the one it is in, so the earth's gravity
+reaches the pen in a pocket without the pocket saying so. But a statement is
+a parameter, not a law of the containment: a sub-container may state its own
+field (zero included) whatever its parent's, and may provide more room inside
+than it occupies outside -- a pocket dimension, only referentially inside its
+parent's scope. The defaults are what make a world of nested places behave
+like one; the escape is that any place can say otherwise
+(`ontology/etcs_causal_constraints.md` §11-§13).
+
 ---
 
 ## 6. Summary of the constraint model

@@ -7,8 +7,9 @@ purpose needs -- while its line here keeps passing. Companion to
 `etcs_ontology_constraint_sets.md`, which says what a family IS; this says
 what this one PROMISES.*
 
-Checked by `loaders/OrderVectorTesterLoader.cc` (the rows alone) and
-`loaders/CausalTesterLoader.cc` (a tree of bodies). A constraint with no line
+Checked by `loaders/OrderVectorTesterLoader.cc` (the rows alone),
+`loaders/CausalTesterLoader.cc` (a tree of bodies) and
+`loaders/SolidTesterLoader.cc` (planes, fields, solids). A constraint with no line
 in either is not a constraint yet; it is a sentence.
 
 ---
@@ -59,7 +60,9 @@ order on every read.
 **Constraint.** Over any sequence of interactions, the energy held by every
 body in a tree plus what left at the open boundary (`EmittedOut`) equals what
 `Impulse` put in, to the bit. A crossing is one number leaving one body and
-landing in another: `Absorb(crossing)` adds exactly `crossing.energy`.
+landing in another: `Absorb(crossing)` adds exactly `crossing.energy`. A
+field's work is the one other way in (§12): it is counted where the field is
+stated (`FieldWork`), and the ledger is held less it.
 
 **Check.** `CausalTester` §1 (2000 interactions over two containers, three
 bodies, contacts included); `OrderVectorTester` §4b (a contact pair, before
@@ -68,7 +71,8 @@ and after, equal to the bit).
 ## 4. The arrow of time
 
 **Constraint.** The ordered energy of a tree -- Σ|K| over its bodies -- never
-rises except through `Impulse`. Drag, emission, absorption and contact each
+rises except through work done from outside: `Impulse`, or a field's
+`Accelerate` (§12). Drag, emission, absorption and contact each
 either hold it or lower it. Per body: `Dissipate` lowers |K|, `Emit` and
 `Advance` hold it, a contact lowers the emitter's by at least what it can
 raise the absorber's.
@@ -213,6 +217,74 @@ recorded action; the last move kept; a parent deleted without its children
 hands a movable one up, its token with it). A persistence round trip of a
 scene with a move comes back as it was.
 
+## 12. A space has parameters, and what is inside is subject to them
+
+**Constraint.** A container states what its space is like, and its members
+are subject to it. The radius of §11 is one parameter (what fits); the field
+is another (`SetGravity`, the value behind "gravity"): every Causal member
+feels the field of the nearest container that states one. Cumulative down the
+tree by default -- a container that states nothing passes on the field it is
+in -- and only by default: a container may state its own, zero included,
+whatever its parent's is (`InheritGravity` takes the statement back), and
+may provide more room than it takes up in its parent. A field changes a
+member's velocity by `g·dt` before its step (`OrderVector::Accelerate`), and
+E moves by exactly the kinetic change; the work, signed, is counted on the
+container that states the field, so §3 holds with it. An anchored body
+(`SetAnchored`) is held where it is: the field moves it not, and motion
+handed to it becomes heat. A container that is not anchored is a thing and
+falls in its own container's field carrying its members.
+
+**Check.** `SolidTester` §2 (a room that states nothing passes the world's
+field in; a pocket stating zero holds its member still; taken back, it
+inherits; a body thrown up and falling back; the ledger each time).
+
+## 13. Solids meet by their shape, through planes
+
+**Constraint.** A plane (`ontology/Plane.h`) is a unit normal and an offset in
+the rows' own integers: a side for a point or a reach, a split for a set
+(`Bisect`), a crossing for a ray, the faces of a solid. A body made solid
+(`SetSolid(restitution, friction)`, the value behind "solid"; `SetShape`:
+sphere, box, half-space) meets another solid by shape instead of by
+transmission (§8), and meets nothing else -- a body that is not solid passes
+through it, so the two contact models never meet in one pair: a sphere against a sphere, a box (six planes about its
+centre, row 3 facing them) or a half-space (one plane through its centre,
+facing row 3's up). Each pair, after the pass's transmissions, from the pairs
+the gate found on the rows the pass started with -- so the kd path and the
+pair-by-pair path meet the same pairs in the same order (a half-space has no
+reach and meets every solid):
+
+- **apart**: the sphere is pushed out along the normal by how deep it is
+  (both, by inverse mass, when neither is anchored) -- positions move here
+  and only here;
+- **bounce**: the closing motion along the normal is turned back times the
+  restitution -- of the approach less one step of the field, since the push
+  out undoes that step -- and a bounce smaller than two steps of the field is
+  a landing;
+- **rub**: the motion across the normal loses friction times the load (the
+  bounce's impulse, plus what the field presses a resting body in with),
+  never more than stops it.
+
+Motion lost is heat in the body that lost it (`SetVelocity` holds E); motion
+one free body hands another leaves the giver's heat and arrives in the taker's
+first, so §3 holds and §4's arrow holds. A body left closing slower than a
+landing with the field pressing it in rests on the other until the next pass
+(`SupportUnder`): the field's part into that surface is not applied, so a
+resting body is still and stays so, and a body on a slope feels only the part
+along it.
+
+A body brought to rest has no kinetic energy, so the interaction that rests
+it ends with nothing under the container `Moving()`: that is what an observer
+asks before looking again (Scene3D draws a ball in flight on a still green,
+and stops drawing when it settles).
+
+**Check.** `SolidTester` §1 (planes), §3 (a drop: each apex lower, then at
+rest on the surface and held there), §4 (a roll stops near v²/2μg; without
+friction it does not; `Moving` while it rolls, not after), §5 (a slope), §6 (two free balls exchange velocities),
+§7 (a half-space far from its centre), §8 (a crowd of 60: the same rows pair
+by pair, through the kd-tree, and twice; the ledger), §9 (a ball rolled at a
+gap in an anchored green drops into a cup -- a container with its own space
+and floor -- is taken in by fit and rests on the cup's floor).
+
 ---
 
 ## Not promised (yet)
@@ -224,11 +296,17 @@ scene with a move comes back as it was.
 - **Moves between modules.** A thing moves only under parents of its own
   module (its bytes and token live in that module's arenas).
 
-- **Restitution.** A contact is transmission: the energy along the line goes
-  to the other body entirely. A coefficient of restitution is a parameter on
-  that one operation, not written.
-- **Separation.** Two overlapping members at rest stay overlapping; nothing
-  pushes them apart. Penetration is not resolved.
+- **Restitution and separation between bodies that are not solid.** A
+  contact between bodies that are not both solid is transmission: the energy
+  along the line goes to the other body entirely, and overlapping members
+  stay overlapping. Both are §13's, for solids.
+- **A box against a box.** Solids meet when one of them is a sphere; two
+  boxes (or a box and a half-space) pass through each other.
+- **Free fall as a frame.** A container that falls carries its members, and
+  they feel the field in its frame as well -- twice the fall. A place is
+  anchored; the equivalence of a falling frame is not modelled.
+- **Rest across a resume.** The surface a body rests on is not kept; the first
+  contact after a resume finds it again (one step of the field, landed).
 - **Angular rate.** Row 3 is a facing; the share of E that is rotational is
   not carried, so contacts transfer no spin and `Reduce` does not sum orbital
   motion.
@@ -238,6 +316,7 @@ scene with a move comes back as it was.
 - **Reach of a container on the driver path.** A member's reach is set where
   it is made (Scene3D: at `Create`); a container's reach over its members is
   recomputed on the observed path (`coverRows`) and not by the driver.
-- **Mass in contact.** Transmission hands over energy, not momentum; unequal
-  masses exchange energy as if equal. Honest, conservative, and not Newtonian
-  in the second body's speed.
+- **Mass in transmission.** Transmission hands over energy, not momentum;
+  unequal masses exchange energy as if equal. Honest, conservative, and not
+  Newtonian in the second body's speed. A solid contact (§13) is Newtonian:
+  impulses by inverse mass.

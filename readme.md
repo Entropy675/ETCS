@@ -101,8 +101,9 @@ one (the Causal rows) is bound and read on demand. The STATE hash
 what a resume, a reflection and a signature compare. The Persistence tag
 (DatabaseProvider) keeps a scene as its compacted script plus its values, and
 `etcs --resume` brings it back and checks it by that number.
-`bin/Run_HashTesterLoader`, `Run_ProvenanceTesterLoader` and
-`Run_CausalTesterLoader` are the proofs.
+`bin/Run_HashTesterLoader`, `Run_ProvenanceTesterLoader`,
+`Run_CausalTesterLoader` and `Run_SolidTesterLoader` (fields, solids, planes)
+are the proofs.
 
 TODO:
 - Identity system / binary signage (over the state hash)
