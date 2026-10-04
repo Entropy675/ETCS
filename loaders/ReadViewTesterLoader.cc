@@ -314,6 +314,37 @@ int main()
         sib.clear();
         check(!root->collectSiblingOrder(root->getRID(), sib) && sib.empty(), "...and an entity not under it has none");
 
+        // A list long enough to be repaired rather than sorted: keys moved one
+        // at a time and in bursts, each read against the model.
+        {
+            A* big = arena.allocate<A>();
+            std::vector<O*> bo;
+            uint64_t st = 0x9e3779b97f4a7c15ull;
+            auto next = [&st]() { st ^= st << 13; st ^= st >> 7; st ^= st << 17; return st; };
+            for (int i = 0; i < 200; ++i) { O* o = big->addTag<O>(); setKey(o, static_cast<int>(next() % 40)); bo.push_back(o); }
+            auto model = [&]() {
+                std::vector<O*> m(bo);
+                std::stable_sort(m.begin(), m.end(), [](O* a, O* b) { return a->key() < b->key(); });
+                std::vector<ETCS::RID> out;
+                for (O* o : m) out.push_back(o->getRID());
+                return out;
+            };
+            auto got = [&]() {
+                Refs r; big->getOrderedTypedChildRefs(r);
+                std::vector<ETCS::RID> out;
+                for (auto& x : r) out.push_back(x.second);
+                return out;
+            };
+            bool all = got() == model();
+            for (int i = 0; i < 300 && all; ++i)
+            {
+                const int burst = i % 10 == 0 ? 20 : 1 + static_cast<int>(next() % 3);   // 20: past the marks kept
+                for (int b = 0; b < burst; ++b) setKey(bo[next() % bo.size()], static_cast<int>(next() % 40));
+                all = got() == model();
+            }
+            check(all, "200 members, 300 rounds of keys moved (1-3, and 20 at once): every read is the full sort's order");
+            del(big);
+        }
         // Readers while a writer moves keys and changes membership.
         std::atomic<bool> stop{ false };
         std::atomic<long> reads{ 0 }, torn{ 0 };

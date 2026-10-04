@@ -434,8 +434,9 @@ private:
  * order (every flag on an orderable child), so it is ordered when read, never
  * when marked. A mark (a member in or out, a key moved) moves order_gen_; a
  * reader whose view is stamped with the current generation reads it without
- * the lock, and one whose view is older takes the lock, sorts again the lists
- * that changed (RIDList::collect_ordered) and publishes for the rest.
+ * the lock, and one whose view is older takes the lock, puts the moved members
+ * back in place (RIDList::repair; a full sort when membership changed or the
+ * rest is not in order) and publishes for the rest.
  *
  * WHAT STAYS UNDER THE LOCK: the sort that rebuilds the ordered view, the
  * in-flight scopes (scope_), and every writer. interface_pointers_ and
@@ -734,14 +735,22 @@ private:
             order_marks_.n = 0;
             order_marks_.overflow = false;
         }
-        // Each list with a key moved sorts again; the rest keep their order.
+        // Each list with keys moved puts those members back in place (or, when
+        // that cannot be trusted, sorts again: RIDList::repair).
         if (marks.overflow) { for (auto& entry : typed_children_) entry.second.invoke_reorder(); }
         else
+        {
+            RID moved[OrderMarks::kMax];
             for (uint32_t i = 0; i < marks.n; ++i)
             {
+                if (!marks.tag[i]) continue;
+                uint32_t k = 0;
+                for (uint32_t j = i; j < marks.n; ++j)
+                    if (marks.tag[j] == marks.tag[i]) { moved[k++] = marks.rid[j]; if (j != i) marks.tag[j] = nullptr; }
                 auto it = typed_children_.find(*marks.tag[i]);
-                if (it != typed_children_.end()) it->second.invoke_reorder();
+                if (it != typed_children_.end()) it->second.invoke_repair(moved, k);
             }
+        }
         ::std::vector<RID> rids;
         ::std::vector<OrderedView::Group> groups;
         bool settled = true;
@@ -1790,7 +1799,7 @@ public:
  * child, from that child's ordering thread, and used to wait out whatever sort
  * a reader of the parent was in the middle of. Now it notes which child moved
  * in which list (through the child view) and moves the generation; the next
- * ordered read sorts that list again.
+ * ordered read puts that child back in place.
  */
     void reorderTypedChild(RID rid)
     {

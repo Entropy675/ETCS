@@ -162,6 +162,8 @@ struct RIDListHandle {
     // commit is waiting to be done again (collect_ordered). A copy of the order
     // taken then must not be kept as if it were settled.
     bool (*ordered_current)(void* self) = nullptr;
+    // Members whose keys moved, put back in place. See RIDList::repair.
+    void (*repair)(void* self, const RID* moved, size_t k) = nullptr;
     size_t  invoke_count()    const { return count(self);             }
     bool    invoke_contains(RID r) const { return contains(self, r);       }
     bool    invoke_remove(RID r)   const { return remove(self, r);         }
@@ -170,6 +172,7 @@ struct RIDListHandle {
     void    invoke_collect_rids_ordered(::std::vector<RID>& out) const { return collect_rids_ordered(self, out); }
     void    invoke_reorder() const { reorder(self); }
     bool    invoke_ordered_current() const { return ordered_current(self); }
+    void    invoke_repair(const RID* moved, size_t k) const { repair(self, moved, k); }
     void    invoke_insert(RID r, Entity* e) const { insert(self, r, e); }
     void    invoke_insert_iface(RID r, void* iface) const { insert_iface(self, r, iface); }
     void*   invoke_get_iface(RID r)        const { return get_iface(self, r);   }
@@ -391,6 +394,53 @@ public:
         }
     }
     /*
+ * A FEW KEYS MOVED: PUT THEM BACK, DON'T SORT. A key moving among siblings is
+ * the common change (a flag on one child of many), and a full sort reads n log n
+ * keys to place one. Here the moved members come out, the rest are checked to
+ * still be in order (n - 1 comparisons), and each moved one goes back where the
+ * full sort would put it: after everything it does not precede, ties broken by
+ * arrival, the order a stable sort from arrival order leaves.
+ *
+ * TRUSTED ONLY WHEN THE REST IS IN ORDER. A key whose write has landed but
+ * whose mark has not (it is on its way) leaves the rest out of order, and a
+ * placement searched past it could land wrong -- so the check fails, and the
+ * list is marked for a full sort instead. A key that moves during the
+ * placement marks the list after it, and that next repair's check catches any
+ * member this one placed wrong. Small lists just sort: there is nothing to win.
+ */
+    void repair(const RID* moved, size_t k) const {
+        if constexpr (detail::has_ordered_pointee_v<T>) {
+            constexpr size_t kSmall = 32;
+            if (ordered_stale_ || entities.size() < kSmall) { ordered_stale_ = true; return; }
+            ::std::vector<RID> mv;
+            for (size_t i = 0; i < k; ++i)
+                if (entities.count(moved[i]) && ::std::find(mv.begin(), mv.end(), moved[i]) == mv.end())
+                    mv.push_back(moved[i]);
+            ordered_.erase(::std::remove_if(ordered_.begin(), ordered_.end(), [&mv](RID r) {
+                return ::std::find(mv.begin(), mv.end(), r) != mv.end(); }), ordered_.end());
+            auto less = [this](RID a, RID b) {
+                T ea = get_typed(a);
+                T eb = get_typed(b);
+                if (!ea || !eb) return ea != nullptr ? false : eb != nullptr;
+                return *ea < *eb;
+            };
+            for (size_t i = 1; i < ordered_.size(); ++i)
+                if (less(ordered_[i], ordered_[i - 1])) { ordered_stale_ = true; return; }
+            auto arrival = [this](RID r) { auto s = slot_.find(r); return s != slot_.end() ? s->second : static_cast<size_t>(-1); };
+            for (RID r : mv) {
+                const size_t ar = arrival(r);
+                auto at = ::std::partition_point(ordered_.begin(), ordered_.end(), [&](RID x) {
+                    if (less(x, r)) return true;
+                    if (less(r, x)) return false;
+                    return arrival(x) < ar;
+                });
+                ordered_.insert(at, r);
+            }
+        } else {
+            (void)moved; (void)k;
+        }
+    }
+    /*
  * EQUAL RANGE, NOT A FIND, and that is forced by what the relation means.
  *
  * Orderable derives == from < , so equality here is EQUIVALENCE -- "neither
@@ -513,6 +563,9 @@ public:
             };
             h.reorder = [](void* self) {
                 static_cast<RIDList<T>*>(self)->reorder();
+            };
+            h.repair = [](void* self, const RID* moved, size_t k) {
+                static_cast<RIDList<T>*>(self)->repair(moved, k);
             };
             h.ordered_current = [](void* self) {
                 if constexpr (detail::has_ordered_pointee_v<T>) return !static_cast<RIDList<T>*>(self)->ordered_stale_;

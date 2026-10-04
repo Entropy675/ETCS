@@ -418,7 +418,8 @@ moved key (`reorderTypedChild`, on every state change of an orderable child)
 is noted under a small lock of its own and moves the entity's order
 generation; it never waits on a sort. A reader whose view carries the current
 generation reads it without the lock; one whose view is older takes the tag
-mutex, sorts again the lists that changed and publishes for the rest. Still under the
+mutex, puts the moved children back in place (`RIDList::repair`, or a full
+sort when that cannot be trusted) and publishes for the rest. Still under the
 tag mutex: that rebuild, the in-flight scopes, and every writer.
 
 The `Ack` mechanism (`DLInEvent::reply_to`, `sendAckIfNeeded`) provides
