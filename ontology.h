@@ -13,6 +13,10 @@
 // leaf of ANY family will state itself in, the way Point2D/Rect2D already are
 // for the flat one.
 #include "ontology/OrderVector.h"
+// The one flat thing (a unit normal and an offset, in the same integers):
+// what cuts space in two -- a side for a point or a reach, a split for a set,
+// a crossing for a ray, the faces of a solid.
+#include "ontology/Plane.h"
 
 // !! ALERT, whenever you add a new Base, you must include it here for it to be visible to other types.
 // If you do not, you will get an error: expected template-name before ‘<’ token

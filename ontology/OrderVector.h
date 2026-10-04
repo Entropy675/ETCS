@@ -50,9 +50,10 @@
 // and nothing had to be subtracted from anywhere. The accounting is the
 // representation.
 //
-// THE ARROW OF TIME IS STRUCTURAL: |K| never rises except through Impulse.
-// Dissipate lowers it, Emit and Advance hold it, Impulse -- work done on the
-// point from outside -- is the only operation here that adds to it. Ordered
+// THE ARROW OF TIME IS STRUCTURAL: |K| never rises except through work done
+// from outside -- Impulse, or a field's Accelerate. Dissipate lowers it, Emit
+// and Advance hold it, and a contact's SetVelocity can only spend what is
+// already there. Ordered
 // energy decays into unordered and never the other way, which is the second
 // law as a property of the operation set. (Emit raises |O| while holding |K|,
 // and that is not a counterexample: heat leaving shrinks the total, so the
@@ -197,6 +198,50 @@ struct OrderVector
         kz += (dz / m) * joules;
         energy += joules;
         setKinetic(kx, ky, kz);
+    }
+
+    /*
+     * A FIELD'S WORK: the velocity changes by a*dt (a gravity, a slope's pull)
+     * and E moves by exactly what the kinetic energy did -- up when the field
+     * speeds the body, down when the body climbs against it. Returned, signed:
+     * the energy the field put in, which its source counts
+     * (CausalBase::CountFieldWorkUnder) so the ledger stays exact. Beside
+     * Impulse, the other way work is done from outside; the one that can also
+     * take it back out.
+     */
+    Fixed Accelerate(Fixed ax, Fixed ay, Fixed az, Fixed dt, Fixed mass)
+    {
+        if (!dt.IsPositive() || !mass.IsPositive()) return Fixed::Zero();
+        Fixed vx, vy, vz;
+        Velocity(mass, vx, vy, vz);
+        const Fixed before = KineticEnergy();
+        vx += ax * dt; vy += ay * dt; vz += az * dt;
+        const Fixed v = Fixed::Length(vx, vy, vz);
+        const Fixed after = Fixed::Half() * mass * v * v;
+        Fixed work = after - before;
+        if ((energy + work).raw < 0) work = -energy;   // cannot give back more than it holds
+        energy += work;
+        if (!v.IsPositive() || !after.IsPositive()) { Rest(); return work; }
+        const Fixed ke = Fixed::Min(after, energy);
+        setKinetic((vx / v) * ke, (vy / v) * ke, (vz / v) * ke);
+        return work;
+    }
+
+    /*
+     * THE MOTION OUTRIGHT, as a velocity: K is set to 1/2 m |v|^2 along v and E
+     * is left alone, so a motion that lost speed (a bounce, a rub) put the
+     * difference into heat by construction. A motion that GAINS must have its
+     * energy arrive first (Absorb, as heat) -- capped at E here, so the row
+     * holds whatever the caller did. Returns the kinetic change.
+     */
+    Fixed SetVelocity(Fixed mass, Fixed vx, Fixed vy, Fixed vz)
+    {
+        const Fixed before = KineticEnergy();
+        const Fixed v = Fixed::Length(vx, vy, vz);
+        if (!mass.IsPositive() || !v.IsPositive()) { Rest(); return -before; }
+        const Fixed ke = Fixed::Min(Fixed::Half() * mass * v * v, energy);
+        setKinetic((vx / v) * ke, (vy / v) * ke, (vz / v) * ke);
+        return ke - before;
     }
 
     // Scale the kinetic share by `factor` in [0,1) and leave E alone: drag,
@@ -375,6 +420,21 @@ struct OrderVector
         renormalise();
     }
 
+    // The orientation outright, so that this frame's up (+y) points along d:
+    // the shortest turn from +y to d, built as a spinor from the two
+    // directions with no angle in it (half-way vector), and a half turn about
+    // x when d is straight down. A zero d leaves the facing as it was.
+    void Aim(Fixed dx, Fixed dy, Fixed dz)
+    {
+        const Fixed l = Fixed::Length(dx, dy, dz);
+        if (!l.IsPositive()) return;
+        const Fixed ux = dx / l, uy = dy / l, uz = dz / l;
+        const Fixed w = Fixed::One() + uy;               // 1 + (+y . d)
+        if (w.raw <= (Fixed::ONE >> 20)) { qx = Fixed::One(); qy = qz = qw = Fixed::Zero(); return; }
+        qx = uz; qy = Fixed::Zero(); qz = -ux; qw = w;   // (+y x d, 1 + +y . d)
+        renormalise();
+    }
+
     // Compose a delta rotation on the LEFT -- R_new = R_delta * R_current --
     // so a movement means "turn from where you are now" rather than in the
     // local frame, which is the difference between a look control that
@@ -403,6 +463,17 @@ struct OrderVector
         const Fixed ry = vy + qw * ty + (qz * tx - qx * tz);
         const Fixed rz = vz + qw * tz + (qx * ty - qy * tx);
         vx = rx; vy = ry; vz = rz;
+    }
+
+    // The inverse: a direction of the frame this vector faces in, back into
+    // its own (the conjugate spinor). What a solid asks to meet a point in
+    // its own frame (CausalBase's solid contact).
+    void UnrotateVector(Fixed& vx, Fixed& vy, Fixed& vz) const
+    {
+        if (!Oriented()) return;
+        OrderVector c;
+        c.qx = -qx; c.qy = -qy; c.qz = -qz; c.qw = qw;
+        c.RotateVector(vx, vy, vz);
     }
 
     // Rotate a point of this vector's frame about its own pivot -- what row 2
