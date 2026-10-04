@@ -18,6 +18,12 @@
  *      groups contiguous), and once the writer stops the readers agree with a
  *      fresh read. Run it under ASAN (ace make loader ReadViewTesterLoader
  *      ASAN=1) and a view freed under a reader is a report, not a guess.
+ *   4. The ordered view: each tag's own order (an orderable type sorted by its
+ *      key, stable by arrival; a plain type by arrival), resorted after a key
+ *      moves or a member comes or goes; the sibling order of one child; and
+ *      readers on other threads reading it while a writer moves keys, adds
+ *      and deletes -- whole groups, no RID twice, and the settled order once
+ *      the writer stops.
  *
  *   ./Run_ReadViewTesterLoader
  */
@@ -46,6 +52,16 @@ static void check(bool ok, const char* what)
 
 class A : public DeletableBase<A> { public: WIRE_TYPE_IDENTITY(A) bool DeleteConcrete() override { return true; } };
 class B : public DeletableBase<B> { public: WIRE_TYPE_IDENTITY(B) bool DeleteConcrete() override { return true; } };
+// Ordered by a stored value: a key set through the funnel moves it among its
+// siblings (Entity::markStateChange marks the parent's order).
+class O : public DeletableBase<O>, public OrderableBase<O>
+{
+public:
+    WIRE_TYPE_IDENTITY(O)
+    bool DeleteConcrete() override { return true; }
+    int key() const { std::string v; return valueOf(ETCS::Buffer("k"), v) ? std::atoi(v.c_str()) : 0; }
+    bool operator<(const O& o) const { return key() < o.key(); }
+};
 class M : public DeletableBase<M>
 {
 public:
@@ -251,6 +267,83 @@ int main()
         moved = lr.size() + rr.size();
         check(got == want && moved == movers.size(), "after the writer stops, a fresh read is exactly what is live");
         std::printf("        (%d writes, %ld reads on two threads)\n", writes, reads.load());
+        del(root);
+    }
+
+    // -- 4. the ordered view --------------------------------------------------
+    {
+        std::cout << "\n-- 4. the ordered view --\n";
+        A* root = arena.allocate<A>();
+        std::vector<O*> os;
+        std::vector<ETCS::RID> plain;
+        auto setKey = [](O* o, int k) { o->addTag(ETCS::Buffer("k"), std::to_string(k)); };
+        const int keys[] = { 5, 1, 3, 1, 4 };
+        for (int k : keys) { O* o = root->addTag<O>(); setKey(o, k); os.push_back(o); }
+        for (int i = 0; i < 3; ++i) plain.push_back(root->addTag<A>()->getRID());
+        // The model: O's group sorted by key, ties by arrival; A's by arrival.
+        auto expect = [&]() {
+            std::vector<O*> s(os);
+            std::stable_sort(s.begin(), s.end(), [](O* a, O* b) { return a->key() < b->key(); });
+            std::vector<ETCS::RID> out;
+            for (O* o : s) out.push_back(o->getRID());
+            out.insert(out.end(), plain.begin(), plain.end());
+            return out;
+        };
+        auto read = [&]() {
+            std::vector<std::pair<ETCS::Buffer, ETCS::RID>> kids;
+            root->getOrderedTypedChildren(kids);
+            std::vector<ETCS::RID> out;
+            for (auto& k : kids) out.push_back(k.second);
+            return out;
+        };
+        check(read() == expect(), "each tag in its own order: by key (ties by arrival), then the plain tag by arrival");
+        Refs refs; root->getOrderedTypedChildRefs(refs);
+        bool same = refs.size() == read().size();
+        for (size_t i = 0; same && i < refs.size(); ++i) same = refs[i].second == read()[i] && root->getTypedChild(*refs[i].first, refs[i].second);
+        check(same, "the refs form is the same order, under tags that resolve");
+        setKey(os[0], 0);
+        check(read() == expect(), "a key moved: the next read is resorted");
+        setKey(os[1], 9); setKey(os[2], 2); setKey(os[1], 7);
+        check(read() == expect(), "a burst of keys, one read: the state at the read");
+        O* late = root->addTag<O>(); setKey(late, 2); os.push_back(late);
+        del(os[3]); os.erase(os.begin() + 3);
+        check(read() == expect(), "a member in and a member out");
+        std::vector<ETCS::RID> sib, want;
+        for (ETCS::RID r : expect()) if (std::find(plain.begin(), plain.end(), r) == plain.end()) want.push_back(r);
+        check(root->collectSiblingOrder(os[2]->getRID(), sib) && sib == want, "a child's sibling order is its own tag's");
+        sib.clear();
+        check(!root->collectSiblingOrder(root->getRID(), sib) && sib.empty(), "...and an entity not under it has none");
+
+        // Readers while a writer moves keys and changes membership.
+        std::atomic<bool> stop{ false };
+        std::atomic<long> reads{ 0 }, torn{ 0 };
+        auto reader = [&]() {
+            Refs r; std::vector<ETCS::RID> s;
+            while (!stop.load(std::memory_order_acquire))
+            {
+                r.clear(); root->getOrderedTypedChildRefs(r);
+                if (!coherent(r)) torn.fetch_add(1);
+                s.clear(); if (!r.empty()) root->collectSiblingOrder(r.front().second, s);
+                reads.fetch_add(1, std::memory_order_relaxed);
+            }
+        };
+        std::thread r1(reader), r2(reader);
+        uint64_t st = 0x2545f4914f6cdd1dull;
+        auto next = [&st]() { st ^= st << 13; st ^= st >> 7; st ^= st << 17; return st; };
+        for (int i = 0; i < 2000; ++i)
+        {
+            switch (next() % 4)
+            {
+                case 0: case 1: setKey(os[next() % os.size()], static_cast<int>(next() % 50)); break;
+                case 2: { O* o = root->addTag<O>(); setKey(o, static_cast<int>(next() % 50)); os.push_back(o); } break;
+                case 3: if (os.size() > 4) { size_t k = next() % os.size(); del(os[k]); os.erase(os.begin() + k); } break;
+            }
+        }
+        stop.store(true, std::memory_order_release);
+        r1.join(); r2.join();
+        check(torn.load() == 0 && reads.load() > 0, "every ordered read was whole groups, no RID twice");
+        check(read() == expect(), "after the writer stops, the read is the settled order");
+        std::printf("        (2000 writes, %ld ordered reads on two threads)\n", reads.load());
         del(root);
     }
 

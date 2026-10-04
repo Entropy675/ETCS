@@ -429,8 +429,15 @@ private:
  * writer or another reader touches. Each view is one malloc block of plain data,
  * so freeing it runs no code.
  *
- * WHAT STAYS UNDER THE LOCK: the ordered child views (a list sorts itself on
- * read: getOrderedTypedChildren, collectSiblingOrder, reorderTypedChild), the
+ * THE ORDERED VIEW is the one built by a reader: an order is a sort over the
+ * children's live keys, and keys move far more often than anyone reads the
+ * order (every flag on an orderable child), so it is ordered when read, never
+ * when marked. A mark (a member in or out, a key moved) moves order_gen_; a
+ * reader whose view is stamped with the current generation reads it without
+ * the lock, and one whose view is older takes the lock, sorts again the lists
+ * that changed (RIDList::collect_ordered) and publishes for the rest.
+ *
+ * WHAT STAYS UNDER THE LOCK: the sort that rebuilds the ordered view, the
  * in-flight scopes (scope_), and every writer. interface_pointers_ and
  * bindings_ need neither: they are written in the constructor, before anyone
  * else can see this entity, and never again.
@@ -502,8 +509,37 @@ private:
             return nullptr;
         }
     };
+    // Each tag's children in that tag's own order (RIDList::collect_ordered),
+    // tags in first-attachment order; `gen` is the order_gen_ it was sorted
+    // at, 0 when the sort straddled a commit and must be done again.
+    struct OrderedView
+    {
+        struct Group { const ETCS::Buffer* tag; uint32_t begin, end; };
+        uint64_t gen = 0;
+        uint32_t n = 0, ngroups = 0;
+        const Group* groups() const { return reinterpret_cast<const Group*>(this + 1); }
+        const RID*   rids()   const { return reinterpret_cast<const RID*>(groups() + ngroups); }
+    };
     mutable ::std::atomic<const SurfaceView*> surface_view_{ nullptr };
     ::std::atomic<const ChildView*>           child_view_{ nullptr };
+    mutable ::std::atomic<const OrderedView*> ordered_view_{ nullptr };
+    // The keys that moved since the last rebuild, which it acts on: which
+    // child, in which list. order_gen_ moves on every mark. A mark is written
+    // before the generation moves and the rebuild reads the generation before
+    // it takes the marks, so a mark is either in a rebuild or makes the next
+    // one happen. Their own small lock, never the tag mutex: a mark must not
+    // wait out a sort.
+    struct OrderMarks
+    {
+        static constexpr uint32_t kMax = 16;   // past this, every list sorts again
+        const ETCS::Buffer* tag[kMax];
+        RID      rid[kMax];
+        uint32_t n = 0;
+        bool     overflow = false;
+    };
+    mutable ::std::atomic<uint64_t> order_gen_{ 1 };
+    mutable ::std::mutex            order_marks_mu_;
+    mutable OrderMarks              order_marks_;
 
     // ── the writers' half: build, publish, retire. All under m_tagMutex. ──
 
@@ -677,6 +713,66 @@ private:
     void publishChildrenLocked(const ChildView* v)
     {
         ETCS::Reclaimer::getInstance().retire(const_cast<ChildView*>(child_view_.exchange(v, ::std::memory_order_acq_rel)));
+        order_gen_.fetch_add(1, ::std::memory_order_acq_rel);   // a member in or out: the list marked itself
+    }
+    /*
+     * The ordered view as of now, under m_tagMutex: the published one if no mark
+     * came since it was sorted (another reader got here first), else sorted
+     * again and published. The generation is read BEFORE the marks are taken,
+     * so a mark landing during the sort leaves the new view a generation behind
+     * and the next read sorts once more.
+     */
+    const OrderedView* orderedViewLocked() const
+    {
+        const uint64_t g = order_gen_.load(::std::memory_order_acquire);
+        const OrderedView* cur = ordered_view_.load(::std::memory_order_relaxed);
+        if (cur && cur->gen == g) return cur;
+        OrderMarks marks;
+        {
+            ::std::lock_guard<::std::mutex> ml(order_marks_mu_);
+            marks = order_marks_;
+            order_marks_.n = 0;
+            order_marks_.overflow = false;
+        }
+        // Each list with a key moved sorts again; the rest keep their order.
+        if (marks.overflow) { for (auto& entry : typed_children_) entry.second.invoke_reorder(); }
+        else
+            for (uint32_t i = 0; i < marks.n; ++i)
+            {
+                auto it = typed_children_.find(*marks.tag[i]);
+                if (it != typed_children_.end()) it->second.invoke_reorder();
+            }
+        ::std::vector<RID> rids;
+        ::std::vector<OrderedView::Group> groups;
+        bool settled = true;
+        for (const ETCS::Buffer& t : typed_child_order_)
+        {
+            auto it = typed_children_.find(t);
+            if (it == typed_children_.end()) continue;
+            const uint32_t begin = static_cast<uint32_t>(rids.size());
+            it->second.invoke_collect_rids_ordered(rids);
+            settled &= it->second.invoke_ordered_current();
+            if (rids.size() > begin) groups.push_back({ &it->first, begin, static_cast<uint32_t>(rids.size()) });
+        }
+        void* blk = ETCS::Reclaimer::getInstance().allocate(sizeof(OrderedView) + groups.size() * sizeof(OrderedView::Group)
+                                                            + rids.size() * sizeof(RID));
+        OrderedView* v = new (blk) OrderedView;
+        v->gen = settled ? g : 0;
+        v->n = static_cast<uint32_t>(rids.size());
+        v->ngroups = static_cast<uint32_t>(groups.size());
+        if (!groups.empty()) ::std::memcpy(const_cast<OrderedView::Group*>(v->groups()), groups.data(), groups.size() * sizeof(OrderedView::Group));
+        if (!rids.empty())   ::std::memcpy(const_cast<RID*>(v->rids()), rids.data(), rids.size() * sizeof(RID));
+        ETCS::Reclaimer::getInstance().retire(const_cast<OrderedView*>(ordered_view_.exchange(v, ::std::memory_order_acq_rel)));
+        return v;
+    }
+    // The current ordered view, for a reader already inside a ReadSection: the
+    // lock only when it has to be sorted again.
+    const OrderedView* orderedView() const
+    {
+        const OrderedView* v = ordered_view_.load(::std::memory_order_acquire);
+        if (v && v->gen == order_gen_.load(::std::memory_order_acquire)) return v;
+        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
+        return orderedViewLocked();
     }
     // A child arrived under `tag` (the key as typed_children_ holds it): last
     // among that tag's children, and the tag's group where typed_child_order_
@@ -1099,6 +1195,7 @@ public:
         // somehow still inside one finishes before it is freed.
         ETCS::Reclaimer::getInstance().retire(const_cast<SurfaceView*>(surface_view_.exchange(nullptr)));
         ETCS::Reclaimer::getInstance().retire(const_cast<ChildView*>(child_view_.exchange(nullptr)));
+        ETCS::Reclaimer::getInstance().retire(const_cast<OrderedView*>(ordered_view_.exchange(nullptr)));
         destructed_ = true;
         /*
  * Unlink our own record HERE, while the object is still alive, rather
@@ -1655,14 +1752,25 @@ public:
  */
     void getOrderedTypedChildren(::std::vector<::std::pair<ETCS::Buffer, RID>>& out) const
     {
-        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
-        for (const auto& tag : typed_child_order_)
+        ETCS::ReadSection rs;
+        const OrderedView* v = orderedView();
+        for (uint32_t g = 0; g < v->ngroups; ++g)
         {
-            auto it = typed_children_.find(tag);
-            if (it == typed_children_.end()) continue;
-            ::std::vector<RID> rids;
-            it->second.invoke_collect_rids_ordered(rids);
-            for (RID r : rids) out.emplace_back(tag, r);
+            const OrderedView::Group& grp = v->groups()[g];
+            for (uint32_t i = grp.begin; i < grp.end; ++i) out.emplace_back(*grp.tag, v->rids()[i]);
+        }
+    }
+    // The same order without a tag copied per child (see getTypedChildRefs):
+    // the tag is the parent's own key, alive as long as the parent is.
+    void getOrderedTypedChildRefs(::std::vector<ChildRef>& out) const
+    {
+        ETCS::ReadSection rs;
+        const OrderedView* v = orderedView();
+        out.reserve(out.size() + v->n);
+        for (uint32_t g = 0; g < v->ngroups; ++g)
+        {
+            const OrderedView::Group& grp = v->groups()[g];
+            for (uint32_t i = grp.begin; i < grp.end; ++i) out.emplace_back(grp.tag, v->rids()[i]);
         }
     }
     /*
@@ -1677,12 +1785,25 @@ public:
  *
  * Silent when no list holds it: a root-level entity, or one already
  * removed. Neither is an error; nothing is holding it in an order.
+ *
+ * NOT THE TAG MUTEX. It is called on every state change of an orderable
+ * child, from that child's ordering thread, and used to wait out whatever sort
+ * a reader of the parent was in the middle of. Now it notes which child moved
+ * in which list (through the child view) and moves the generation; the next
+ * ordered read sorts that list again.
  */
     void reorderTypedChild(RID rid)
     {
-        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
-        for (auto& entry : typed_children_)
-            if (entry.second.invoke_contains(rid)) { entry.second.invoke_reorder(); return; }
+        ETCS::ReadSection rs;
+        const ChildView*  cv = childView();
+        const ChildEntry* e  = cv ? cv->find(rid) : nullptr;
+        if (!e) return;
+        {
+            ::std::lock_guard<::std::mutex> ml(order_marks_mu_);
+            if (order_marks_.n < OrderMarks::kMax) { order_marks_.tag[order_marks_.n] = e->tag; order_marks_.rid[order_marks_.n++] = rid; }
+            else order_marks_.overflow = true;
+        }
+        order_gen_.fetch_add(1, ::std::memory_order_acq_rel);
     }
     /*
  * collectSiblingOrder(rid, out) - the ordered contents of whichever of this
@@ -1712,14 +1833,18 @@ public:
  */
     bool collectSiblingOrder(RID rid, ::std::vector<RID>& out) const
     {
-        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
-        for (const auto& entry : typed_children_)
-            if (entry.second.invoke_contains(rid))
+        ETCS::ReadSection rs;
+        const ChildView*  cv = childView();
+        const ChildEntry* e  = cv ? cv->find(rid) : nullptr;
+        if (!e) return false;
+        const OrderedView* v = orderedView();
+        for (uint32_t g = 0; g < v->ngroups; ++g)
+            if (v->groups()[g].tag == e->tag)
             {
-                entry.second.invoke_collect_rids_ordered(out);
-                return true;
+                out.insert(out.end(), v->rids() + v->groups()[g].begin, v->rids() + v->groups()[g].end);
+                break;
             }
-        return false;
+        return true;
     }
     Entity* getTypedChild(const ETCS::Buffer& tag, RID rid) const
     {

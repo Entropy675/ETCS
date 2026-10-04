@@ -158,6 +158,10 @@ struct RIDListHandle {
     // both sides, so a caller that cannot name the pointee can still ask.
     // See RIDList::search_ordered_by.
     void (*search_ordered_by)(void* self, RID exemplar, ::std::vector<RID>& out) = nullptr;
+    // Whether the ordered view is current: false while a sort that straddled a
+    // commit is waiting to be done again (collect_ordered). A copy of the order
+    // taken then must not be kept as if it were settled.
+    bool (*ordered_current)(void* self) = nullptr;
     size_t  invoke_count()    const { return count(self);             }
     bool    invoke_contains(RID r) const { return contains(self, r);       }
     bool    invoke_remove(RID r)   const { return remove(self, r);         }
@@ -165,6 +169,7 @@ struct RIDListHandle {
     void    invoke_collect_rids(::std::vector<RID>& out)  const { return collect_rids(self, out); }
     void    invoke_collect_rids_ordered(::std::vector<RID>& out) const { return collect_rids_ordered(self, out); }
     void    invoke_reorder() const { reorder(self); }
+    bool    invoke_ordered_current() const { return ordered_current(self); }
     void    invoke_insert(RID r, Entity* e) const { insert(self, r, e); }
     void    invoke_insert_iface(RID r, void* iface) const { insert_iface(self, r, iface); }
     void*   invoke_get_iface(RID r)        const { return get_iface(self, r);   }
@@ -348,8 +353,8 @@ public:
  * bounded number of times; past that it is returned but not cached, and the
  * next read tries again. A commit still between its write and its bump when
  * the epochs are checked is caught one read later instead: its own mark
- * (reorderTypedChild) waits on the parent's lock this read holds, and lands
- * after it.
+ * (reorderTypedChild) moves the parent's order generation, and the view this
+ * read published is stamped with the generation from before it.
  */
     void collect_ordered(::std::vector<RID>& out) const {
         if constexpr (detail::has_ordered_pointee_v<T>) {
@@ -508,6 +513,10 @@ public:
             };
             h.reorder = [](void* self) {
                 static_cast<RIDList<T>*>(self)->reorder();
+            };
+            h.ordered_current = [](void* self) {
+                if constexpr (detail::has_ordered_pointee_v<T>) return !static_cast<RIDList<T>*>(self)->ordered_stale_;
+                else { (void)self; return true; }   // arrival order: nothing to settle
             };
             // getTrueType(): correct here because a concrete-tag list's T IS
             // the entity's most-derived type. A family aggregate must NOT
