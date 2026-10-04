@@ -254,14 +254,17 @@ struct RIDList {
  * changes once a second sorts once a second, not sixty times; a list
  * nobody reads in order never sorts at all.
  *
- * STALE IS SET AT THE SEAMS. insert and remove below are where a hash is
- * pushed into or pulled out of this list, and both mark it -- so
- * membership changes need no cooperation from anyone. The case they do
- * NOT cover is the key moving while membership stays put, which no
- * container can observe, and which is the entire reason an ordered
- * container keyed on mutable state is a bug rather than a speedup. That
- * one is Orderable_::Reorder()'s job (ontology/Orderable.h), reaching
- * this through the handle's own reorder slot.
+ * CHANGES ARE NOTED AT THE SEAMS AND SETTLED ON READ. insert and remove
+ * below are where a hash is pushed into or pulled out of this list: an
+ * arrival is noted (pending_) and a departure flips departed_, and the next
+ * ordered read drops the departed and places the arrivals (settle_pending)
+ * -- the members that stayed keep the order they had, so nothing is sorted.
+ * The case the seams do NOT cover is the key moving while membership stays
+ * put, which no container can observe, and which is the entire reason an
+ * ordered container keyed on mutable state is a bug rather than a speedup.
+ * That one is Orderable_::Reorder()'s job (ontology/Orderable.h): a moved
+ * member is noted the same way (repair), and an order nobody can vouch for
+ * any more is marked stale (reorder) and sorted whole.
  *
  * mutable, and rebuilt from a const read: the cache is not part of the
  * list's value. Two lists holding the same entities are the same list
@@ -275,6 +278,10 @@ struct RIDList {
     mutable OrderVec ordered_;
     mutable OrderVec scratch_;      // the merge's other half, kept like ordered_
     mutable bool     ordered_stale_ = true;
+    mutable OrderVec pending_;      // arrivals and moved keys, placed at the next ordered read
+    mutable bool     departed_ = false;   // a member left: dropped at the next ordered read
+    // Past this many to place, a sort is as cheap: the list is marked stale.
+    static constexpr size_t kPendingMax = 64;
 
     // Initialize the map with the singleton arena
     RIDList()
@@ -282,7 +289,8 @@ struct RIDList {
         , arrival_(ArenaAllocator<RID>(&MemoryArena::getInstance()))
         , slot_(ArenaAllocator<::std::pair<const RID, size_t>>(&MemoryArena::getInstance()))
         , ordered_(ArenaAllocator<RID>(&MemoryArena::getInstance()))
-        , scratch_(ArenaAllocator<RID>(&MemoryArena::getInstance())) {}
+        , scratch_(ArenaAllocator<RID>(&MemoryArena::getInstance()))
+        , pending_(ArenaAllocator<RID>(&MemoryArena::getInstance())) {}
     // Entity-local variant — used by Entity::addTag<T> so typed children are
     // allocated out of the owning entity's local arena instead of the global
     // singleton, and get torn down with it.
@@ -291,17 +299,26 @@ struct RIDList {
         , arrival_(ArenaAllocator<RID>(&arena))
         , slot_(ArenaAllocator<::std::pair<const RID, size_t>>(&arena))
         , ordered_(ArenaAllocator<RID>(&arena))
-        , scratch_(ArenaAllocator<RID>(&arena)) {}
+        , scratch_(ArenaAllocator<RID>(&arena))
+        , pending_(ArenaAllocator<RID>(&arena)) {}
     void insert(RID rid, T entity) {
         entities[rid] = entity;
         if (slot_.try_emplace(rid, arrival_.size()).second)   // a re-insert keeps its place
             arrival_.push_back(rid);
-        ordered_stale_ = true;
+        note(rid);
     }
     void remove(RID rid) {
         entities.erase(rid);
         forget_arrival(rid);
-        ordered_stale_ = true;
+        departed_ = true;
+    }
+    // A member to place at the next ordered read. Nothing to note while the
+    // whole order is due anyway.
+    void note(RID rid) const {
+        if constexpr (!detail::has_ordered_pointee_v<T>) { (void)rid; return; }   // arrival order: nothing to place
+        if (ordered_stale_) return;
+        if (pending_.size() >= kPendingMax) { ordered_stale_ = true; pending_.clear(); return; }
+        pending_.push_back(rid);
     }
 
     // The members in arrival order: the enumeration every read starts from.
@@ -361,6 +378,9 @@ public:
  */
     void collect_ordered(::std::vector<RID>& out) const {
         if constexpr (detail::has_ordered_pointee_v<T>) {
+            if (!ordered_stale_ && (departed_ || !pending_.empty())) settle_pending();
+            pending_.clear();
+            departed_ = false;
             if (ordered_stale_) {
                 // From arrival order, so what the stable sort keeps for
                 // equivalent members is the order the script attached them.
@@ -393,31 +413,42 @@ public:
             collect_arrived(out);   // no relation: the order they arrived in
         }
     }
+    // Members whose keys moved: noted, and put back in place at the next
+    // ordered read (settle_pending), like an arrival.
+    void repair(const RID* moved, size_t k) const {
+        for (size_t i = 0; i < k; ++i) note(moved[i]);
+    }
+private:
     /*
- * A FEW KEYS MOVED: PUT THEM BACK, DON'T SORT. A key moving among siblings is
- * the common change (a flag on one child of many), and a full sort reads n log n
- * keys to place one. Here the moved members come out, the rest are checked to
- * still be in order (n - 1 comparisons), and each moved one goes back where the
- * full sort would put it: after everything it does not precede, ties broken by
- * arrival, the order a stable sort from arrival order leaves.
+ * WHAT CHANGED, PUT RIGHT, NOT SORTED. A member arriving or a key moving
+ * among siblings is the common change (a flag on one child of many, one child
+ * added), and a full sort reads n log n keys to place one. Here the departed
+ * are dropped (the rest keep their order: removing never disorders), the
+ * noted members come out, the rest are checked to still be in order (n - 1
+ * comparisons), and each noted one goes back where the full sort would put
+ * it: after everything it does not precede, ties broken by arrival, the order
+ * a stable sort from arrival order leaves.
  *
  * TRUSTED ONLY WHEN THE REST IS IN ORDER. A key whose write has landed but
  * whose mark has not (it is on its way) leaves the rest out of order, and a
  * placement searched past it could land wrong -- so the check fails, and the
- * list is marked for a full sort instead. A key that moves during the
- * placement marks the list after it, and that next repair's check catches any
- * member this one placed wrong. Small lists just sort: there is nothing to win.
+ * list is sorted whole instead. A key that moves during the placement marks
+ * the list after it, and the next settle's check catches any member this one
+ * placed wrong. Small lists just sort: there is nothing to win.
  */
-    void repair(const RID* moved, size_t k) const {
+    void settle_pending() const {
         if constexpr (detail::has_ordered_pointee_v<T>) {
             constexpr size_t kSmall = 32;
-            if (ordered_stale_ || entities.size() < kSmall) { ordered_stale_ = true; return; }
+            if (entities.size() < kSmall) { ordered_stale_ = true; return; }
             ::std::vector<RID> mv;
-            for (size_t i = 0; i < k; ++i)
-                if (entities.count(moved[i]) && ::std::find(mv.begin(), mv.end(), moved[i]) == mv.end())
-                    mv.push_back(moved[i]);
-            ordered_.erase(::std::remove_if(ordered_.begin(), ordered_.end(), [&mv](RID r) {
-                return ::std::find(mv.begin(), mv.end(), r) != mv.end(); }), ordered_.end());
+            mv.reserve(pending_.size());
+            for (RID r : pending_) if (entities.count(r)) mv.push_back(r);
+            ::std::sort(mv.begin(), mv.end());
+            mv.erase(::std::unique(mv.begin(), mv.end()), mv.end());
+            const bool gone = departed_;
+            ordered_.erase(::std::remove_if(ordered_.begin(), ordered_.end(), [&](RID r) {
+                return ::std::binary_search(mv.begin(), mv.end(), r) || (gone && !entities.count(r)); }), ordered_.end());
+            if (mv.empty()) return;
             auto less = [this](RID a, RID b) {
                 T ea = get_typed(a);
                 T eb = get_typed(b);
@@ -427,6 +458,8 @@ public:
             for (size_t i = 1; i < ordered_.size(); ++i)
                 if (less(ordered_[i], ordered_[i - 1])) { ordered_stale_ = true; return; }
             auto arrival = [this](RID r) { auto s = slot_.find(r); return s != slot_.end() ? s->second : static_cast<size_t>(-1); };
+            // In arrival order, so equal keys land as the stable sort leaves them.
+            ::std::sort(mv.begin(), mv.end(), [&](RID a, RID b) { return arrival(a) < arrival(b); });
             for (RID r : mv) {
                 const size_t ar = arrival(r);
                 auto at = ::std::partition_point(ordered_.begin(), ordered_.end(), [&](RID x) {
@@ -436,10 +469,9 @@ public:
                 });
                 ordered_.insert(at, r);
             }
-        } else {
-            (void)moved; (void)k;
         }
     }
+public:
     /*
  * EQUAL RANGE, NOT A FIND, and that is forced by what the relation means.
  *
@@ -542,7 +574,7 @@ public:
                 list->forget_arrival(r);
                 // The erased path is a seam too -- destroyImpl pulls RIDs out
                 // through this slot, not through remove() above.
-                if (erased) list->reorder();
+                if (erased) list->departed_ = true;
                 return erased;
             };
             h.get = [](void* self, RID r) -> Entity* {

@@ -19,8 +19,9 @@
  *      fresh read. Run it under ASAN (ace make loader ReadViewTesterLoader
  *      ASAN=1) and a view freed under a reader is a report, not a guess.
  *   4. The ordered view: each tag's own order (an orderable type sorted by its
- *      key, stable by arrival; a plain type by arrival), resorted after a key
- *      moves or a member comes or goes; the sibling order of one child; and
+ *      key, stable by arrival; a plain type by arrival), put right after a key
+ *      moves or a member comes or goes -- placed, not sorted, and every read
+ *      checked against a full sort; the sibling order of one child; and
  *      readers on other threads reading it while a writer moves keys, adds
  *      and deletes -- whole groups, no RID twice, and the settled order once
  *      the writer stops.
@@ -343,6 +344,17 @@ int main()
                 all = got() == model();
             }
             check(all, "200 members, 300 rounds of keys moved (1-3, and 20 at once): every read is the full sort's order");
+            // Arrivals and departures are placed and dropped, not sorted: with
+            // moved keys between them, and 70 at once (past the noted kept).
+            for (int i = 0; i < 300 && all; ++i)
+            {
+                const int adds = i % 25 == 0 ? 70 : static_cast<int>(next() % 3);
+                for (int a = 0; a < adds; ++a) { O* o = big->addTag<O>(); setKey(o, static_cast<int>(next() % 40)); bo.push_back(o); }
+                for (int d = static_cast<int>(next() % 3); d > 0 && bo.size() > 40; --d) { size_t k = next() % bo.size(); del(bo[k]); bo.erase(bo.begin() + k); }
+                if (next() % 2) setKey(bo[next() % bo.size()], static_cast<int>(next() % 40));
+                all = got() == model();
+            }
+            check(all, "300 rounds of members in and out (and 70 at once), keys moving between: every read is the full sort's order");
             del(big);
         }
         // Readers while a writer moves keys and changes membership.

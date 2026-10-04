@@ -434,9 +434,10 @@ private:
  * order (every flag on an orderable child), so it is ordered when read, never
  * when marked. A mark (a member in or out, a key moved) moves order_gen_; a
  * reader whose view is stamped with the current generation reads it without
- * the lock, and one whose view is older takes the lock, puts the moved members
- * back in place (RIDList::repair; a full sort when membership changed or the
- * rest is not in order) and publishes for the rest.
+ * the lock, and one whose view is older takes the lock, has each changed list
+ * drop its departed and place its arrivals and moved members (RIDList::
+ * settle_pending; a full sort only when the rest is not in order) and
+ * publishes for the rest.
  *
  * WHAT STAYS UNDER THE LOCK: the sort that rebuilds the ordered view, the
  * in-flight scopes (scope_), and every writer. interface_pointers_ and
@@ -714,7 +715,7 @@ private:
     void publishChildrenLocked(const ChildView* v)
     {
         ETCS::Reclaimer::getInstance().retire(const_cast<ChildView*>(child_view_.exchange(v, ::std::memory_order_acq_rel)));
-        order_gen_.fetch_add(1, ::std::memory_order_acq_rel);   // a member in or out: the list marked itself
+        order_gen_.fetch_add(1, ::std::memory_order_acq_rel);   // a member in or out: the list noted it
     }
     /*
      * The ordered view as of now, under m_tagMutex: the published one if no mark
@@ -735,8 +736,8 @@ private:
             order_marks_.n = 0;
             order_marks_.overflow = false;
         }
-        // Each list with keys moved puts those members back in place (or, when
-        // that cannot be trusted, sorts again: RIDList::repair).
+        // Each list with keys moved notes those members, to be put back in
+        // place as it is read below (RIDList::repair, settle_pending).
         if (marks.overflow) { for (auto& entry : typed_children_) entry.second.invoke_reorder(); }
         else
         {
