@@ -290,7 +290,9 @@ int main()
               "state packs and unpacks, binary-safe");
         back.migrate("old=mid\nmid=new\n");
         check(back.get("new") && !back.get("old"), "migration applies its renames oldest first");
-        check(!back.unpack(std::string("\x05\x00\x00\x00ab", 6)), "a truncated state is refused");
+        // A length of 5 and 2 bytes after it. The literal is split because a hex
+        // escape is greedy: "\x00ab" would be one byte, 0xab.
+        check(!back.unpack(std::string("\x05\x00\x00\x00" "ab", 6)), "a truncated state is refused");
     }
 
     // -- 7b. the value surface ----------------------------------------------------
