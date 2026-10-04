@@ -2933,6 +2933,10 @@ extern "C" ETCS_API ETCS::EventNode* RegisterDynamicLoader(void* ptr)
  */
         ETCS::MemoryArena::getInstance(); // this may actaully be the real cleanup order
         ETCS_LOG("DynamicLoader", "Passed MemoryArena! ");
+        // The loader's Reclaimer, before this image reads any view: one set of
+        // reader slots for the runtime (core/Reclaim.h).
+        if (dynamicLoader.node && dynamicLoader.node->get_reclaimer)
+            ETCS::Reclaimer::adopt_shared(dynamicLoader.node->get_reclaimer());
 #if ETCS_SHARED_THREAD_POOL
         /*
  * ADOPT THE LOADER'S POOL, before this image's own getInstance() is asked for

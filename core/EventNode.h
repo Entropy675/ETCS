@@ -10,6 +10,7 @@
 #include "RIDList.h"
 #include "EventStream.h"
 #include "ArenaAllocator.h"
+#include "Reclaim.h"
 #include "Bundles.h"
 namespace ETCS {
 // Forward declarations
@@ -636,6 +637,12 @@ public:
  * ABOVE the fork, for the same layout reason as the four above it.
  */
     ETCS::ThreadPool* (*get_pool)() = nullptr;
+    /*
+ * WHOSE Reclaimer THIS IMAGE USES (core/Reclaim.h): one per runtime, because an
+ * entity made in one image is read in another and every reader must announce
+ * into the same slots. Not gated like the pool: there is no per-image choice.
+ */
+    ETCS::Reclaimer* (*get_reclaimer)() = nullptr;
 
     ::std::unordered_map<ETCS::Buffer, RIDListHandle> ridMap;
 
@@ -1250,6 +1257,7 @@ public:
      * macro, and EventNode.h is reached from places core_defs.h is not.
      */
         get_pool       = []() { return &ETCS::ThreadPool::getInstance(); };
+        get_reclaimer  = []() { return &ETCS::Reclaimer::getInstance(); };
         stream.owner = this; // wire back-pointer now that EventNode is complete --
                               // both LoaderStream and ModuleProxy have this member.
         s_alive.store(true, ::std::memory_order_release);
