@@ -7,6 +7,7 @@
 #include "ArenaAllocator.h"
 #include "MemoryArena.h"
 #include "RIDList.h"
+#include "Reclaim.h"
 /*
  * EventNode.h - needed for AddTagEvent (addTag<T>, below), EntityUnloadEvent
  * (operator delete, below), and for the EventNode::ridMap access in
@@ -32,6 +33,8 @@
 #include <set>
 #include <map>
 #include <unordered_map>   // the region-digest table below
+#include <cstring>
+#include <new>
 namespace ETCS
 {
 inline ETCS::Buffer source()
@@ -414,6 +417,326 @@ private:
     };
     /*
  * ---------------------------------------------------------------------
+ * THE PUBLISHED VIEWS -- what readers read, without the tag mutex.
+ *
+ * The maps above are the writers' truth. Writers are few and already in one
+ * order (the ordering threads; a delete; a restore) and still exclude each other
+ * with m_tagMutex. After each change a writer builds an immutable view of what
+ * changed -- the surface (flags, values, tags) or the children -- and publishes
+ * it with one pointer store; the view it replaced is retired to the Reclaimer
+ * (core/Reclaim.h) and freed once no reader can still hold it. A reader opens a
+ * ReadSection, loads the pointer and reads: no lock, no write to anything the
+ * writer or another reader touches. Each view is one malloc block of plain data,
+ * so freeing it runs no code.
+ *
+ * WHAT STAYS UNDER THE LOCK: the ordered child views (a list sorts itself on
+ * read: getOrderedTypedChildren, collectSiblingOrder, reorderTypedChild), the
+ * in-flight scopes (scope_), and every writer. interface_pointers_ and
+ * bindings_ need neither: they are written in the constructor, before anyone
+ * else can see this entity, and never again.
+ * ---------------------------------------------------------------------
+ */
+    struct ViewStr { uint32_t off, n; };   // bytes in the view's own text
+    static int viewCmp(const char* a, size_t an, const char* b, size_t bn)
+    {
+        const int c = ::std::memcmp(a, b, an < bn ? an : bn);
+        return c ? c : (an < bn ? -1 : (an > bn ? 1 : 0));
+    }
+    // One block: this header, then sorted arrays -- flags; value keys and
+    // values (parallel); tag keys, relation names and entries (parallel) --
+    // then the text they point into. A relation's name ("module:tag" of the
+    // child it names) is copied in when the view is built: a reader of a
+    // replaced view must not reach through entry.child, which may be gone.
+    // `hash` is the surface hash, filled by the first reader that asks (0: not
+    // yet). `live` is the text still pointed at: a value set again leaves its
+    // old bytes behind until a full rebuild.
+    struct SurfaceView
+    {
+        mutable ::std::atomic<uint64_t> hash{ 0 };
+        uint32_t nflags = 0, nvalues = 0, ntags = 0, ntext = 0, live = 0;
+        const ViewStr*  flags()  const { return reinterpret_cast<const ViewStr*>(this + 1); }
+        const ViewStr*  vkeys()  const { return flags() + nflags; }
+        const ViewStr*  vvals()  const { return vkeys() + nvalues; }
+        const ViewStr*  tkeys()  const { return vvals() + nvalues; }
+        const ViewStr*  trels()  const { return tkeys() + ntags; }
+        const TagEntry* tentry() const { return reinterpret_cast<const TagEntry*>(trels() + ntags); }
+        const char*     text()   const { return reinterpret_cast<const char*>(tentry() + ntags); }
+        const char*     p(ViewStr x) const { return text() + x.off; }
+        ::std::string   str(ViewStr x) const { return ::std::string(p(x), x.n); }
+        static size_t   bytes(uint32_t nf, uint32_t nv, uint32_t nt, uint32_t nx)
+        { return sizeof(SurfaceView) + (nf + 2 * size_t(nv) + 2 * size_t(nt)) * sizeof(ViewStr) + nt * sizeof(TagEntry) + nx; }
+        // Index of `key` in a sorted array, or -1; `at` is where it would go.
+        int find(const ViewStr* a, uint32_t n, const char* k, size_t kn, uint32_t* at = nullptr) const
+        {
+            uint32_t lo = 0, hi = n;
+            while (lo < hi)
+            {
+                const uint32_t mid = (lo + hi) / 2;
+                const int c = viewCmp(p(a[mid]), a[mid].n, k, kn);
+                if (c == 0) { if (at) *at = mid; return static_cast<int>(mid); }
+                if (c < 0) lo = mid + 1; else hi = mid;
+            }
+            if (at) *at = lo;
+            return -1;
+        }
+    };
+    static_assert(sizeof(SurfaceView) % alignof(TagEntry) == 0 && sizeof(ViewStr) % alignof(TagEntry) == 0,
+                  "the tag entries follow the string arrays in one block");
+    // Children in canonical attach order (tag first-attachment, then arrival),
+    // each with the entity itself, and an open-addressed index by RID. `tag`
+    // points at typed_children_'s key, which is never erased: it lives as long
+    // as this entity does.
+    struct ChildEntry { const ETCS::Buffer* tag; RID rid; Entity* child; };
+    struct ChildView
+    {
+        uint32_t n = 0, mask = 0;
+        const ChildEntry* entries() const { return reinterpret_cast<const ChildEntry*>(this + 1); }
+        const uint32_t*   index()   const { return reinterpret_cast<const uint32_t*>(entries() + n); }
+        static uint32_t slotOf(RID r) { uint64_t h = r * 0x9e3779b97f4a7c15ULL; return static_cast<uint32_t>(h >> 32); }
+        const ChildEntry* find(RID r) const
+        {
+            if (!n) return nullptr;
+            const uint32_t* idx = index();
+            for (uint32_t i = slotOf(r) & mask; idx[i]; i = (i + 1) & mask)
+                if (entries()[idx[i] - 1].rid == r) return &entries()[idx[i] - 1];
+            return nullptr;
+        }
+    };
+    mutable ::std::atomic<const SurfaceView*> surface_view_{ nullptr };
+    ::std::atomic<const ChildView*>           child_view_{ nullptr };
+
+    // ── the writers' half: build, publish, retire. All under m_tagMutex. ──
+
+    static SurfaceView* allocSurface(uint32_t nf, uint32_t nv, uint32_t nt, uint32_t nx)
+    {
+        SurfaceView* v = new (ETCS::Reclaimer::getInstance().allocate(SurfaceView::bytes(nf, nv, nt, nx))) SurfaceView;
+        v->nflags = nf; v->nvalues = nv; v->ntags = nt; v->ntext = nx;
+        return v;
+    }
+    void publishSurface(const SurfaceView* v)
+    {
+        ETCS::Reclaimer::getInstance().retire(const_cast<SurfaceView*>(surface_view_.exchange(v, ::std::memory_order_acq_rel)));
+    }
+    // The whole surface, from the maps: for a tag going on or off (rare), and
+    // whenever a view's text is mostly bytes nothing points at any more.
+    void publishSurfaceLocked()
+    {
+        auto byKey = [](const ETCS::Buffer* a, const ETCS::Buffer* b) { return viewCmp(a->buf, a->written, b->buf, b->written) < 0; };
+        ::std::vector<const ETCS::Buffer*> fk, vk, tk;
+        size_t chars = 0;
+        for (auto const& kv : flags_)  { fk.push_back(&kv.first); chars += kv.first.written; }
+        for (auto const& kv : values_) { vk.push_back(&kv.first); chars += kv.first.written + kv.second.size(); }
+        ::std::vector<::std::string> rel;   // by tk's order, once sorted
+        for (auto const& kv : tags)    { tk.push_back(&kv.first); chars += kv.first.written; }
+        ::std::sort(fk.begin(), fk.end(), byKey);
+        ::std::sort(vk.begin(), vk.end(), byKey);
+        ::std::sort(tk.begin(), tk.end(), byKey);
+        for (const ETCS::Buffer* k : tk)
+        {
+            const TagEntry& e = tags.find(*k)->second;
+            rel.push_back(e.child ? e.child->getSourceModule().toString() + ":" + e.child->getSourceTag().toString() : ::std::string());
+            chars += rel.back().size();
+        }
+        SurfaceView* v = allocSurface(static_cast<uint32_t>(fk.size()), static_cast<uint32_t>(vk.size()),
+                                      static_cast<uint32_t>(tk.size()), static_cast<uint32_t>(chars));
+        ViewStr*  fl = const_cast<ViewStr*>(v->flags());
+        ViewStr*  ks = const_cast<ViewStr*>(v->vkeys());
+        ViewStr*  vs = const_cast<ViewStr*>(v->vvals());
+        ViewStr*  ts = const_cast<ViewStr*>(v->tkeys());
+        ViewStr*  tr = const_cast<ViewStr*>(v->trels());
+        TagEntry* te = const_cast<TagEntry*>(v->tentry());
+        char*     text = const_cast<char*>(v->text());
+        uint32_t  off = 0;
+        auto put = [&](const char* p, size_t n) { if (n) ::std::memcpy(text + off, p, n); ViewStr r{ off, static_cast<uint32_t>(n) }; off += static_cast<uint32_t>(n); return r; };
+        for (size_t i = 0; i < fk.size(); ++i) fl[i] = put(fk[i]->buf, fk[i]->written);
+        for (size_t i = 0; i < vk.size(); ++i)
+        {
+            ks[i] = put(vk[i]->buf, vk[i]->written);
+            const ::std::string& val = values_.find(*vk[i])->second;
+            vs[i] = put(val.data(), val.size());
+        }
+        for (size_t i = 0; i < tk.size(); ++i)
+        {
+            ts[i] = put(tk[i]->buf, tk[i]->written);
+            tr[i] = put(rel[i].data(), rel[i].size());
+            te[i] = tags.find(*tk[i])->second;
+        }
+        v->live = off;
+        publishSurface(v);
+    }
+    // Dead text a view may carry before a full rebuild: every write copies
+    // the whole text, so slack is paid on each write, the rebuild only once.
+    static constexpr uint32_t kSurfaceSlack = 256;
+    /*
+     * ONE FLAG OR VALUE, from the last view rather than the maps: the funnel's
+     * write path (a flag on, a value set, a value restored) copies the arrays
+     * with one entry put in or changed and appends the new bytes -- no walk of
+     * the maps, no sort. `value` null: the flag only.
+     */
+    void surfaceSetLocked(const ETCS::Buffer& key, const ::std::string* value)
+    {
+        const SurfaceView* o = surface_view_.load(::std::memory_order_relaxed);
+        if (!o) { publishSurfaceLocked(); return; }
+        uint32_t fat = 0, vat = 0;
+        const bool newflag = o->find(o->flags(), o->nflags, key.buf, key.written, &fat) < 0;
+        const int  vi      = value ? o->find(o->vkeys(), o->nvalues, key.buf, key.written, &vat) : -1;
+        const bool newval  = value && vi < 0;
+        const uint32_t keyn = static_cast<uint32_t>(key.written);
+        const uint32_t addn = ((newflag || newval) ? keyn : 0) + (value ? static_cast<uint32_t>(value->size()) : 0);
+        // `live` counts a key once per array it is in (a full rebuild stores
+        // it twice), so a removal can take back exactly what was added.
+        const uint32_t live = o->live + (newflag ? keyn : 0) + (newval ? keyn : 0)
+                            + (value ? static_cast<uint32_t>(value->size()) : 0) - (value && vi >= 0 ? o->vvals()[vi].n : 0);
+        if (o->ntext + addn > 2 * live + kSurfaceSlack) { publishSurfaceLocked(); return; }
+        const uint32_t nf = o->nflags + (newflag ? 1 : 0), nv = o->nvalues + (newval ? 1 : 0), nt = o->ntags;
+        SurfaceView* v = allocSurface(nf, nv, nt, o->ntext + addn);
+        v->live = live;
+        char* text = const_cast<char*>(v->text());
+        ::std::memcpy(text, o->text(), o->ntext);
+        uint32_t off = o->ntext;
+        ViewStr k{ off, keyn };
+        if (newflag || newval) { ::std::memcpy(text + off, key.buf, keyn); off += keyn; }
+        else k = (vi >= 0 ? o->vkeys()[vi] : o->flags()[o->find(o->flags(), o->nflags, key.buf, key.written)]);
+        ViewStr val{ off, value ? static_cast<uint32_t>(value->size()) : 0u };
+        if (value && !value->empty()) ::std::memcpy(text + off, value->data(), value->size());
+        auto splice = [](ViewStr* dst, const ViewStr* src, uint32_t n, uint32_t at, bool insert, ViewStr x) {
+            ::std::memcpy(dst, src, at * sizeof(ViewStr));
+            if (insert) { dst[at] = x; ::std::memcpy(dst + at + 1, src + at, (n - at) * sizeof(ViewStr)); }
+            else        ::std::memcpy(dst + at, src + at, (n - at) * sizeof(ViewStr));
+        };
+        splice(const_cast<ViewStr*>(v->flags()), o->flags(), o->nflags, newflag ? fat : o->nflags, newflag, k);
+        if (value)
+        {
+            splice(const_cast<ViewStr*>(v->vkeys()), o->vkeys(), o->nvalues, newval ? vat : o->nvalues, newval, k);
+            splice(const_cast<ViewStr*>(v->vvals()), o->vvals(), o->nvalues, newval ? vat : o->nvalues, newval, val);
+            if (!newval) const_cast<ViewStr*>(v->vvals())[vi] = val;
+        }
+        else
+        {
+            ::std::memcpy(const_cast<ViewStr*>(v->vkeys()), o->vkeys(), o->nvalues * sizeof(ViewStr));
+            ::std::memcpy(const_cast<ViewStr*>(v->vvals()), o->vvals(), o->nvalues * sizeof(ViewStr));
+        }
+        copyTags(v, o);
+        publishSurface(v);
+    }
+    // The tag arrays, unchanged by a flag or value.
+    static void copyTags(SurfaceView* v, const SurfaceView* o)
+    {
+        ::std::memcpy(const_cast<ViewStr*>(v->tkeys()), o->tkeys(), 2 * size_t(o->ntags) * sizeof(ViewStr));   // keys, relations
+        ::std::memcpy(const_cast<TagEntry*>(v->tentry()), o->tentry(), o->ntags * sizeof(TagEntry));
+    }
+    // A flag gone, with its value.
+    void surfaceRemoveLocked(const ETCS::Buffer& key)
+    {
+        const SurfaceView* o = surface_view_.load(::std::memory_order_relaxed);
+        if (!o) { publishSurfaceLocked(); return; }
+        const int fi = o->find(o->flags(), o->nflags, key.buf, key.written);
+        const int vi = o->find(o->vkeys(), o->nvalues, key.buf, key.written);
+        if (fi < 0 && vi < 0) return;
+        const uint32_t live = o->live - (fi >= 0 ? o->flags()[fi].n : 0) - (vi >= 0 ? o->vkeys()[vi].n + o->vvals()[vi].n : 0);
+        if (o->ntext > 2 * live + kSurfaceSlack) { publishSurfaceLocked(); return; }
+        const uint32_t nf = o->nflags - (fi >= 0 ? 1 : 0), nv = o->nvalues - (vi >= 0 ? 1 : 0), nt = o->ntags;
+        SurfaceView* v = allocSurface(nf, nv, nt, o->ntext);
+        v->live = live;
+        ::std::memcpy(const_cast<char*>(v->text()), o->text(), o->ntext);
+        auto drop = [](ViewStr* dst, const ViewStr* src, uint32_t n, int at) {
+            if (at < 0) { ::std::memcpy(dst, src, n * sizeof(ViewStr)); return; }
+            ::std::memcpy(dst, src, at * sizeof(ViewStr));
+            ::std::memcpy(dst + at, src + at + 1, (n - at - 1) * sizeof(ViewStr));
+        };
+        drop(const_cast<ViewStr*>(v->flags()), o->flags(), o->nflags, fi);
+        drop(const_cast<ViewStr*>(v->vkeys()), o->vkeys(), o->nvalues, vi);
+        drop(const_cast<ViewStr*>(v->vvals()), o->vvals(), o->nvalues, vi);
+        copyTags(v, o);
+        publishSurface(v);
+    }
+
+    // A view of n entries with an index of `cap` slots (a power of two, at
+    // least twice n), entries and index left for the caller to fill.
+    static ChildView* allocChildView(uint32_t n, uint32_t cap)
+    {
+        char* blk = static_cast<char*>(ETCS::Reclaimer::getInstance().allocate(sizeof(ChildView) + n * sizeof(ChildEntry) + cap * sizeof(uint32_t)));
+        ChildView* v = new (blk) ChildView;
+        v->n = n;
+        v->mask = cap - 1;
+        return v;
+    }
+    static uint32_t capFor(uint32_t n) { uint32_t cap = 1; while (cap < n * 2) cap <<= 1; return cap; }
+    static void indexOne(ChildView* v, uint32_t i)
+    {
+        uint32_t* idx = const_cast<uint32_t*>(v->index());
+        uint32_t at = ChildView::slotOf(v->entries()[i].rid) & v->mask;
+        while (idx[at]) at = (at + 1) & v->mask;
+        idx[at] = i + 1;
+    }
+    static void indexAll(ChildView* v)
+    {
+        ::std::memset(const_cast<uint32_t*>(v->index()), 0, (v->mask + 1) * sizeof(uint32_t));
+        for (uint32_t i = 0; i < v->n; ++i) indexOne(v, i);
+    }
+    void publishChildrenLocked(const ChildView* v)
+    {
+        ETCS::Reclaimer::getInstance().retire(const_cast<ChildView*>(child_view_.exchange(v, ::std::memory_order_acq_rel)));
+    }
+    // A child arrived under `tag` (the key as typed_children_ holds it): last
+    // among that tag's children, and the tag's group where typed_child_order_
+    // puts it -- the order getTypedChildRefs has always reported. Arriving last
+    // of all (one tag, or the last one), the old index still holds: copied, and
+    // the newcomer added; anywhere else the entries after it moved, so it is
+    // made again.
+    void childAddedLocked(const ETCS::Buffer* tag, RID rid, Entity* child)
+    {
+        const ChildView*  old = child_view_.load(::std::memory_order_relaxed);
+        const uint32_t    n   = old ? old->n : 0;
+        const ChildEntry* e   = old ? old->entries() : nullptr;
+        uint32_t at = n;
+        bool grouped = false;
+        for (uint32_t i = n; i-- > 0; ) if (e[i].tag == tag) { at = i + 1; grouped = true; break; }
+        if (!grouped && n)
+        {
+            // A tag with no child now: before the first child whose tag came later.
+            ::std::vector<const ETCS::Buffer*> order;
+            for (const ETCS::Buffer& t : typed_child_order_)
+            {
+                auto it = typed_children_.find(t);
+                if (it != typed_children_.end()) order.push_back(&it->first);
+            }
+            auto rank = [&order](const ETCS::Buffer* t) { return ::std::find(order.begin(), order.end(), t) - order.begin(); };
+            const auto mine = rank(tag);
+            for (uint32_t i = 0; i < n; ++i) if (rank(e[i].tag) > mine) { at = i; break; }
+        }
+        const uint32_t cap = (old && old->mask + 1 >= 2 * (n + 1)) ? old->mask + 1 : capFor(n + 1);
+        ChildView*  v  = allocChildView(n + 1, cap);
+        ChildEntry* ne = const_cast<ChildEntry*>(v->entries());
+        if (at) ::std::memcpy(ne, e, at * sizeof(ChildEntry));
+        ne[at] = ChildEntry{ tag, rid, child };
+        if (n > at) ::std::memcpy(ne + at + 1, e + at, (n - at) * sizeof(ChildEntry));
+        if (old && at == n && old->mask + 1 == cap)
+        {
+            ::std::memcpy(const_cast<uint32_t*>(v->index()), old->index(), cap * sizeof(uint32_t));
+            indexOne(v, n);
+        }
+        else indexAll(v);
+        publishChildrenLocked(v);
+    }
+    void childRemovedLocked(RID rid)
+    {
+        const ChildView* old = child_view_.load(::std::memory_order_relaxed);
+        const ChildEntry* gone = old ? old->find(rid) : nullptr;
+        if (!gone) return;
+        const uint32_t n  = old->n;
+        const uint32_t at = static_cast<uint32_t>(gone - old->entries());
+        ChildView*  v  = allocChildView(n - 1, old->mask + 1);   // the same index size: no thrash at a boundary
+        ChildEntry* ne = const_cast<ChildEntry*>(v->entries());
+        if (at) ::std::memcpy(ne, old->entries(), at * sizeof(ChildEntry));
+        if (n - 1 > at) ::std::memcpy(ne + at, old->entries() + at + 1, (n - 1 - at) * sizeof(ChildEntry));
+        indexAll(v);
+        publishChildrenLocked(v);
+    }
+    const SurfaceView* surfaceView() const { return surface_view_.load(::std::memory_order_acquire); }
+    const ChildView*   childView()   const { return child_view_.load(::std::memory_order_acquire); }
+    /*
+ * ---------------------------------------------------------------------
  * THE NODE HASH -- this entity's state surface and everything under it, as
  * one 64-bit value, recomputed only when pulled and only if something moved.
  *
@@ -772,6 +1095,10 @@ public:
             ::std::lock_guard<::std::mutex> lock(m_tagMutex);
             scope_.interruptAll();
         }
+        // The views go the way every replaced one does: a reader that is
+        // somehow still inside one finishes before it is freed.
+        ETCS::Reclaimer::getInstance().retire(const_cast<SurfaceView*>(surface_view_.exchange(nullptr)));
+        ETCS::Reclaimer::getInstance().retire(const_cast<ChildView*>(child_view_.exchange(nullptr)));
         destructed_ = true;
         /*
  * Unlink our own record HERE, while the object is still alive, rather
@@ -1042,15 +1369,18 @@ public:
     // The value behind `key`, stored or bound: false when there is none.
     bool valueOf(const ETCS::Buffer& key, ::std::string& out) const
     {
-        ValueBinding b;
         {
-            ::std::lock_guard<::std::mutex> lock(m_tagMutex);
-            auto v = values_.find(key);
-            if (v != values_.end()) { out = v->second; return true; }
-            auto it = bindings_.find(key);
-            if (it == bindings_.end()) return false;
-            b = it->second;
+            ETCS::ReadSection rs;
+            if (const SurfaceView* v = surfaceView())
+            {
+                const int i = v->find(v->vkeys(), v->nvalues, key.buf, key.written);
+                if (i >= 0) { out.assign(v->p(v->vvals()[i]), v->vvals()[i].n); return true; }
+            }
         }
+        // Bindings are made in the constructor and never again: no lock to read.
+        auto it = bindings_.find(key);
+        if (it == bindings_.end()) return false;
+        const ValueBinding b = it->second;
         if (!b.write) return false;
         out.clear();
         b.write(b.self, out);      // outside the tag mutex: the binding takes its own lock
@@ -1066,11 +1396,8 @@ public:
         // stack, read with the tag mutex released.
         ValueBinding bound[8];
         size_t n = 0;
-        {
-            ::std::lock_guard<::std::mutex> lock(m_tagMutex);
-            if (bindings_.size() > 8) return false;
-            for (auto const& [key, b] : bindings_) bound[n++] = b;
-        }
+        if (bindings_.size() > 8) return false;   // constructor-written: read without a lock
+        for (auto const& [key, b] : bindings_) bound[n++] = b;
         uint64_t h = 0x9e3779b97f4a7c15ULL;
         for (size_t i = 0; i < n; ++i)
         {
@@ -1086,10 +1413,12 @@ public:
     {
         ::std::vector<::std::pair<::std::string, ValueBinding>> bound;
         {
-            ::std::lock_guard<::std::mutex> lock(m_tagMutex);
-            for (auto const& [key, v] : values_) out.emplace_back(key.toString(), v);
+            ETCS::ReadSection rs;
+            const SurfaceView* v = surfaceView();
+            const uint32_t nv = v ? v->nvalues : 0;
+            for (uint32_t i = 0; i < nv; ++i) out.emplace_back(v->str(v->vkeys()[i]), v->str(v->vvals()[i]));
             for (auto const& [key, b] : bindings_)
-                if (values_.find(key) == values_.end()) bound.emplace_back(key.toString(), b);
+                if (!v || v->find(v->vkeys(), nv, key.buf, key.written) < 0) bound.emplace_back(key.toString(), b);
         }
         for (auto& [key, b] : bound)
         {
@@ -1113,7 +1442,7 @@ public:
             auto it = bindings_.find(key);
             if (it != bindings_.end()) { b = it->second; bound = true; }
             else if (flags_.find(key) == flags_.end()) return false;
-            else values_[key] = v;
+            else { values_[key] = v; surfaceSetLocked(key, &v); }
         }
         if (!bound) { onValue(key, &v); return true; }   // stored: the family's copy follows
         return b.read && b.read(b.self, v);
@@ -1232,7 +1561,7 @@ public:
                 ::std::string("addTypeTag: type tag must start with an uppercase letter: ")
                 + (s ? s : ""));
         ::std::lock_guard<::std::mutex> lock(m_tagMutex);
-        tags.emplace(type_tag, TagEntry{});
+        if (tags.emplace(type_tag, TagEntry{}).second) publishSurfaceLocked();
     }
 
     /*
@@ -1263,6 +1592,7 @@ public:
             if (handle.invoke_contains(rid))
             {
                 handle.invoke_remove(rid);
+                childRemovedLocked(rid);
                 return;
             }
         }
@@ -1279,15 +1609,9 @@ public:
  */
     void getTypedChildren(::std::vector<::std::pair<ETCS::Buffer, RID>>& out) const
     {
-        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
-        for (const auto& tag : typed_child_order_)
-        {
-            auto it = typed_children_.find(tag);
-            if (it == typed_children_.end()) continue;
-            ::std::vector<RID> rids;
-            it->second.invoke_collect_rids(rids);
-            for (RID r : rids) out.emplace_back(tag, r);
-        }
+        ETCS::ReadSection rs;
+        if (const ChildView* v = childView())
+            for (uint32_t i = 0; i < v->n; ++i) out.emplace_back(*v->entries()[i].tag, v->entries()[i].rid);
     }
     /*
  * getTypedChildRefs(out) - the same enumeration, without copying a tag per
@@ -1302,16 +1626,9 @@ public:
     using ChildRef = ::std::pair<const ETCS::Buffer*, RID>;
     void getTypedChildRefs(::std::vector<ChildRef>& out) const
     {
-        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
-        ::std::vector<RID> rids;
-        for (const auto& tag : typed_child_order_)
-        {
-            auto it = typed_children_.find(tag);
-            if (it == typed_children_.end()) continue;
-            rids.clear();
-            it->second.invoke_collect_rids(rids);
-            for (RID r : rids) out.emplace_back(&it->first, r);
-        }
+        ETCS::ReadSection rs;
+        if (const ChildView* v = childView())
+            for (uint32_t i = 0; i < v->n; ++i) out.emplace_back(v->entries()[i].tag, v->entries()[i].rid);
     }
     /*
  * getTypedChild(tag, rid) - resolves a single live child by exactly
@@ -1406,10 +1723,10 @@ public:
     }
     Entity* getTypedChild(const ETCS::Buffer& tag, RID rid) const
     {
-        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
-        auto it = typed_children_.find(tag);
-        if (it == typed_children_.end()) return nullptr;
-        return it->second.invoke_get(rid);
+        ETCS::ReadSection rs;
+        const ChildView* v = childView();
+        const ChildEntry* e = v ? v->find(rid) : nullptr;
+        return (e && *e->tag == tag) ? e->child : nullptr;
     }
     /*
  * Takes the BARE label ("Listen"), not a prefixed key -- the shared
@@ -1541,7 +1858,7 @@ public:
                          << "they will be orphaned in this entity's arena.");
                 continue;
             }
-            RIDListHandle* dest = nullptr;
+            ListSlot dest;
             for (ETCS::RID rid : child_rids)
             {
                 Entity* child = handle.invoke_get(rid);
@@ -1627,7 +1944,7 @@ private:
             {
                 auto it = from->typed_children_.find(tag);
                 if (it == from->typed_children_.end() || it->second.invoke_get(rid) != child) continue;
-                RIDListHandle* dest = nullptr;
+                ListSlot dest;
                 if (!it->second.make_in || !relistLocked(child, rid, it->second, it->first, to, dest)) return false;
                 break;
             }
@@ -1658,27 +1975,31 @@ private:
      * edge always -- left stale it would point into a shell about to be
      * reclaimed and handed to the next same-type allocation.
      */
+    struct ListSlot { RIDListHandle* list = nullptr; const ETCS::Buffer* key = nullptr; };
     static bool relistLocked(Entity* child, RID rid, RIDListHandle& src, const ETCS::Buffer& tag,
-                             Entity* to, RIDListHandle*& dest)
+                             Entity* to, ListSlot& dest)
     {
+        Entity* from = child->parent_;
         if (child->token_)
         {
             if (!to->local_arena_->moveToken(child->token_, *child->owning_arena_)) return false;
             child->owning_arena_ = to->local_arena_;
         }
-        if (!dest)
+        if (!dest.list)
         {
             auto dit = to->typed_children_.find(tag);
-            if (dit != to->typed_children_.end()) dest = &dit->second;
-            else
+            if (dit == to->typed_children_.end())
             {
                 RIDListHandle fresh = src.invoke_make_in(*to->local_arena_, tag.c_str());
-                dest = &to->typed_children_.emplace(tag, fresh).first->second;
+                dit = to->typed_children_.emplace(tag, fresh).first;
                 to->typed_child_order_.push_back(tag);
             }
+            dest = ListSlot{ &dit->second, &dit->first };
         }
-        dest->invoke_insert(rid, child);   // insert before remove: an exception leaves it where it was
+        dest.list->invoke_insert(rid, child);   // insert before remove: an exception leaves it where it was
         src.invoke_remove(rid);
+        to->childAddedLocked(dest.key, rid, child);
+        if (from) from->childRemovedLocked(rid);
         child->parent_ = to;
         child->depth_  = to->depth_ + 1;   // its own subtree: renumberDepth, below the locks
         child->ctx_.setProvider(&to->ctx_);
@@ -1786,6 +2107,7 @@ public:
  * real bundle existed at all.
  */
     tags[source_tag] = TagEntry{ &bundle, child };
+    publishSurfaceLocked();
     }
 #endif /*
  * ETCS_LOADER
@@ -1849,11 +2171,13 @@ public:
  */
     bool hasTag(const ETCS::Buffer& tag) const
     {
-        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
         const char* s = tag.c_str();
-        bool is_flag = s && s[0] >= 'a' && s[0] <= 'z';
-        return is_flag ? (flags_.find(tag) != flags_.end())
-                        : (tags.find(tag) != tags.end());
+        const bool is_flag = s && s[0] >= 'a' && s[0] <= 'z';
+        ETCS::ReadSection rs;
+        const SurfaceView* v = surfaceView();
+        if (!v) return false;
+        return is_flag ? v->find(v->flags(), v->nflags, tag.buf, tag.written) >= 0
+                       : v->find(v->tkeys(), v->ntags,  tag.buf, tag.written) >= 0;
     }
     /*
  * safeBundleFor - the SAME null-bundle guard the plain, non-stream
@@ -1897,13 +2221,15 @@ public:
     }
     void getTags(::std::vector<ETCS::Buffer>& result) const
     {
-        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
-        for (auto const& [key, _] : tags) result.push_back(key);
+        ETCS::ReadSection rs;
+        if (const SurfaceView* v = surfaceView())
+            for (uint32_t i = 0; i < v->ntags; ++i) result.emplace_back(v->str(v->tkeys()[i]));
     }
     void getFlags(::std::vector<ETCS::Buffer>& result) const
     {
-        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
-        for (auto const& [key, _] : flags_) result.push_back(key);
+        ETCS::ReadSection rs;
+        if (const SurfaceView* v = surfaceView())
+            for (uint32_t i = 0; i < v->nflags; ++i) result.emplace_back(v->str(v->flags()[i]));
     }
     /*
  * ═══ THE RUNTIME HASH ════════════════════════════════════════════════════
@@ -2075,9 +2401,10 @@ public:
         if (family == ETCS::Buffer("Observable")) observable_wire_ = ptr;
         if (family == ETCS::Buffer("Orderable"))  is_orderable_    = ptr != nullptr;
     }
+    // Written in the constructor and never again (registerInterfacePointer):
+    // read without a lock.
     void* getInterfacePointer(const ETCS::Buffer& family) const
     {
-        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
         auto it = interface_pointers_.find(family);
         return it != interface_pointers_.end() ? it->second : nullptr;
     }
@@ -2164,7 +2491,6 @@ public:
 
     void getInterfaceFamilies(::std::vector<ETCS::Buffer>& result) const
     {
-        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
         for (auto const& [family, _] : interface_pointers_) result.push_back(family);
     }
     void getAllActions(::std::vector<ETCS::Buffer>& all_actions)
@@ -2483,11 +2809,13 @@ public:
     void stateFlags(::std::vector<::std::string>& out) const
     {
         const ::std::string scope = ETCS::ScopeTag::kPrefix;
-        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
-        for (auto const& [key, _] : flags_)
+        ETCS::ReadSection rs;
+        const SurfaceView* v = surfaceView();
+        for (uint32_t i = 0; v && i < v->nflags; ++i)
         {
-            ::std::string f = key.toString();
-            if (f.compare(0, scope.size(), scope) != 0) out.push_back(::std::move(f));
+            const ViewStr f = v->flags()[i];
+            if (f.n < scope.size() || ::std::memcmp(v->p(f), scope.data(), scope.size()) != 0)
+                out.emplace_back(v->p(f), f.n);
         }
     }
     static ::std::string flagKey(const Entity* e, const ::std::string& flag)
@@ -3213,14 +3541,16 @@ private:
         if (!is_remove)
         {
             ::std::lock_guard<::std::mutex> lock(target->m_tagMutex);
-            bool changed = target->flags_.emplace(key, true).second;
+            const bool flag_on = target->flags_.emplace(key, true).second;
+            bool value_set = false;
             if (value)
             {
                 auto v = target->values_.find(key);
-                if (v == target->values_.end()) { target->values_.emplace(key, *value); changed = true; }
-                else if (v->second != *value)   { v->second = *value;                  changed = true; }
+                if (v == target->values_.end()) { target->values_.emplace(key, *value); value_set = true; }
+                else if (v->second != *value)   { v->second = *value;                  value_set = true; }
             }
-            return changed;
+            if (flag_on || value_set) target->surfaceSetLocked(key, value_set ? value : nullptr);
+            return flag_on || value_set;
         }
  
         /*
@@ -3313,11 +3643,13 @@ private:
                 child_to_delete = it->second.child;
                 target->tags.erase(it);
                 changed = true;
+                target->publishSurfaceLocked();
             }
             else
             {
                 changed = (target->flags_.erase(key) > 0);
                 target->values_.erase(key);
+                if (changed) target->surfaceRemoveLocked(key);
             }
         }
  
@@ -3385,6 +3717,7 @@ template<typename T>
  
         RID rid = child->getRID(); // virtual call - no cast needed
         it->second.invoke_insert(rid, child);
+        parent->childAddedLocked(&it->first, rid, child);
  
         /*
  * Also register into T's own module-level RIDList - the same one
@@ -4805,9 +5138,6 @@ inline uint64_t Entity::subtreeValueHashOf(const ::std::vector<uint64_t>& per_no
 
 inline uint64_t Entity::surfaceHash() const
 {
-    // Snapshot under the tag mutex, hash outside it: XXH3 over a few hundred
-    // bytes is longer than a lock should be held by anything a call() path
-    // waits on.
     /*
      * NO RIDS. A RID is where and when an entity was made -- the order types
      * happened to be created in -- and a scene rebuilt in another order is the
@@ -4822,27 +5152,30 @@ inline uint64_t Entity::surfaceHash() const
      * (ScopeTag::kPrefix); that is the motion of the runtime, not its state,
      * and a hash taken mid-call must equal one taken after.
      */
+    // From the published surface, and kept on it: the surface moves only by
+    // publishing a new view, so a view's hash is computed once, by the first
+    // reader that asks (two racing readers store the same number).
+    ETCS::ReadSection rs;
+    const SurfaceView* v = surfaceView();
+    if (!v) return XXH3_64bits("\x00", 1);
+    if (const uint64_t h = v->hash.load(::std::memory_order_relaxed)) return h;
     ::std::vector<::std::string> markers, dispatch, relations, flags;
+    for (uint32_t i = 0; i < v->ntags; ++i)
     {
-        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
-        for (auto const& [key, entry] : tags)
-        {
-            if (entry.child)        { ::std::string r = key.toString() + "=" +
-                                          entry.child->getSourceModule().toString() + ":" +
-                                          entry.child->getSourceTag().toString();
-                                      relations.push_back(::std::move(r)); }
-            else if (entry.bundle)  { ::std::string d = key.toString();
-                                      etcs_hash_detail::put_u64(d, entry.bundle->hash);
-                                      dispatch.push_back(::std::move(d)); }
-            else                    markers.push_back(key.toString());
-        }
-        const ::std::string scope = ETCS::ScopeTag::kPrefix;
-        for (auto const& [key, _] : flags_)
-        {
-            ::std::string f = key.toString();
-            if (f.compare(0, scope.size(), scope) == 0) continue;
-            flags.push_back(::std::move(f));
-        }
+        const ::std::string key = v->str(v->tkeys()[i]);
+        const TagEntry& entry = v->tentry()[i];
+        if (entry.child)        relations.push_back(key + "=" + v->str(v->trels()[i]));
+        else if (entry.bundle)  { ::std::string d = key;
+                                  etcs_hash_detail::put_u64(d, entry.bundle->hash);
+                                  dispatch.push_back(::std::move(d)); }
+        else                    markers.push_back(key);
+    }
+    const ::std::string scope = ETCS::ScopeTag::kPrefix;
+    for (uint32_t i = 0; i < v->nflags; ++i)
+    {
+        ::std::string f = v->str(v->flags()[i]);
+        if (f.compare(0, scope.size(), scope) == 0) continue;
+        flags.push_back(::std::move(f));
     }
     ::std::sort(markers.begin(),   markers.end());
     ::std::sort(dispatch.begin(),  dispatch.end());
@@ -4855,7 +5188,9 @@ inline uint64_t Entity::surfaceHash() const
     for (auto const& d : dispatch)  etcs_hash_detail::put(in, 'D', d.data(), d.size());
     for (auto const& r : relations) etcs_hash_detail::put(in, 'R', r.data(), r.size());
     for (auto const& f : flags)     etcs_hash_detail::put(in, 'F', f.data(), f.size());
-    return XXH3_64bits(in.data(), in.size());
+    const uint64_t h = XXH3_64bits(in.data(), in.size());
+    v->hash.store(h, ::std::memory_order_relaxed);
+    return h;
 }
 
 /*

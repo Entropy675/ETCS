@@ -400,6 +400,19 @@ Three graduated tiers of causal weight, not a flat local/global split:
   token changing hands) — never treated as commutable with *anything*
   in flight, regardless of type or module.
 
+**Reading an entity takes no lock.** Writers to an entity's surface (flags,
+values, tags) and children still exclude each other with its `m_tagMutex`,
+and most already arrive on an ordering thread. Each write publishes an
+immutable view with one pointer store; readers (`hasTag`, `valueOf`,
+`getTypedChild`, the child walks, the surface hash) read the view they
+loaded. A replaced view is freed once no reader can still hold it (grace
+periods, `core/Reclaim.h`). Views are not arena memory: they are plain blocks
+from the one process-wide `Reclaimer`, which modules adopt through the
+loader's node as they adopt the thread pool, so a view a module retired is
+freed after that module has unloaded without calling into its code. Still
+under the lock: the ordered child views (`getOrderedTypedChildren`), the
+in-flight scopes, and every writer.
+
 The `Ack` mechanism (`DLInEvent::reply_to`, `sendAckIfNeeded`) provides
 the happen-before edge across the module/loader thread boundary: after
 finishing one of the five reply-eligible kinds, the loader enqueues a

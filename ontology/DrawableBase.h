@@ -102,8 +102,8 @@ ETCS_SUPERTYPE_BASE(Drawable), public SurfaceBase<Derived>
 
     /*
      * CACHED, as close to where it is read as it can be: this is asked for
-     * every child on every compose and every pick, and a flag lookup takes
-     * the tag mutex. The cache is stamped with the node's hash epoch, which
+     * every child on every compose and every pick, and a flag lookup builds
+     * a key and searches the node's published surface. The cache is stamped with the node's hash epoch, which
      * every flag change bumps (Entity::markStateChange) -- so it is current
      * exactly when the epochs agree, the same test getHash makes, and a
      * change landing during a refresh is stored but never believed.
