@@ -71,6 +71,7 @@ To serve a page locally:
 etcs modules/PaintProvider/scripts/serve_paint.etcs      # https://localhost:8443/
 etcs modules/ChessProvider/scripts/serve_chess.etcs      # https://localhost:8444/
 etcs modules/RenderProvider/scripts/serve_scene3d.etcs   # https://localhost:8443/
+etcs modules/GolfProvider/scripts/serve_golf.etcs        # https://localhost:8443/
 etcs modules/WindowProvider/scripts/serve_web.etcs       # https://localhost:8443/
 etcs scripts/run_tls_website.etcs                        # the whole site, paint at /paint/
 ```
