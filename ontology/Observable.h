@@ -131,6 +131,21 @@ inline void etcs_mark_observed(ETCS::Entity* from)
 }
 
 /*
+ * Mark `node` as RESTATED: what it derives from changed -- a camera's eye, the
+ * scene it is bound to -- so its own view of itself is stale too. The same
+ * walk with no origin, so nothing is excluded, the self edge included: a
+ * node whose cache is gated on its self edge (Camera3D's picture) re-derives,
+ * and everything above it hears it as before. Its own writes still mark with
+ * itself as origin (etcs_mark_observed), so re-deriving does not re-mark.
+ */
+inline void etcs_mark_restated(ETCS::Entity* node)
+{
+    for (ETCS::Entity* n = node; n; n = n->getParent())
+        if (ETCS::IWireObservable* o = etcs_observable_of(n))
+        { o->MarkObserved(0); return; }
+}
+
+/*
  * A batch on whatever Observable `target` is, for the length of a scope.
  *
  * The family verbs are on ObservableBase (BeginBatch/EndBatch, which say why),
