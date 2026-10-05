@@ -67,7 +67,7 @@ run site_pages.etcs tree=tree
 tree.SetDefaultExtension(.html)
 tree.ListPaths()
 
-# ── the wasm apps: /paint, /chess/play, /golf ───────────────────────────────
+# ── the wasm apps ───────────────────────────────────────────────────────────
 #
 # Each a self-contained site under a prefix of its own, from its module's own
 # list of files, and the runtime they share at /wasm/ (site_apps.etcs).

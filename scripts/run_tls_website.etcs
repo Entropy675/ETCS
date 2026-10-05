@@ -6,8 +6,8 @@ web.SetPort(8443)
 web.EnableTLS(/tmp/etcs-cert.pem /tmp/etcs-key.pem)
 
 # Cross-origin isolation, site-wide -- SharedArrayBuffer, and therefore threads,
-# for the -pthread wasm apps (/paint, /chess/play, /golf). See run_website.etcs for why this is
-# safe for the pages that came first and what it does change.
+# for the -pthread wasm apps (site_apps.etcs). See run_website.etcs for why this
+# is safe for the pages that came first and what it does change.
 web.AddHeader(Cross-Origin-Opener-Policy same-origin)
 web.AddHeader(Cross-Origin-Embedder-Policy require-corp)
 
@@ -27,8 +27,8 @@ run site_pages.etcs tree=tree
 tree.SetDefaultExtension(.html)
 tree.ListPaths()
 
-# The wasm apps -- /paint, /chess/play, /golf -- and /wasm/, from the one list
-# both spellings of the site run (site_apps.etcs).
+# The wasm apps and /wasm/, from the one list both spellings of the site run
+# (site_apps.etcs).
 run site_apps.etcs tree=tree
 tree.ListPaths()
 

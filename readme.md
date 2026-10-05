@@ -74,7 +74,7 @@ etcs modules/RenderProvider/scripts/serve_scene3d.etcs   # https://localhost:844
 etcs modules/GolfProvider/scripts/serve_golf.etcs        # https://localhost:8443/
 etcs modules/KartProvider/scripts/serve_kart.etcs        # https://localhost:8445/
 etcs modules/WindowProvider/scripts/serve_web.etcs       # https://localhost:8443/
-etcs scripts/run_tls_website.etcs                        # the whole site: /paint/, /chess/, /golf/
+etcs scripts/run_tls_website.etcs                        # the whole site: /paint/, /chess/, /golf/, /kart/
 ```
 
 A page belongs to its module, in the module's `scripts/www/`; the site mounts it from there rather than keeping a copy (`scripts/site_pages.etcs` for a single page; `scripts/site_apps.etcs` for a wasm app, from its module's `*_mounts.etcs`).
