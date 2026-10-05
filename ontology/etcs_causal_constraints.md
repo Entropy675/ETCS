@@ -51,9 +51,17 @@ hash -- its place is by what it is. Twins attached in the other order: a
 different hash, because the first twin is whichever came first, and that is
 the one fact the lines carry about them.
 
+**What that means for runtimes sharing one world.** The lines must be all
+that steps it. A picture steps a scene by the wall clock (being looked at
+is an interaction, §7), and the clock and each runtime's own eye are what
+two runtimes do not share -- so a world replayed from one record is stepped
+by its driver alone (RenderProvider's `Scene3D.SetDriven`), with the ticks
+as lines of that record (KartProvider's race).
+
 **Check.** `CausalTester` §4 (the same lines twice; a distinguishable member
 moved; twins swapped; the tuple on the rows). `HashTester` §10: arrival
-order on every read.
+order on every read. `KartTester` §6: three races, one judging and two
+following its record, the same race to the bit.
 
 ## 3. Energy is conserved, exactly
 
