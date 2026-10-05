@@ -1,0 +1,58 @@
+#!/usr/bin/env etcs
+#IMPORT ACE_ROOT/modules
+
+# THE WASM APPS, mounted into the site's FileHtmlPage -- one list for both
+# spellings of the site (run_website.etcs, run_tls_website.etcs):
+#
+#   run site_apps.etcs tree=tree
+#
+# Each app is a SELF-CONTAINED SITE: its own index.html, its own modules.json,
+# its own scripts. A prefix of its own is what keeps the index.html files from
+# landing on the same name -- flat, the winner would be attach order. Every url
+# inside a page is relative, so it does not learn it was mounted. Relative is
+# also why each address takes the slash (/paint/, /golf/): from /paint the
+# browser resolves "modules.json" to /modules.json. The server answers the bare
+# spelling with a 301 to the slashed one (FileHtmlPage::ResolveConcrete).
+#
+# Each app's files come from ITS module's list of them (<Name>_mounts.etcs, the
+# same list its own serve script runs at the root of its own server); the site
+# only says where the app lives (FileHtmlPage::SetMountPrefix). A name a page
+# asks for and nothing mounts is a 404 -- and the one that matters is
+# render_frames.etcs, the frame pump: losing it leaves a black canvas on a
+# working runtime.
+#
+# The site's SetDefaultExtension(.html) is ITS node's, not a mounted subtree's:
+# an app fetches exact names (modules.json, etcs.js, *.wasm, shell), so a
+# prefix needs no extension guessing and inherits none.
+
+requires tree [FileHtmlPage]
+
+# The one copy of the browser runtime: `ace wasm make` writes bin/wasm/ and
+# nothing else does (Makefile, WASM_DIR, on why it is its own directory and why
+# a page never holds a copy). Every app resolves its modules from /wasm/.
+tree.MountTree(wasm ACE_ROOT/bin/wasm)
+
+# ── /paint ───────────────────────────────────────────────────────────────────
+# Its www/ mounted whole, then the files it stages into the browser FS.
+tree.MountTree(paint ACE_ROOT/modules/PaintProvider/scripts/www)
+tree.SetMountPrefix(paint)
+run PaintProvider/scripts/paint_mounts.etcs tree=tree
+tree.SetMountPrefix()
+
+# ── /chess ───────────────────────────────────────────────────────────────────
+# /chess/ is a LANDING PAGE (scripts/www/chess/index.html): what there is to
+# play, and the buttons that open it. The game is the wasm chess page, mounted
+# two deep at /chess/play/; it plays on the visitor's own runtime, and its hall
+# -- who is hosting, which ranked table has a seat -- is a listing over the
+# link, read from the services the site runs after Start (chess_service.etcs).
+# The server-played page it replaced is at /chess-classic (site_pages.etcs).
+tree.SetMountPrefix(chess/play)
+run ChessProvider/scripts/chess_mounts.etcs tree=tree
+tree.SetMountPrefix()
+
+# ── /golf ────────────────────────────────────────────────────────────────────
+# One hole, played on the visitor's own runtime: RenderProvider's 3D page with
+# the golf course and game staged into it (GolfProvider/scripts/golf_mounts.etcs).
+tree.SetMountPrefix(golf)
+run GolfProvider/scripts/golf_mounts.etcs tree=tree
+tree.SetMountPrefix()

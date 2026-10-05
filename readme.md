@@ -73,10 +73,10 @@ etcs modules/ChessProvider/scripts/serve_chess.etcs      # https://localhost:844
 etcs modules/RenderProvider/scripts/serve_scene3d.etcs   # https://localhost:8443/
 etcs modules/GolfProvider/scripts/serve_golf.etcs        # https://localhost:8443/
 etcs modules/WindowProvider/scripts/serve_web.etcs       # https://localhost:8443/
-etcs scripts/run_tls_website.etcs                        # the whole site, paint at /paint/
+etcs scripts/run_tls_website.etcs                        # the whole site: /paint/, /chess/, /golf/
 ```
 
-A page belongs to its module, in the module's `scripts/www/`; the site mounts it from there rather than keeping a copy (`scripts/site_pages.etcs`, and each module's `*_mounts.etcs` for a page with files of its own).
+A page belongs to its module, in the module's `scripts/www/`; the site mounts it from there rather than keeping a copy (`scripts/site_pages.etcs` for a single page; `scripts/site_apps.etcs` for a wasm app, from its module's `*_mounts.etcs`).
 
 A `-pthread` build needs cross-origin isolation for `SharedArrayBuffer`, so every serve script sets `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp`; a plain static server without those headers loads the page and then every Worker dies on `wasmMemory is undefined`.
 
