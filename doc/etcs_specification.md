@@ -423,6 +423,14 @@ many actions and streams run on them, they share its one connection: a stream is
 channel on it, not a connection of its own. A second `Peer` to an address one already holds is
 refused.
 
+**An answer is waited for as long as the link lives.** An action on a surface, a `Bind`, a stream
+opening: each holds its caller as a local action does, until the far side answers, the link
+closes, or the caller is interrupted. So does making the link: a guest waits for its welcome, and
+a hub keeps it parked, until a host hosting through the hub comes for it. Whether the far side is still there is the transport's to
+say -- a server's end pings every 10 s, and either end closes a link it has heard nothing on for
+35 s, which wakes every caller waiting on it. How long the far side takes is not: one that is busy
+(a browser tab moves its socket's bytes only when its main thread runs) answers late, not never.
+
 **A browser is a runtime like any other.** The web build dials the same way (its socket is the
 browser's WebSocket), so a page's runtime binds surfaces and opens streams on a native one
 directly. A page cannot accept a connection, so a page that hosts does it through a hub
