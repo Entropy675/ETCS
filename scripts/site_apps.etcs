@@ -58,7 +58,7 @@ run GolfProvider/scripts/golf_mounts.etcs tree=tree
 tree.SetMountPrefix()
 
 # ── /kart ────────────────────────────────────────────────────────────────────
-# A race between runtimes: hosted by a visitor's tab, joined from others over
+# A battle between runtimes: hosted by a visitor's tab, joined from others over
 # the site's hub, listed in the same hall the chess tables are
 # (KartProvider/scripts/kart_mounts.etcs).
 tree.SetMountPrefix(kart)
