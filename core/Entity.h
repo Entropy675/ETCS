@@ -289,8 +289,9 @@ private:
  * parent deleted without its children (MemoryArena::moveToken: moveTo,
  * reparentChildrenTo). Everything it holds is still in here.
  *
- * It is ALSO independently resettable at any time via getArena().reset(),
- * which only touches this entity's own chunks.
+ * It is NOT resettable on its own: this entity's maps live in it, so a reset
+ * would leave the owner holding its own freed state. It ends with the owner
+ * (MemoryArena::reset refuses an owned arena).
  *
  * Must be declared before tags/flags_/typed_children_ below - member
  * init order follows declaration order, and all three allocate out of
@@ -1136,7 +1137,7 @@ public:
         , bindings_(ArenaAllocator<::std::pair<const ETCS::Buffer, ValueBinding>>(local_arena_))
         , interface_pointers_(ArenaAllocator<::std::pair<const ETCS::Buffer, void*>>(local_arena_))
         , typed_children_(ArenaAllocator<::std::pair<const ETCS::Buffer, RIDListHandle>>(local_arena_))
-    {}
+    { local_arena_->markOwned(); }
     /*
  * -----------------------------------------------------------------------
  * ~Entity() - pure, ordinary cleanup now. Both the child-reparenting

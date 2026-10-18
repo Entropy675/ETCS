@@ -624,7 +624,8 @@ private:
      */
     DestructorRecord*   dtorTail_     = nullptr;   // oldest
     bool                isTeardown_   = false;
-    bool                pagesReleased_ = false;   // releasePages ran (memoryTeardown runs it once)
+    bool                pagesReleased_ = false;
+    bool                owned_        = false;    // an entity's own arena (markOwned)   // releasePages ran (memoryTeardown runs it once)
 
     // ---------------------------------------------------------------------
     // Child-page pool — meaningful ONLY on the true global singleton
@@ -1903,6 +1904,13 @@ public:
     Entity* findNextCandidateScope(Pred&& pred, Entity* exclude = nullptr)
     {
         ::std::lock_guard<::std::mutex> lock(allocationMutex_);
+        return findCandidateLocked(pred, exclude);
+    }
+
+private:
+    template<typename Pred>
+    Entity* findCandidateLocked(Pred&& pred, Entity* exclude) const
+    {
         for (DestructorRecord* rec = dtorHead_; rec; rec = rec->prev)
         {
             if (!rec->as_entity) continue;
@@ -1912,6 +1920,7 @@ public:
         }
         return nullptr;
     }
+public:
  
     void cleanupTypedEntities()
     {
@@ -1923,12 +1932,44 @@ public:
         dtorHead_ = dtorTail_ = nullptr;
     }
  
-    void reset()
+    /*
+     * AN ENTITY'S OWN ARENA. Its tags, flags, values and child lists are
+     * allocated here (Entity's constructor), so the arena IS the owner's state:
+     * it ends when the owner is deleted, never under it. Set once, by Entity.
+     */
+    void markOwned() { owned_ = true; }
+
+    /*
+     * RESET IS AN UNLOAD AND A RELOAD WITHOUT THE dlclose. The causal model
+     * cannot tell the two apart, so reset is legal exactly where an unload is:
+     * nothing holds the arena's lifetime. Refused, and said so, when the arena
+     * belongs to an owner (delete the owner) or when the lifetime election
+     * would still find a survivor: every entity whose record is on this chain
+     * is root-level here and externally referenced, so each one is a holder
+     * the token can pass to -- the same search, the same answer
+     * (findNextCandidateScope, run_entity_delete). A movable child's bytes may
+     * sit here with its record in its parent's chain, but its parent's line
+     * ends at a root on this chain, so it never stands here alone. Returns
+     * whether it reset.
+     */
+    bool reset()
     {
         DestructorRecord* rec;
         {
             ::std::lock_guard<::std::mutex> lock(allocationMutex_);
-            if (isTeardown_) return;
+            if (isTeardown_) return false;
+            if (owned_)
+            {
+                ETCS_LOG("MemoryArena", "reset refused: this arena is an entity's own "
+                         "state -- delete the owner, and the arena goes with it.");
+                return false;
+            }
+            if (findCandidateLocked([](Entity*) { return true; }, nullptr))
+            {
+                ETCS_LOG("MemoryArena", "reset refused: a root-level entity still holds "
+                         "its lifetime -- the same condition an unload waits on.");
+                return false;
+            }
             rec = dtorHead_;
             dtorHead_ = dtorTail_ = nullptr;
         }
@@ -1972,6 +2013,7 @@ public:
         }
  
         current_ = head_;
+        return true;
     }
  
     /*

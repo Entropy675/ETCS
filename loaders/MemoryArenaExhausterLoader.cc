@@ -365,36 +365,50 @@ static void test_reparent_case()
 }
 
 // ===========================================================================
-// Test 6 -- reset() specifically.
+// Test 6 -- reset() is an unload, and is refused wherever an unload would be.
 //
-// reset() has the identical dtor-walk-under-lock shape memoryTeardown()
-// had -- same fix, same reason to verify independently. Spawns several
-// LeafWithMap instances (live entries) directly into a CHILD arena
-// (not the global singleton itself, since reset() on the true root
-// would tear down this whole test process's own state), then calls
-// reset() on that child arena and confirms it returns normally.
+// The causal model cannot tell a reset from an unload and a reload, so reset
+// is legal exactly when nothing holds the arena's lifetime. An entity's own
+// arena holds that entity's tags, flags and child lists: it is the owner's
+// state, and it ends by deleting the owner. Resetting it under a live owner
+// used to "work" only because the owner's maps came back zeroed; once the
+// child views lived outside the arena, the owner was left naming children
+// whose destructors had run, and deleting it walked into them.
+//
+// Before: the first check reads false (reset ran), and deleteEntity(host)
+// below crashed in etcs_retire_entity.
 // ===========================================================================
 static void test_reset_reentrancy()
 {
-    section("Test 6: reset() reentrancy (same shape as memoryTeardown())");
+    section("Test 6: reset() only where nothing holds the arena's lifetime");
 
     auto& arena = ETCS::MemoryArena::getInstance();
 
-    // A throwaway top-level entity purely to host a REAL, resettable
-    // child arena (getArena()) that isn't the global singleton itself.
     ParentLeaf* host = arena.allocate<ParentLeaf>();
     for (int i = 0; i < 10; ++i)
     {
         LeafWithMap* child = host->addTag<LeafWithMap>();
         child->fill(20);
     }
-
-    std::cout << "  calling reset() on host's own local_arena_ (10 prior live-map children)...\n";
-    host->getArena().reset();
-    std::cout << "  reset() returned normally\n";
-    CHECK(true, "reset() completed without crashing despite live-map children");
-
+    CHECK(!host->getArena().reset(), "reset() refuses an entity's own arena -- the owner is alive");
+    std::vector<ETCS::Entity::ChildRef> kids;
+    host->getTypedChildRefs(kids);
+    CHECK(kids.size() == 10, "...and the owner still has all ten children");
     arena.deleteEntity(host, true);
+    CHECK(true, "deleting the owner takes its arena and children with it");
+
+    // An arena with no owner: reset while it holds a live entity is refused
+    // (that entity holds its lifetime), and allowed once it holds none.
+    ETCS::MemoryArena* loose = arena.allocate<ETCS::MemoryArena>(DEFAULT_ARENA_START_PAGE, false);
+    LeafWithMap* leaf = loose->allocate<LeafWithMap>();
+    leaf->fill(20);
+    CHECK(!loose->reset(), "reset() refuses an arena still holding a live entity");
+    loose->deleteEntity(leaf, true);
+    int* scratch = loose->allocate<int>(7);
+    CHECK(scratch && *scratch == 7, "the arena still allocates after the entity left");
+    CHECK(loose->reset(), "with nothing holding its lifetime, reset() runs");
+    int* again = loose->allocate<int>(9);
+    CHECK(again && *again == 9, "...and the arena is usable after it");
 }
 
 // ===========================================================================
