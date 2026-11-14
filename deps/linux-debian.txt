@@ -1,6 +1,9 @@
 # ETCS build dependencies -- Debian family (debian, ubuntu, raspbian)
 #
-# FORMAT:  <package-name>   <probe>   [# comment]
+# FORMAT:  <package-name>   <probe>   [optional]   [# comment]
+#
+# `optional` marks a package whose absence is shown but never counted as
+# missing: it cannot block a build or keep the first-run check re-running.
 #
 # The PACKAGE NAME is the only distro-specific thing on each line. The
 # PROBE is distro-independent -- it tests whether the thing is actually
@@ -34,5 +37,5 @@ libsqlite3-dev    pkgconfig:sqlite3     # database scripting layer
 libmbedtls-dev    header:mbedtls/ssl.h  # MbedTLSContext (no .pc file on 2.x)
 
 # --- Development ------------------------------------------------------
-gdb               binary:gdb
-lldb              binary:lldb
+gdb               binary:gdb            optional
+lldb              binary:lldb           optional

@@ -12,13 +12,16 @@ I do not recommend working on this substrate until the below todo's are complete
 
 To write an ETCS provider, you effectively have to introduce yourself to the ETCS runtime via a thin ontology compliant wrapper. Every module has the same shape (`modules/readme.txt`: which file holds what, and why ace only attests headers in those places). See ChessProvider in ETCS-Commons repo (https://github.com/Entropy675/ETCS-Commons/tree/main/ChessProvider) for a bare bones example. Once your types speak over the ETCS scripting language, you can act across the arbitrary MirrorBuffer boundary, which is the function call boundary for stream functions or streams you negotiate yourself (less recommended unless you know what you are doing - I'll make a tutorials). The stream work function contract is an explicit lifetime: the consume stream function holds open the lifetime of the connection and is blocking; the produce side is non-blocking and expected to output continuously over the MirrorBuffer they share, which wraps/unwraps via the Wrapper_ based types owned by either side. A connection drop or otherwise failure to set up a MirrorBuffer ends the connection, logging it as a failure on both sides. If one side cannot assemble the same Wrapper_ based types required to generate a valid MirrorBuffer to a target type, stream calls fail. Since all scripts are run locally remote connections have to be brokered via a name server equivalent domain (See ChessNode from ChessProvider). MirrorBuffer covers quite literally every physical boundary from LMAX within process local buffers to sockets, the local EventNode's EventStream negotiates the provenience of local memory with the most local loader separately from the identity of the code, all entities' origin is local in every way (RIDs are runtime deterministic sequences). It's maximized for decreasing arbitrary pattern replication via the ontology, the CRTP layer reduces that pattern match to static casts. An ontology compliant wrapper of existing code gains distribution over all platforms ETCS supports, including the ETCS kernel when it releases, unless platform specific types are declared in the modules type contract declaration (the auto generated header via ace tool's module setup, Contract_XXXXXProvider.h where you can typecast unify your types for every supported system).
 
-To build, pull ACE-Build-Tools in one folder. Pull ETCS in another folder. Pull ETCS-Commons as 'modules' folder in the ETCS folder (it's a git sub-project already, you can init subprojects for the same thing). Run:
+To build, pull ACE-Build-Tools in one folder and ETCS in another. ETCS-Commons is the `modules/` submodule of ETCS, and the vendored sources (sqlite, mbedtls, glfw, stb, ...) are submodules of it, so one recursive init fetches everything, shallow:
 
 ```
-sudo python3 ace_install.py install
+git clone https://github.com/Entropy675/ETCS.git
+git clone https://github.com/Entropy675/ACE-Build-Tools.git
+cd ETCS && git submodule update --init --recursive
 
-// within the ETCS repo or the ETCS-Commons repo you need the submodules before compiling:
-git submodule update --init --recursive
+// from ACE-Build-Tools: probes the machine, installs what is missing
+// (apt/dnf/pacman/zypper), links /usr/local/bin/ace. -y answers every prompt.
+sudo python3 ace_install.py install
 ```
 
 Every system package a module needs is declared in its ACE manifest (`requires.system`), and the first build on a machine checks them all and offers to install what is missing. That check runs once per machine, so when a pull adds a requirement (RenderProvider's `glslang-tools`, which compiles its shaders), run it yourself:
