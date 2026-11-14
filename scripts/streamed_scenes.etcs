@@ -39,7 +39,7 @@ spawn WindowProvider::Window main
 main.Create(1024, 768, 'ETCS composed scenes')
 
 main.spawn(RenderProvider::Surface view)
-view.Create(@gpu, modules/RenderProvider/shaders/)
+view.Create(@gpu)
 
 # The stage: a rectangle the size of the frame, and the root of the tree.
 # Ordinary in every way -- it is the polygon nobody nested inside anything.

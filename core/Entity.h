@@ -3,9 +3,11 @@
 #include "ETCS_API.h"
 #include "../libs.h"
 #include "Bundles.h"
+#include "Provenance.h"
 #include "ArenaAllocator.h"
 #include "MemoryArena.h"
 #include "RIDList.h"
+#include "Reclaim.h"
 /*
  * EventNode.h - needed for AddTagEvent (addTag<T>, below), EntityUnloadEvent
  * (operator delete, below), and for the EventNode::ridMap access in
@@ -27,9 +29,12 @@
 #include <chrono>
 #include <string>
 #include <algorithm>
+#include <array>
 #include <set>
 #include <map>
 #include <unordered_map>   // the region-digest table below
+#include <cstring>
+#include <new>
 namespace ETCS
 {
 inline ETCS::Buffer source()
@@ -162,6 +167,17 @@ inline ETCS::TagMask resolvePairModuleMask(const ETCS::Buffer& tag_a,
 class Entity;
 inline void etcs_supertype_fanout(Entity* e);
 
+/*
+ * A MOVABLE TYPE can change parents while it lives (Entity::moveTo): a family
+ * whose containment is a fact that changes -- the Causal family, where what
+ * holds a thing is what it fits in -- says so with a static kEtcsMovable.
+ * Its children are made with their bytes in a stable home (addTag<T>), so a
+ * move is a lifetime-token move and nothing else.
+ */
+template<class T, class = void> struct etcs_movable : ::std::false_type {};
+template<class T> struct etcs_movable<T, ::std::void_t<decltype(T::kEtcsMovable)>>
+    : ::std::bool_constant<T::kEtcsMovable> {};
+
 class Entity
 {
     /*
@@ -218,6 +234,7 @@ private:
     // why neither alone is enough.
     ::std::atomic<int>                    lifetime_holds_{ 0 };
     ::std::atomic<bool>                   retiring_{ false };
+    ::std::atomic<bool>                   retired_{ false };    // etcs_retire_entity told the parent: once per entity
     /*
  * ---------------------------------------------------------------------
  * owning_arena_ - the arena this entity's OWN outer object and its
@@ -264,8 +281,17 @@ private:
  * inside its parent's arena, so evoking the parent's arena tree
  * reaches everything in one place.
  *
- * It is ALSO independently resettable at any time via getArena().reset(),
- * which only touches this entity's own chunks.
+ * A MOVABLE CHILD (etcs_movable) is the one exception, by design: its outer
+ * object and this arena's object live in its module's root arena -- a home
+ * that outlives every parent it will have -- and only their two destructor
+ * records, its lifetime token, sit in the parent's arena. The parent's
+ * cascade still reaches it through them; a move hands them on, and so does a
+ * parent deleted without its children (MemoryArena::moveToken: moveTo,
+ * reparentChildrenTo). Everything it holds is still in here.
+ *
+ * It is NOT resettable on its own: this entity's maps live in it, so a reset
+ * would leave the owner holding its own freed state. It ends with the owner
+ * (MemoryArena::reset refuses an owned arena).
  *
  * Must be declared before tags/flags_/typed_children_ below - member
  * init order follows declaration order, and all three allocate out of
@@ -295,6 +321,54 @@ private:
  */
     ArenaMap<ETCS::Buffer, bool>        flags_;
     /*
+ * THE VALUE BEHIND A TAG. A flag is a presence -- the tag surface has
+ * always said "this is so" -- and a tag can also carry WHAT is so: the
+ * state-altering variables behind the name that names the state, kept on
+ * the one surface the funnel orders, the record keeps, and the store
+ * persists, rather than in a third place beside it. Two kinds of value,
+ * one key space, and which one is not a choice:
+ *
+ *   STORED   state a verb sets (a damping, a colour, an emissivity): set
+ *            through the funnel like a flag (addTag(key, value)) --
+ *            ordered, marked, recorded as the action that set it, so a
+ *            replay sets it again. Bytes, binary-safe (putWord/getWord for
+ *            words). A family that reads one every tick keeps a working
+ *            copy and refreshes it in onValue, so the value is still the
+ *            only writer.
+ *   BOUND    state that moves WITHOUT this script's verb -- the Causal
+ *            rows behind "Causal" move on every interaction, a Ledger's
+ *            lines behind "ledger" arrive from whoever appends over a link
+ *            -- read on demand (bindValue). Set once at
+ *            construction like an interface pointer and never written per
+ *            change; a restore hands the bytes back to the same binding.
+ *
+ * The identity hash (identityHash) covers the flags, not the values; the
+ * state hash (getHash) is both, so one number says "the same state"
+ * (Persistence.h). Values stay out of the identity because a bound value
+ * changes without a funnel -- in the cached merkle it would make every
+ * moving body a divergence and the Causal identity (row 0 carries it)
+ * circular.
+ *
+ * Read with the tag mutex released: a binding takes its family's own lock
+ * (the Causal tree's), and refreshIdentityLocked already goes tree-lock
+ * then the tag mutex, so the other order anywhere would be half of a
+ * deadlock. onValue runs released for the same reason.
+ */
+public:
+    struct ValueBinding
+    {
+        void* self = nullptr;
+        void (*write)(void*, ::std::string&)       = nullptr;   // the value, now
+        bool (*read)(void*, const ::std::string&)  = nullptr;   // the value, back; false if unreadable
+        // A cheap number that changes when the value does (equality only),
+        // for a reader asking whether it MOVED without reading it (a frozen
+        // read reusing what it read last). Null: unknown -- always read it.
+        uint64_t (*digest)(void*)                  = nullptr;
+    };
+private:
+    ArenaMap<ETCS::Buffer, ::std::string>  values_;     // stored values, by key
+    ArenaMap<ETCS::Buffer, ValueBinding>   bindings_;   // bound values, by key
+    /*
  * One type-erased pointer per composed family, keyed by family name.
  * Populated by ETCS_MAKE_INSTANCE's own constructor (ETCS_API.h) via
  * static_cast<Name##_*>(this) -- always a legal, ordinary upcast
@@ -307,6 +381,18 @@ private:
  * never needs to know what any of these families actually are.
  */
     ArenaMap<ETCS::Buffer, void*>       interface_pointers_;
+    /*
+ * THE TWO FAMILIES THE MARK WALK ASKS EVERY ANCESTOR ABOUT, kept as plain
+ * pointers beside the map. markStateChange climbs to the root on every
+ * state transition, and asked each level the map (a lock and a string-keyed
+ * find) whether it was Observable -- which made an attach into a chain of
+ * N cost N such lookups, and a chain of 20,000 take a minute to build. The
+ * map is written once per family at construction (ETCS_MAKE_INSTANCE), so
+ * these two are set at the same moment and never move: the walk is an
+ * atomic increment and a pointer read per level, as its comment promises.
+ */
+    void*                               observable_wire_ = nullptr;   // the IWireObservable half, if composed
+    bool                                is_orderable_    = false;
     /*
  * Typed children - addTag<T>(tag, ...). One RIDList<T*> per distinct
  * tag string, type-erased via RIDListHandle so a single map can hold
@@ -332,6 +418,432 @@ private:
     };
     /*
  * ---------------------------------------------------------------------
+ * THE PUBLISHED VIEWS -- what readers read, without the tag mutex.
+ *
+ * The maps above are the writers' truth. Writers are few and already in one
+ * order (the ordering threads; a delete; a restore) and still exclude each other
+ * with m_tagMutex. After each change a writer builds an immutable view of what
+ * changed -- the surface (flags, values, tags) or the children -- and publishes
+ * it with one pointer store; the view it replaced is retired to the Reclaimer
+ * (core/Reclaim.h) and freed once no reader can still hold it. A reader opens a
+ * ReadSection, loads the pointer and reads: no lock, no write to anything the
+ * writer or another reader touches. Each view is one malloc block of plain data,
+ * so freeing it runs no code.
+ *
+ * THE ORDERED VIEW is the one built by a reader: an order is a sort over the
+ * children's live keys, and keys move far more often than anyone reads the
+ * order (every flag on an orderable child), so it is ordered when read, never
+ * when marked. A mark (a member in or out, a key moved) moves order_gen_; a
+ * reader whose view is stamped with the current generation reads it without
+ * the lock, and one whose view is older takes the lock, has each changed list
+ * drop its departed and place its arrivals and moved members (RIDList::
+ * settle_pending; a full sort only when the rest is not in order) and
+ * publishes for the rest.
+ *
+ * WHAT STAYS UNDER THE LOCK: the sort that rebuilds the ordered view, the
+ * in-flight scopes (scope_), and every writer. interface_pointers_ and
+ * bindings_ need neither: they are written in the constructor, before anyone
+ * else can see this entity, and never again.
+ * ---------------------------------------------------------------------
+ */
+    struct ViewStr { uint32_t off, n; };   // bytes in the view's own text
+    static int viewCmp(const char* a, size_t an, const char* b, size_t bn)
+    {
+        const int c = ::std::memcmp(a, b, an < bn ? an : bn);
+        return c ? c : (an < bn ? -1 : (an > bn ? 1 : 0));
+    }
+    // One block: this header, then sorted arrays -- flags; value keys and
+    // values (parallel); tag keys, relation names and entries (parallel) --
+    // then the text they point into. A relation's name ("module:tag" of the
+    // child it names) is copied in when the view is built: a reader of a
+    // replaced view must not reach through entry.child, which may be gone.
+    // `hash` is the surface hash, filled by the first reader that asks (0: not
+    // yet). `live` is the text still pointed at: a value set again leaves its
+    // old bytes behind until a full rebuild.
+    struct SurfaceView
+    {
+        mutable ::std::atomic<uint64_t> hash{ 0 };
+        uint32_t nflags = 0, nvalues = 0, ntags = 0, ntext = 0, live = 0;
+        const ViewStr*  flags()  const { return reinterpret_cast<const ViewStr*>(this + 1); }
+        const ViewStr*  vkeys()  const { return flags() + nflags; }
+        const ViewStr*  vvals()  const { return vkeys() + nvalues; }
+        const ViewStr*  tkeys()  const { return vvals() + nvalues; }
+        const ViewStr*  trels()  const { return tkeys() + ntags; }
+        const TagEntry* tentry() const { return reinterpret_cast<const TagEntry*>(trels() + ntags); }
+        const char*     text()   const { return reinterpret_cast<const char*>(tentry() + ntags); }
+        const char*     p(ViewStr x) const { return text() + x.off; }
+        ::std::string   str(ViewStr x) const { return ::std::string(p(x), x.n); }
+        static size_t   bytes(uint32_t nf, uint32_t nv, uint32_t nt, uint32_t nx)
+        { return sizeof(SurfaceView) + (nf + 2 * size_t(nv) + 2 * size_t(nt)) * sizeof(ViewStr) + nt * sizeof(TagEntry) + nx; }
+        // Index of `key` in a sorted array, or -1; `at` is where it would go.
+        int find(const ViewStr* a, uint32_t n, const char* k, size_t kn, uint32_t* at = nullptr) const
+        {
+            uint32_t lo = 0, hi = n;
+            while (lo < hi)
+            {
+                const uint32_t mid = (lo + hi) / 2;
+                const int c = viewCmp(p(a[mid]), a[mid].n, k, kn);
+                if (c == 0) { if (at) *at = mid; return static_cast<int>(mid); }
+                if (c < 0) lo = mid + 1; else hi = mid;
+            }
+            if (at) *at = lo;
+            return -1;
+        }
+    };
+    static_assert(sizeof(SurfaceView) % alignof(TagEntry) == 0 && sizeof(ViewStr) % alignof(TagEntry) == 0,
+                  "the tag entries follow the string arrays in one block");
+    // Children in canonical attach order (tag first-attachment, then arrival),
+    // each with the entity itself, and an open-addressed index by RID. `tag`
+    // points at typed_children_'s key, which is never erased: it lives as long
+    // as this entity does.
+    struct ChildEntry { const ETCS::Buffer* tag; RID rid; Entity* child; };
+    struct ChildView
+    {
+        uint32_t n = 0, mask = 0;
+        const ChildEntry* entries() const { return reinterpret_cast<const ChildEntry*>(this + 1); }
+        const uint32_t*   index()   const { return reinterpret_cast<const uint32_t*>(entries() + n); }
+        static uint32_t slotOf(RID r) { uint64_t h = r * 0x9e3779b97f4a7c15ULL; return static_cast<uint32_t>(h >> 32); }
+        const ChildEntry* find(RID r) const
+        {
+            if (!n) return nullptr;
+            const uint32_t* idx = index();
+            for (uint32_t i = slotOf(r) & mask; idx[i]; i = (i + 1) & mask)
+                if (entries()[idx[i] - 1].rid == r) return &entries()[idx[i] - 1];
+            return nullptr;
+        }
+    };
+    // Each tag's children in that tag's own order (RIDList::collect_ordered),
+    // tags in first-attachment order; `gen` is the order_gen_ it was sorted
+    // at, 0 when the sort straddled a commit and must be done again.
+    struct OrderedView
+    {
+        struct Group { const ETCS::Buffer* tag; uint32_t begin, end; };
+        uint64_t gen = 0;
+        uint32_t n = 0, ngroups = 0;
+        const Group* groups() const { return reinterpret_cast<const Group*>(this + 1); }
+        const RID*   rids()   const { return reinterpret_cast<const RID*>(groups() + ngroups); }
+    };
+    mutable ::std::atomic<const SurfaceView*> surface_view_{ nullptr };
+    ::std::atomic<const ChildView*>           child_view_{ nullptr };
+    mutable ::std::atomic<const OrderedView*> ordered_view_{ nullptr };
+    // The keys that moved since the last rebuild, which it acts on: which
+    // child, in which list. order_gen_ moves on every mark. A mark is written
+    // before the generation moves and the rebuild reads the generation before
+    // it takes the marks, so a mark is either in a rebuild or makes the next
+    // one happen. Their own small lock, never the tag mutex: a mark must not
+    // wait out a sort.
+    struct OrderMarks
+    {
+        static constexpr uint32_t kMax = 16;   // past this, every list sorts again
+        const ETCS::Buffer* tag[kMax];
+        RID      rid[kMax];
+        uint32_t n = 0;
+        bool     overflow = false;
+    };
+    mutable ::std::atomic<uint64_t> order_gen_{ 1 };
+    mutable ::std::mutex            order_marks_mu_;
+    mutable OrderMarks              order_marks_;
+
+    // ── the writers' half: build, publish, retire. All under m_tagMutex. ──
+
+    static SurfaceView* allocSurface(uint32_t nf, uint32_t nv, uint32_t nt, uint32_t nx)
+    {
+        SurfaceView* v = new (ETCS::Reclaimer::getInstance().allocate(SurfaceView::bytes(nf, nv, nt, nx))) SurfaceView;
+        v->nflags = nf; v->nvalues = nv; v->ntags = nt; v->ntext = nx;
+        return v;
+    }
+    void publishSurface(const SurfaceView* v)
+    {
+        ETCS::Reclaimer::getInstance().retire(const_cast<SurfaceView*>(surface_view_.exchange(v, ::std::memory_order_acq_rel)));
+    }
+    // The whole surface, from the maps: for a tag going on or off (rare), and
+    // whenever a view's text is mostly bytes nothing points at any more.
+    void publishSurfaceLocked()
+    {
+        auto byKey = [](const ETCS::Buffer* a, const ETCS::Buffer* b) { return viewCmp(a->buf, a->written, b->buf, b->written) < 0; };
+        ::std::vector<const ETCS::Buffer*> fk, vk, tk;
+        size_t chars = 0;
+        for (auto const& kv : flags_)  { fk.push_back(&kv.first); chars += kv.first.written; }
+        for (auto const& kv : values_) { vk.push_back(&kv.first); chars += kv.first.written + kv.second.size(); }
+        ::std::vector<::std::string> rel;   // by tk's order, once sorted
+        for (auto const& kv : tags)    { tk.push_back(&kv.first); chars += kv.first.written; }
+        ::std::sort(fk.begin(), fk.end(), byKey);
+        ::std::sort(vk.begin(), vk.end(), byKey);
+        ::std::sort(tk.begin(), tk.end(), byKey);
+        for (const ETCS::Buffer* k : tk)
+        {
+            const TagEntry& e = tags.find(*k)->second;
+            rel.push_back(e.child ? e.child->getSourceModule().toString() + ":" + e.child->getSourceTag().toString() : ::std::string());
+            chars += rel.back().size();
+        }
+        SurfaceView* v = allocSurface(static_cast<uint32_t>(fk.size()), static_cast<uint32_t>(vk.size()),
+                                      static_cast<uint32_t>(tk.size()), static_cast<uint32_t>(chars));
+        ViewStr*  fl = const_cast<ViewStr*>(v->flags());
+        ViewStr*  ks = const_cast<ViewStr*>(v->vkeys());
+        ViewStr*  vs = const_cast<ViewStr*>(v->vvals());
+        ViewStr*  ts = const_cast<ViewStr*>(v->tkeys());
+        ViewStr*  tr = const_cast<ViewStr*>(v->trels());
+        TagEntry* te = const_cast<TagEntry*>(v->tentry());
+        char*     text = const_cast<char*>(v->text());
+        uint32_t  off = 0;
+        auto put = [&](const char* p, size_t n) { if (n) ::std::memcpy(text + off, p, n); ViewStr r{ off, static_cast<uint32_t>(n) }; off += static_cast<uint32_t>(n); return r; };
+        for (size_t i = 0; i < fk.size(); ++i) fl[i] = put(fk[i]->buf, fk[i]->written);
+        for (size_t i = 0; i < vk.size(); ++i)
+        {
+            ks[i] = put(vk[i]->buf, vk[i]->written);
+            const ::std::string& val = values_.find(*vk[i])->second;
+            vs[i] = put(val.data(), val.size());
+        }
+        for (size_t i = 0; i < tk.size(); ++i)
+        {
+            ts[i] = put(tk[i]->buf, tk[i]->written);
+            tr[i] = put(rel[i].data(), rel[i].size());
+            te[i] = tags.find(*tk[i])->second;
+        }
+        v->live = off;
+        publishSurface(v);
+    }
+    // Dead text a view may carry before a full rebuild: every write copies
+    // the whole text, so slack is paid on each write, the rebuild only once.
+    static constexpr uint32_t kSurfaceSlack = 256;
+    /*
+     * ONE FLAG OR VALUE, from the last view rather than the maps: the funnel's
+     * write path (a flag on, a value set, a value restored) copies the arrays
+     * with one entry put in or changed and appends the new bytes -- no walk of
+     * the maps, no sort. `value` null: the flag only.
+     */
+    void surfaceSetLocked(const ETCS::Buffer& key, const ::std::string* value)
+    {
+        const SurfaceView* o = surface_view_.load(::std::memory_order_relaxed);
+        if (!o) { publishSurfaceLocked(); return; }
+        uint32_t fat = 0, vat = 0;
+        const bool newflag = o->find(o->flags(), o->nflags, key.buf, key.written, &fat) < 0;
+        const int  vi      = value ? o->find(o->vkeys(), o->nvalues, key.buf, key.written, &vat) : -1;
+        const bool newval  = value && vi < 0;
+        const uint32_t keyn = static_cast<uint32_t>(key.written);
+        const uint32_t addn = ((newflag || newval) ? keyn : 0) + (value ? static_cast<uint32_t>(value->size()) : 0);
+        // `live` counts a key once per array it is in (a full rebuild stores
+        // it twice), so a removal can take back exactly what was added.
+        const uint32_t live = o->live + (newflag ? keyn : 0) + (newval ? keyn : 0)
+                            + (value ? static_cast<uint32_t>(value->size()) : 0) - (value && vi >= 0 ? o->vvals()[vi].n : 0);
+        if (o->ntext + addn > 2 * live + kSurfaceSlack) { publishSurfaceLocked(); return; }
+        const uint32_t nf = o->nflags + (newflag ? 1 : 0), nv = o->nvalues + (newval ? 1 : 0), nt = o->ntags;
+        SurfaceView* v = allocSurface(nf, nv, nt, o->ntext + addn);
+        v->live = live;
+        char* text = const_cast<char*>(v->text());
+        ::std::memcpy(text, o->text(), o->ntext);
+        uint32_t off = o->ntext;
+        ViewStr k{ off, keyn };
+        if (newflag || newval) { ::std::memcpy(text + off, key.buf, keyn); off += keyn; }
+        else k = (vi >= 0 ? o->vkeys()[vi] : o->flags()[o->find(o->flags(), o->nflags, key.buf, key.written)]);
+        ViewStr val{ off, value ? static_cast<uint32_t>(value->size()) : 0u };
+        if (value && !value->empty()) ::std::memcpy(text + off, value->data(), value->size());
+        auto splice = [](ViewStr* dst, const ViewStr* src, uint32_t n, uint32_t at, bool insert, ViewStr x) {
+            ::std::memcpy(dst, src, at * sizeof(ViewStr));
+            if (insert) { dst[at] = x; ::std::memcpy(dst + at + 1, src + at, (n - at) * sizeof(ViewStr)); }
+            else        ::std::memcpy(dst + at, src + at, (n - at) * sizeof(ViewStr));
+        };
+        splice(const_cast<ViewStr*>(v->flags()), o->flags(), o->nflags, newflag ? fat : o->nflags, newflag, k);
+        if (value)
+        {
+            splice(const_cast<ViewStr*>(v->vkeys()), o->vkeys(), o->nvalues, newval ? vat : o->nvalues, newval, k);
+            splice(const_cast<ViewStr*>(v->vvals()), o->vvals(), o->nvalues, newval ? vat : o->nvalues, newval, val);
+            if (!newval) const_cast<ViewStr*>(v->vvals())[vi] = val;
+        }
+        else
+        {
+            ::std::memcpy(const_cast<ViewStr*>(v->vkeys()), o->vkeys(), o->nvalues * sizeof(ViewStr));
+            ::std::memcpy(const_cast<ViewStr*>(v->vvals()), o->vvals(), o->nvalues * sizeof(ViewStr));
+        }
+        copyTags(v, o);
+        publishSurface(v);
+    }
+    // The tag arrays, unchanged by a flag or value.
+    static void copyTags(SurfaceView* v, const SurfaceView* o)
+    {
+        ::std::memcpy(const_cast<ViewStr*>(v->tkeys()), o->tkeys(), 2 * size_t(o->ntags) * sizeof(ViewStr));   // keys, relations
+        ::std::memcpy(const_cast<TagEntry*>(v->tentry()), o->tentry(), o->ntags * sizeof(TagEntry));
+    }
+    // A flag gone, with its value.
+    void surfaceRemoveLocked(const ETCS::Buffer& key)
+    {
+        const SurfaceView* o = surface_view_.load(::std::memory_order_relaxed);
+        if (!o) { publishSurfaceLocked(); return; }
+        const int fi = o->find(o->flags(), o->nflags, key.buf, key.written);
+        const int vi = o->find(o->vkeys(), o->nvalues, key.buf, key.written);
+        if (fi < 0 && vi < 0) return;
+        const uint32_t live = o->live - (fi >= 0 ? o->flags()[fi].n : 0) - (vi >= 0 ? o->vkeys()[vi].n + o->vvals()[vi].n : 0);
+        if (o->ntext > 2 * live + kSurfaceSlack) { publishSurfaceLocked(); return; }
+        const uint32_t nf = o->nflags - (fi >= 0 ? 1 : 0), nv = o->nvalues - (vi >= 0 ? 1 : 0), nt = o->ntags;
+        SurfaceView* v = allocSurface(nf, nv, nt, o->ntext);
+        v->live = live;
+        ::std::memcpy(const_cast<char*>(v->text()), o->text(), o->ntext);
+        auto drop = [](ViewStr* dst, const ViewStr* src, uint32_t n, int at) {
+            if (at < 0) { ::std::memcpy(dst, src, n * sizeof(ViewStr)); return; }
+            ::std::memcpy(dst, src, at * sizeof(ViewStr));
+            ::std::memcpy(dst + at, src + at + 1, (n - at - 1) * sizeof(ViewStr));
+        };
+        drop(const_cast<ViewStr*>(v->flags()), o->flags(), o->nflags, fi);
+        drop(const_cast<ViewStr*>(v->vkeys()), o->vkeys(), o->nvalues, vi);
+        drop(const_cast<ViewStr*>(v->vvals()), o->vvals(), o->nvalues, vi);
+        copyTags(v, o);
+        publishSurface(v);
+    }
+
+    // A view of n entries with an index of `cap` slots (a power of two, at
+    // least twice n), entries and index left for the caller to fill.
+    static ChildView* allocChildView(uint32_t n, uint32_t cap)
+    {
+        char* blk = static_cast<char*>(ETCS::Reclaimer::getInstance().allocate(sizeof(ChildView) + n * sizeof(ChildEntry) + cap * sizeof(uint32_t)));
+        ChildView* v = new (blk) ChildView;
+        v->n = n;
+        v->mask = cap - 1;
+        return v;
+    }
+    static uint32_t capFor(uint32_t n) { uint32_t cap = 1; while (cap < n * 2) cap <<= 1; return cap; }
+    static void indexOne(ChildView* v, uint32_t i)
+    {
+        uint32_t* idx = const_cast<uint32_t*>(v->index());
+        uint32_t at = ChildView::slotOf(v->entries()[i].rid) & v->mask;
+        while (idx[at]) at = (at + 1) & v->mask;
+        idx[at] = i + 1;
+    }
+    static void indexAll(ChildView* v)
+    {
+        ::std::memset(const_cast<uint32_t*>(v->index()), 0, (v->mask + 1) * sizeof(uint32_t));
+        for (uint32_t i = 0; i < v->n; ++i) indexOne(v, i);
+    }
+    void publishChildrenLocked(const ChildView* v)
+    {
+        ETCS::Reclaimer::getInstance().retire(const_cast<ChildView*>(child_view_.exchange(v, ::std::memory_order_acq_rel)));
+        order_gen_.fetch_add(1, ::std::memory_order_acq_rel);   // a member in or out: the list noted it
+    }
+    /*
+     * The ordered view as of now, under m_tagMutex: the published one if no mark
+     * came since it was sorted (another reader got here first), else sorted
+     * again and published. The generation is read BEFORE the marks are taken,
+     * so a mark landing during the sort leaves the new view a generation behind
+     * and the next read sorts once more.
+     */
+    const OrderedView* orderedViewLocked() const
+    {
+        const uint64_t g = order_gen_.load(::std::memory_order_acquire);
+        const OrderedView* cur = ordered_view_.load(::std::memory_order_relaxed);
+        if (cur && cur->gen == g) return cur;
+        OrderMarks marks;
+        {
+            ::std::lock_guard<::std::mutex> ml(order_marks_mu_);
+            marks = order_marks_;
+            order_marks_.n = 0;
+            order_marks_.overflow = false;
+        }
+        // Each list with keys moved notes those members, to be put back in
+        // place as it is read below (RIDList::repair, settle_pending).
+        if (marks.overflow) { for (auto& entry : typed_children_) entry.second.invoke_reorder(); }
+        else
+        {
+            RID moved[OrderMarks::kMax];
+            for (uint32_t i = 0; i < marks.n; ++i)
+            {
+                if (!marks.tag[i]) continue;
+                uint32_t k = 0;
+                for (uint32_t j = i; j < marks.n; ++j)
+                    if (marks.tag[j] == marks.tag[i]) { moved[k++] = marks.rid[j]; if (j != i) marks.tag[j] = nullptr; }
+                auto it = typed_children_.find(*marks.tag[i]);
+                if (it != typed_children_.end()) it->second.invoke_repair(moved, k);
+            }
+        }
+        ::std::vector<RID> rids;
+        ::std::vector<OrderedView::Group> groups;
+        bool settled = true;
+        for (const ETCS::Buffer& t : typed_child_order_)
+        {
+            auto it = typed_children_.find(t);
+            if (it == typed_children_.end()) continue;
+            const uint32_t begin = static_cast<uint32_t>(rids.size());
+            it->second.invoke_collect_rids_ordered(rids);
+            settled &= it->second.invoke_ordered_current();
+            if (rids.size() > begin) groups.push_back({ &it->first, begin, static_cast<uint32_t>(rids.size()) });
+        }
+        void* blk = ETCS::Reclaimer::getInstance().allocate(sizeof(OrderedView) + groups.size() * sizeof(OrderedView::Group)
+                                                            + rids.size() * sizeof(RID));
+        OrderedView* v = new (blk) OrderedView;
+        v->gen = settled ? g : 0;
+        v->n = static_cast<uint32_t>(rids.size());
+        v->ngroups = static_cast<uint32_t>(groups.size());
+        if (!groups.empty()) ::std::memcpy(const_cast<OrderedView::Group*>(v->groups()), groups.data(), groups.size() * sizeof(OrderedView::Group));
+        if (!rids.empty())   ::std::memcpy(const_cast<RID*>(v->rids()), rids.data(), rids.size() * sizeof(RID));
+        ETCS::Reclaimer::getInstance().retire(const_cast<OrderedView*>(ordered_view_.exchange(v, ::std::memory_order_acq_rel)));
+        return v;
+    }
+    // The current ordered view, for a reader already inside a ReadSection: the
+    // lock only when it has to be sorted again.
+    const OrderedView* orderedView() const
+    {
+        const OrderedView* v = ordered_view_.load(::std::memory_order_acquire);
+        if (v && v->gen == order_gen_.load(::std::memory_order_acquire)) return v;
+        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
+        return orderedViewLocked();
+    }
+    // A child arrived under `tag` (the key as typed_children_ holds it): last
+    // among that tag's children, and the tag's group where typed_child_order_
+    // puts it -- the order getTypedChildRefs has always reported. Arriving last
+    // of all (one tag, or the last one), the old index still holds: copied, and
+    // the newcomer added; anywhere else the entries after it moved, so it is
+    // made again.
+    void childAddedLocked(const ETCS::Buffer* tag, RID rid, Entity* child)
+    {
+        const ChildView*  old = child_view_.load(::std::memory_order_relaxed);
+        const uint32_t    n   = old ? old->n : 0;
+        const ChildEntry* e   = old ? old->entries() : nullptr;
+        uint32_t at = n;
+        bool grouped = false;
+        for (uint32_t i = n; i-- > 0; ) if (e[i].tag == tag) { at = i + 1; grouped = true; break; }
+        if (!grouped && n)
+        {
+            // A tag with no child now: before the first child whose tag came later.
+            ::std::vector<const ETCS::Buffer*> order;
+            for (const ETCS::Buffer& t : typed_child_order_)
+            {
+                auto it = typed_children_.find(t);
+                if (it != typed_children_.end()) order.push_back(&it->first);
+            }
+            auto rank = [&order](const ETCS::Buffer* t) { return ::std::find(order.begin(), order.end(), t) - order.begin(); };
+            const auto mine = rank(tag);
+            for (uint32_t i = 0; i < n; ++i) if (rank(e[i].tag) > mine) { at = i; break; }
+        }
+        const uint32_t cap = (old && old->mask + 1 >= 2 * (n + 1)) ? old->mask + 1 : capFor(n + 1);
+        ChildView*  v  = allocChildView(n + 1, cap);
+        ChildEntry* ne = const_cast<ChildEntry*>(v->entries());
+        if (at) ::std::memcpy(ne, e, at * sizeof(ChildEntry));
+        ne[at] = ChildEntry{ tag, rid, child };
+        if (n > at) ::std::memcpy(ne + at + 1, e + at, (n - at) * sizeof(ChildEntry));
+        if (old && at == n && old->mask + 1 == cap)
+        {
+            ::std::memcpy(const_cast<uint32_t*>(v->index()), old->index(), cap * sizeof(uint32_t));
+            indexOne(v, n);
+        }
+        else indexAll(v);
+        publishChildrenLocked(v);
+    }
+    void childRemovedLocked(RID rid)
+    {
+        const ChildView* old = child_view_.load(::std::memory_order_relaxed);
+        const ChildEntry* gone = old ? old->find(rid) : nullptr;
+        if (!gone) return;
+        const uint32_t n  = old->n;
+        const uint32_t at = static_cast<uint32_t>(gone - old->entries());
+        ChildView*  v  = allocChildView(n - 1, old->mask + 1);   // the same index size: no thrash at a boundary
+        ChildEntry* ne = const_cast<ChildEntry*>(v->entries());
+        if (at) ::std::memcpy(ne, old->entries(), at * sizeof(ChildEntry));
+        if (n - 1 > at) ::std::memcpy(ne + at, old->entries() + at + 1, (n - 1 - at) * sizeof(ChildEntry));
+        indexAll(v);
+        publishChildrenLocked(v);
+    }
+    const SurfaceView* surfaceView() const { return surface_view_.load(::std::memory_order_acquire); }
+    const ChildView*   childView()   const { return child_view_.load(::std::memory_order_acquire); }
+    /*
+ * ---------------------------------------------------------------------
  * THE NODE HASH -- this entity's state surface and everything under it, as
  * one 64-bit value, recomputed only when pulled and only if something moved.
  *
@@ -349,6 +861,22 @@ private:
  * ---------------------------------------------------------------------
  */
     mutable ::std::atomic<uint32_t> hash_epoch_{1};
+    /*
+     * THE TWINS AMONG THIS ENTITY'S CHILDREN, as a parent knows them: each
+     * child's index among the same-tag children with its identity hash, in
+     * attach order (siblingIndex), all made in one pass and kept until this
+     * entity's hash epoch moves -- which every change under it does. Asked
+     * child by child it was a walk of all the siblings per child: n squared
+     * per parent, paid by every member's next tick after any one of them
+     * changed. Made on first use; a childless entity carries the pointer.
+     */
+    struct TwinIndex
+    {
+        ::std::mutex                         mu;
+        uint32_t                             epoch = 0;   // 0: never made (hash_epoch_ starts at 1)
+        ::std::unordered_map<RID, uint32_t>  index;
+    };
+    mutable ::std::atomic<TwinIndex*> twins_{ nullptr };
     mutable ::std::atomic<uint32_t> hash_valid_epoch_{0};
     mutable ::std::atomic<uint64_t> hash_cached_{0};
     /*
@@ -358,6 +886,21 @@ private:
  * sees the epoch move and reads again rather than taking a torn copy.
  */
     mutable unsigned char           hash_digest_[32] = {};
+    /*
+ * HOW FAR DOWN THIS ENTITY IS: the number of parents above it. Written
+ * where parent_ is (addTagTrampoline, reparentChildrenTo -- the two
+ * writers of that link) and read nowhere the runtime branches on. It
+ * exists to be WATCHED. The runtime's own walks over the tree are loops
+ * -- the hash pull (computeNodeHash), the observed mark (ObservableBase),
+ * the cascade delete and the arena teardown (MemoryArena::cascade,
+ * memoryTeardown) -- so no depth exhausts a stack in core. What still
+ * recurses is a family's or a leaf's own walk over its subtree (a Causal
+ * interaction, a scene's collect), one frame per level in whichever
+ * module wrote it. There is no cap: a script may build what it likes.
+ * Instead the attach that crosses each of kDepthWarnAt says so, once per
+ * process per threshold, naming the RID (noteDepth, from addTagImpl).
+ */
+    uint32_t depth_ = 0;
     /*
  * Per-entity registry of every currently-in-flight stream call's own
  * SignalContext -- see Scope's own comment (Bundles.h) for the full
@@ -410,6 +953,12 @@ private:
  */
     ETCS::Buffer source_module_;
     ETCS::Buffer source_tag;
+    // See setRemoteWire. Mutable count: a const walk may still call through.
+    ::std::atomic<ETCS::IWireRemote*> remote_wire_{nullptr};
+    mutable ::std::atomic<int>        remote_calls_{0};
+    // Claims Environmental and is in the graph: its tag changes are recorded
+    // (recordEffect). The record itself is the family's (IWireEnvironmental).
+    ::std::atomic<bool>               environmental_{false};
     /*
  * Set true as the FIRST action inside ~Entity(). A no-op operator
  * delete (the child case, below) means the object's own bytes are
@@ -468,6 +1017,24 @@ private:
  */
     Entity* parent_     = nullptr;
     RID     parent_rid_ = 0;
+    /*
+ * A MODULE ROOT WITH A PARENT: a child made by one module under another
+ * module's entity (addTag<T>, crossesModule). To its own module it is a
+ * root like any global-scope entity -- it lives in that module's root
+ * arena, not its parent's, and it is election-visible: it can hold the
+ * module's lifetime token, and a survivor is sought among its siblings
+ * there when it dies (MemoryArena::registerDtor). Only its place in the
+ * graph is its parent's. Set once, before the AddTagEvent.
+ */
+    bool    module_root_ = false;
+    /*
+ * MADE TO MOVE (etcs_movable): its bytes are in its module's root arena and
+ * only its lifetime token -- its record and its arena's -- is in its parent's
+ * chain, held here so a move (moveTo, reparentChildrenTo) hands it on without
+ * looking for it. Set once, by addTag<T>, before the AddTagEvent; empty for
+ * every other entity.
+ */
+    MemoryArena::Token token_;
     /*
  * Set by addTagTrampoline<T>() (via AddTagEvent, on the loader's
  * ordering thread) iff T's type-provider module registered a
@@ -566,9 +1133,11 @@ public:
               DEFAULT_ARENA_START_PAGE, /* performance */ false))
         , tags(ArenaAllocator<::std::pair<const ETCS::Buffer, TagEntry>>(local_arena_))
         , flags_(ArenaAllocator<::std::pair<const ETCS::Buffer, bool>>(local_arena_))
+        , values_(ArenaAllocator<::std::pair<const ETCS::Buffer, ::std::string>>(local_arena_))
+        , bindings_(ArenaAllocator<::std::pair<const ETCS::Buffer, ValueBinding>>(local_arena_))
         , interface_pointers_(ArenaAllocator<::std::pair<const ETCS::Buffer, void*>>(local_arena_))
         , typed_children_(ArenaAllocator<::std::pair<const ETCS::Buffer, RIDListHandle>>(local_arena_))
-    {}
+    { local_arena_->markOwned(); }
     /*
  * -----------------------------------------------------------------------
  * ~Entity() - pure, ordinary cleanup now. Both the child-reparenting
@@ -597,6 +1166,7 @@ public:
  */
     virtual ~Entity()
     {
+        delete twins_.exchange(nullptr);
         /*
  * Signal every currently-in-flight stream call's own
  * SignalContext FIRST, before anything else -- see Scope::
@@ -632,6 +1202,11 @@ public:
             ::std::lock_guard<::std::mutex> lock(m_tagMutex);
             scope_.interruptAll();
         }
+        // The views go the way every replaced one does: a reader that is
+        // somehow still inside one finishes before it is freed.
+        ETCS::Reclaimer::getInstance().retire(const_cast<SurfaceView*>(surface_view_.exchange(nullptr)));
+        ETCS::Reclaimer::getInstance().retire(const_cast<ChildView*>(child_view_.exchange(nullptr)));
+        ETCS::Reclaimer::getInstance().retire(const_cast<OrderedView*>(ordered_view_.exchange(nullptr)));
         destructed_ = true;
         /*
  * Unlink our own record HERE, while the object is still alive, rather
@@ -652,7 +1227,10 @@ public:
  * Idempotent by construction: forget() on an already-unlinked record
  * returns false and does nothing, so the reclaim paths (which unlink
  * via unlinkRecord before ever running ~T()) are unaffected -- they
- * simply find nothing left to remove.
+ * simply find nothing left to remove. And find it without looking: the
+ * arena names the entity whose record it is destroying
+ * (etcs_destructing_entity, MemoryArena.h), so this is one compare on
+ * those paths rather than a walk of every sibling's record.
  */
         if (parent_ != nullptr && owning_arena_ != nullptr)
             owning_arena_->forget(this);
@@ -714,6 +1292,19 @@ public:
  */
     bool isDestructed() const { return destructed_; }
     const ETCS::Buffer& getSourceModule() const { return source_module_; }
+    // Election-visible for its module's lifetime token: global scope, or a
+    // module root under another module's entity (module_root_).
+    bool isModuleRoot() const { return parent_ == nullptr || module_root_; }
+    // Would a child this binary makes under this entity cross into another
+    // module? Only a module knows its own name; the loader makes no types.
+    bool crossesModule() const
+    {
+#if defined(ETCS_LOADER)
+        return false;
+#else
+        return source_module_.written && !(source_module_ == ETCS::Buffer(ETCS_MODULE_NAME));
+#endif
+    }
     const ETCS::Buffer& getSourceTag()    const { return source_tag; }
     /*
  * The single fact everything outside this class needs to branch on:
@@ -810,7 +1401,9 @@ public:
             throw ::std::invalid_argument(
                 ::std::string("addTag: flag must start with a lowercase letter: ")
                 + (s ? s : ""));
-        return ETCS::TagModifyEvent{this, flag, false, &Entity::tagModifyImpl}();
+        const bool on = ETCS::TagModifyEvent{this, flag, false, &Entity::tagModifyImpl}();
+        if (on) recordEffect(this, flagKey(this, flag.toString()), true);
+        return on;
     }
     /*
  * TAG-scope bits beyond this entity's own closure -- ScopeTag passes a
@@ -827,6 +1420,144 @@ public:
                 + (s ? s : ""));
         return ETCS::TagModifyEvent{this, flag, false, &Entity::tagModifyImpl, extra}();
     }
+
+    // ── the value surface (see values_) ─────────────────────────────────
+
+    // The flag, with a value behind it, through the funnel: true when this
+    // call put the flag on or changed what it says. Recorded as the action
+    // that set it, so a replay sets it again.
+    bool addTag(const ETCS::Buffer& flag, const ::std::string& value)
+    {
+        const char* s = flag.c_str();
+        if (!s || !s[0] || s[0] < 'a' || s[0] > 'z')
+            throw ::std::invalid_argument(
+                ::std::string("addTag: flag must start with a lowercase letter: ")
+                + (s ? s : ""));
+        ETCS::TagModifyEvent ev{this, flag, false, &Entity::tagModifyImpl};
+        ev.value = &value;
+        const bool changed = ev();
+        if (changed) { recordEffect(this, flagKey(this, flag.toString()), true); onValue(flag, &value); }
+        return changed;
+    }
+
+    /*
+ * A STORED VALUE CHANGED under `key` (null: it left with its flag). Called
+ * on the thread that changed it, once the funnel has applied the change,
+ * and by restoreValue -- never on the ordering thread, and with no mutex of
+ * Entity's held, so a family may take its own locks here. The one place a
+ * family that reads a value every tick refreshes its working copy: the
+ * value stays the only writer, and a replay, a restore and a verb all
+ * arrive the same way.
+ */
+    virtual void onValue(const ETCS::Buffer& key, const ::std::string* value) { (void)key; (void)value; }
+
+    // A word in a value, little-endian, so a store reads the same on every
+    // host. getWord advances `at`; false when the bytes run out.
+    static void putWord(::std::string& out, int64_t v)
+    {
+        for (int i = 0; i < 8; ++i) out.push_back(static_cast<char>((static_cast<uint64_t>(v) >> (8 * i)) & 0xff));
+    }
+    static bool getWord(const ::std::string& in, size_t& at, int64_t& v)
+    {
+        if (at + 8 > in.size()) return false;
+        uint64_t u = 0;
+        for (int i = 0; i < 8; ++i) u |= static_cast<uint64_t>(static_cast<unsigned char>(in[at + i])) << (8 * i);
+        v = static_cast<int64_t>(u); at += 8;
+        return true;
+    }
+
+    // A family's state, readable behind a key. At construction, once, like
+    // registerInterfacePointer; a second binding of a key replaces the first.
+    void bindValue(const ETCS::Buffer& key, ValueBinding b)
+    {
+        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
+        bindings_[key] = b;
+    }
+
+    // The value behind `key`, stored or bound: false when there is none.
+    bool valueOf(const ETCS::Buffer& key, ::std::string& out) const
+    {
+        {
+            ETCS::ReadSection rs;
+            if (const SurfaceView* v = surfaceView())
+            {
+                const int i = v->find(v->vkeys(), v->nvalues, key.buf, key.written);
+                if (i >= 0) { out.assign(v->p(v->vvals()[i]), v->vvals()[i].n); return true; }
+            }
+        }
+        // Bindings are made in the constructor and never again: no lock to read.
+        auto it = bindings_.find(key);
+        if (it == bindings_.end()) return false;
+        const ValueBinding b = it->second;
+        if (!b.write) return false;
+        out.clear();
+        b.write(b.self, out);      // outside the tag mutex: the binding takes its own lock
+        return true;
+    }
+
+    // Whether the bound values moved, without reading them: their digests
+    // folded together. False when one has none (then only reading tells).
+    // Stored values need no digest -- a change to one moves the hash epoch.
+    bool valueDigest(uint64_t& out) const
+    {
+        // Bindings are few (one per family that has one): copied to the
+        // stack, read with the tag mutex released.
+        ValueBinding bound[8];
+        size_t n = 0;
+        if (bindings_.size() > 8) return false;   // constructor-written: read without a lock
+        for (auto const& [key, b] : bindings_) bound[n++] = b;
+        uint64_t h = 0x9e3779b97f4a7c15ULL;
+        for (size_t i = 0; i < n; ++i)
+        {
+            if (!bound[i].digest) return false;
+            h = (h ^ bound[i].digest(bound[i].self)) * 0x100000001b3ULL;
+        }
+        out = h;
+        return true;
+    }
+
+    // The whole value surface, by key: what a capture keeps and a hash reads.
+    void values(::std::vector<::std::pair<::std::string, ::std::string>>& out) const
+    {
+        ::std::vector<::std::pair<::std::string, ValueBinding>> bound;
+        {
+            ETCS::ReadSection rs;
+            const SurfaceView* v = surfaceView();
+            const uint32_t nv = v ? v->nvalues : 0;
+            for (uint32_t i = 0; i < nv; ++i) out.emplace_back(v->str(v->vkeys()[i]), v->str(v->vvals()[i]));
+            for (auto const& [key, b] : bindings_)
+                if (!v || v->find(v->vkeys(), nv, key.buf, key.written) < 0) bound.emplace_back(key.toString(), b);
+        }
+        for (auto& [key, b] : bound)
+        {
+            ::std::string v;
+            if (b.write) b.write(b.self, v);
+            out.emplace_back(::std::move(key), ::std::move(v));
+        }
+        ::std::sort(out.begin(), out.end());
+    }
+
+    // A record's value, back: a stored value is set, a bound one is handed
+    // to its binding. No funnel and no record -- this is a value the capture
+    // kept as WHAT, coming back as what. False when the key has no place
+    // here, or the binding refused it.
+    bool restoreValue(const ETCS::Buffer& key, const ::std::string& v)
+    {
+        ValueBinding b;
+        bool bound = false;
+        {
+            ::std::lock_guard<::std::mutex> lock(m_tagMutex);
+            auto it = bindings_.find(key);
+            if (it != bindings_.end()) { b = it->second; bound = true; }
+            else if (flags_.find(key) == flags_.end()) return false;
+            else { values_[key] = v; surfaceSetLocked(key, &v); }
+        }
+        if (!bound) { onValue(key, &v); return true; }   // stored: the family's copy follows
+        return b.read && b.read(b.self, v);
+    }
+
+    // This node's values as one number; getHash composes them over the subtree.
+    uint64_t valueHash() const;
     /*
  * -----------------------------------------------------------------------
  * addTag<T>(args...) - typed child, module-side. Returns T*, not RID.
@@ -867,10 +1598,25 @@ public:
     {
         static_assert(::std::is_base_of<Entity, T>::value,
                       "addTag<T>: T must derive from Entity");
+        // A child of another module's entity is a root of its OWN module:
+        // its whole footprint goes in that module's root arena (the one
+        // MemoryArena::getInstance() names in the binary compiling this),
+        // which lives exactly as long as the module does -- not in the
+        // parent's, which the module owning the parent tears down.
+        // A movable child (etcs_movable) is made there too, for another reason:
+        // a stable home for its bytes, while its lifetime token -- its record
+        // and its arena's -- goes in this entity's chain, so this entity's
+        // cascade still takes it and a move can hand the token on.
+        const bool   boundary = crossesModule();
+        const bool   movable  = !boundary && etcs_movable<T>::value;
+        MemoryArena& home     = (boundary || movable) ? MemoryArena::getInstance() : getArena();
         MemoryArena* saved = s_pending_parent_arena_;
-        s_pending_parent_arena_ = &getArena();
-        T* child = getArena().allocate<T>(::std::forward<Args>(args)...);
+        s_pending_parent_arena_ = &home;
+        T* child = home.allocate<T>(::std::forward<Args>(args)...);
         s_pending_parent_arena_ = saved;
+        child->module_root_ = boundary;
+        if (movable && getArena().adoptToken(child->token_, child, child->local_arena_, home))
+            child->owning_arena_ = &getArena();
         child->getArena().setScopeTag(T::CONTRACT_TAG);   /*
  * CONTRACT_TAG -- not getSourceTag(), still empty here (setModuleSource
  * runs later, inside addTagImpl, as part of this same blocking call),
@@ -923,7 +1669,7 @@ public:
                 ::std::string("addTypeTag: type tag must start with an uppercase letter: ")
                 + (s ? s : ""));
         ::std::lock_guard<::std::mutex> lock(m_tagMutex);
-        tags.emplace(type_tag, TagEntry{});
+        if (tags.emplace(type_tag, TagEntry{}).second) publishSurfaceLocked();
     }
 
     /*
@@ -954,6 +1700,7 @@ public:
             if (handle.invoke_contains(rid))
             {
                 handle.invoke_remove(rid);
+                childRemovedLocked(rid);
                 return;
             }
         }
@@ -970,15 +1717,26 @@ public:
  */
     void getTypedChildren(::std::vector<::std::pair<ETCS::Buffer, RID>>& out) const
     {
-        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
-        for (const auto& tag : typed_child_order_)
-        {
-            auto it = typed_children_.find(tag);
-            if (it == typed_children_.end()) continue;
-            ::std::vector<RID> rids;
-            it->second.invoke_collect_rids(rids);
-            for (RID r : rids) out.emplace_back(tag, r);
-        }
+        ETCS::ReadSection rs;
+        if (const ChildView* v = childView())
+            for (uint32_t i = 0; i < v->n; ++i) out.emplace_back(*v->entries()[i].tag, v->entries()[i].rid);
+    }
+    /*
+ * getTypedChildRefs(out) - the same enumeration, without copying a tag per
+ * child: each entry points at the tag as typed_children_ keeps it. A key
+ * there is never erased and an unordered_map's elements do not move when
+ * it grows, so the pointer is good for as long as this entity lives -- a
+ * walk that holds this entity holds its tags. A child that is gone by the
+ * time it is resolved (getTypedChild answers null) is simply skipped.
+ * Every walk that visits whole subtrees uses this one; getTypedChildren
+ * copies a 256-byte Buffer per child.
+ */
+    using ChildRef = ::std::pair<const ETCS::Buffer*, RID>;
+    void getTypedChildRefs(::std::vector<ChildRef>& out) const
+    {
+        ETCS::ReadSection rs;
+        if (const ChildView* v = childView())
+            for (uint32_t i = 0; i < v->n; ++i) out.emplace_back(v->entries()[i].tag, v->entries()[i].rid);
     }
     /*
  * getTypedChild(tag, rid) - resolves a single live child by exactly
@@ -1005,14 +1763,25 @@ public:
  */
     void getOrderedTypedChildren(::std::vector<::std::pair<ETCS::Buffer, RID>>& out) const
     {
-        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
-        for (const auto& tag : typed_child_order_)
+        ETCS::ReadSection rs;
+        const OrderedView* v = orderedView();
+        for (uint32_t g = 0; g < v->ngroups; ++g)
         {
-            auto it = typed_children_.find(tag);
-            if (it == typed_children_.end()) continue;
-            ::std::vector<RID> rids;
-            it->second.invoke_collect_rids_ordered(rids);
-            for (RID r : rids) out.emplace_back(tag, r);
+            const OrderedView::Group& grp = v->groups()[g];
+            for (uint32_t i = grp.begin; i < grp.end; ++i) out.emplace_back(*grp.tag, v->rids()[i]);
+        }
+    }
+    // The same order without a tag copied per child (see getTypedChildRefs):
+    // the tag is the parent's own key, alive as long as the parent is.
+    void getOrderedTypedChildRefs(::std::vector<ChildRef>& out) const
+    {
+        ETCS::ReadSection rs;
+        const OrderedView* v = orderedView();
+        out.reserve(out.size() + v->n);
+        for (uint32_t g = 0; g < v->ngroups; ++g)
+        {
+            const OrderedView::Group& grp = v->groups()[g];
+            for (uint32_t i = grp.begin; i < grp.end; ++i) out.emplace_back(grp.tag, v->rids()[i]);
         }
     }
     /*
@@ -1027,12 +1796,25 @@ public:
  *
  * Silent when no list holds it: a root-level entity, or one already
  * removed. Neither is an error; nothing is holding it in an order.
+ *
+ * NOT THE TAG MUTEX. It is called on every state change of an orderable
+ * child, from that child's ordering thread, and used to wait out whatever sort
+ * a reader of the parent was in the middle of. Now it notes which child moved
+ * in which list (through the child view) and moves the generation; the next
+ * ordered read puts that child back in place.
  */
     void reorderTypedChild(RID rid)
     {
-        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
-        for (auto& entry : typed_children_)
-            if (entry.second.invoke_contains(rid)) { entry.second.invoke_reorder(); return; }
+        ETCS::ReadSection rs;
+        const ChildView*  cv = childView();
+        const ChildEntry* e  = cv ? cv->find(rid) : nullptr;
+        if (!e) return;
+        {
+            ::std::lock_guard<::std::mutex> ml(order_marks_mu_);
+            if (order_marks_.n < OrderMarks::kMax) { order_marks_.tag[order_marks_.n] = e->tag; order_marks_.rid[order_marks_.n++] = rid; }
+            else order_marks_.overflow = true;
+        }
+        order_gen_.fetch_add(1, ::std::memory_order_acq_rel);
     }
     /*
  * collectSiblingOrder(rid, out) - the ordered contents of whichever of this
@@ -1062,21 +1844,25 @@ public:
  */
     bool collectSiblingOrder(RID rid, ::std::vector<RID>& out) const
     {
-        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
-        for (const auto& entry : typed_children_)
-            if (entry.second.invoke_contains(rid))
+        ETCS::ReadSection rs;
+        const ChildView*  cv = childView();
+        const ChildEntry* e  = cv ? cv->find(rid) : nullptr;
+        if (!e) return false;
+        const OrderedView* v = orderedView();
+        for (uint32_t g = 0; g < v->ngroups; ++g)
+            if (v->groups()[g].tag == e->tag)
             {
-                entry.second.invoke_collect_rids_ordered(out);
-                return true;
+                out.insert(out.end(), v->rids() + v->groups()[g].begin, v->rids() + v->groups()[g].end);
+                break;
             }
-        return false;
+        return true;
     }
     Entity* getTypedChild(const ETCS::Buffer& tag, RID rid) const
     {
-        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
-        auto it = typed_children_.find(tag);
-        if (it == typed_children_.end()) return nullptr;
-        return it->second.invoke_get(rid);
+        ETCS::ReadSection rs;
+        const ChildView* v = childView();
+        const ChildEntry* e = v ? v->find(rid) : nullptr;
+        return (e && *e->tag == tag) ? e->child : nullptr;
     }
     /*
  * Takes the BARE label ("Listen"), not a prefixed key -- the shared
@@ -1170,35 +1956,28 @@ public:
  * is public, so it's checked rather than assumed.
  */
         if (!newParent || newParent == this) return;
-        bool moved = false;
+        ::std::vector<Entity*> moved;
         /*
- * BOTH locks, held together for the whole migration. The old body
- * only took this entity's own, which was sufficient only because it
- * never touched newParent's state at all -- it just rewrote
- * child->parent_ and left the child sitting in a typed_children_
- * list belonging to an entity that was about to be destructed. Now
- * that the child genuinely moves between two maps, a single lock
- * can't cover it.
+ * BOTH locks, held together for the whole migration: the child moves between
+ * two maps, and holding both is what keeps it from ever being observable in
+ * NEITHER parent's list by a concurrent getTypedChild on another thread.
  *
- * Nested acquisition is safe here because this is the ONLY site in
- * this class that ever holds two entity locks at once -- a lock
- * cycle requires two sites that disagree about ordering, and there
- * is no second site to disagree with. addTagTrampoline<T> holds only
- * the PARENT's lock and reaches into the child by direct field
- * access; ~Entity() closes its own lock scope before calling
- * parent_->removeTypedChild(); tagModifyImpl fires EntityUnloadEvent
- * outside the lock; every scope_/tags/flags_ accessor takes exactly
- * one lock and never calls outward. Holding both (rather than a
- * plan-then-apply split across two disjoint critical sections) is
- * also what keeps a child from ever being observable in NEITHER
- * parent's list by a concurrent getTypedChildren()/getTypedChild()
- * on some other thread.
+ * TWO SITES hold two entity locks -- this and moveImpl -- and both take them
+ * with scoped_lock (std::lock), which never waits on one while holding the
+ * other, so the two need no order to agree on. Every other accessor takes
+ * exactly one lock and never calls outward.
  */
-        {   // both locks end before the mark below, which takes them again
-        ::std::lock_guard<::std::mutex> self_lock(m_tagMutex);
-        ::std::lock_guard<::std::mutex> dest_lock(newParent->m_tagMutex);
-        for (auto& [tag, handle] : typed_children_)
+        {   // both locks end before the marks below, which take them again
+        ::std::scoped_lock both(m_tagMutex, newParent->m_tagMutex);
+        // In THIS entity's first-seen tag order, not the map's: a tag new to
+        // newParent is appended to its typed_child_order_ as it is met here,
+        // and that order is state (computeNodeHash composes children by it),
+        // so it has to be the program's order and not a hash map's walk.
+        for (const ETCS::Buffer& tag : typed_child_order_)
         {
+            auto handle_it = typed_children_.find(tag);
+            if (handle_it == typed_children_.end()) continue;
+            RIDListHandle& handle = handle_it->second;
             /*
  * Snapshot first. invoke_remove below erases from the very map
  * a live iterator would be walking, so the RIDs have to be
@@ -1207,87 +1986,20 @@ public:
             ::std::vector<ETCS::RID> child_rids;
             handle.invoke_collect_rids(child_rids);
             if (child_rids.empty()) continue;
-            /*
- * Pointer into newParent's own map, not an iterator: emplace()
- * below can rehash, which invalidates iterators but NOT
- * references or pointers to elements (::std::unordered_map is
- * node-based, and ArenaMap only changes where those nodes are
- * allocated from, not that guarantee).
- */
-            RIDListHandle* dest = nullptr;
-            auto dit = newParent->typed_children_.find(tag);
-            if (dit != newParent->typed_children_.end())
-                dest = &dit->second;
+            if (!handle.make_in)
+            {
+                ETCS_LOG("Entity", "reparentChildrenTo: tag '" << tag
+                         << "' has no make_in factory -- cannot migrate its "
+                         << child_rids.size() << " child(ren) to newParent; "
+                         << "they will be orphaned in this entity's arena.");
+                continue;
+            }
+            ListSlot dest;
             for (ETCS::RID rid : child_rids)
             {
                 Entity* child = handle.invoke_get(rid);
-                if (!child || child->parent_ != this) continue;
-                if (!dest)
-                {
-                    /*
- * Lazily minted on the first child that actually
- * migrates under this tag -- deliberately inside the
- * inner loop, not above it, so a tag whose entries all
- * fail the parent_ == this check doesn't leave an empty
- * list (and a spurious typed_child_order_ entry) behind
- * on newParent.
- *
- * Cannot copy `handle` across: the RIDList<T*> object it
- * points at was allocated from THIS entity's own
- * local_arena_ (addTagTrampoline<T>, below), and while
- * that arena does survive as coyote time, it is not
- * newParent's to depend on -- newParent can outlive this
- * entity's arena by an arbitrary margin. invoke_make_in
- * mints a fresh, correctly-typed list in newParent's own
- * arena instead, from the factory captured back when T
- * was still known (RIDList.h).
- */
-                    if (!handle.make_in)
-                    {
-                        ETCS_LOG("Entity", "reparentChildrenTo: tag '" << tag
-                                 << "' has no make_in factory -- cannot migrate its "
-                                 << child_rids.size() << " child(ren) to newParent; "
-                                 << "they will be orphaned in this entity's arena.");
-                        break;
-                    }
-                    RIDListHandle fresh =
-                        handle.invoke_make_in(*newParent->local_arena_, tag.c_str());
-                    dest = &newParent->typed_children_.emplace(tag, fresh).first->second;
-                    /*
- * Mirrors addTagTrampoline<T>'s own first-seen-tag
- * branch exactly -- typed_child_order_ is a type-level
- * record appended only when a tag is genuinely new to
- * that entity, and we only reach here when find() missed.
- */
-                    newParent->typed_child_order_.push_back(tag);
-                }
-                /*
- * Insert BEFORE remove: with both locks held nothing can
- * observe either state, but ordering it this way means an
- * exception from invoke_insert leaves the child still owned
- * by its original list rather than by nothing.
- */
-                dest->invoke_insert(rid, child);
-                handle.invoke_remove(rid);
-                child->parent_ = newParent;
-                /*
- * parent_rid_ deliberately untouched -- addTagTrampoline<T>
- * sets it to child->getRID(), which is the same value in any
- * parent's list, so ~Entity()'s own
- * parent_->removeTypedChild(parent_rid_) resolves correctly
- * against newParent without any rewrite here.
- */
-
-                /*
- * Passive edge follows the ownership edge, always. THIS is
- * the load-bearing half: child->parent_ going stale is a
- * lookup miss, but ctx_.provider going stale is a pointer
- * into the dying entity's outer shell, which reclaimEntity
- * is about to zero and hand to the next same-type
- * allocation -- see SignalContext::provider's own comment.
- */
-                child->ctx_.setProvider(&newParent->ctx_);
-                moved = true;
+                if (child && child->parent_ == this && relistLocked(child, rid, handle, tag, newParent, dest))
+                    moved.push_back(child);
             }
         }
         }
@@ -1298,7 +2010,196 @@ public:
  * needs nothing -- its retire path marks its own parent. Outside the locks,
  * because markStateChange walks parents and takes their mutexes.
  */
-        if (moved) markStateChange(newParent, getRID());
+        if (!moved.empty())
+        {
+            markStateChange(newParent, getRID());
+            // Everything under the moved children is one level nearer the root
+            // now -- theirs, not newParent's whole subtree. Outside the locks:
+            // the walk takes each entity's own.
+            for (Entity* c : moved) renumberDepth(c);
+        }
+    }
+
+    /*
+     * moveTo(to) - THIS ENTITY CHANGES PARENTS, keeping its RID, its subtree
+     * and its rows. Only a movable entity (etcs_movable, made by addTag<T>
+     * with its bytes in a stable home), and never into its own subtree.
+     *
+     * THE FUNNEL'S OWN EVENT: a TagModify on this entity carrying the move,
+     * with both parents' bits added, so the move orders against every tag
+     * operation on any of the three; moveImpl runs it on the ordering thread.
+     *
+     * ITS OWN ACTION. Recorded as `<to>.Contain(@<this>)` against a frame of
+     * its own, whatever is running around it: a move made inside a step must
+     * not be credited to the line that ran the step (replaying `Run` would run
+     * the physics again). The key is placeKey, so a replay keeps the last move
+     * only, and the spawn that made this entity keeps its own key (childKey).
+     */
+    bool moveTo(Entity* to)
+    {
+        Entity* from = getParent();
+        if (!to || !from || to == from || !token_ || to->isDestructed()) return false;
+        if (!(to->getSourceModule() == getSourceModule())) return false;   // one module's tokens and bytes
+        TagModifyEvent evt{ this, ETCS::Buffer("p:"), false, nullptr, to->myTagMask() | from->myTagMask() };
+        evt.move_to   = to;
+        evt.move_impl = &Entity::moveImpl;
+        if (!evt()) return false;
+        const ETCS::TagMask edge = myTagMask() | to->myTagMask();
+        if (edge.any()) ETCS::NoteCausalEdge(edge);
+        ETCS::ActionFrame f;
+        f.id               = ETCS::next_action_frame_id();
+        f.line.receiver    = to->getRID();
+        f.line.verb        = "Contain";
+        f.line.payload     = "@m";
+        f.line.refs.emplace_back("m", getRID());
+        recordEffectIn(this, placeKey(getRID()), true, &f);
+        return true;
+    }
+    bool isMovable() const { return static_cast<bool>(token_); }
+
+private:
+    /*
+     * The move, on the ordering thread: the token first, then the lists. Both
+     * entity locks are held across both (scoped_lock: no order to agree on with
+     * reparentChildrenTo), so a parent that begins to retire during it is seen
+     * before anything moves -- and once the token is in `to`'s chain, `from`'s
+     * cascade can no longer take the child.
+     */
+    static bool moveImpl(Entity* child, Entity* to)
+    {
+        Entity* from = child->parent_;
+        if (!from || from == to || !child->token_) return false;
+        for (Entity* a = to; a; a = a->parent_) if (a == child) return false;   // into its own subtree
+        const RID rid = child->getRID();
+        {
+            ::std::scoped_lock both(from->m_tagMutex, to->m_tagMutex);
+            if (from->isDestructed() || to->isDestructed() || from->isRetiring() || to->isRetiring()
+                || child->parent_ != from)
+                return false;
+            for (const ETCS::Buffer& tag : from->typed_child_order_)
+            {
+                auto it = from->typed_children_.find(tag);
+                if (it == from->typed_children_.end() || it->second.invoke_get(rid) != child) continue;
+                ListSlot dest;
+                if (!it->second.make_in || !relistLocked(child, rid, it->second, it->first, to, dest)) return false;
+                break;
+            }
+            if (child->parent_ != to) return false;
+        }
+        const ETCS::TagMask cm = child->myTagMask();
+        if (cm.any()) { to->noteAcquires(cm); child->noteAcquires(to->myTagMask()); }
+        // Both sides' subtrees changed; outside the locks, as markStateChange climbs.
+        markStateChange(from, rid);
+        markStateChange(child, rid);
+        renumberDepth(child);
+        return true;
+    }
+
+    /*
+     * ONE CHILD FROM ONE PARENT'S LIST TO ANOTHER'S, both entity locks held
+     * (reparentChildrenTo, moveImpl). `dest` caches `to`'s list for `tag`
+     * across calls -- a pointer, not an iterator: an emplace can rehash, and
+     * only pointers into a node map survive it. A list new to `to` is minted
+     * lazily, on the first child that actually moves, in `to`'s own arena --
+     * never copied, the old one is the old parent's arena's -- and the tag
+     * joins `to`'s first-seen order (that order is state). A movable child's
+     * lifetime token goes first, so the old parent's cascade cannot take it
+     * once it is listed elsewhere; when the token cannot move, nothing does.
+     *
+     * parent_rid_ is untouched: it is the child's own RID, the same in any
+     * parent's list. The passive edge (ctx_ provider) follows the ownership
+     * edge always -- left stale it would point into a shell about to be
+     * reclaimed and handed to the next same-type allocation.
+     */
+    struct ListSlot { RIDListHandle* list = nullptr; const ETCS::Buffer* key = nullptr; };
+    static bool relistLocked(Entity* child, RID rid, RIDListHandle& src, const ETCS::Buffer& tag,
+                             Entity* to, ListSlot& dest)
+    {
+        Entity* from = child->parent_;
+        if (child->token_)
+        {
+            if (!to->local_arena_->moveToken(child->token_, *child->owning_arena_)) return false;
+            child->owning_arena_ = to->local_arena_;
+        }
+        if (!dest.list)
+        {
+            auto dit = to->typed_children_.find(tag);
+            if (dit == to->typed_children_.end())
+            {
+                RIDListHandle fresh = src.invoke_make_in(*to->local_arena_, tag.c_str());
+                dit = to->typed_children_.emplace(tag, fresh).first;
+                to->typed_child_order_.push_back(tag);
+            }
+            dest = ListSlot{ &dit->second, &dit->first };
+        }
+        dest.list->invoke_insert(rid, child);   // insert before remove: an exception leaves it where it was
+        src.invoke_remove(rid);
+        to->childAddedLocked(dest.key, rid, child);
+        if (from) from->childRemovedLocked(rid);
+        child->parent_ = to;
+        child->depth_  = to->depth_ + 1;   // its own subtree: renumberDepth, below the locks
+        child->ctx_.setProvider(&to->ctx_);
+        return true;
+    }
+
+public:
+    /*
+     * depth_ for everything under `top`, from top's own. A loop over an
+     * explicit frontier rather than a recursion, for the reason depth_
+     * exists at all. Only reparenting needs it: an attach sets one entity
+     * from its parent, and a subtree never moves otherwise.
+     */
+    static void renumberDepth(Entity* top)
+    {
+        ::std::vector<Entity*> frontier{ top };
+        ::std::vector<ChildRef> kids;
+        while (!frontier.empty())
+        {
+            Entity* n = frontier.back();
+            frontier.pop_back();
+            kids.clear();
+            n->getTypedChildRefs(kids);
+            for (const auto& [tag, rid] : kids)
+            {
+                Entity* c = n->getTypedChild(*tag, rid);
+                if (!c || c->parent_ != n) continue;
+                c->depth_ = n->depth_ + 1;
+                frontier.push_back(c);
+            }
+        }
+    }
+
+    /*
+     * THE GRADUATED WARNING. An attach that lands exactly on a threshold
+     * says so, once per process per threshold: the first line is a note, the
+     * later ones say what is at stake, and none of them refuses anything --
+     * the tree is whatever a script built, and a limit here would be a
+     * policy the runtime has no standing to hold. What the numbers mean:
+     * core walks the tree in loops, but a family's own recursive walk costs
+     * a few hundred bytes of stack per level, so 16,384 levels is a few
+     * megabytes -- the size of a default thread stack -- and 262,144 is
+     * past any. Called after the attach, outside the parent's lock
+     * (addTagImpl): a log line is not something to hold a tag mutex across.
+     */
+    static constexpr uint32_t kDepthWarnAt[4] = { 64, 1024, 16384, 262144 };
+    static void noteDepth(const Entity* child)
+    {
+        static ::std::atomic<uint32_t> announced{ 0 };   // how many thresholds have been
+        const uint32_t d = child->depth_;
+        for (uint32_t i = announced.load(::std::memory_order_acquire); i < 4; ++i)
+        {
+            if (d < kDepthWarnAt[i]) return;
+            uint32_t expect = i;
+            if (!announced.compare_exchange_strong(expect, i + 1, ::std::memory_order_acq_rel)) return;
+            static const char* const what[4] = {
+                "a deep tree; nothing to do yet",
+                "core walks it in loops, but a family's recursive walk over this branch (an interaction, a collect) is a recursion this deep",
+                "a family's recursive walk over a branch this deep may exhaust a default thread stack",
+                "a family's recursive walk over a branch this deep will exhaust any thread stack",
+            };
+            ETCS_LOG("Entity", "RID:" << child->getRID() << " attached at depth " << d
+                     << " (threshold " << kDepthWarnAt[i] << "): " << what[i] << ".");
+        }
     }
 #ifdef ETCS_LOADER
     /*
@@ -1342,6 +2243,7 @@ public:
  * real bundle existed at all.
  */
     tags[source_tag] = TagEntry{ &bundle, child };
+    publishSurfaceLocked();
     }
 #endif /*
  * ETCS_LOADER
@@ -1370,7 +2272,19 @@ public:
  */
     bool removeTag(const ETCS::Buffer& tag)
     {
-        return ETCS::TagModifyEvent{this, tag, true, &Entity::tagModifyImpl}();
+        // A relation going takes its child with it (above): that is this
+        // entity's change, recorded here, where the action's frame still is.
+        RID leaving = 0;
+        {
+            ::std::lock_guard<::std::mutex> lock(m_tagMutex);
+            auto it = tags.find(tag);
+            if (it != tags.end() && it->second.child) leaving = it->second.child->getRID();
+        }
+        const bool off = ETCS::TagModifyEvent{this, tag, true, &Entity::tagModifyImpl}();
+        const char c = tag.c_str()[0];
+        if (off && c >= 'a' && c <= 'z') { recordEffect(this, flagKey(this, tag.toString()), false); onValue(tag, nullptr); }
+        if (off && leaving) recordEffect(this, childKey(leaving), false, true);
+        return off;
     }
     /*
  * See addTag's own overload. ScopeTag's destructor must pass the same extra
@@ -1393,11 +2307,13 @@ public:
  */
     bool hasTag(const ETCS::Buffer& tag) const
     {
-        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
         const char* s = tag.c_str();
-        bool is_flag = s && s[0] >= 'a' && s[0] <= 'z';
-        return is_flag ? (flags_.find(tag) != flags_.end())
-                        : (tags.find(tag) != tags.end());
+        const bool is_flag = s && s[0] >= 'a' && s[0] <= 'z';
+        ETCS::ReadSection rs;
+        const SurfaceView* v = surfaceView();
+        if (!v) return false;
+        return is_flag ? v->find(v->flags(), v->nflags, tag.buf, tag.written) >= 0
+                       : v->find(v->tkeys(), v->ntags,  tag.buf, tag.written) >= 0;
     }
     /*
  * safeBundleFor - the SAME null-bundle guard the plain, non-stream
@@ -1441,13 +2357,15 @@ public:
     }
     void getTags(::std::vector<ETCS::Buffer>& result) const
     {
-        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
-        for (auto const& [key, _] : tags) result.push_back(key);
+        ETCS::ReadSection rs;
+        if (const SurfaceView* v = surfaceView())
+            for (uint32_t i = 0; i < v->ntags; ++i) result.emplace_back(v->str(v->tkeys()[i]));
     }
     void getFlags(::std::vector<ETCS::Buffer>& result) const
     {
-        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
-        for (auto const& [key, _] : flags_) result.push_back(key);
+        ETCS::ReadSection rs;
+        if (const SurfaceView* v = surfaceView())
+            for (uint32_t i = 0; i < v->nflags; ++i) result.emplace_back(v->str(v->flags()[i]));
     }
     /*
  * ═══ THE RUNTIME HASH ════════════════════════════════════════════════════
@@ -1464,10 +2382,16 @@ public:
  *
  * NODE HASH -- the surface, then the typed children in the order dispatch
  * and wrap chains read them (typed_child_order_: first-attachment order of
- * each tag; within one tag, ascending RID, because the list is a hash map
- * with no order of its own and RIDs are deterministic). Each child
- * contributes its tag, its RID and its own node hash, so the value is a
- * merkle root over the subtree and a change anywhere below moves it.
+ * each tag; within one tag, by the children's own hashes). Each child
+ * contributes its tag and its own node hash, so the value is a merkle root
+ * over the subtree and a change anywhere below moves it.
+ *
+ * NO RIDS, anywhere in it. A RID is where and when an entity was made; the
+ * same state made again in another order (a replay, a reflection in another
+ * runtime) has other RIDs, and a hash that read them would be one more RID --
+ * two equal states would disagree and a rebuild could never check itself
+ * (ontology/Environmental.h). A relation is its key and its child's type; a
+ * dispatch tag carries the compile-time hash of the code behind it.
  *
  * XXH3 BELOW A GLOBAL SCOPE BOUNDARY, SHA-256 AT ONE. A node's hash is in
  * flux on every transition under it -- every flag, every stream call's scope
@@ -1508,11 +2432,61 @@ public:
  * changes slowly and is read rarely costs nothing between reads. Nothing is
  * recomputed on a schedule.
  */
-    uint64_t getHash() const;
+    uint64_t identityHash() const;
 
-    // Whether a pull would answer from the cache. What an audit compares
-    // against: a current cache that disagrees with a recompute is a change
-    // that never went through a funnel.
+    /*
+ * THE STATE HASH: what it is AND what is so -- the identity half above,
+ * and the value surface of every node under this one (values_), as one
+ * number. The identity half is the cached merkle, funnel-covered, audited;
+ * the value half is read live off the surfaces (a bound value moves without
+ * a funnel, so it is never cached and never audited -- there is no cache to
+ * disagree). One number to compare for "the same state": a resume, a
+ * reflection, a signature. The identity half alone is what a RECORD is
+ * keyed by (a box that moved is the same box) and what the Causal rows
+ * carry as their identity, so it keeps its own name.
+ *
+ * The level rule holds for this pair as for the identity's: a parentless
+ * entity's state hash is the first word of its state digest (SHA-256), a
+ * child's is XXH3 over the same input.
+ */
+    uint64_t getHash() const;
+    void     getDigest(unsigned char out[32]) const;
+    // The value surfaces under this node, in the walk's order, as one
+    // number. Live: O(subtree) per call, no cache.
+    uint64_t subtreeValueHash() const;
+    /*
+ * THE SAME RULE, OVER VALUES ALREADY READ -- what a frozen read composes its
+ * state hash with (etcs_freeze, ontology/Environmental.h), so the number it
+ * keeps describes exactly the values it kept, whatever moved after. One rule:
+ * the live forms above are these over a live read.
+ *
+ *   valueHashOf         one node's sorted (key, value) list (values())
+ *   subtreeValueHashOf  those, one per node in the walk's order
+ *   stateHashWith       this node's state hash given its subtree's values;
+ *                       the identity half is read live, so a caller holds it
+ *                       still (the hash epoch) for the pair to be one state
+ */
+    static uint64_t valueHashOf(const ::std::vector<::std::pair<::std::string, ::std::string>>& kv);
+    static uint64_t subtreeValueHashOf(const ::std::vector<uint64_t>& per_node);
+    uint64_t stateHashWith(uint64_t subtree_values) const;
+    void     stateDigestWith(uint64_t subtree_values, unsigned char out[32]) const;
+
+    /*
+ * WHERE THIS ENTITY STANDS AMONG ITS TWINS: the index, in attach order,
+ * among the parent's children of the same tag whose identity hash equals
+ * this one's. Zero for the first, for a parentless entity, and for an
+ * entity with no twin. With the identity hash it is the identity TUPLE --
+ * what it is, then which of the indistinguishable ones -- the same two
+ * keys a persistence record is looked up by (type and hash, then emergent
+ * creation order), and what the Causal rows carry in row 0. A scene
+ * rebuilt in another order gives its twins other indices: creation order
+ * is the last key, by design, never a stored RID.
+ */
+    uint32_t siblingIndex() const;
+
+    // Whether a pull of the identity half would answer from the cache. What
+    // an audit compares against: a current cache that disagrees with a
+    // recompute is a change that never went through a funnel.
     bool hashCurrent() const
     {
         return hash_valid_epoch_.load(::std::memory_order_acquire)
@@ -1525,12 +2499,15 @@ public:
     // has to make the tree above it recompute.
     void markHashStale() const { hash_epoch_.fetch_add(1, ::std::memory_order_acq_rel); }
 
-    // The 32-byte form. For a parentless entity this is its node hash in
-    // full (SHA-256); for a child it is SHA-256 over the same input its XXH3
-    // node hash was taken from -- what an audit of a subtree reports as its
-    // root. Same laziness as getHash.
-    void getDigest(unsigned char out[32]) const;
+    // The identity half's 32-byte form. For a parentless entity this is its
+    // identity hash in full (SHA-256); for a child it is SHA-256 over the
+    // same input its XXH3 identity hash was taken from -- what an audit of a
+    // subtree reports as its root. Same laziness as identityHash.
+    void identityDigest(unsigned char out[32]) const;
     bool isGlobalScope() const { return parent_ == nullptr; }
+
+    // Parents above this entity: 0 at the top of a branch. See depth_.
+    uint32_t depth() const { return depth_; }
 
     // The recompute every pull shares. `audit` non-null forces every level to
     // recompute rather than trust its cache, and reports each node whose
@@ -1557,13 +2534,19 @@ public:
     {
         ::std::lock_guard<::std::mutex> lock(m_tagMutex);
         interface_pointers_[family] = ptr;
+        if (family == ETCS::Buffer("Observable")) observable_wire_ = ptr;
+        if (family == ETCS::Buffer("Orderable"))  is_orderable_    = ptr != nullptr;
     }
+    // Written in the constructor and never again (registerInterfacePointer):
+    // read without a lock.
     void* getInterfacePointer(const ETCS::Buffer& family) const
     {
-        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
         auto it = interface_pointers_.find(family);
         return it != interface_pointers_.end() ? it->second : nullptr;
     }
+    // getInterfacePointer("Observable"), without the lock or the lookup: what
+    // the mark walks ask of every ancestor (see observable_wire_).
+    void* observableWire() const { return observable_wire_; }
     /*
  * The families this entity actually fulfills. Read off
  * interface_pointers_ rather than the tags map on purpose: this map is
@@ -1625,6 +2608,8 @@ public:
     // only a snapshot -- take a hold if you are about to USE it.
     bool isRetiring() const { return retiring_.load(::std::memory_order_seq_cst); }
     void beginRetire()      { retiring_.store(true, ::std::memory_order_seq_cst); }
+    // True for the one retire that gets to tell the parent (etcs_retire_entity).
+    bool markRetired()      { return !retired_.exchange(true, ::std::memory_order_acq_rel); }
 
     // True once nothing is inside. The deadline is so that a walk which breaks
     // the no-event rule degrades to the old behaviour with a line naming it,
@@ -1642,7 +2627,6 @@ public:
 
     void getInterfaceFamilies(::std::vector<ETCS::Buffer>& result) const
     {
-        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
         for (auto const& [family, _] : interface_pointers_) result.push_back(family);
     }
     void getAllActions(::std::vector<ETCS::Buffer>& all_actions)
@@ -1669,6 +2653,17 @@ public:
 #ifdef ETCS_LOG_FUNCTION_EVOCATION_PATH
         ETCS_LOG("Entity::call", "parsed tag_type=" << tag_type << " action=" << action);
 #endif
+        // A surface of a remote: its own verbs are the far node's, run there
+        // and answered in `data` like any work function (setRemoteWire).
+        if (remoteWire() && tag_type == getSourceTag())
+        {
+            RemoteCallGuard guard(*this);
+            if (ETCS::IWireRemote* far = remoteWire())
+            {
+                far->RemoteWork(action, data, ctx);
+                return;
+            }
+        }
         if (!hasTag(tag_type))
         {
             ETCS_LOG("Entity::call", "Could not find tag " << tag_type << " within tag list, failed action: " << action);
@@ -1797,6 +2792,240 @@ public:
     }
  
  
+    /*
+ * -----------------------------------------------------------------------
+ * ONE HALF OF A STREAM PAIR, the other half running in another runtime.
+ *
+ * `chain_owner` is whose Wrapper children wrap the pair (MirrorBuffer::
+ * wrap_owner_rid_): this entity by default, the surface when this half is
+ * the near end of a pair whose far end is remote -- the far node's authority
+ * layer, mirrored there, is what the frames must pass on both sides.
+ *
+ * The produce/consume contract does not change across a network: the caller
+ * names both halves, the consumer's frame is the pair's lifetime, and the
+ * producer's write end closes when its body returns (ETCS_API.h). What
+ * changes is that one half is somebody else's to run. These run the one that
+ * is ours, on a connected socket whose far end is running the other --
+ * StrategySocket, with the socket as both fds (makePair). The fd is taken
+ * over and closed when the half ends, which is also how the far half learns
+ * this one is gone.
+ *
+ * produceOnto returns when the produce BODY has returned, not when its
+ * trampoline has, for the reason the untyped call below waits
+ * (SharedPage::producers_live) -- and with no deadline: the body ends when
+ * its reader goes away, which on a socket is a write failing, or on a
+ * signal it can see.
+ * -----------------------------------------------------------------------
+ */
+    bool produceOnto(const ETCS::Buffer& conjugateAction, const ETCS::Buffer& config,
+                     int fd, SignalContext ctx = {}, Entity* chain_owner = nullptr)
+    {
+        if (fd < 0) return false;
+        auto [tag_type, action] = parseConjugateActionKey(conjugateAction);
+        ModuleBundle* b = hasTag(tag_type) ? safeBundleFor(tag_type, "producer") : nullptr;
+        if (!b || !b->isActionStream(action))
+        {
+            ETCS_LOG("[CALL]", "produceOnto: RID:" << getRID() << " has no stream "
+                     << tag_type << "." << action << " -- closing the far half's socket.");
+            ::close(fd);
+            return false;
+        }
+        ETCS::SharedPage* page = allocatePage<ETCS::StrategySocket, ETCS::SharedPage>(getRID());
+        ETCS::MirrorBuffer producer(config, ctx);
+        ETCS::MirrorBuffer consumer(config, ctx);
+        ETCS::MirrorBuffer::makePair<ETCS::StrategySocket, ETCS::SharedPage>(
+            producer, consumer, page, static_cast<uint64_t>(fd), static_cast<uint64_t>(fd),
+            chain_owner ? chain_owner : this);
+        // This thread is the body's: the caller gave it one (a link's edge),
+        // and a pool worker is not to be held for the life of a far edge.
+        producer.produceHere(true);
+        ETCS::MBuffer transport;
+        producer.packProducer(transport);
+        {
+            ETCS::ProducerLiveGuard dispatch(producer.producerEnter());
+            try { (*b)(getRID(), myConjugateKey(), action, transport, ctx); }
+            catch (const ::std::exception& e)
+            { ETCS_LOG("[CALL]", "produceOnto: producer failed: " << e.what()); }
+        }
+        while (producer.producerBusy())
+            ::std::this_thread::sleep_for(::std::chrono::milliseconds(2));
+        ETCS::MirrorBuffer::teardownPair<ETCS::StrategySocket, ETCS::SharedPage>(
+            producer, consumer, page);
+        return true;
+    }
+    bool consumeFrom(const ETCS::Buffer& conjugateActionRcv, const ETCS::Buffer& config,
+                     int fd, SignalContext ctx = {}, Entity* chain_owner = nullptr)
+    {
+        if (fd < 0) return false;
+        auto [tag_type, action] = parseConjugateActionKey(conjugateActionRcv);
+        ModuleBundle* b = hasTag(tag_type) ? safeBundleFor(tag_type, "consumer") : nullptr;
+        if (!b || !b->isActionStream(action))
+        {
+            ETCS_LOG("[CALL]", "consumeFrom: RID:" << getRID() << " has no stream "
+                     << tag_type << "." << action << " -- closing the far half's socket.");
+            ::close(fd);
+            return false;
+        }
+        ETCS::SharedPage* page = allocatePage<ETCS::StrategySocket, ETCS::SharedPage>(getRID());
+        ETCS::MirrorBuffer producer(config, ctx);
+        ETCS::MirrorBuffer consumer(config, ctx);
+        ETCS::MirrorBuffer::makePair<ETCS::StrategySocket, ETCS::SharedPage>(
+            producer, consumer, page, static_cast<uint64_t>(fd), static_cast<uint64_t>(fd),
+            chain_owner ? chain_owner : this);
+        ETCS::MBuffer transport;
+        consumer.packConsumer(transport);
+        try { (*b)(getRID(), myConjugateKey(), action, transport, ctx); }
+        catch (const ::std::exception& e)
+        { ETCS_LOG("[CALL]", "consumeFrom: consumer failed: " << e.what()); }
+        ETCS::MirrorBuffer::teardownPair<ETCS::StrategySocket, ETCS::SharedPage>(
+            producer, consumer, page);
+        return true;
+    }
+    /*
+ * A SURFACE OF A REMOTE: this entity is a local instance of a type whose real
+ * node lives in another runtime, and its Remote child (ontology/Remote.h) is
+ * the wire to it. Set and cleared only by that child. While set, every verb
+ * addressed to this entity's own tag, and either half of a stream pair naming
+ * it, runs on the far node instead (call(), callAcrossRuntimes).
+ *
+ * The child's teardown clears the wire and then waits out the calls already
+ * through it -- remote_calls_ counts them -- so a verb in flight never lands
+ * on a child that is gone.
+ */
+    void setRemoteWire(ETCS::IWireRemote* w)
+    {
+        remote_wire_.store(w, ::std::memory_order_release);
+        if (!w)
+            while (remote_calls_.load(::std::memory_order_acquire) > 0)
+                ::std::this_thread::sleep_for(::std::chrono::milliseconds(1));
+    }
+    ETCS::IWireRemote* remoteWire() const { return remote_wire_.load(::std::memory_order_acquire); }
+
+    /*
+ * PROVENANCE. Turned on once, when an entity that claims Environmental joins
+ * the graph (etcs_supertype_fanout) -- after its constructor, so what it does
+ * while being made is its making, not its record. From then on every tag that
+ * goes on or off it, or any plain entity beneath it up to the next
+ * Environmental one, is recorded against the action it happened in
+ * (core/Provenance.h), in the family's own record (IWireEnvironmental).
+ */
+    void markEnvironmental() { environmental_.store(true, ::std::memory_order_release); }
+    bool isEnvironmental() const { return environmental_.load(::std::memory_order_acquire); }
+    ETCS::IWireEnvironmental* environmentalWire()
+    {
+        return isEnvironmental()
+            ? static_cast<ETCS::IWireEnvironmental*>(getInterfacePointer(ETCS::Buffer("Environmental")))
+            : nullptr;
+    }
+    /*
+ * `in_frame_only`: a child made or removed outside any action is its maker's
+ * business -- a constructor's, a connection's -- not the scene's, and the
+ * executor records the children its own lines make (CommandExecutor.h). A
+ * flag changed outside one is recorded, as what cannot be replayed.
+ */
+    static void recordEffect(Entity* touched, const ::std::string& key, bool created,
+                             bool in_frame_only = false)
+    {
+        ETCS::ActionFrame* f = ETCS::current_action_frame();
+        if (!f && in_frame_only) return;
+        recordEffectIn(touched, key, created, f);
+    }
+    // The same, against a frame the caller made: an effect that is its own
+    // action whatever is running around it (moveTo). Null: outside any. A
+    // lazy frame is settled only once something is recorded against it.
+    static void recordEffectIn(Entity* touched, const ::std::string& key, bool created, ETCS::ActionFrame* f)
+    {
+        Entity* env = touched;
+        while (env && !env->isEnvironmental()) env = env->getParent();
+        if (!env) return;
+        if (f) f->settle();
+        if (ETCS::IWireEnvironmental* w = env->environmentalWire()) w->RecordEffect(f, key, created);
+    }
+    // The flags that are state -- not the in-flight scopes (surfaceHash).
+    void stateFlags(::std::vector<::std::string>& out) const
+    {
+        const ::std::string scope = ETCS::ScopeTag::kPrefix;
+        ETCS::ReadSection rs;
+        const SurfaceView* v = surfaceView();
+        for (uint32_t i = 0; v && i < v->nflags; ++i)
+        {
+            const ViewStr f = v->flags()[i];
+            if (f.n < scope.size() || ::std::memcmp(v->p(f), scope.data(), scope.size()) != 0)
+                out.emplace_back(v->p(f), f.n);
+        }
+    }
+    static ::std::string flagKey(const Entity* e, const ::std::string& flag)
+    { return "f:" + ::std::to_string(e->getRID()) + ":" + flag; }
+    static ::std::string childKey(RID child) { return "c:" + ::std::to_string(child); }
+    // Where a child sits, once it has moved (moveTo): the last move keeps it.
+    static ::std::string placeKey(RID child) { return "p:" + ::std::to_string(child); }
+    struct RemoteCallGuard
+    {
+        const Entity& e;
+        explicit RemoteCallGuard(const Entity& x) : e(x) { e.remote_calls_.fetch_add(1, ::std::memory_order_acq_rel); }
+        ~RemoteCallGuard() { e.remote_calls_.fetch_sub(1, ::std::memory_order_acq_rel); }
+    };
+    /*
+ * A stream pair with a remote end: the far half is asked for by name, the
+ * near half runs here. True when it was such a pair (handled, whatever the
+ * outcome); false leaves the in-process call to proceed. Both ends remote is
+ * refused -- that pair is between two other runtimes, and this one would be
+ * a relay for bytes it cannot read.
+ */
+    bool callAcrossRuntimes(ETCS::Entity* producer_entity,
+                            const ETCS::Buffer& conjugateAction,
+                            const ETCS::Buffer& conjugateActionRcv,
+                            const ETCS::Buffer& config, SignalContext ctx)
+    {
+        if (!producer_entity->remoteWire() && !remoteWire()) return false;
+        RemoteCallGuard g_p(*producer_entity), g_c(*this);
+        ETCS::IWireRemote* far_producer = producer_entity->remoteWire();
+        ETCS::IWireRemote* far_consumer = remoteWire();
+        if (!far_producer && !far_consumer) return false;
+        if (far_producer && far_consumer)
+        {
+            ETCS_LOG("[CALL]", "stream refused: both ends are remote (RID:"
+                     << producer_entity->getRID() << " -> RID:" << getRID() << ").");
+            return true;
+        }
+        // The far half is asked for BY THE SURFACE's wire, which knows the
+        // code it names (the surface is the far node's type, so it has the
+        // action's hash) and the authority layer it must pass (its Wrapper
+        // children); the far side refuses unless both are its own. The near
+        // half then runs here, wrapped by that same layer.
+        Entity* surface = far_producer ? producer_entity : this;
+        const ETCS::Buffer& key = far_producer ? conjugateAction : conjugateActionRcv;
+        const ETCS::Buffer verb = parseConjugateActionKey(key).second;
+        const int fd = (far_producer ? far_producer : far_consumer)->RemoteStream(
+            verb, config, far_producer != nullptr, ctx);
+        if (fd < 0)
+        {
+            ETCS_LOG("[CALL]", "remote " << (far_producer ? "producer " : "consumer ")
+                     << verb << " did not open.");
+            return true;
+        }
+        if (far_producer) consumeFrom(conjugateActionRcv, config, fd, ctx, surface);
+        else              producer_entity->produceOnto(conjugateAction, config, fd, ctx, surface);
+        return true;
+    }
+    // The source-region hash of "Tag.Action" as this entity's bundle has it --
+    // what a link compares before running a verb or a stream half for the far
+    // side (NetworkProvider/Edge.h). 0 when unknown, which never agrees.
+    HASH_TYPE actionHash(const ETCS::Buffer& conjugateAction) const
+    {
+        auto [tag_type, action] = parseConjugateActionKey(conjugateAction);
+        auto it = tags.find(tag_type);
+        if (it == tags.end() || !it->second.bundle) return 0;
+        auto a = it->second.bundle->actions.find(action);
+        return a == it->second.bundle->actions.end() ? 0 : a->second.hash;
+    }
+    // The tag's own hash, composed over all its actions: equal on two sides
+    // means every verb of the type is the same code on both.
+    HASH_TYPE tagHash(const ETCS::Buffer& tag_type) const
+    {
+        auto it = tags.find(tag_type);
+        return (it == tags.end() || !it->second.bundle) ? 0 : it->second.bundle->hash;
+    }
 #ifdef ETCS_LOADER
     /*
  * -----------------------------------------------------------------------
@@ -1832,6 +3061,8 @@ public:
               SignalContext        ctx = {})
     {
         if (!producer_entity) return;
+        if (callAcrossRuntimes(producer_entity, conjugateAction, conjugateActionRcv, config, ctx))
+            return;
         /*
      * NAMED LOCALS, not the structured bindings themselves. A lambda below
      * captures tag_type and action, and capturing a structured binding is a
@@ -2046,6 +3277,10 @@ public:
         using Strategy = typename ETCS::StrategyFor<ProducerTag, ConsumerTag>::type;
         using Page     = typename ETCS::PageFor<Strategy>::type;
         if (!producer_entity) return;
+        // A Remote end is a socket to another runtime, not an fd pair to be
+        // made here -- StrategySocket's pair comes from the far side.
+        if (callAcrossRuntimes(producer_entity, conjugateAction, conjugateActionRcv, config, ctx))
+            return;
         auto [tag_type, action]     = parseConjugateActionKey(conjugateAction);
         auto [tag_type_r, action_r] = parseConjugateActionKey(conjugateActionRcv);
         if (!producer_entity->hasTag(tag_type) || !hasTag(tag_type_r))
@@ -2377,16 +3612,16 @@ private:
  * what changed, and MarkObserved excludes only the edge whose observer IS the
  * origin -- which is how a node's own write stays out of its own self-edge.
  *
- * Nearest claimant only, then stop: MarkObserved bubbles upward itself
- * (ontology/ObservableBase.h), so walking past the first one would mark the
- * ancestors twice.
+ * Every Observable ancestor, one hop each (ontology/ObservableBase.h,
+ * MarkObservedHop): the same statement MarkObserved would make by climbing
+ * from the nearest claimant, made from this climb instead.
  *
  * isDestructed stops the walk rather than skipping the link -- past a
  * half-destroyed ancestor there is nothing trustworthy left to climb. Only
  * reachable under arena teardown, which is the one context tag modification
  * never sees.
  *
- * Callers hold no lock here. MarkObserved takes its own and walks parents.
+ * Callers hold no lock here.
  */
     /*
  * AND THE ONE PLACE A STATE CHANGE BECOMES A STALE HASH. The two walks differ
@@ -2399,34 +3634,59 @@ private:
 public:
     static void markStateChange(Entity* from, RID origin)
     {
-        bool told = false;
+        /*
+ * AN ORDERABLE'S KEY IS ITS TAG STATE. A leaf's operator< may read any of its
+ * tags or flags (a hidden drawable loses every comparison), so a change to
+ * `from`'s own tag state can move it among its siblings -- the case RIDList
+ * cannot see, since membership stayed put. Marks the parent's list stale and
+ * never sorts: a burst of changes costs one rebuild, at the next ordered read.
+ * `from` only -- an ancestor's subtree moved, not its key.
+ */
+        if (from && !from->isDestructed() && from->is_orderable_)
+            if (Entity* p = from->getParent(); p && !p->isDestructed())
+                p->reorderTypedChild(from->getRID());
+
+        // ONE CLIMB. The Observable statement hops through every Observable
+        // ancestor (ObservableBase::MarkObservedHop: its own edges, and
+        // whether the statement travels on -- a batch in progress holds it),
+        // which is the same path this walk takes for the epochs; made here,
+        // level by level, rather than handed to the nearest claimant to
+        // climb again. Over a deep tree each climb is a cache miss per
+        // level, and this was two of them.
+        bool travels = true;
         for (Entity* n = from; n; n = n->getParent())
         {
             if (n->isDestructed()) return;
             n->hash_epoch_.fetch_add(1, ::std::memory_order_acq_rel);
-            if (told) continue;
-            void* p = n->getInterfacePointer(ETCS::Buffer("Observable"));
-            if (!p) continue;
-            static_cast<ETCS::IWireObservable*>(p)->MarkObserved(origin);
-            told = true;
+            if (travels && n->observable_wire_)
+                travels = static_cast<ETCS::IWireObservable*>(n->observable_wire_)->MarkObservedHop(origin);
         }
     }
 private:
 
-    static bool tagModifyImpl(Entity* target, const ETCS::Buffer& key, bool is_remove)
+    static bool tagModifyImpl(Entity* target, const ETCS::Buffer& key, bool is_remove, const ::std::string* value)
     {
-        const bool changed = tagModifyBody(target, key, is_remove);
+        const bool changed = tagModifyBody(target, key, is_remove, value);
         if (!changed || !target) return changed;
         markStateChange(target, target->getRID());
         return changed;
     }
 
-    static bool tagModifyBody(Entity* target, const ETCS::Buffer& key, bool is_remove)
+    static bool tagModifyBody(Entity* target, const ETCS::Buffer& key, bool is_remove, const ::std::string* value)
     {
         if (!is_remove)
         {
             ::std::lock_guard<::std::mutex> lock(target->m_tagMutex);
-            return target->flags_.emplace(key, true).second;
+            const bool flag_on = target->flags_.emplace(key, true).second;
+            bool value_set = false;
+            if (value)
+            {
+                auto v = target->values_.find(key);
+                if (v == target->values_.end()) { target->values_.emplace(key, *value); value_set = true; }
+                else if (v->second != *value)   { v->second = *value;                  value_set = true; }
+            }
+            if (flag_on || value_set) target->surfaceSetLocked(key, value_set ? value : nullptr);
+            return flag_on || value_set;
         }
  
         /*
@@ -2519,10 +3779,13 @@ private:
                 child_to_delete = it->second.child;
                 target->tags.erase(it);
                 changed = true;
+                target->publishSurfaceLocked();
             }
             else
             {
                 changed = (target->flags_.erase(key) > 0);
+                target->values_.erase(key);
+                if (changed) target->surfaceRemoveLocked(key);
             }
         }
  
@@ -2590,6 +3853,7 @@ template<typename T>
  
         RID rid = child->getRID(); // virtual call - no cast needed
         it->second.invoke_insert(rid, child);
+        parent->childAddedLocked(&it->first, rid, child);
  
         /*
  * Also register into T's own module-level RIDList - the same one
@@ -2626,6 +3890,7 @@ template<typename T>
  
         child->parent_     = parent;
         child->parent_rid_ = rid;
+        child->depth_      = parent->depth_ + 1;    // noted after the lock: addTagImpl
         /*
  * Passive edge, set at the same moment and in the same place as
  * parent_ itself -- these two are the same fact recorded twice, for
@@ -3681,6 +4946,25 @@ inline bool etcs_retire_entity(Entity* e)
     if (void* raw = e->getInterfacePointer(ETCS::Buffer("Lifecycle")))
         released = static_cast<ETCS::IWireLifecycle*>(raw)->Release();
     /*
+ * Children made by ANOTHER module are roots of that module's arena
+ * (addTag<T>), so this entity's own arena teardown never reaches them. They
+ * go here, through their own arena, while this entity is still whole and
+ * still their parent -- which also hands their module's lifetime token on,
+ * or gives it up, the way any root leaving does. A reparent (the
+ * non-cascade delete) moves them before this runs, and there are none left.
+ */
+    {
+        ::std::vector<Entity::ChildRef> kids;
+        e->getTypedChildRefs(kids);
+        for (auto& [tag, rid] : kids)
+        {
+            Entity* c = e->getTypedChild(*tag, rid);
+            if (!c || !c->isModuleRoot()) continue;
+            etcs_retire_entity(c);
+            c->getOwningArena().deleteEntity(c, true);
+        }
+    }
+    /*
  * Then leave the parent's child list, for every entity. This used to happen in
  * ~Entity(), which meant a child was still answerable through getTypedChild
  * while its own destructor ran: a concurrent frame edge resolved it, called
@@ -3718,7 +5002,16 @@ inline bool etcs_retire_entity(Entity* e)
  * where an ancestor may already have run ~Entity() -- the one context tag
  * modification never reaches.
  */
-    Entity::markStateChange(e->getParent(), e->getRID());
+    // ONCE PER ENTITY, AND NOT UNDER A CASCADE. Every way an entity dies
+    // reaches here more than once (the cascade's driver, then reclaimEntity,
+    // each in its own image -- and the rest of this function is meant to run
+    // in each, since a family list lives in the image that published it),
+    // but the walk up the tree is one statement, and over a deep chain it was
+    // most of a delete. Under a cascade the subtree's root told the tree
+    // above (MemoryArena::deleteEntity), and every ancestor this would reach
+    // up to it is dying with it.
+    if (etcs_cascade_depth == 0 && e->markRetired())
+        Entity::markStateChange(e->getParent(), e->getRID());
     // And leave every registry it was published into, keyed the way it was
     // admitted. This is what turns "the RID resolved" into "it is alive".
     etcs_supertype_fanin(e);
@@ -3731,6 +5024,8 @@ inline void etcs_supertype_fanout(Entity* e)
     ::std::vector<ETCS::Buffer> families;
     e->getInterfaceFamilies(families);
     if (families.empty()) return;
+    // Built and joining the graph: the moment its record starts.
+    if (e->getInterfacePointer(ETCS::Buffer("Environmental"))) e->markEnvironmental();
 
     auto& ridMap = ETCS::EventNode::getInstance().ridMap;
     const RID rid = e->getRID();
@@ -3876,8 +5171,8 @@ struct Entity::HashAudit
     size_t   nodes      = 0;   // entities visited
     size_t   diverged   = 0;   // current caches that did not match their state
     size_t   skipped    = 0;   // children retiring during the walk, not hashed
-    uint64_t top_hash   = 0;   // the top's own node hash, as the walk computed it
-    unsigned char root[32] = {};   // the top's digest (getDigest), as the walk computed it
+    uint64_t top_hash   = 0;   // the top's own identity hash, as the walk computed it
+    unsigned char root[32] = {};   // the top's identity digest (identityDigest), as the walk computed it
 };
 
 namespace etcs_hash_detail
@@ -3898,40 +5193,125 @@ namespace etcs_hash_detail
     }
     // getTypedChildren answers grouped by tag, in first-attachment order --
     // that order is state (a wrap chain applies in it) and is kept. Within a
-    // group the list is a hash map with no order of its own, so each group is
-    // put in the one deterministic order there is: ascending RID.
-    inline void order_children(::std::vector<::std::pair<ETCS::Buffer, RID>>& kids)
+    // group, ascending RID: a WALK order only, for the identity walk, which
+    // composes each tag's children as a multiset (finish sorts them by hash),
+    // so no RID reaches its number. A walk whose order is part of what it
+    // produces walks in order_canonical instead.
+    inline void order_children(::std::vector<Entity::ChildRef>& kids)
     {
+        // A group is one tag: the same key, so the same pointer.
         auto lo = kids.begin();
         while (lo != kids.end())
         {
             auto hi = lo + 1;
             while (hi != kids.end() && hi->first == lo->first) ++hi;
-            ::std::sort(lo, hi, [](const ::std::pair<ETCS::Buffer, RID>& a,
-                                   const ::std::pair<ETCS::Buffer, RID>& b)
-                                { return a.second < b.second; });
+            ::std::sort(lo, hi, [](const Entity::ChildRef& a, const Entity::ChildRef& b) { return a.second < b.second; });
             lo = hi;
         }
     }
+    /*
+     * THE CANONICAL ORDER of a node's children -- the one CausalHash walks
+     * (P54): tag groups in first-attachment order; within a tag, by identity
+     * hash, so a distinguishable child stands by what it is; between twins,
+     * the order they were attached (getTypedChildren's arrival order, kept by
+     * a stable sort) -- creation order as the last key, and only there. No
+     * RID decides anything, so the same state made at other RIDs walks the
+     * same. Every walk whose order is part of its output walks in it: the
+     * values in the state hash (subtreeValueHash), a frozen read
+     * (etcs_freeze), a store's record order (Persistence).
+     */
+    inline void order_canonical(const Entity* parent, ::std::vector<Entity::ChildRef>& kids)
+    {
+        // Sorted as indices; a group is one tag (one key, one pointer, kept
+        // together in first-attachment order by getTypedChildRefs).
+        const size_t n = kids.size();
+        if (n < 2) return;
+        ::std::vector<uint32_t> group(n), idx(n);
+        ::std::vector<uint64_t> id(n);
+        uint32_t g = 0;
+        for (size_t i = 0; i < n; ++i)
+        {
+            if (i && kids[i].first != kids[i - 1].first) ++g;
+            group[i] = g;
+            idx[i] = static_cast<uint32_t>(i);
+            Entity* c = parent->getTypedChild(*kids[i].first, kids[i].second);
+            LifetimeHold hold(c);
+            id[i] = hold ? c->identityHash() : 0;
+        }
+        ::std::stable_sort(idx.begin(), idx.end(), [&](uint32_t a, uint32_t b) {
+            return group[a] != group[b] ? group[a] < group[b] : id[a] < id[b]; });
+        ::std::vector<Entity::ChildRef> out;
+        out.reserve(n);
+        for (uint32_t i : idx) out.push_back(kids[i]);
+        kids.swap(out);
+    }
+}
+
+inline uint64_t Entity::valueHashOf(const ::std::vector<::std::pair<::std::string, ::std::string>>& kv)
+{
+    ::std::string in;
+    for (auto& [k, v] : kv)
+    {
+        etcs_hash_detail::put(in, 'V', k.data(), k.size());
+        etcs_hash_detail::put(in, 'v', v.data(), v.size());
+    }
+    return XXH3_64bits(in.data(), in.size());
+}
+
+inline uint64_t Entity::valueHash() const
+{
+    ::std::vector<::std::pair<::std::string, ::std::string>> kv;
+    values(kv);
+    return valueHashOf(kv);
+}
+
+inline uint64_t Entity::subtreeValueHashOf(const ::std::vector<uint64_t>& per_node)
+{
+    ::std::string in;
+    for (uint64_t h : per_node) etcs_hash_detail::put_u64(in, h);
+    return XXH3_64bits(in.data(), in.size());
 }
 
 inline uint64_t Entity::surfaceHash() const
 {
-    // Snapshot under the tag mutex, hash outside it: XXH3 over a few hundred
-    // bytes is longer than a lock should be held by anything a call() path
-    // waits on.
+    /*
+     * NO RIDS. A RID is where and when an entity was made -- the order types
+     * happened to be created in -- and a scene rebuilt in another order is the
+     * same scene with other RIDs. Hashed, it would make this one more RID: two
+     * equal states would disagree, and a restore could never check itself
+     * (ontology/Environmental.h). So a relation is its key and the type it
+     * points at, and a dispatch tag carries the compile-time hash of the code
+     * behind it (ModuleBundle::hash, over its actions' source regions) -- the
+     * most specific type's own identity, which a rebuilt entity has too.
+     *
+     * NOT THE IN-FLIGHT SCOPES. A call in progress flags its receiver
+     * (ScopeTag::kPrefix); that is the motion of the runtime, not its state,
+     * and a hash taken mid-call must equal one taken after.
+     */
+    // From the published surface, and kept on it: the surface moves only by
+    // publishing a new view, so a view's hash is computed once, by the first
+    // reader that asks (two racing readers store the same number).
+    ETCS::ReadSection rs;
+    const SurfaceView* v = surfaceView();
+    if (!v) return XXH3_64bits("\x00", 1);
+    if (const uint64_t h = v->hash.load(::std::memory_order_relaxed)) return h;
     ::std::vector<::std::string> markers, dispatch, relations, flags;
+    for (uint32_t i = 0; i < v->ntags; ++i)
     {
-        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
-        for (auto const& [key, entry] : tags)
-        {
-            if (entry.child)        { ::std::string r = key.toString();
-                                      etcs_hash_detail::put_u64(r, entry.child->getRID());
-                                      relations.push_back(::std::move(r)); }
-            else if (entry.bundle)  dispatch.push_back(key.toString());
-            else                    markers.push_back(key.toString());
-        }
-        for (auto const& [key, _] : flags_) flags.push_back(key.toString());
+        const ::std::string key = v->str(v->tkeys()[i]);
+        const TagEntry& entry = v->tentry()[i];
+        if (entry.child)        relations.push_back(key + "=" + v->str(v->trels()[i]));
+        else if (entry.bundle)  { ::std::string d = key;
+                                  etcs_hash_detail::put_u64(d, entry.bundle->hash);
+                                  dispatch.push_back(::std::move(d)); }
+        else                    markers.push_back(key);
+    }
+    const ::std::string scope = ETCS::ScopeTag::kPrefix;
+    for (uint32_t i = 0; i < v->nflags; ++i)
+    {
+        ::std::string f = v->str(v->flags()[i]);
+        if (f.compare(0, scope.size(), scope) == 0) continue;
+        flags.push_back(::std::move(f));
     }
     ::std::sort(markers.begin(),   markers.end());
     ::std::sort(dispatch.begin(),  dispatch.end());
@@ -3944,96 +5324,177 @@ inline uint64_t Entity::surfaceHash() const
     for (auto const& d : dispatch)  etcs_hash_detail::put(in, 'D', d.data(), d.size());
     for (auto const& r : relations) etcs_hash_detail::put(in, 'R', r.data(), r.size());
     for (auto const& f : flags)     etcs_hash_detail::put(in, 'F', f.data(), f.size());
-    return XXH3_64bits(in.data(), in.size());
+    const uint64_t h = XXH3_64bits(in.data(), in.size());
+    v->hash.store(h, ::std::memory_order_relaxed);
+    return h;
 }
+
+/*
+ * ONE FRAME PER LEVEL, ON THE HEAP, NOT THE STACK. The recompute is a
+ * post-order walk -- a node's input is its surface and its children's
+ * hashes -- and written as a call per child it was a C++ frame per level
+ * of the tree, with the strings and vectors below in each. A tree is as
+ * deep as somebody made it (depth_ and its warnings, addTagTrampoline), so
+ * the levels live in this vector and the walk is a loop; the stack cost of
+ * a pull is one frame whatever the depth. The order of reads and stamps is
+ * the recursive one's exactly: a child's epoch is read BEFORE its subtree
+ * is hashed and stamped after, and a child whose cache is current is taken
+ * from the cache without descending (the lazy pull, getHash).
+ */
+struct EntityHashFrame
+{
+    const Entity*  node = nullptr;
+    const ETCS::Buffer* tag = nullptr;  // under which the parent composes it (its key in the parent)
+    RID            rid  = 0;
+    uint32_t       epoch = 0;           // read before, stamped after
+    bool           was_current = false; // audit: what the cache claimed
+    uint64_t       was = 0;
+    LifetimeHold   hold;                // the parent's hold on this child, for the whole subtree
+    ::std::vector<Entity::ChildRef>                         kids;
+    size_t                                                  next = 0;
+    ::std::vector<::std::pair<const ETCS::Buffer*, uint64_t>> composed;   // (tag, hash): a group is one tag
+};
 
 inline uint64_t Entity::computeNodeHash(HashAudit* audit, unsigned char* digest) const
 {
+    // Finish one level: compose the children's hashes into the node's input
+    // and take the hash the level rule says (below), filling `d` with the
+    // SHA-256 when asked.
+    auto finish = [](EntityHashFrame& f, unsigned char* d) -> uint64_t
+    {
+        ::std::string in;
+        in.push_back('\x01');                               // a node
+        etcs_hash_detail::put_u64(in, f.node->surfaceHash());
+        for (auto lo = f.composed.begin(); lo != f.composed.end(); )
+        {
+            auto hi = lo + 1;
+            while (hi != f.composed.end() && hi->first == lo->first) ++hi;
+            ::std::sort(lo, hi);
+            lo = hi;
+        }
+        for (auto const& [tag, h] : f.composed)
+        {
+            etcs_hash_detail::put(in, 'C', tag->buf, tag->written);   // the tag's bytes, as toString() gives them
+            etcs_hash_detail::put_u64(in, h);
+        }
+        /*
+         * THE LEVEL RULE. A child answers XXH3 and its parent composes over
+         * that. A parentless entity has no parent to compose over it -- what
+         * composes over it is a module's root, which is a global-scope
+         * boundary -- so its node hash is the SHA-256 of the same input, and
+         * the 64-bit view is that digest's first word. One input, two
+         * functions, chosen by where the node stands; nothing above it has
+         * to ask which.
+         */
+        const bool global = f.node->isGlobalScope();
+        if (d || global)
+        {
+            unsigned char dd[32];
+            picohash_ctx_t ctx;
+            picohash_init_sha256(&ctx);
+            picohash_update(&ctx, in.data(), in.size());
+            picohash_final(&ctx, dd);
+            if (d) ::std::memcpy(d, dd, 32);
+            if (global)
+            {
+                uint64_t first = 0;
+                ::std::memcpy(&first, dd, sizeof(first));
+                return first;
+            }
+        }
+        return XXH3_64bits(in.data(), in.size());
+    };
+
+    // Children by tag in first-attachment order -- that order is state (a
+    // wrap chain applies in it) -- and within a tag a MULTISET of hashes:
+    // ordered by hash, never by RID, so the same children made at other
+    // RIDs hash the same (surfaceHash).
+    auto open = [](EntityHashFrame& f)
+    {
+        f.node->getTypedChildRefs(f.kids);
+        etcs_hash_detail::order_children(f.kids);
+    };
+
+    ::std::vector<EntityHashFrame> frames;
+    frames.reserve(16);
+    frames.emplace_back();
+    frames.back().node = this;
+    open(frames.back());
     if (audit) ++audit->nodes;
 
-    ::std::string in;
-    in.push_back('\x01');                               // a node
-    etcs_hash_detail::put_u64(in, surfaceHash());
-
-    ::std::vector<::std::pair<ETCS::Buffer, RID>> kids;
-    getTypedChildren(kids);
-    etcs_hash_detail::order_children(kids);
-
-    for (auto const& [tag, rid] : kids)
+    for (;;)
     {
-        Entity* child = getTypedChild(tag, rid);
-        LifetimeHold hold(child);
-        if (!hold) { if (audit) ++audit->skipped; continue; }
-
-        uint64_t h;
-        if (!audit) h = child->getHash();
-        else
+        EntityHashFrame& f = frames.back();
+        if (f.next < f.kids.size())
         {
-            const bool     was_current = child->hashCurrent();
-            const uint64_t was         = child->hashCached();
-            const uint32_t epoch       = child->hashEpoch();
-            unsigned char  cd[32];
-            h = child->computeNodeHash(audit, cd);
-            if (was_current && was != h)
+            const auto [tag, rid] = f.kids[f.next++];
+            Entity* child = f.node->getTypedChild(*tag, rid);
+            LifetimeHold hold(child);
+            if (!hold) { if (audit) ++audit->skipped; continue; }
+
+            // The lazy pull: a current cache is the child's answer, and its
+            // subtree is not walked.
+            if (!audit && child->hashCurrent())
             {
-                /*
-                 * The cache said current and the state says otherwise: something
-                 * moved this subtree without passing a funnel. Reported, and
-                 * marked so every observer above hears it through the ordinary
-                 * wire -- an audit finding a hole is itself a transition.
-                 *
-                 * EVERY CACHE ON THE PATH ABOVE THE HOLE REPORTS TOO, because each
-                 * was computed from the lie below it. So one unrecorded write
-                 * reads as a chain of divergences from the top down to one node,
-                 * and the DEEPEST of them is where it happened; the rest are its
-                 * consequences. The chain is the trace.
-                 *
-                 * The mark bumps this node's epoch after `epoch` was read, so the
-                 * stamp below leaves a diverged node stale: its next pull
-                 * recomputes once more, cheaply, from the state just verified.
-                 */
-                ++audit->diverged;
-                ETCS_LOG("Hash", "DIVERGENCE at RID:" << rid << " (" << tag
-                         << "): cached 0x" << ::std::hex << was << " but the state hashes to 0x"
-                         << h << ::std::dec << " -- a change that never went through a funnel.");
-                markStateChange(child, rid);
+                f.composed.emplace_back(tag, child->hashCached());
+                continue;
             }
-            child->stampHash(h, epoch, cd);
+            // Down a level. `f` may move when the vector grows; nothing
+            // below reads it again before the next iteration re-takes back().
+            EntityHashFrame c;
+            c.node        = child;
+            c.tag         = tag;
+            c.rid         = rid;
+            c.epoch       = child->hashEpoch();
+            c.was_current = audit ? child->hashCurrent() : false;
+            c.was         = audit ? child->hashCached()  : 0;
+            c.hold        = ::std::move(hold);
+            open(c);
+            frames.push_back(::std::move(c));
+            if (audit) ++audit->nodes;
+            continue;
         }
-        ::std::string tagstr = tag.toString();
-        etcs_hash_detail::put(in, 'C', tagstr.data(), tagstr.size());
-        etcs_hash_detail::put_u64(in, rid);
-        etcs_hash_detail::put_u64(in, h);
-    }
 
-    /*
-     * THE LEVEL RULE. A child answers XXH3 and its parent composes over that.
-     * A parentless entity has no parent to compose over it -- what composes
-     * over it is a module's root, which is a global-scope boundary -- so its
-     * node hash is the SHA-256 of the same input, and the 64-bit view is that
-     * digest's first word. One input, two functions, chosen by where the
-     * node stands; nothing above it has to ask which.
-     */
-    const bool global = isGlobalScope();
-    if (digest || global)
-    {
-        unsigned char d[32];
-        picohash_ctx_t ctx;
-        picohash_init_sha256(&ctx);
-        picohash_update(&ctx, in.data(), in.size());
-        picohash_final(&ctx, d);
-        if (digest) ::std::memcpy(digest, d, 32);
-        if (global)
+        // Every child composed: this level's hash.
+        if (frames.size() == 1) return finish(f, digest);
+
+        unsigned char cd[32];
+        const uint64_t h = finish(f, audit ? cd : nullptr);
+        if (audit && f.was_current && f.was != h)
         {
-            uint64_t first = 0;
-            ::std::memcpy(&first, d, sizeof(first));
-            return first;
+            /*
+             * The cache said current and the state says otherwise: something
+             * moved this subtree without passing a funnel. Reported, and
+             * marked so every observer above hears it through the ordinary
+             * wire -- an audit finding a hole is itself a transition.
+             *
+             * EVERY CACHE ON THE PATH ABOVE THE HOLE REPORTS TOO, because each
+             * was computed from the lie below it. So one unrecorded write
+             * reads as a chain of divergences from the top down to one node,
+             * and the DEEPEST of them is where it happened; the rest are its
+             * consequences. The chain is the trace.
+             *
+             * The mark bumps this node's epoch after `epoch` was read, so the
+             * stamp below leaves a diverged node stale: its next pull
+             * recomputes once more, cheaply, from the state just verified.
+             */
+            ++audit->diverged;
+            ETCS_LOG("Hash", "DIVERGENCE at RID:" << f.rid << " (" << *f.tag
+                     << "): cached 0x" << ::std::hex << f.was << " but the state hashes to 0x"
+                     << h << ::std::dec << " -- a change that never went through a funnel.");
+            markStateChange(const_cast<Entity*>(f.node), f.rid);
         }
+        // What the child's own getHash would have stamped: the epoch read
+        // before its subtree was hashed. A child is never global, so its
+        // digest is kept only by an audit.
+        f.node->stampHash(h, f.epoch, audit ? cd : nullptr);
+        const ETCS::Buffer* const tagp = f.tag;
+        frames.pop_back();
+        frames.back().composed.emplace_back(tagp, h);
     }
-    return XXH3_64bits(in.data(), in.size());
 }
 
-inline uint64_t Entity::getHash() const
+inline uint64_t Entity::identityHash() const
 {
     const uint32_t epoch = hash_epoch_.load(::std::memory_order_acquire);
     if (hash_valid_epoch_.load(::std::memory_order_acquire) == epoch)
@@ -4047,7 +5508,7 @@ inline uint64_t Entity::getHash() const
     return h;
 }
 
-inline void Entity::getDigest(unsigned char out[32]) const
+inline void Entity::identityDigest(unsigned char out[32]) const
 {
     if (isGlobalScope())
     {
@@ -4055,7 +5516,7 @@ inline void Entity::getDigest(unsigned char out[32]) const
         {
             const uint32_t epoch = hash_epoch_.load(::std::memory_order_acquire);
             if (hash_valid_epoch_.load(::std::memory_order_acquire) != epoch)
-            { (void)getHash(); continue; }          // fills the digest, then re-read
+            { (void)identityHash(); continue; }     // fills the digest, then re-read
             ::std::memcpy(out, hash_digest_, 32);
             // Same epoch after the copy: the copy was of one stamp, not two.
             if (hash_valid_epoch_.load(::std::memory_order_acquire) == epoch
@@ -4065,6 +5526,108 @@ inline void Entity::getDigest(unsigned char out[32]) const
     // A child: not cached, because nothing composes over a child's digest --
     // it is asked for by an audit of a subtree and answered from the input.
     (void)computeNodeHash(nullptr, out);
+}
+
+inline uint64_t Entity::subtreeValueHash() const
+{
+    // The canonical walk (order_canonical): which value comes first is part
+    // of the number, so no RID may decide it. One frame per level on this
+    // vector, each child held for the visit as the identity walk holds it.
+    struct Frame { const Entity* node = nullptr; ::std::vector<ChildRef> kids; size_t next = 0; LifetimeHold hold; };
+    ::std::vector<Frame> stack;
+    ::std::vector<uint64_t> per_node;
+    auto open = [&per_node](const Entity* n, LifetimeHold&& hold) {
+        Frame f; f.node = n; f.hold = ::std::move(hold);
+        per_node.push_back(n->valueHash());
+        n->getTypedChildRefs(f.kids);
+        etcs_hash_detail::order_canonical(n, f.kids);
+        return f;
+    };
+    stack.push_back(open(this, LifetimeHold()));
+    while (!stack.empty())
+    {
+        Frame& f = stack.back();
+        if (f.next < f.kids.size())
+        {
+            const auto [tag, rid] = f.kids[f.next++];
+            Entity* child = f.node->getTypedChild(*tag, rid);
+            LifetimeHold hold(child);
+            if (!hold) continue;
+            stack.push_back(open(child, ::std::move(hold)));
+            continue;
+        }
+        stack.pop_back();
+    }
+    return subtreeValueHashOf(per_node);
+}
+
+inline void Entity::stateDigestWith(uint64_t subtree_values, unsigned char out[32]) const
+{
+    // The identity half's digest, then the values: one input, SHA-256.
+    unsigned char id[32];
+    identityDigest(id);
+    ::std::string in;
+    in.push_back('\x02');                               // a state: identity and values
+    in.append(reinterpret_cast<const char*>(id), 32);
+    etcs_hash_detail::put_u64(in, subtree_values);
+    picohash_ctx_t ctx;
+    picohash_init_sha256(&ctx);
+    picohash_update(&ctx, in.data(), in.size());
+    picohash_final(&ctx, out);
+}
+
+inline uint64_t Entity::stateHashWith(uint64_t subtree_values) const
+{
+    if (isGlobalScope())
+    {
+        unsigned char d[32];
+        stateDigestWith(subtree_values, d);
+        uint64_t first = 0;
+        ::std::memcpy(&first, d, sizeof(first));
+        return first;
+    }
+    ::std::string in;
+    in.push_back('\x02');
+    etcs_hash_detail::put_u64(in, identityHash());
+    etcs_hash_detail::put_u64(in, subtree_values);
+    return XXH3_64bits(in.data(), in.size());
+}
+
+inline void Entity::getDigest(unsigned char out[32]) const { stateDigestWith(subtreeValueHash(), out); }
+inline uint64_t Entity::getHash() const { return stateHashWith(subtreeValueHash()); }
+
+inline uint32_t Entity::siblingIndex() const
+{
+    const Entity* p = getParent();
+    if (!p || p->isDestructed()) return 0;
+    TwinIndex* t = p->twins_.load(::std::memory_order_acquire);
+    if (!t)
+    {
+        TwinIndex* fresh = new TwinIndex();
+        if (p->twins_.compare_exchange_strong(t, fresh, ::std::memory_order_acq_rel)) t = fresh;
+        else delete fresh;   // another made it first; `t` is theirs
+    }
+    ::std::lock_guard<::std::mutex> lock(t->mu);
+    const uint32_t epoch = p->hashEpoch();
+    if (t->epoch != epoch)
+    {
+        // Tag groups in first-attachment order, attach order within
+        // (getTypedChildren): count each (tag, identity) as it comes.
+        ::std::vector<ChildRef> kids;
+        p->getTypedChildRefs(kids);
+        ::std::map<::std::pair<const ETCS::Buffer*, uint64_t>, uint32_t> seen;   // a tag is its key's address
+        t->index.clear();
+        for (auto const& [tag, rid] : kids)
+        {
+            Entity* c = p->getTypedChild(*tag, rid);
+            LifetimeHold hold(c);
+            if (!hold) continue;
+            t->index[rid] = seen[{ tag, c->identityHash() }]++;
+        }
+        t->epoch = epoch;   // read before the walk: a change during it makes the next ask walk again
+    }
+    auto it = t->index.find(parent_rid_);
+    return it == t->index.end() ? 0 : it->second;
 }
 
 /*
@@ -4127,6 +5690,268 @@ inline Entity::HashAudit etcs_root_hash(Entity* top)
  * is why RIDs are collected into a set first: an entity counts once however
  * many names it answers to. Each is held for the length of its pull.
  */
+/*
+ * ═══ REPLAY CAPTURE ══════════════════════════════════════════════════════
+ *
+ * The ETCS lines that rebuild an Environmental entity (ontology/
+ * Environmental.h) as it is now, from the actions recorded against it
+ * (core/Provenance.h) -- the same script whether it is replayed here, from
+ * this runtime's own store, or on the far side of a MirrorBuffer to build a
+ * reflection.
+ *
+ * WHAT IS KEPT. For every key still there, the LAST action that put it on (a
+ * value set again replaces the set before; etcs_replay_compose); then every
+ * later action that took off something a kept action put on -- or replaying
+ * the first would bring it back. In the order they ran.
+ * Nothing else: an action whose every effect was later undone is history the
+ * surface no longer shows, and the record drops it here too (KeepActions).
+ *
+ * NAMES, NOT RIDS. The entity is `name` (the caller binds it); a child made
+ * by a script line is named here, from its type and the order it was made in,
+ * when the line that makes it is written; @names in a payload become those
+ * names. A RID is never written. What cannot be named -- an action on
+ * something outside what is being rebuilt, a child made in C++ that a later
+ * line addresses, a change made outside any action -- is a warning, and the
+ * caller's hash check after replay is what says whether it mattered.
+ *
+ * REGION. The entity, and the plain entities under it, down to (not into) the
+ * next Environmental ones -- those carry their own record, captured after
+ * their parent's, once the line that makes them has named them.
+ */
+struct ReplayCapture
+{
+    ::std::string                                 script;
+    ::std::vector<::std::pair<::std::string, Entity*>> environmental;   // in rebuild order
+    ::std::vector<::std::pair<size_t, size_t>>    spans;   // each one's own lines in `script`
+    ::std::vector<::std::string>                  warnings;
+};
+
+namespace etcs_replay_detail
+{
+    inline ::std::string ident(const ::std::string& s)
+    {
+        ::std::string o;
+        for (char c : s) o += (::std::isalnum(static_cast<unsigned char>(c)) ? c : '_');
+        return o;
+    }
+    // Rewrites @old-name tokens whose RID is known into @new-name.
+    inline ::std::string rename_refs(const ::std::string& payload,
+                                     const ::std::vector<::std::pair<::std::string, RID>>& refs,
+                                     const ::std::map<RID, ::std::string>& names, bool& unresolved)
+    {
+        ::std::string out;
+        for (size_t i = 0; i < payload.size(); )
+        {
+            if (payload[i] != '@') { out += payload[i++]; continue; }
+            size_t end = i + 1;
+            while (end < payload.size()
+                   && (::std::isalnum(static_cast<unsigned char>(payload[end])) || payload[end] == '_')) ++end;
+            const ::std::string tok = payload.substr(i + 1, end - i - 1);
+            ::std::string repl = payload.substr(i, end - i);
+            for (auto const& [n, rid] : refs)
+                if (n == tok)
+                {
+                    auto it = names.find(rid);
+                    if (it != names.end()) repl = "@" + it->second; else unresolved = true;
+                    break;
+                }
+            out += repl;
+            i = end;
+        }
+        return out;
+    }
+}
+
+/*
+ * IN TWO HALVES, so a frozen read holds the graph only for the reading:
+ * etcs_replay_gather takes what the capture needs off the live graph (the
+ * region's live keys and parents, each record, the Environmental entities
+ * below), and etcs_replay_compose writes the script from that alone, with
+ * nothing held -- then trims each record to what it kept (KeepActions, up to
+ * the record the gather saw, so a line recorded since is untouched).
+ */
+struct ReplayGather
+{
+    Entity*                     e = nullptr;     // identity only (ReplayCapture::environmental)
+    RID                         rid = 0;
+    ::std::string               tag;             // its source tag, for a warning
+    IWireEnvironmental*         wire = nullptr;
+    ::std::set<::std::string>   live;
+    ::std::map<RID, RID>        parent_of;       // a child in the region -> its parent
+    ::std::vector<ActionRecord> log;
+    uint64_t                    upto = 0;
+    ::std::vector<ReplayGather> below;           // the Environmental ones under it
+};
+
+inline void etcs_replay_gather(Entity* e, ReplayGather& g)
+{
+    g.e = e;
+    g.wire = e ? e->environmentalWire() : nullptr;
+    if (!g.wire) return;
+    g.rid = e->getRID();
+    g.tag = e->getSourceTag().toString();
+    // The region and what is live in it.
+    ::std::vector<Entity*> region{ e };
+    for (size_t i = 0; i < region.size(); ++i)
+    {
+        Entity* x = region[i];
+        ::std::vector<::std::string> fl;
+        x->stateFlags(fl);
+        for (auto& f : fl) g.live.insert(Entity::flagKey(x, f));
+        ::std::vector<Entity::ChildRef> kids;
+        x->getTypedChildRefs(kids);
+        for (auto& [tag, rid] : kids)
+        {
+            Entity* c = x->getTypedChild(*tag, rid);
+            if (!c) continue;
+            g.live.insert(Entity::childKey(rid));
+            g.parent_of[rid] = x->getRID();
+            if (c->isEnvironmental()) { g.below.emplace_back(); etcs_replay_gather(c, g.below.back()); }
+            else                      region.push_back(c);
+        }
+    }
+    g.log  = g.wire->ActionLog();
+    g.upto = g.log.empty() ? 0 : g.log.back().seq;
+}
+
+inline void etcs_replay_compose(ReplayGather& g, const ::std::string& name,
+                                ::std::map<RID, ::std::string>& names, ReplayCapture& out,
+                                uint64_t born = 0)
+{
+    if (!g.wire) return;
+    names[g.rid] = name;
+    out.environmental.emplace_back(name, g.e);
+    const size_t at = out.environmental.size() - 1, begin = out.script.size();
+    out.spans.emplace_back(begin, begin);
+
+    // What to keep: see the banner.
+    // `born`: the action that made this entity. Whatever else it did to it is
+    // its making -- the parent's line does it again -- not its own record.
+    ::std::vector<ActionRecord>& log = g.log;
+    if (born) log.erase(::std::remove_if(log.begin(), log.end(),
+                                         [born](const ActionRecord& r) { return r.frame == born; }),
+                        log.end());
+    ::std::map<RID, uint64_t> made_in;   // a child -> the action that made it
+    for (auto& r : log)
+        for (auto& k : r.created)
+            if (k.compare(0, 2, "c:") == 0) made_in[::std::strtoull(k.c_str() + 2, nullptr, 10)] = r.frame;
+    /*
+     * THE LAST SETTER WINS. A key still live is kept by the LAST action that
+     * put it on: a value set again replaces the one before (the funnel records
+     * each set), and a flag put on, taken off and put on again is the last put.
+     * Every earlier one is superseded -- kept only for another key it alone
+     * still holds.
+     */
+    // Live: on the surface now. A place key (a move: Entity::placeKey) is
+    // live while its child is in the region, wherever it sits -- asked of
+    // parent_of here rather than added to `live` for every child at gather.
+    auto live = [&g](const ::std::string& k) {
+        if (k.compare(0, 2, "p:") == 0) return g.parent_of.count(::std::strtoull(k.c_str() + 2, nullptr, 10)) != 0;
+        return g.live.count(k) != 0;
+    };
+    ::std::map<::std::string, size_t> last;
+    for (size_t i = 0; i < log.size(); ++i)
+        for (auto& k : log[i].created) if (live(k)) last[k] = i;
+    ::std::vector<bool> keep(log.size(), false);
+    for (auto& [k, i] : last) keep[i] = true;
+    // Then every later action that took off something a kept action put on --
+    // or replaying the first would bring it back. A removal only ever answers
+    // an EARLIER put, so one forward pass is the fixed point.
+    ::std::set<::std::string> put_by_kept;
+    for (size_t j = 0; j < log.size(); ++j)
+    {
+        if (!keep[j])
+            for (auto& rk : log[j].removed)
+                if (put_by_kept.count(rk)) { keep[j] = true; break; }
+        if (keep[j]) for (auto& k : log[j].created) put_by_kept.insert(k);
+    }
+
+    ::std::map<::std::string, int> made;   // per type, for the names children get
+    ::std::vector<uint64_t> kept;
+    for (size_t i = 0; i < log.size(); ++i)
+    {
+        if (!keep[i]) continue;
+        const ActionRecord& r = log[i];
+        kept.push_back(r.seq);
+        if (!r.frame)
+        {
+            out.warnings.push_back(name + ": a change made outside any action cannot be replayed");
+            continue;
+        }
+        auto recv = names.find(r.line.receiver);
+        if (recv == names.end())
+        {
+            out.warnings.push_back(name + ": '" + r.line.verb + "' ran on something this record does not rebuild");
+            continue;
+        }
+        if (r.line.verb == "spawn")
+        {
+            // One line makes one child: the one under the receiver. Anything
+            // else the line created, the child's own making makes again.
+            RID child = 0;
+            for (auto& k : r.created)
+            {
+                if (k.compare(0, 2, "c:") != 0) continue;
+                const RID c = ::std::strtoull(k.c_str() + 2, nullptr, 10);
+                auto p = g.parent_of.find(c);
+                if (!child || (p != g.parent_of.end() && p->second == r.line.receiver)) child = c;
+            }
+            if (!child) continue;
+            const ::std::string tag = r.line.payload.substr(r.line.payload.rfind(':') + 1);
+            const ::std::string cname = name + "_" + etcs_replay_detail::ident(tag) + ::std::to_string(++made[tag]);
+            names[child] = cname;
+            out.script += recv->second + ".spawn(" + r.line.payload + " " + cname + ")\n";
+            continue;
+        }
+        if (r.line.payload.find('\n') != ::std::string::npos)
+        {
+            out.warnings.push_back(name + ": '" + r.line.verb + "' took a payload no line can hold");
+            continue;
+        }
+        bool unresolved = false;
+        const ::std::string payload =
+            etcs_replay_detail::rename_refs(r.line.payload, r.line.refs, names, unresolved);
+        if (unresolved)
+            out.warnings.push_back(name + ": '" + r.line.verb + "' names something this record does not rebuild");
+        ::std::string line = recv->second + "." + r.line.verb + "(" + payload + ")";
+        if (r.line.stream_to)
+        {
+            auto to = names.find(r.line.stream_to);
+            if (to == names.end())
+            {
+                out.warnings.push_back(name + ": a stream into something this record does not rebuild");
+                continue;
+            }
+            line += " -> " + to->second + "." + r.line.stream_verb + "()";
+        }
+        out.script += line + "\n";
+    }
+    g.wire->KeepActions(kept, g.upto);
+    out.spans[at].second = out.script.size();
+
+    for (ReplayGather& c : g.below)
+    {
+        auto it = names.find(c.rid);
+        if (it == names.end())
+        {
+            out.warnings.push_back(name + ": a " + c.tag
+                                   + " under it was not made by a script line and cannot be named");
+            continue;
+        }
+        auto m = made_in.find(c.rid);
+        etcs_replay_compose(c, it->second, names, out, m == made_in.end() ? 0 : m->second);
+    }
+}
+
+inline void etcs_replay_capture(Entity* e, const ::std::string& name,
+                                ::std::map<RID, ::std::string>& names, ReplayCapture& out,
+                                uint64_t born = 0)
+{
+    ReplayGather g;
+    etcs_replay_gather(e, g);
+    etcs_replay_compose(g, name, names, out, born);
+}
+
 inline void etcs_module_root_hash(const ::std::vector<const RIDListHandle*>& rows,
                                   unsigned char out[32], size_t* entities = nullptr)
 {
@@ -4139,11 +5964,9 @@ inline void etcs_module_root_hash(const ::std::vector<const RIDListHandle*>& row
         rids.insert(found.begin(), found.end());
     }
 
-    picohash_ctx_t ctx;
-    picohash_init_sha256(&ctx);
-    const unsigned char kind = 0x03;
-    picohash_update(&ctx, &kind, 1);
-    size_t n = 0;
+    // The roots' digests as a multiset, sorted -- not keyed by RID, for the
+    // reason surfaceHash gives.
+    ::std::vector<::std::array<unsigned char, 32>> digests;
     for (RID rid : rids)
     {
         Entity* e = nullptr;
@@ -4152,12 +5975,17 @@ inline void etcs_module_root_hash(const ::std::vector<const RIDListHandle*>& row
         if (!e || !e->isGlobalScope()) continue;      // children are under their branch
         LifetimeHold hold(e);
         if (!hold) continue;                           // retiring: gone from the next pull
-        unsigned char d[32];
-        e->getDigest(d);
-        picohash_update(&ctx, &rid, sizeof(rid));
-        picohash_update(&ctx, d, 32);
-        ++n;
+        ::std::array<unsigned char, 32> d;
+        e->getDigest(d.data());
+        digests.push_back(d);
     }
+    ::std::sort(digests.begin(), digests.end());
+    picohash_ctx_t ctx;
+    picohash_init_sha256(&ctx);
+    const unsigned char kind = 0x03;
+    picohash_update(&ctx, &kind, 1);
+    for (auto const& d : digests) picohash_update(&ctx, d.data(), 32);
+    const size_t n = digests.size();
     picohash_final(&ctx, out);
     if (entities) *entities = n;
 }

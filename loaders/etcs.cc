@@ -519,6 +519,39 @@ int main(int argc, char* argv[])
     // process exits, exactly once, regardless of which branch ran. It
     // takes ctx explicitly now rather than closing over it, since it no
     // longer lives here as a local lambda.
+    // ── Continue where you left off ──────────────────────────────────────
+    // etcs [--resume | --fresh] ...
+    //
+    // Flag-first, like -q. An interactive start with no script asks
+    // (offer_resume, CommandExecutor.h); a script, or a build with no prompt,
+    // starts fresh unless told --resume, which replays the last scene BEFORE
+    // the script runs, so the script can use what it brings back.
+    while (argc >= 2 && (std::string_view(argv[1]) == "--resume" || std::string_view(argv[1]) == "--fresh"))
+    {
+        resume_choice().store(std::string_view(argv[1]) == "--resume" ? 1 : -1);
+        argv++;
+        argc--;
+    }
+    {
+        bool has_script = false;
+        for (int i = 1; i < argc; ++i)
+            if (std::string_view(argv[i]).size() > 5
+                && std::string_view(argv[i]).substr(std::string_view(argv[i]).size() - 5) == ".etcs")
+                has_script = true;
+        if (has_script && resume_choice().load() == 0) resume_choice().store(-1);
+#if !defined(ETCS_REPL_SHELL)
+        if (resume_choice().load() == 0) resume_choice().store(-1);
+#endif
+#if !defined(__EMSCRIPTEN__)
+        // In a browser this waits for the worker that runs the script or the
+        // REPL: a replay must not hold the page's thread.
+        if (resume_choice().load() == 1)
+        {
+            resume_choice().store(-1);
+            resume_last_scene(ctx);
+        }
+#endif
+    }
     if (argc < 2)
     {
         // ── No script given ───────────────────────────────────────────────────
@@ -686,6 +719,7 @@ int main(int argc, char* argv[])
             ETCS_LOG("ETCS", "[trace] web script thread: entered for '" << s_script_path << "'");
             try
             {
+                if (resume_choice().exchange(-1) == 1) resume_last_scene(ctx);
                 ETCS::run_script(s_script_file, s_script_path, s_script_ctx);
                 ETCS_LOG("ETCS", "[trace] web script thread: '" << s_script_path << "' returned");
             }

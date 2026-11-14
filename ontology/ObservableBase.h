@@ -158,24 +158,39 @@ ETCS_SUPERTYPE_BASE(Observable)
  */
     void MarkObserved(uint64_t origin_rid) override
     {
-        // A batch in progress means this mark is one write inside a sequence that
-        // is not finished. The local edges are set -- an observer's copy IS stale
-        // from the first write -- but the walk upward waits, and EndBatch makes it
-        // once. See BeginBatch.
-        if (m_batch.load(::std::memory_order_acquire) > 0)
-        {
-            MarkObservedLocal(origin_rid);
-            m_batch_marked.store(true, ::std::memory_order_release);
-            return;
-        }
-        MarkObservedLocal(origin_rid);
+        if (!MarkObservedHop(origin_rid)) return;
+        /*
+         * THE HOPS, AS ONE LOOP. Each Observable ancestor makes the same
+         * statement to its own observers and says whether it travels on; the
+         * walk itself stays here, in the entity that changed, rather than
+         * being a call per level -- a chain of N observable ancestors was N
+         * stack frames of this function, and a tree is as deep as somebody
+         * made it (core/Entity.h, depth_). What each hop DOES is unchanged,
+         * and still one edge at a time: nobody holds a path.
+         */
+        // observableWire, not getInterfacePointer: the latter is a lock and a
+        // string-keyed find, and this asks it of every level above a change.
         for (ETCS::Entity* n = static_cast<Derived*>(this)->getParent(); n; n = n->getParent())
         {
-            void* p = n->getInterfacePointer(ETCS::Buffer("Observable"));
+            void* p = n->observableWire();
             if (!p) continue;
-            static_cast<ETCS::IWireObservable*>(p)->MarkObserved(origin_rid);
-            return;
+            if (!static_cast<ETCS::IWireObservable*>(p)->MarkObservedHop(origin_rid)) return;
         }
+    }
+
+    // One hop: mine, and whether it goes on. A batch in progress means this
+    // mark is one write inside a sequence that is not finished. The local
+    // edges are set -- an observer's copy IS stale from the first write --
+    // but the walk upward waits, and EndBatch makes it once. See BeginBatch.
+    bool MarkObservedHop(uint64_t origin_rid) override
+    {
+        MarkObservedLocal(origin_rid);
+        if (m_batch.load(::std::memory_order_acquire) > 0)
+        {
+            m_batch_marked.store(true, ::std::memory_order_release);
+            return false;
+        }
+        return true;
     }
 
     /*
@@ -236,6 +251,13 @@ ETCS_SUPERTYPE_BASE(Observable)
  */
     void MarkObservedLocal(uint64_t origin_rid) override
     {
+        // Nobody registered: nothing to mark, and no edge to look for. Two
+        // loads, and the common case for every hop a mark makes through a
+        // tree whose observers sit at the top -- the search for the origin's
+        // edge below is 64 loads per block, and it was paid at every level.
+        if (m_head.occupied.load(::std::memory_order_acquire) == 0
+         && !m_head.next.load(::std::memory_order_acquire)) return;
+
         int32_t excludeIdx = -1;
         if (origin_rid)
         {
@@ -294,7 +316,7 @@ ETCS_SUPERTYPE_BASE(Observable)
         {
             ETCS::Entity* child = static_cast<Derived*>(this)->getTypedChild(entry.first, entry.second);
             if (!child) continue;
-            void* p = child->getInterfacePointer(ETCS::Buffer("Observable"));
+            void* p = child->observableWire();
             if (!p) continue;
             static_cast<ETCS::IWireObservable*>(p)->MarkObservedLocal(
                 static_cast<Derived*>(this)->getRID());

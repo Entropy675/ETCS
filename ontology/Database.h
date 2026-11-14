@@ -26,6 +26,10 @@ struct DatabaseValue
     static DatabaseValue blob(const void* b, size_t len) { DatabaseValue o; o.kind = Blob;    o.p = b; o.n = len; return o; }
 };
 
+// A RESOURCE OF A LOCALE. A database is somewhere before it is anywhere, so
+// its surface is this runtime's alone: no MirrorBuffer binds or streams onto
+// one (MirrorBuffer::localFrame). What it holds reaches another runtime only
+// through a type that is published and reads it here.
 class Database_ : virtual public ETCS::Entity
 {
 protected:

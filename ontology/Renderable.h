@@ -31,13 +31,19 @@
 // are in the same memory and their owner may copy between them
 // without a host round trip, and any other combination cannot.
 // A backend publishes whatever identifies its device uniquely
-// within the process -- VulkanSurface publishes its VkDevice
-// handle. Zero means "no device yet", which is what an entity
-// answers between construction and Create.
+// within the process -- the Vulkan backend's key is its VkDevice
+// handle (RenderProvider's Device). Zero means "no device yet",
+// which is what an entity answers between construction and Create.
+//
+// NO LEAF CLAIMS THIS TODAY. The window surface is a host raster
+// that draws through a device when it has one (RenderProvider's
+// OS/HostSurface.h), so it is Pixels; a device-resident offscreen
+// surface -- a layer kept as a texture -- is what would be the
+// first Renderable.
 //
 // WHAT THIS UNBLOCKS TODAY IS THE REFUSAL, and that is worth
-// stating plainly rather than dressing up. VulkanSurface::Blit
-// used to say "has no Pixels interface -- only a CPU-backed
+// stating plainly rather than dressing up. The Vulkan window
+// surface's Blit used to say "has no Pixels interface -- only a CPU-backed
 // surface can be blitted from yet" to everything that was not a
 // CPU raster, which lumped "this is not a picture at all" together
 // with "this is a picture on the very device you are drawing on".

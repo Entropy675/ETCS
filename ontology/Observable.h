@@ -68,6 +68,7 @@ public:
     ETCS::ObserverEdge Observe(uint64_t observer_rid) override = 0;
     void Unobserve(uint64_t observer_rid) override = 0;
     void MarkObserved(uint64_t origin_rid) override = 0;
+    bool MarkObservedHop(uint64_t origin_rid) override = 0;
     void BeginBatch() override = 0;
     void EndBatch() override   = 0;
     bool TakeObserved(const ETCS::ObserverEdge& edge) override = 0;
@@ -87,12 +88,13 @@ public:
 };
 
 // This entity's Observable half, or null if it never claimed the family.
-// Reached by family name like every other cross-family hop -- a caller holding
-// a Pixels_* or a Resizable_* has no static route to it, by design.
+// A cross-family hop like any other -- a caller holding a Pixels_* or a
+// Resizable_* has no static route to it, by design -- answered from the one
+// pointer Entity keeps for this family (observableWire) rather than the map.
 inline ETCS::IWireObservable* etcs_observable_of(ETCS::Entity* e)
 {
     if (!e) return nullptr;
-    void* p = e->getInterfacePointer(ETCS::Buffer("Observable"));
+    void* p = e->observableWire();
     return p ? static_cast<ETCS::IWireObservable*>(p) : nullptr;
 }
 
@@ -126,6 +128,21 @@ inline void etcs_mark_observed(ETCS::Entity* from)
     for (ETCS::Entity* n = from; n; n = n->getParent())
         if (ETCS::IWireObservable* o = etcs_observable_of(n))
         { o->MarkObserved(from->getRID()); return; }
+}
+
+/*
+ * Mark `node` as RESTATED: what it derives from changed -- a camera's eye, the
+ * scene it is bound to -- so its own view of itself is stale too. The same
+ * walk with no origin, so nothing is excluded, the self edge included: a
+ * node whose cache is gated on its self edge (Camera3D's picture) re-derives,
+ * and everything above it hears it as before. Its own writes still mark with
+ * itself as origin (etcs_mark_observed), so re-deriving does not re-mark.
+ */
+inline void etcs_mark_restated(ETCS::Entity* node)
+{
+    for (ETCS::Entity* n = node; n; n = n->getParent())
+        if (ETCS::IWireObservable* o = etcs_observable_of(n))
+        { o->MarkObserved(0); return; }
 }
 
 /*

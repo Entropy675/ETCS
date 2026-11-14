@@ -3,6 +3,10 @@
 
 #include "Buffer.h"
 #include "SignalContext.h"
+#include "Provenance.h"
+
+#include <string>
+#include <vector>
 
 namespace ETCS
 {
@@ -74,6 +78,18 @@ enum class WireScope : uint8_t
 // reinterpreted from the registered interface pointer -- before there was a
 // word for it.
 // ---------------------------------------------------------------------------
+/*
+ * A STAGE MAY REFUSE A FRAME, and that is how a Wrapper is an authority
+ * rather than only a transform: an Unwrap that cannot verify what it was
+ * handed (a seal that does not match, a check that fails) marks the frame
+ * refused instead of passing something on. The mark is a read offset past
+ * the end, which no ordinary frame has, so an EMPTY frame -- a legitimate
+ * payload -- is never mistaken for one. Whoever runs the chain stops at a
+ * refused frame: MirrorBuffer ends the stream, a link refuses the verb.
+ */
+inline void wire_refuse(ETCS::MBuffer& io)       { io.reset(); io.read_offset = static_cast<size_t>(-1); }
+inline bool wire_refused(const ETCS::MBuffer& io) { return io.read_offset == static_cast<size_t>(-1); }
+
 struct IWireWrapper
 {
     virtual ~IWireWrapper() = default;
@@ -321,6 +337,16 @@ struct IWireObservable
     virtual void MarkObservedLocal(uint64_t origin_rid) = 0;
 
     /*
+     * One hop of MarkObserved's walk upward, taken at THIS entity: mark my
+     * observers, and answer whether the statement travels on to the next
+     * Observable above -- false inside a batch, whose EndBatch carries it
+     * instead. The walk is a loop in the entity that changed, one hop per
+     * Observable ancestor (ObservableBase.h), which is why this is on the
+     * wire: the ancestor is reached by family name, not by type.
+     */
+    virtual bool MarkObservedHop(uint64_t origin_rid) = 0;
+
+    /*
      * A SEQUENCE OF WRITES IS ONE CHANGE -- open one, and the marks inside it
      * set observers' edges without walking upward until it closes, which then
      * makes the single statement the sequence was.
@@ -343,6 +369,65 @@ struct IWireObservable
     // Has this changed since `observer` last looked? Read-and-clear, and only
     // for that observer.
     virtual bool TakeObserved(uint64_t observer_rid) = 0;
+};
+
+// ---------------------------------------------------------------------------
+// IWireRemote — the call's slot. CLAIMED by the Remote family
+// (ontology/Remote.h): an entity that stands, in this runtime, for a node in
+// ANOTHER one.
+//
+// Entity::call is what reaches it, which is why it is a wire. A verb on such
+// an entity is not this image's to run, and neither half of a stream pair
+// that names it is either -- but the CALLER still says both halves, exactly
+// as it does in-process (the produce/consume contract, ETCS_API.h). So the
+// runtime asks the entity for the far half and runs the near half itself:
+//
+//   RemoteWork   -- run `action` (bare, no tag) on the far node with this
+//                   Buffer; the answer comes back in it, as a local work
+//                   function's does. False: not delivered, nothing written.
+//   RemoteStream -- a connected socket whose far end is running `action` on
+//                   the far node, as the producer (`produces`) or consumer
+//                   of the pair, with this config. The near half is then an
+//                   ordinary StrategySocket pair on it. -1 if none opened.
+// ---------------------------------------------------------------------------
+struct IWireRemote
+{
+    virtual ~IWireRemote() = default;
+    virtual bool RemoteWork(const Buffer& action, Buffer& data, const SignalContext& ctx) = 0;
+    virtual int  RemoteStream(const Buffer& action, const Buffer& config, bool produces,
+                              const SignalContext& ctx) = 0;
+};
+
+// ---------------------------------------------------------------------------
+// IWireEnvironmental — the record's slot. Fulfilled by the Environmental
+// family (ontology/Environmental.h): an entity that can be made present again
+// -- rebuilt here from this runtime's store, or reflected in another runtime.
+//
+// The runtime calls it because the runtime is what sees a tag change and a
+// global name given: every tag that goes on or off it, or on a plain entity
+// beneath it, is recorded against the action that did it (Entity::recordEffect,
+// core/Provenance.h), and compacted into the script that rebuilds it
+// (etcs_replay_capture). The record lives in the family, so an entity that
+// never claims it carries none.
+//
+//   RecordEffect -- `key` came on (`created`) or went off inside `frame`
+//                   (null: outside any action).
+//   ActionLog / KeepActions -- the record, and trimming it to what a capture
+//                   up to record `upto` kept.
+//   NoteName / ScriptName -- the name a script gave it at global scope, which a
+//                   rebuilt scene calls it by again.
+//   Closing -- the loader is leaving (drive_main_loop_then_exit), before any
+//                   teardown: a last word for whatever keeps it.
+// ---------------------------------------------------------------------------
+struct IWireEnvironmental
+{
+    virtual ~IWireEnvironmental() = default;
+    virtual void RecordEffect(const ActionFrame* frame, const ::std::string& key, bool created) = 0;
+    virtual ::std::vector<ActionRecord> ActionLog() const = 0;
+    virtual void KeepActions(const ::std::vector<uint64_t>& seqs, uint64_t upto) = 0;
+    virtual void NoteName(const ::std::string& name) = 0;
+    virtual ::std::string ScriptName() const = 0;
+    virtual void Closing() = 0;
 };
 
 } // namespace ETCS

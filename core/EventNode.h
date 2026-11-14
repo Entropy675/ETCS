@@ -10,6 +10,7 @@
 #include "RIDList.h"
 #include "EventStream.h"
 #include "ArenaAllocator.h"
+#include "Reclaim.h"
 #include "Bundles.h"
 namespace ETCS {
 // Forward declarations
@@ -56,12 +57,29 @@ struct DLInEvent
     // it just calls whatever Entity::addTag/removeTag captured here,
     // mirroring the same reasoning addTagTrampoline<T> already uses for
     // crossing that same boundary.
+    // The target BY NAME -- its RID and the conjugate key its type's list is
+    // published under -- which the handler re-resolves (etcs_tagmodify_target,
+    // DynamicLoader.h), because a RID resolution is the liveness check. The
+    // address rides along only for a type that publishes NO list: there is no
+    // liveness surface to ask about it anywhere in the runtime, so the
+    // emitter's pointer is the whole of what is known, exactly as before.
+    RID                tagmodify_rid = 0;
+    ETCS::Buffer       tagmodify_type;
     ETCS::Entity*      tagmodify_target = nullptr;
     bool               tagmodify_is_remove = false;
     // Returns whether the surface actually moved -- see Entity::tagModifyImpl.
     // The answer rides home in release_value and is published by on_emit, the
     // same read-then-publish split AddTag uses for rid_out.
-    bool              (*tagmodify_impl)(ETCS::Entity*, const ETCS::Buffer&, bool) = nullptr;
+    bool              (*tagmodify_impl)(ETCS::Entity*, const ETCS::Buffer&, bool, const ::std::string*) = nullptr;
+    const ::std::string* tagmodify_value = nullptr;   // the value behind the flag, when the add carries one (Entity::values_)
+    // A MOVE rides the same event (Entity::moveTo): the child is the target,
+    // the new parent comes by name like it -- RID and published key, the
+    // pointer only for a type with no list -- and move_impl runs in impl's
+    // place. Null move_impl: an ordinary flag.
+    bool              (*tagmodify_move_impl)(ETCS::Entity*, ETCS::Entity*) = nullptr;
+    RID                tagmodify_move_to_rid = 0;
+    ETCS::Buffer       tagmodify_move_to_type;
+    ETCS::Entity*      tagmodify_move_to = nullptr;
     ::std::atomic<bool>* tagmodify_done = nullptr;
     ::std::atomic<bool>* tagmodify_changed = nullptr;
     // TagModify only — the emitting entity's own TYPE bit, stamped at the
@@ -344,11 +362,18 @@ struct AddTagEvent : Event
 // state) — only the DECISION to remove the tag stays local here.
 struct TagModifyEvent : Event
 {
-    using Impl = bool(*)(ETCS::Entity*, const ETCS::Buffer&, bool);
+    using Impl = bool(*)(ETCS::Entity*, const ETCS::Buffer&, bool, const ::std::string*);
     ETCS::Entity*     target;
     bool              is_remove;
     Impl              impl;
     ETCS::TagMask     extra_mask;
+    const ::std::string* value = nullptr;   // a value behind the flag (Entity::addTag(flag, value)); null for presence alone
+    // A move instead of a flag (Entity::moveTo): the target is the child, this
+    // its new parent. Both parents' bits ride in extra, so the move orders
+    // against every tag operation on any of the three.
+    using MoveImpl = bool(*)(ETCS::Entity* child, ETCS::Entity* to);
+    ETCS::Entity*     move_to   = nullptr;
+    MoveImpl          move_impl = nullptr;
     ::std::atomic<bool> done{false};
     ::std::atomic<bool> changed{false};
     // The fail-shut substitution an empty mask needs — a type with no tag
@@ -612,6 +637,12 @@ public:
  * ABOVE the fork, for the same layout reason as the four above it.
  */
     ETCS::ThreadPool* (*get_pool)() = nullptr;
+    /*
+ * WHOSE Reclaimer THIS IMAGE USES (core/Reclaim.h): one per runtime, because an
+ * entity made in one image is read in another and every reader must announce
+ * into the same slots. Not gated like the pool: there is no per-image choice.
+ */
+    ETCS::Reclaimer* (*get_reclaimer)() = nullptr;
 
     ::std::unordered_map<ETCS::Buffer, RIDListHandle> ridMap;
 
@@ -1080,6 +1111,10 @@ public:
         bool          attachModule(const ::std::string& module_name,
                                     ETCS::LifetimeOwner entity,
                                     const ::std::string& spawn_tag);
+        // The lifetime-token election for a module root attaching to a
+        // loaded module -- attachModule's, and addTagImpl's for a child made
+        // under another module's entity. Ordering-thread only.
+        void          claimLifetime(ETCS::Module* global_mod, ETCS::LifetimeOwner entity);
         // THE Kind::RequestUnload delayed-recheck handler -- called after
         // the delay (see DLInEvent::request_unload_recheck).
         // Re-verifies lifetime_owner is still nullptr before
@@ -1222,6 +1257,7 @@ public:
      * macro, and EventNode.h is reached from places core_defs.h is not.
      */
         get_pool       = []() { return &ETCS::ThreadPool::getInstance(); };
+        get_reclaimer  = []() { return &ETCS::Reclaimer::getInstance(); };
         stream.owner = this; // wire back-pointer now that EventNode is complete --
                               // both LoaderStream and ModuleProxy have this member.
         s_alive.store(true, ::std::memory_order_release);

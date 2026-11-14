@@ -28,8 +28,9 @@ struct WindowPosition
 // their own compiled code, against whichever windowing library
 // they've already initialized -- so a caller reading it back never
 // needs to link that library, and there is exactly one initialized
-// copy of it in the process. See RenderProvider's OS/VulkanSurface.h
-// for the reason this matters: a second, independently-linked copy
+// copy of it in the process. See RenderProvider's OS/VulkanPresenter.h
+// and OS/HostSurface.h (a VkSurfaceKHR, and an XPutImage onto the
+// same window) for the reason this matters: a second, independently-linked copy
 // of a windowing library's own static platform state (X11/Wayland
 // connection handles live in globals, not per-instance) would be
 // invalid the moment anything called into it -- this struct exists

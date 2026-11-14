@@ -13,6 +13,10 @@
 // leaf of ANY family will state itself in, the way Point2D/Rect2D already are
 // for the flat one.
 #include "ontology/OrderVector.h"
+// The one flat thing (a unit normal and an offset, in the same integers):
+// what cuts space in two -- a side for a point or a reach, a split for a set,
+// a crossing for a ray, the faces of a solid.
+#include "ontology/Plane.h"
 
 // !! ALERT, whenever you add a new Base, you must include it here for it to be visible to other types.
 // If you do not, you will get an error: expected template-name before ‘<’ token
@@ -112,6 +116,10 @@
 // finished, come back", and nothing else about the entity has to be true. Note
 // that the family deliberately does NOT say who steps it; see ontology/Animated.h.
 #include "ontology/AnimatedBase.h"
+// Causal is the physics as a trait: an entity that has an OrderVector, and
+// therefore a history. A projection of it (a camera, a mesh on a device) is a
+// separate claim a runtime can decline to make -- see ontology/Causal.h.
+#include "ontology/CausalBase.h"
 #include "ontology/ParserBase.h"
 #include "ontology/WrapperBase.h"
 // Matrix refines Wrapper: one step, and a forward link, in a transform chain.
@@ -120,6 +128,19 @@
 // wiring. See ontology/Matrix.h.
 #include "ontology/MatrixBase.h"
 #include "ontology/GateBase.h"
+// A node in another runtime, seen through the families both sides share. The
+// runtime calls it (IWireRemote), so it is here with the other wired families.
+// See ontology/Remote.h.
+#include "ontology/RemoteBase.h"
+// How an entity is made present in a frame of reference: rebuilt here from its
+// own record, or reflected over a MirrorBuffer -- one replay, two sides. Opt-in.
+// See ontology/Environmental.h.
+#include "ontology/EnvironmentalBase.h"
+// What rides on links: who can be reached (Directory) and what happened, in
+// one authority's order (Record). The lobby and session shapes chess and paint
+// each wrote for themselves. See ontology/Directory.h, ontology/Record.h.
+#include "ontology/DirectoryBase.h"
+#include "ontology/RecordBase.h"
 #include "ontology/SwitchableBase.h"
 #include "ontology/FilterBase.h"
 

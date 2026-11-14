@@ -50,7 +50,7 @@ spawn WindowProvider::Window main
 main.Create(800, 600, 'ETCS RenderProvider')
 
 main.spawn(RenderProvider::Surface view)
-view.Create(@gpu, modules/RenderProvider/shaders/)
+view.Create(@gpu)
 
 detach WindowProvider/scripts/window_events.etcs window=main
 detach RenderProvider/scripts/render_frames.etcs view=view

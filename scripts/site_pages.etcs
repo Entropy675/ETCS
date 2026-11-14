@@ -1,0 +1,19 @@
+#!/usr/bin/env etcs
+#IMPORT ACE_ROOT/modules
+
+# ── THE MODULES' PAGES THE SITE SERVES AT ITS ROOT ───────────────────────────
+#
+#     run site_pages.etcs tree=tree
+#
+# A page belongs to the module it is the front of, the way /paint and
+# /chess/play are mounted from their modules' lists rather than copied here: a
+# copy in the site's www/ is a second thing to keep current, and the module's
+# copy is the one that falls behind. One list for both site scripts
+# (run_website.etcs, run_tls_website.etcs).
+#
+#   /chess-classic   the server-played chess page (ChessProvider)
+#   /forum.html      the forum (ForumWebsiteProvider)
+
+requires tree [FileHtmlPage]
+tree.MountFile(chess-classic.html ACE_ROOT/modules/ChessProvider/scripts/www/chess-classic.html)
+tree.MountFile(forum.html ACE_ROOT/modules/ForumWebsiteProvider/scripts/www/forum.html)

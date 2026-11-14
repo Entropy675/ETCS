@@ -40,6 +40,7 @@ ETCS_SUPERTYPE_BASE(Camera), public Drawable2DBase<Derived>
     // request is stored and the effective mode is derived.
     ETCS_DISPATCH_METHOD(bool,        SetDeviceProjection, (bool, on));
     ETCS_DISPATCH_METHOD_CONST(bool,  DeviceProjectionRequested);
+    ETCS_DISPATCH_METHOD_CONST(bool,  DeviceProjectionLands);
 };
 
 #endif

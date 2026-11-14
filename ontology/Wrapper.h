@@ -10,6 +10,12 @@
 // Unwrap = wire bytes -> logical payload. In-place on the same Buffer,
 // matching every other in-place mutation convention here (WORK_FUNC_TYPED's
 // own by-reference OUT fields) rather than returning a new one.
+//
+// An Unwrap may also REFUSE (ETCS::wire_refuse, core/InterfaceWire.h), and
+// that is what makes this family the authority layer between runtimes: the
+// network-scope stages under a published node are what a guest's surface
+// must carry to be bound at all, and a frame a stage refuses ends the stream
+// or refuses the verb (ontology/Remote.h).
 namespace ETCS
 {
 /*

@@ -8,7 +8,7 @@
 <link rel="icon" href="/favicon/favicon.ico">
 <link rel="apple-touch-icon" href="/favicon/apple-touch-icon.png">
 <link rel="manifest" href="/favicon/site.webmanifest">
-<title>ACE Games · Lobbies</title>
+<title>ACE Games · Chess</title>
 <style>
   /* The chess page's own palette, so the list and the board it opens read as
      one site. */
@@ -42,16 +42,6 @@
           padding:12px 14px; display:flex; flex-direction:column; gap:8px; }
   .game .name { color:var(--sel); letter-spacing:.12em; }
   .game .what { color:var(--dim); font-size:12px; }
-  #status { min-height:1.3em; font-size:11px; color:var(--dim); }
-  #status.err { color:var(--err); } #status.ok { color:var(--ok); }
-  table { width:100%; border-collapse:collapse; font-size:13px; table-layout:fixed; }
-  th { text-align:left; color:var(--dim); font-weight:normal; font-size:10px; letter-spacing:.08em;
-       text-transform:uppercase; border-bottom:1px solid var(--line); padding:5px 8px; }
-  td { padding:6px 8px; border-bottom:1px solid #24261c; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  tr:hover td { background:#1e1f16; }
-  td.key { color:var(--sel); }
-  td button { font-size:11px; padding:2px 8px; }
-  .st-waiting { color:var(--sel); } .st-open { color:var(--dim); } .st-playing { color:#8fbf7a; }
   .empty { color:var(--dim); padding:10px 8px; font-size:12px; }
   .cols { display:flex; gap:20px; flex-wrap:wrap; align-items:flex-start; }
   .cols > div { flex:1 1 300px; min-width:0; }
@@ -68,43 +58,21 @@
 
 <main>
   <!--
-    A LOBBY LIST, AND NOTHING ELSE. The same name server the chess page asks
-    (its panel beside the board, ChessProvider/scripts/www), read here with no
-    game attached: who is online, which game their lobby is for, who is
-    sitting with them. The game itself runs in the page a row opens, on the
-    player's own runtime; this page never plays and is never listed.
+    A LANDING PAGE, AND NOTHING ELSE. The hall -- who is hosting a game, which
+    ranked tables have a seat open -- is a listing over the link
+    (ChessProvider/scripts/chess_hall.etcs), read by the runtime the chess page
+    runs in your browser, so the list itself is on that page. This one says
+    what there is to play and opens it.
   -->
-  <p class="blurb">Every player has a lobby with two seats, on their own machine. This
-    page is the name server's list of them: join one to sit across from its owner,
-    or quick match to be paired with whoever is waiting. The game runs in your
-    browser; the server only lists, pairs and relays the moves in one order.</p>
+  <p class="blurb">Every game is played on the players' own machines: a casual game on
+    one of theirs, which judges it, and a ranked game at one of this site's tables,
+    where the site's own runtime judges and keeps the result. The hall on the
+    chess page lists both; the site is the name server for the one and the host
+    of the other.</p>
 
   <div>
     <h3>Play</h3>
     <div id="games" class="games"></div>
-  </div>
-
-  <div>
-    <h3>Lobbies</h3>
-    <div class="row">
-      <input id="search" placeholder="search by name or game" spellcheck="false">
-      <input id="ns" spellcheck="false" title="the name server this list is read from">
-      <button id="go">Refresh</button>
-    </div>
-    <div id="status"></div>
-    <table><thead><tr><th style="width:30%">lobby</th><th style="width:14%">game</th>
-      <th style="width:26%">partner</th><th style="width:14%">state</th><th></th></tr></thead>
-      <tbody id="lobbies"></tbody></table>
-    <div id="no-lobbies" class="empty">nobody is online here yet — open your own lobby above</div>
-  </div>
-
-  <div class="cols">
-    <div>
-      <h3>Players</h3>
-      <table><thead><tr><th>name</th><th>W</th><th>L</th><th>D</th><th>idle</th></tr></thead>
-        <tbody id="players"></tbody></table>
-      <div id="no-players" class="empty">no players</div>
-    </div>
   </div>
 </main>
 
@@ -112,117 +80,42 @@
 (function () {
 const $ = id => document.getElementById(id);
 
-/*
- * THE GAMES THIS LIST KNOWS HOW TO OPEN. A lobby's fourth field names its
- * game (ChessNode::lobbiesLocked); this maps the name to the page that plays
- * it. A lobby for a game not here is still listed -- the name server does not
- * care what is relayed -- it just has no page on this site to open.
- */
-const GAMES = {
-  chess: { title:'CHESS', page:'/chess/play/', what:'Two players, one board each, one game.' }
-};
-
-// The name server: this site's, at /game, unless the address says another.
-const qs = new URLSearchParams(location.search);
-$('ns').value = qs.get('ns') || (location.origin + '/game');
-function nsBase(){ return ($('ns').value || '').trim().replace(/\/+$/, ''); }
-async function get(verb){
-  try {
-    const r = await fetch(nsBase() + '/' + verb, { mode:'cors', cache:'no-store', credentials:'omit' });
-    return r.ok ? await r.text() : null;
-  } catch(e){ return null; }
-}
-const lines = t => t.split('\n').map(l => l.trim()).filter(Boolean);
-function say(m, cls){ $('status').textContent = m; $('status').className = cls || ''; }
-
-// A game page's address, told where to find the name server and what to do.
-function open(game, params){
-  const g = GAMES[game]; if(!g) return;
-  const q = new URLSearchParams(params || {});
-  if(nsBase() !== location.origin + '/game') q.set('ns', nsBase());
-  location.href = g.page + (q.toString() ? '?' + q : '');
-}
-
-// The name the game pages go by in this browser (they make one up on first
-// visit); shown so a row reading "(you)" makes sense.
+// The name the chess page goes by in this browser (it makes one up on first
+// visit), shown so the page's hall reads right when you get there.
 let myName = '';
 try { myName = localStorage.getItem('etcs-chess-name') || ''; } catch(e){}
 $('you').innerHTML = myName ? 'you play as <b></b>' : '';
 if(myName) $('you').querySelector('b').textContent = myName;
 
+const GAMES = {
+  chess: { title:'CHESS', page:'/chess/play/', what:'Two players, one board each, one game. Casual at a table of your own; ranked at one of the site\'s.' }
+};
+function open(game, params){
+  const g = GAMES[game]; if(!g) return;
+  const q = new URLSearchParams(params || {});
+  location.href = g.page + (q.toString() ? '?' + q : '');
+}
 for(const [key, g] of Object.entries(GAMES)){
   const card = document.createElement('div'); card.className = 'game';
   const name = document.createElement('span'); name.className = 'name'; name.textContent = g.title;
   const what = document.createElement('span'); what.className = 'what'; what.textContent = g.what;
   const row = document.createElement('div'); row.className = 'row';
   const quick = document.createElement('button'); quick.className = 'primary';
-  quick.textContent = 'Quick match'; quick.title = 'pair with whoever is waiting, or wait for them';
+  quick.textContent = 'Quick match'; quick.title = 'sit at the first table with a seat open, or open one and wait';
   quick.onclick = () => open(key, { quick:'1' });
+  const ranked = document.createElement('button');
+  ranked.textContent = 'Ranked'; ranked.title = 'a table the site hosts and judges';
+  ranked.onclick = () => open(key, { ranked:'1' });
   const mine = document.createElement('button');
-  mine.textContent = 'Open my lobby'; mine.title = 'your own board, listed here for others to join';
-  mine.onclick = () => open(key);
-  row.append(quick, mine);
+  mine.textContent = 'Open a table'; mine.title = 'your own board, listed in the hall for others to join';
+  mine.onclick = () => open(key, { host:'1' });
+  const hall = document.createElement('button');
+  hall.textContent = 'The hall'; hall.title = 'who is playing, and where there is a seat';
+  hall.onclick = () => open(key);
+  row.append(quick, ranked, mine, hall);
   card.append(name, what, row);
   $('games').appendChild(card);
 }
-
-function cell(text, cls){ const td = document.createElement('td'); td.textContent = text; if(cls) td.className = cls; return td; }
-let lastLobbies = '';
-function renderLobbies(text){
-  const tb = $('lobbies'); tb.innerHTML = '';
-  const want = ($('search').value || '').trim().toLowerCase();
-  let shown = 0;
-  for(const line of lines(text)){
-    const p = line.split(/\s+/);
-    if(p.length < 3) continue;
-    const [owner, partner, state] = p, game = p[3] || 'chess';
-    if(want && ![owner, partner, game].some(s => s.toLowerCase().includes(want))) continue;
-    const tr = document.createElement('tr');
-    tr.append(cell(owner + (owner === myName ? ' (you)' : ''), 'key'),
-              cell(game), cell(partner === '-' ? '' : partner), cell(state, 'st-' + state));
-    const td = document.createElement('td');
-    if(GAMES[game] && owner !== myName){
-      const b = document.createElement('button');
-      b.textContent = state === 'playing' ? 'full' : 'join';
-      b.disabled = state === 'playing';
-      b.onclick = () => open(game, { lobby:owner });
-      td.appendChild(b);
-    }
-    tr.appendChild(td);
-    tb.appendChild(tr); shown++;
-  }
-  $('no-lobbies').classList.toggle('hidden', shown > 0);
-}
-function renderPlayers(text){
-  const tb = $('players'); tb.innerHTML = '';
-  let shown = 0;
-  for(const line of lines(text)){
-    const p = line.split(/\s+/);
-    if(p.length < 7) continue;
-    const tr = document.createElement('tr');
-    tr.append(cell(p[0], 'key'), cell(p[1]), cell(p[2]), cell(p[3]), cell(p[6] + 's'));
-    tb.appendChild(tr); shown++;
-  }
-  $('no-players').classList.toggle('hidden', shown > 0);
-}
-
-// Generation-counted: an answer from an address the field no longer names
-// is dropped.
-let gen = 0;
-async function refresh(){
-  const mine = ++gen, where = nsBase();
-  const [l, p] = await Promise.all([get('lobbies'), get('players')]);
-  if(mine !== gen) return;
-  if(l == null){ say(where + ' did not answer -- down, or not sending CORS headers', 'err'); return; }
-  lastLobbies = l; renderLobbies(l);
-  if(p != null) renderPlayers(p);
-  say('read ' + where + ' at ' + new Date().toLocaleTimeString(), 'ok');
-}
-$('search').addEventListener('input', () => renderLobbies(lastLobbies));
-$('go').onclick = refresh;
-$('ns').addEventListener('keydown', ev => { if(ev.key === 'Enter') refresh(); });
-refresh();
-setInterval(() => { if(!document.hidden) refresh(); }, 3000);
 })();
 </script>
 </body>

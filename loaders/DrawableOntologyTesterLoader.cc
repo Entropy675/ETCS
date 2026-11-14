@@ -197,6 +197,7 @@ public:
     bool m_want_device = true;
     bool SetDeviceProjectionConcrete(bool on) { m_want_device = on; return on == m_want_device; }
     bool DeviceProjectionRequestedConcrete() const { return m_want_device; }
+    bool DeviceProjectionLandsConcrete() const     { return true; }
 
     bool RenderConcrete()
     {
@@ -390,8 +391,8 @@ public:
 
 // ---------------------------------------------------------------------------
 // The other side of the raster split (ontology/Raster.h): a Drawable2D whose
-// pixels are somewhere this process cannot address. VulkanSurface is the real
-// one; this is the same claim with the device replaced by two numbers, which
+// pixels are somewhere this process cannot address. No RenderProvider leaf
+// claims it today (ontology/Renderable.h); this is the same claim with the device replaced by two numbers, which
 // is all the ontology can see of a device anyway.
 //
 // Drawable2D as well as Renderable, deliberately -- the coordinate-origin walk
@@ -1256,7 +1257,7 @@ int main()
     // lists that resolve reads -- probed: MISS. The OLD FollowResize resolved
     // at fire time for the same reason and would miss identically, so this is
     // the tester's reach, not a change in behaviour. The full pull is covered
-    // where entities are loader-spawned (VulkanSurface follows GLFWWindow).
+    // where entities are loader-spawned (the window surface follows GLFWWindow).
     //
     // What IS checkable here is the part that used to be a callback list: that
     // following registers an observation edge on the SOURCE, and that a resize
@@ -1990,18 +1991,18 @@ int main()
               "...with the product actually computed");
 
         // The OrderVector -> 4x4 function: DERIVED, not reinterpreted. Row 0's
-        // fourth slot is a RID and no product may touch it, which is why this
-        // is a function rather than a cast.
+        // fourth slot is an identity and no product may touch it, which is
+        // why this is a function rather than a cast.
         OrderVector ov;
-        ov.PlaceAt(3.0f, 4.0f, 5.0f);
-        ov.rid = 12345;
+        ov.PlaceAt(Fixed::FromInt(3), Fixed::FromInt(4), Fixed::FromInt(5));
+        ov.id = 12345;
         const Matrix4 om = ov.ToMatrix4();
         check(om.at(0,3)==3.0f && om.at(1,3)==4.0f && om.at(2,3)==5.0f,
               "an OrderVector's position becomes the translation column");
         check(om.at(3,3)==1.0f && om.at(3,0)==0.0f,
-              "and the bottom row is affine -- the RID is nowhere in the matrix, "
+              "and the bottom row is affine -- the identity is nowhere in the matrix, "
               "which is the whole reason this is built rather than cast");
-        check(ov.rid == 12345, "...and the vector still knows who it is");
+        check(ov.id == 12345, "...and the vector still knows what it is");
 
         // Now the family: stages, their values, and the chain rule.
         Xform* first  = ETCS::MemoryArena::getInstance().allocate<Xform>();

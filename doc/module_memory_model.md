@@ -400,6 +400,31 @@ Three graduated tiers of causal weight, not a flat local/global split:
   token changing hands) — never treated as commutable with *anything*
   in flight, regardless of type or module.
 
+**Reading an entity takes no lock.** Writers to an entity's surface (flags,
+values, tags) and children still exclude each other with its `m_tagMutex`,
+and most already arrive on an ordering thread. Each write publishes an
+immutable view with one pointer store; readers (`hasTag`, `valueOf`,
+`getTypedChild`, the child walks, the surface hash) read the view they
+loaded. A replaced view is freed once no reader can still hold it (grace
+periods, `core/Reclaim.h`). Views are not arena memory: they are plain blocks
+from the one process-wide `Reclaimer`, which modules adopt through the
+loader's node as they adopt the thread pool, so a view a module retired is
+freed after that module has unloaded without calling into its code.
+
+The ordered child view (`getOrderedTypedChildren`, `collectSiblingOrder`) is
+published the same way but built by a reader: an order is a sort over the
+children's live keys, and keys move far more often than the order is read. A
+moved key (`reorderTypedChild`, on every state change of an orderable child)
+is noted under a small lock of its own and moves the entity's order
+generation; it never waits on a sort. A reader whose view carries the current
+generation reads it without the lock; one whose view is older takes the tag
+mutex and publishes for the rest. Nothing is sorted whole for an ordinary
+change: each list notes arrivals and moved keys and flags a departure at the
+seam, and its next ordered read drops the departed and places the noted
+(`RIDList::settle_pending`), falling back to a full sort only when the rest
+is found out of order or too much is pending. Still under the tag mutex: that
+rebuild, the in-flight scopes, and every writer.
+
 The `Ack` mechanism (`DLInEvent::reply_to`, `sendAckIfNeeded`) provides
 the happen-before edge across the module/loader thread boundary: after
 finishing one of the five reply-eligible kinds, the loader enqueues a

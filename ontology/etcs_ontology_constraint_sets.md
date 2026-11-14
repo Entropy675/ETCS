@@ -121,7 +121,7 @@ detach children. So `ThreadBase` composes `ThreadedBase`, the Base spelling
 above, and the refinement is a genuine is-a — every Thread owns a body that
 can be halted, and the reverse does not hold.
 
-The reverse mattering is the point. `VulkanSurface` is `Threaded` and is
+The reverse mattering is the point. The window surface (`HostSurface`) is `Threaded` and is
 deliberately **not** a `Thread`: it has a frame loop, it is not an actor
 running scripts. A family that collapsed the two would force every entity with
 a loop to also claim signal authority and a closure it has no use for.

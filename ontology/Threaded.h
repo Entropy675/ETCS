@@ -10,7 +10,7 @@
 //
 // Claims IWireThread, which core/InterfaceWire.h declared and left unclaimed.
 // It is claimed now because the gap it named stopped being an argument: a frame
-// producer holds a `VulkanSurface&` for a window's lifetime, and every guard
+// producer holds the window surface for a window's lifetime, and every guard
 // available to it is a question it must dereference the object to ask. Adding
 // another predicate narrows the window between check and use; it cannot close
 // it. Measured -- a Retired() check on that loop moved the fault rate by less
@@ -27,8 +27,8 @@
 // WHATEVER SCHEDULES IS Thread, which refines this one (ontology/Thread.h). The
 // pair reads in one direction: this family is the LESS strict of the two, held
 // by anything with a body to stop, while a Thread additionally owns signal
-// authority and a closure and can detach children. So VulkanSurface is Threaded
-// and is not a Thread -- it has a frame loop, it is not an actor. Claiming
+// authority and a closure and can detach children. So the window surface is
+// Threaded and is not a Thread -- it has a frame loop, it is not an actor. Claiming
 // Thread claims this cumulatively; claiming both Bases is a redundant claim and
 // a compile error.
 //

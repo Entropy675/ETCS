@@ -15,7 +15,7 @@
 // cooperative stop, claimed by anything with a loop in it; Thread is the actor
 // that owns signal authority, carries a closure, and can detach children.
 //
-// So VulkanSurface stays Threaded and is NOT a Thread: it has a frame loop, it
+// So the window surface stays Threaded and is NOT a Thread: it has a frame loop, it
 // is not an actor running scripts. That distinction is worth keeping sharp,
 // because the two answer different questions and the wire only covers the first.
 //

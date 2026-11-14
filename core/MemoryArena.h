@@ -78,6 +78,22 @@ class Entity;
 // Returns whether THIS call did the release. See retireEntity below.
 bool etcs_retire_entity(Entity* e);
 
+// Non-zero on a thread that is inside a cascade delete or an arena teardown
+// (MemoryArena::cascade, memoryTeardown): every entity retired under it is in
+// a subtree whose root's parent was told once, by the root's own retire, so
+// the retire of a dying child does not walk its dying ancestors' epochs
+// (Entity.h, etcs_retire_entity) -- a chain of N would otherwise pay N walks
+// of N.
+inline thread_local int etcs_cascade_depth = 0;
+
+// The entity whose record destructor is running on this thread, if any
+// (MemoryArena::runRecordDtor): its record is already out of the chain, or
+// in a chain the loop running it is about to drop, so a search for it from
+// its own ~Entity (forget) can only come back empty -- and it was a walk of
+// every live sibling per delete. Set while the object is still whole, since
+// a record's own pointer is not comparable with an Entity* once it is not.
+inline thread_local Entity* etcs_destructing_entity = nullptr;
+
 /*
  * NO DESTRUCTIBLE STATIC IN HERE, and that is a hard requirement rather than
  * a style preference -- this function is called from memoryTeardown(), which
@@ -338,11 +354,13 @@ private:
     // (T is fully known at the allocate<T> call site), which is legal even
     // across virtual inheritance — unlike the reverse direction, which is
     // exactly why addTagTrampoline<T> (Entity.h) never casts the other way.
+    enum class DeleteStep : uint8_t { Reparent, Enter, Leave };
+
     struct DestructorRecord 
     {
         void*             ptr;
         void            (*dtor)(void*);
-        DestructorRecord* prev;
+        DestructorRecord* prev;                 // the older record, toward the tail
         Entity*         (*as_entity)(void*) = nullptr;
         // The full "properly delete this entity" logic -- election
         // search + promote/vacate for a global-scope entity (evoking
@@ -353,7 +371,26 @@ private:
         // only forward-declares Entity and can't call its members
         // directly -- see registerDtor<T>'s own comment for why this
         // works despite that.
-        void            (*run_entity_delete)(void*, MemoryArena&, bool) = nullptr;
+        //
+        // IN STEPS, NOT AS ONE CALL, because the cascade is a loop now and
+        // not a recursion (deleteEntity, cascade): the driver asks Enter
+        // (everything before the children go; the answer is the arena the
+        // children live in), drains that arena itself, then asks Leave
+        // (reclaim the entity, then the arena). Reparent is the whole
+        // non-cascade delete in one step, answering null -- unless the
+        // entity turns out to be a module root, which cascades regardless,
+        // in which case it answers as Enter does.
+        MemoryArena*    (*run_entity_delete)(void*, MemoryArena&, DeleteStep, MemoryArena*) = nullptr;
+        // Set when the record IS a nested arena, so a teardown can walk
+        // into it instead of recursing through its destructor.
+        MemoryArena*    (*as_arena)(void*) = nullptr;
+        // The newer record, toward the head: the tail's way up (see dtorTail_).
+        // After the positional fields, so registerDtorLocked's initialisation holds.
+        DestructorRecord* next = nullptr;
+        // Where the bytes of `ptr` and of this record live, when that is not
+        // the arena whose chain holds the record: a token moved by
+        // adoptToken. A reclaim returns the bytes here. Null: this arena.
+        MemoryArena*      home = nullptr;
     };
 
     // -------------------------------------------------------------------
@@ -573,8 +610,22 @@ private:
     long long           hugePageSize_;            // 0 if unavailable
     long long           chunkSize_;               // chunk granularity
     bool                useHugePages_;
-    DestructorRecord*   dtorHead_     = nullptr;
+    DestructorRecord*   dtorHead_     = nullptr;   // newest
+    /*
+     * BOTH ENDS, AND BOTH LINKS. The chain is a LIFO through `prev`, and
+     * the cascade takes it oldest-first (oldestEntity): reached by walking
+     * to the tail, that was a walk of every live sibling per delete, and
+     * reclaiming the oldest (unlinkRecord, from the head) was another --
+     * twenty thousand children under one node took 84 s to cascade, where a
+     * chain of twenty thousand took 0.4. The tail and `next` make each of
+     * those one read and one splice. `next` lives in the arena-side
+     * DestructorRecord, not in the record's ptr, so nothing an entity holds
+     * changed.
+     */
+    DestructorRecord*   dtorTail_     = nullptr;   // oldest
     bool                isTeardown_   = false;
+    bool                pagesReleased_ = false;
+    bool                owned_        = false;    // an entity's own arena (markOwned)   // releasePages ran (memoryTeardown runs it once)
 
     // ---------------------------------------------------------------------
     // Child-page pool — meaningful ONLY on the true global singleton
@@ -824,7 +875,8 @@ private:
     }
 
     void registerDtorLocked(void* ptr, void (*dtor)(void*), Entity* (*as_entity)(void*) = nullptr,
-                            void (*run_entity_delete)(void*, MemoryArena&, bool) = nullptr)
+                            MemoryArena* (*run_entity_delete)(void*, MemoryArena&, DeleteStep, MemoryArena*) = nullptr,
+                            MemoryArena* (*as_arena)(void*) = nullptr)
     {
         // Checks this arena's own free list first, via the same
         // tryAcquireFromFreeListLocked primitive allocate<T>()/
@@ -853,7 +905,9 @@ private:
             ETCS_ARENA_DEBUG_LOG("MemoryArena", "registerDtorLocked: [" << scope_tag_
                      << "] free-list MISS for DestructorRecord -- bump-allocating fresh, mem=" << recMem);
         }
-        dtorHead_ = new (recMem) DestructorRecord{ptr, dtor, dtorHead_, as_entity, run_entity_delete};
+        DestructorRecord* rec = new (recMem) DestructorRecord{ptr, dtor, dtorHead_, as_entity, run_entity_delete, as_arena};
+        if (dtorHead_) dtorHead_->next = rec; else dtorTail_ = rec;
+        dtorHead_ = rec;
     }
 
     // Chunk granularity: huge page size if available, else OS page size,
@@ -1243,21 +1297,28 @@ public:
     // run_entity_delete, written in terms of dependent T so two-phase
     // lookup defers checking it until Entity/Module are complete at the
     // actual call site (allocate<T>, via addTag<T>/ETCS_TAG_DECLARE or
-    // DynamicLoader.h).
+    // DynamicLoader.h). For T == MemoryArena it resolves as_arena, so a
+    // teardown can walk a nested arena's chain without recursing through
+    // its destructor (memoryTeardown).
     //
     // Three cases, decided each time deleteEntity actually runs:
-    //   - Global (getParent() == nullptr): search for a sibling,
-    //     promoteOrVacate, evoke e AND its own arena unconditionally --
-    //     already a full subtree delete regardless of delete_children,
-    //     since only root-level entities are ever lifetime_owner-eligible.
-    //   - Non-global, delete_children == true: evoke e, then evoke e's
-    //     own arena too -- its ~MemoryArena() walks e's own dtor chain in
-    //     turn, cascading the subtree via ordinary nested teardown. Never
-    //     paired with reparenting -- that would destroy entities the
-    //     RIDList rewrite just told the grandparent it now owns.
+    //   - A module root (isModuleRoot: global scope, or a child made under
+    //     another module's entity, which lives in its own module's root
+    //     arena): search for a sibling, promoteOrVacate, then its children,
+    //     then it and its own arena unconditionally -- already a full
+    //     subtree delete regardless of delete_children, since module roots
+    //     are what the lifetime token is handed between.
+    //   - Non-global, delete_children == true: its children, depth-first,
+    //     oldest first, then it, then its own arena.
     //   - Non-global, delete_children == false (default): reparent e's
     //     children up to e's own parent, evoke only e -- e's own arena
     //     stays intact ("coyote time" -- see reparentChildrenTo, Entity.h).
+    //
+    // THE CHILDREN ARE THE DRIVER'S TO DESTROY, not this callback's: it
+    // answers Enter with the arena they live in, the driver drains that
+    // arena (cascade, below: a loop over an explicit stack, however deep
+    // the branch), and asks Leave when the arena is empty. What this
+    // callback never does is call back into the driver.
     template<typename T>
     void registerDtor(T* ptr)
     {
@@ -1269,130 +1330,108 @@ public:
                 if constexpr (::std::is_base_of<Entity, T>::value)
                     registerDtorLocked(ptr, [](void* p) { static_cast<T*>(p)->~T(); },
                         [](void* p) -> Entity* { return static_cast<Entity*>(static_cast<T*>(p)); },
-                        [](void* p, MemoryArena& parentArena, bool delete_children)
+                        [](void* p, MemoryArena& parentArena, DeleteStep step, MemoryArena* own) -> MemoryArena*
                         {
                             T* e = static_cast<T*>(p);
-                            if (e->getParent() == nullptr)
+                            if (step == DeleteStep::Leave)
                             {
-                                Entity* survivor = parentArena.findNextCandidateScope(
-                                    [](Entity*) { return true; }, e);
-                                e->module_.promoteOrVacate(survivor);
-                                // Captured BEFORE reclaimEntity, not after --
-                                // reclaimEntity's own memset zeroes e's
-                                // WHOLE outer-shell memory once ~T() has
-                                // run, including e->local_arena_ itself, so
-                                // reading e->getArena() AFTER that call
-                                // reads zeroed garbage instead of the real
-                                // pointer (this is exactly what crashed
-                                // immediately -- the original evokeDestructor
-                                // (e) never touched the bytes after running
-                                // ~T(), only reclaimEntity's own zeroing
-                                // does, and only this ordering avoids it).
-                                MemoryArena* own_arena = &e->getArena();
-                                // Children first -- see
-                                // destroyChildEntitiesFirst. Before
-                                // reclaimEntity, because that is what runs
-                                // this entity's own ~T().
-                                own_arena->destroyChildEntitiesFirst();
+                                // The arena was captured at Enter, before
+                                // reclaimEntity: its memset zeroes e's WHOLE
+                                // outer-shell memory once ~T() has run,
+                                // including e->local_arena_ itself, so
+                                // reading e->getArena() after that call
+                                // reads zeroed garbage (this is exactly
+                                // what crashed immediately once).
+                                //
                                 // reclaimEntity, not evokeDestructor -- see
-                                // that method's own comment. Safe here for
-                                // the same reason it's safe below: whatever
-                                // referenced e (its parent's own
+                                // that method's own comment. Safe here:
+                                // whatever referenced e (its parent's own
                                 // typed_children_ entry, or the module
                                 // registry for a global-scope entity) has
                                 // already been resolved/removed by this
                                 // point, so its own outer-shell bytes are
-                                // free to recycle, not just its content arena.
+                                // free to recycle, not just its content.
+                                //
+                                // reclaimArena, not evokeDestructor: the
+                                // arena object itself was
+                                // allocate<MemoryArena>'d out of parentArena,
+                                // so its own outer bytes belong back on
+                                // parentArena's free list exactly as the
+                                // entity's do. evokeDestructor runs the dtor
+                                // and unlinks the record but returns nothing
+                                // -- leaking sizeof(MemoryArena) per deleted
+                                // child, which under connection churn is
+                                // unbounded growth in a parent that never
+                                // tears down.
                                 parentArena.reclaimEntity(e, sizeof(T), alignof(T));
-                                // reclaimArena, not evokeDestructor: the arena
-                                // object itself was allocate<MemoryArena>'d out
-                                // of parentArena, so its own outer bytes belong
-                                // back on parentArena's free list exactly as the
-                                // entity's do. evokeDestructor runs the dtor and
-                                // unlinks the record but returns nothing --
-                                // leaking sizeof(MemoryArena) per deleted child,
-                                // which under connection churn is unbounded
-                                // growth in a parent that never tears down.
-                                parentArena.reclaimArena(own_arena);
+                                parentArena.reclaimArena(own);
+                                return nullptr;
                             }
-                            else if (delete_children)
+                            if (e->isModuleRoot())
                             {
-                                MemoryArena* own_arena = &e->getArena(); // see comment above
-                                // Children first -- see
-                                // destroyChildEntitiesFirst. This is the
-                                // cascade case, so every descendant is
-                                // destroyed here, depth-first, and only then
-                                // does reclaimEntity run this entity's ~T().
-                                own_arena->destroyChildEntitiesFirst();
-                                parentArena.reclaimEntity(e, sizeof(T), alignof(T));
-                                // reclaimArena, not evokeDestructor -- see above.
-                                parentArena.reclaimArena(own_arena);
+                                // Enter, or a Reparent that turns out to be
+                                // a root: the election first, with e still
+                                // whole; the children are the driver's.
+                                Entity* survivor = parentArena.findNextCandidateScope(
+                                    [](Entity*) { return true; }, e);
+                                e->module_.promoteOrVacate(survivor);
+                                return &e->getArena();
                             }
-                            else
-                            {
-                                // reparentChildrenTo redirects every child's own
-                                // addressing past e, so nothing dangling depends on
-                                // e's own address surviving and its outer shell is
-                                // as reclaimable here as in the cascade case above.
-                                // Capture own_arena BEFORE reclaimEntity zeroes that
-                                // shell -- local_arena_ lives in those bytes (same
-                                // reason the two branches above capture it early).
-                                MemoryArena* own_arena = &e->getArena();
+                            if (step == DeleteStep::Enter) return &e->getArena();
 
-                                // "Coyote time" -- keeping this entity's own arena
-                                // alive after the entity itself is gone -- exists
-                                // for exactly ONE reason: reparented children whose
-                                // storage still physically lives in it. An entity
-                                // with no typed children has nothing to preserve it
-                                // for, and preserving it anyway leaks the arena
-                                // object plus its DestructorRecord into the PARENT's
-                                // arena, permanently, once per deletion. Measured at
-                                // 2112 bytes per connection against a
-                                // SocketConnectionState (children=0, always, since a
-                                // connection never addTag<T>s anything) -- invisible
-                                // per request, tens of MB over a day of polling.
-                                //
-                                // Checked BEFORE the reparent, not after. The
-                                // question is "does any entity still have STORAGE
-                                // inside this arena", and reparenting does not move
-                                // storage: reparentChildrenTo rewrites parent_ and
-                                // mints a fresh RIDList in newParent's arena, but
-                                // every child's own shell and local_arena_ stay
-                                // physically here -- which is the entire reason that
-                                // method's own comment says this arena "does survive
-                                // as coyote time".
-                                //
-                                // Asking AFTER inverted it. A SUCCESSFUL migration
-                                // empties typed_children_, so the arena hosting those
-                                // now-migrated children was reclaimed out from under
-                                // them (their shells destructed with it -- a live
-                                // grandparent left holding RIDs into freed memory).
-                                // A migration that FAILED left its children behind
-                                // and kept the arena -- alive for the one case that
-                                // no longer needed reachable children. Exactly
-                                // backwards, and reachable from any
-                                // deleteEntity(middle, false) on a three-level tree.
-                                //
-                                // Before the reparent, "had children at all" answers
-                                // it for both kinds at once: migrated and orphaned
-                                // children are hosted here alike. The children == 0
-                                // case this check exists for (SocketConnectionState,
-                                // which never addTag<T>s anything) is untouched --
-                                // it has nothing hosted here either way.
-                                ::std::vector<::std::pair<ETCS::Buffer, ETCS_RID_SIZE>> hosted;
-                                e->getTypedChildren(hosted);
-                                e->reparentChildrenTo(e->getParent());
-                                parentArena.reclaimEntity(e, sizeof(T), alignof(T));
-                                if (hosted.empty())
-                                    parentArena.reclaimArena(own_arena);
-                            }
+                            // Reparent: the whole non-cascade delete, here.
+                            // reparentChildrenTo redirects every child's own
+                            // addressing past e, so nothing dangling depends on
+                            // e's own address surviving and its outer shell is
+                            // as reclaimable here as in the cascade case above.
+                            // Capture own_arena BEFORE reclaimEntity zeroes that
+                            // shell -- local_arena_ lives in those bytes.
+                            MemoryArena* own_arena = &e->getArena();
+
+                            // "Coyote time" -- keeping this entity's own arena
+                            // alive after the entity itself is gone -- exists
+                            // for exactly ONE reason: reparented children whose
+                            // storage still physically lives in it.
+                            // reparentChildrenTo rewrites parent_ and mints a
+                            // fresh RIDList in newParent's arena, but a child's
+                            // shell and local_arena_ stay physically here, and
+                            // so does its lifetime token -- its record in this
+                            // chain. A movable child's token is handed on with
+                            // it (its bytes were never here: MemoryArena::
+                            // adoptToken), so it holds nothing.
+                            //
+                            // ASKED OF THE CHAIN, AFTER. Asking the child lists
+                            // after inverted it once: a successful migration
+                            // empties them, and the arena was reclaimed out
+                            // from under the children it still hosted. The
+                            // chain does not empty on a migration -- only a
+                            // token handed on leaves it -- so after the reparent
+                            // it answers for every kind at once: migrated or
+                            // orphaned children hosted here keep it; nothing,
+                            // or only movable children, and it goes now.
+                            e->reparentChildrenTo(e->getParent());
+                            parentArena.reclaimEntity(e, sizeof(T), alignof(T));
+                            if (!own_arena->holdsEntities())
+                                parentArena.reclaimArena(own_arena);
+                            return nullptr;
                         });
+                else if constexpr (::std::is_same<MemoryArena, T>::value)
+                    registerDtorLocked(ptr, [](void* p) { static_cast<T*>(p)->~T(); }, nullptr, nullptr,
+                        [](void* p) -> MemoryArena* { return static_cast<MemoryArena*>(p); });
                 else
                     registerDtorLocked(ptr, [](void* p) { static_cast<T*>(p)->~T(); });
             }
         }
     }
  
+    // Out of the chain, both links, either end. Under allocationMutex_.
+    void spliceOut(DestructorRecord* rec)
+    {
+        if (rec->next) rec->next->prev = rec->prev; else dtorHead_ = rec->prev;
+        if (rec->prev) rec->prev->next = rec->next; else dtorTail_ = rec->next;
+        rec->next = nullptr;
+    }
+
     // Entity*-aware overload: compares via the stored as_entity
     // conversion, never the raw record pointer. Required for correctness
     // under virtual inheritance — several ontology leaf types inherit
@@ -1405,20 +1444,19 @@ public:
     // callers (Module*, MemoryArena*), which are never polymorphic.
     DestructorRecord* unlinkRecord(Entity* target)
     {
+        if (target && target == etcs_destructing_entity) return nullptr;   // see etcs_destructing_entity
         ::std::lock_guard<::std::mutex> lock(allocationMutex_);
         if (isTeardown_) return nullptr;
-        DestructorRecord* prevRec = nullptr;
-        DestructorRecord* cur = dtorHead_;
+        // From the tail: a cascade reclaims the oldest, which is the tail.
+        DestructorRecord* cur = dtorTail_;
         while (cur)
         {
             if (cur->as_entity && cur->as_entity(cur->ptr) == target)
             {
-                if (prevRec) prevRec->prev = cur->prev;
-                else         dtorHead_    = cur->prev;
+                spliceOut(cur);
                 return cur;
             }
-            prevRec = cur;
-            cur = cur->prev;
+            cur = cur->next;
         }
         return nullptr;
     }
@@ -1427,18 +1465,15 @@ public:
     {
         ::std::lock_guard<::std::mutex> lock(allocationMutex_);
         if (isTeardown_) return nullptr;
-        DestructorRecord* prevRec = nullptr;
-        DestructorRecord* cur = dtorHead_;
+        DestructorRecord* cur = dtorTail_;
         while (cur)
         {
             if (cur->ptr == target)
             {
-                if (prevRec) prevRec->prev = cur->prev;
-                else         dtorHead_    = cur->prev;
+                spliceOut(cur);
                 return cur;
             }
-            prevRec = cur;
-            cur = cur->prev;
+            cur = cur->next;
         }
         return nullptr;
     }
@@ -1496,6 +1531,7 @@ public:
         //ETCS_LOG("MemoryArena", "reclaimEntity: reclaiming " << (void*)target
         //         << " size=" << size << " align=" << alignment);
         void* raw = rec->ptr;
+        MemoryArena& bytes = rec->home ? *rec->home : *this;   // a moved token's bytes go home
         runRecordDtor(rec);
  
         // rec itself -- unlinkRecord only removed it from dtorHead_'s own
@@ -1521,8 +1557,8 @@ public:
         // call site regardless of what's actually being passed in --
         // -Wclass-memaccess only fires when a properly-typed pointer is
         // passed to memset directly, which this no longer does.
-        releaseToFreeList(raw, size, alignment);
-        releaseToFreeList(rec,
+        bytes.releaseToFreeList(raw, size, alignment);
+        bytes.releaseToFreeList(rec,
             static_cast<long long>(sizeof(DestructorRecord)),
             static_cast<long long>(alignof(DestructorRecord)));
         return true;
@@ -1541,62 +1577,17 @@ public:
         DestructorRecord* rec = unlinkRecord(static_cast<void*>(target));
         if (!rec) return false;
         void* raw = rec->ptr;
+        MemoryArena& bytes = rec->home ? *rec->home : *this;
         runRecordDtor(rec);
-        releaseToFreeList(raw, static_cast<long long>(sizeof(MemoryArena)),
+        bytes.releaseToFreeList(raw, static_cast<long long>(sizeof(MemoryArena)),
                                 static_cast<long long>(alignof(MemoryArena)));
-        releaseToFreeList(rec,
+        bytes.releaseToFreeList(rec,
             static_cast<long long>(sizeof(DestructorRecord)),
             static_cast<long long>(alignof(DestructorRecord)));
         return true;
     }
     
  
-    // deleteEntity — THE entry point for properly deleting an arena-
-    // resident entity. delete_children only changes anything for a
-    // non-global target: true cascades the whole subtree; false
-    // (default) reparents children instead, preserving prior behavior.
-    // Meaningless for a global-scope target -- already a full cascade
-    // either way (see registerDtor<T>'s own comment).
-    //
-    // Looks up target's own run_entity_delete callback WITHOUT unlinking
-    // its record -- the callback itself unlinks+destructs via its own
-    // evokeDestructor call, once it's finished any election/reparenting
-    // work that needs target still fully intact.
-    /*
- * destroyChildEntitiesFirst — destroy every ENTITY this arena holds, oldest
- * first, before anything destroys the entity that OWNS the arena.
- *
- * WHY THIS EXISTS. A subtree teardown used to run the parent's ~T() and only
- * then walk the arena, so the observed order for a three-level tree was
- *
- *     parent  child_b  child_a  grandchild
- *
- * -- exactly inverted. A child's destructor legitimately reaches its parent
- * (to unregister, to hand back a token, to log what it belonged to), and
- * every one of those reads a destroyed object. It survived because the
- * children in this codebase mostly do not look up; the first one that does
- * would have been a use-after-free with no obvious cause.
- *
- * Only ENTITY records are touched. The parent's own container allocations
- * live in this same arena and its ~T() still needs them, so they are left
- * exactly where they are -- this is the one reason the fix is not simply
- * "reclaim the arena first", which would pull the parent's own members out
- * from under its destructor.
- *
- * Oldest first, and deterministic. dtorHead_ is a LIFO stack, so taking the
- * head would destroy siblings newest-first -- an order nothing chose and
- * nothing can rely on. Walking to the tail destroys them in the order they
- * were attached, which is what "first in, first out" says and what a reader
- * of the script that spawned them expects.
- *
- * Depth is free: each callback is the same cascade, so a child destroys ITS
- * children before itself by the same path, all the way down.
- *
- * Terminates because each callback reclaims the entity it was given, which
- * unlinks that record from this chain -- so the search that follows cannot
- * return it again. The lock is released across the callback for the same
- * reason deleteEntity releases it: the cascade re-enters this arena.
- */
     /*
  * Give an entity its Lifecycle release before anything else touches it.
  *
@@ -1642,44 +1633,29 @@ public:
     static void runRecordDtor(DestructorRecord* rec)
     {
         if (!rec) return;
-        if (rec->as_entity) etcs_retire_entity(rec->as_entity(rec->ptr));
+        Entity* e = rec->as_entity ? rec->as_entity(rec->ptr) : nullptr;
+        if (e) etcs_retire_entity(e);
+        Entity* const outer = etcs_destructing_entity;   // a destructor may run another record's
+        etcs_destructing_entity = e;
         rec->dtor(rec->ptr);
+        etcs_destructing_entity = outer;
     }
 
-    void destroyChildEntitiesFirst()
-    {
-        while (true)
-        {
-            void (*callback)(void*, MemoryArena&, bool) = nullptr;
-            void* rawPtr = nullptr;
-            Entity* (*to_entity)(void*) = nullptr;
-            {
-                ::std::lock_guard<::std::mutex> lock(allocationMutex_);
-                for (DestructorRecord* rec = dtorHead_; rec; rec = rec->prev)
-                {
-                    if (rec->as_entity && rec->run_entity_delete)
-                    {
-                        callback  = rec->run_entity_delete;  // keep walking:
-                        rawPtr    = rec->ptr;                // the tail is the
-                        to_entity = rec->as_entity;          // oldest record
-                    }
-                }
-            }
-            if (!callback) return;
-            // The release goes BEFORE the destroy callback, while the entity is
-            // still whole and everything around it still resolves -- which is
-            // the only moment a release can do what a release is for. See
-            // retireEntity. Outside the lock, deliberately: the callback
-            // below already re-enters this arena, and a release may too.
-            if (to_entity) retireEntity(to_entity(rawPtr));
-            callback(rawPtr, *this, true);
-        }
-    }
-
+    // deleteEntity — THE entry point for properly deleting an arena-
+    // resident entity. delete_children only changes anything for a
+    // non-global target: true cascades the whole subtree; false
+    // (default) reparents children instead, preserving prior behavior.
+    // Meaningless for a global-scope target -- already a full cascade
+    // either way (see registerDtor<T>'s own comment).
+    //
+    // Looks up target's own run_entity_delete callback WITHOUT unlinking
+    // its record -- the callback itself unlinks+destructs via its own
+    // reclaimEntity call, once it's finished any election/reparenting
+    // work that needs target still fully intact.
     void deleteEntity(Entity* target, bool delete_children = true)
     {
-        void (*callback)(void*, MemoryArena&, bool) = nullptr;
-        void* rawPtr = nullptr;
+        DeleteFn callback = nullptr;
+        void*    rawPtr   = nullptr;
         {
             ::std::lock_guard<::std::mutex> lock(allocationMutex_);
             DestructorRecord* rec = dtorHead_;
@@ -1694,14 +1670,192 @@ public:
                 rec = rec->prev;
             }
         }
-        if (callback) callback(rawPtr, *this, delete_children);
+        if (!callback) return;
+        MemoryArena* own = callback(rawPtr, *this, delete_children ? DeleteStep::Enter : DeleteStep::Reparent, nullptr);
+        if (own) cascade(rawPtr, callback, this, own);     // a reparent answers null: it is done
     }
- 
+
+    /*
+ * destroyChildEntitiesFirst — destroy every ENTITY this arena holds, oldest
+ * first, before anything destroys the entity that OWNS the arena.
+ *
+ * WHY THIS EXISTS. A subtree teardown used to run the parent's ~T() and only
+ * then walk the arena, so the observed order for a three-level tree was
+ *
+ *     parent  child_b  child_a  grandchild
+ *
+ * -- exactly inverted. A child's destructor legitimately reaches its parent
+ * (to unregister, to hand back a token, to log what it belonged to), and
+ * every one of those reads a destroyed object. It survived because the
+ * children in this codebase mostly do not look up; the first one that does
+ * would have been a use-after-free with no obvious cause.
+ *
+ * Only ENTITY records are touched. The parent's own container allocations
+ * live in this same arena and its ~T() still needs them, so they are left
+ * exactly where they are -- this is the one reason the fix is not simply
+ * "reclaim the arena first", which would pull the parent's own members out
+ * from under its destructor.
+ *
+ * Oldest first, and deterministic. dtorHead_ is a LIFO stack, so taking the
+ * head would destroy siblings newest-first -- an order nothing chose and
+ * nothing can rely on. The tail (dtorTail_) destroys them in the order they
+ * were attached, which is what "first in, first out" says and what a reader
+ * of the script that spawned them expects.
+ *
+ * DEPTH IS A VECTOR, NOT THE STACK. Each child's own children go before it
+ * by the same rule, all the way down -- and that used to be a C++ frame per
+ * level, the callback re-entering this function on the child's arena, so a
+ * branch deep enough was a stack overflow in a delete with no warning but
+ * Entity::noteDepth's. Now the levels are frames on an explicit stack
+ * (cascade): a child is Entered, its arena becomes the frame being drained,
+ * and it is Left when that arena has no entity left. The order every
+ * destructor sees is exactly the recursive one's.
+ *
+ * Terminates because each Leave reclaims the entity it was given, which
+ * unlinks that record from its arena's chain -- so the search that follows
+ * cannot return it again. The lock is released across the callbacks for the
+ * same reason deleteEntity releases it: a step re-enters this arena.
+ */
+    void destroyChildEntitiesFirst() { cascade(nullptr, nullptr, nullptr, this); }
+
+private:
+    using DeleteFn = MemoryArena* (*)(void*, MemoryArena&, DeleteStep, MemoryArena*);
+
+    // The oldest entity record of this arena: the tail of the LIFO chain.
+    bool oldestEntity(void*& rawPtr, DeleteFn& callback, Entity* (*&to_entity)(void*))
+    {
+        ::std::lock_guard<::std::mutex> lock(allocationMutex_);
+        callback = nullptr; rawPtr = nullptr; to_entity = nullptr;
+        for (DestructorRecord* rec = dtorTail_; rec; rec = rec->next)   // oldest first
+            if (rec->as_entity && rec->run_entity_delete)
+            {
+                callback  = rec->run_entity_delete;
+                rawPtr    = rec->ptr;
+                to_entity = rec->as_entity;
+                break;
+            }
+        return callback != nullptr;
+    }
+
+    /*
+     * The cascade: drain `own` (every entity it holds, oldest first, each
+     * one's own arena drained before it), then Leave `owner` -- or nothing,
+     * when there is no owner (destroyChildEntitiesFirst on an arena whose
+     * owner somebody else finishes). One frame per level on this vector.
+     */
+    static void cascade(void* owner, DeleteFn ownerFn, MemoryArena* ownerParent, MemoryArena* own)
+    {
+        struct Frame { void* ptr; DeleteFn fn; MemoryArena* parent; MemoryArena* own; };
+        ::std::vector<Frame> stack;
+        stack.push_back(Frame{ owner, ownerFn, ownerParent, own });
+        {
+            // The subtree under the owner dies here, and its retires tell no
+            // ancestor (etcs_cascade_depth); the owner's own Leave, below,
+            // is outside that, because its retire is the one that tells the
+            // tree above.
+            struct InCascade { InCascade() { ++etcs_cascade_depth; } ~InCascade() { --etcs_cascade_depth; } } in_cascade;
+            for (;;)
+            {
+                MemoryArena* arena = stack.back().own;
+                void*       rawPtr;
+                DeleteFn    fn;
+                Entity*   (*to_entity)(void*);
+                if (arena->oldestEntity(rawPtr, fn, to_entity))
+                {
+                    // The release goes BEFORE the destroy, while the entity is
+                    // still whole and everything around it still resolves --
+                    // which is the only moment a release can do what a release
+                    // is for. See retireEntity. Outside the lock, deliberately:
+                    // the steps below re-enter this arena, and a release may too.
+                    if (to_entity) retireEntity(to_entity(rawPtr));
+                    MemoryArena* childOwn = fn(rawPtr, *arena, DeleteStep::Enter, nullptr);
+                    stack.push_back(Frame{ rawPtr, fn, arena, childOwn });
+                    continue;
+                }
+                if (stack.size() == 1) break;          // the owner's arena is empty
+                const Frame f = stack.back();
+                stack.pop_back();
+                f.fn(f.ptr, *f.parent, DeleteStep::Leave, f.own);
+            }
+        }
+        if (owner) ownerFn(owner, *ownerParent, DeleteStep::Leave, own);
+    }
+
+public:
     bool forget(Entity* target)
     {
         return unlinkRecord(target) != nullptr;
     }
- 
+
+    /*
+     * THE LIFETIME TOKEN MOVES; THE BYTES STAY HOME. Whose chain holds an
+     * entity's records -- its own and its arena's -- is whose cascade destroys
+     * it and where deleteEntity finds it: those two records are its lifetime
+     * token. adoptToken finds them in `from` (newest first: they were just
+     * made) and moves them here; moveToken moves a token already in hand.
+     * The bytes stay where they were allocated, and a reclaim returns them
+     * there (DestructorRecord::home). Meant for bytes with a stable home (a
+     * module's root arena: Entity::addTag<T> for a movable type), which
+     * outlives every chain the token visits.
+     */
+    struct Token
+    {
+        DestructorRecord* entity = nullptr;
+        DestructorRecord* arena  = nullptr;
+        explicit operator bool() const { return entity && arena; }
+    };
+    bool adoptToken(Token& t, Entity* e, MemoryArena* e_arena, MemoryArena& from)
+    {
+        if (&from == this) return false;
+        ::std::scoped_lock lock(allocationMutex_, from.allocationMutex_);
+        if (isTeardown_ || from.isTeardown_) return false;
+        Token found;
+        for (DestructorRecord* r = from.dtorHead_; r && !found; r = r->prev)
+        {
+            if (!found.entity && r->as_entity && r->as_entity(r->ptr) == e) found.entity = r;
+            else if (!found.arena && r->ptr == static_cast<void*>(e_arena)) found.arena = r;
+        }
+        if (!found) return false;
+        relinkLocked(found, from);
+        t = found;
+        return true;
+    }
+    bool moveToken(const Token& t, MemoryArena& from)
+    {
+        if (!t) return false;
+        if (&from == this) return true;
+        ::std::scoped_lock lock(allocationMutex_, from.allocationMutex_);
+        if (isTeardown_ || from.isTeardown_) return false;
+        relinkLocked(t, from);
+        return true;
+    }
+    // Whether any entity's lifetime is still in this arena's chain: a child
+    // made here and not handed on (a movable one's token goes with it).
+    bool holdsEntities() const
+    {
+        ::std::lock_guard<::std::mutex> lock(allocationMutex_);
+        for (DestructorRecord* r = dtorHead_; r; r = r->prev) if (r->as_entity) return true;
+        return false;
+    }
+
+private:
+    // Both records out of `from`, onto this chain's head, in the order they
+    // were made (the arena first, in the entity's constructor). Both locks held.
+    void relinkLocked(const Token& t, MemoryArena& from)
+    {
+        from.spliceOut(t.arena);
+        from.spliceOut(t.entity);
+        for (DestructorRecord* r : { t.arena, t.entity })
+        {
+            if (!r->home) r->home = &from;
+            r->prev = dtorHead_;
+            r->next = nullptr;
+            if (dtorHead_) dtorHead_->next = r; else dtorTail_ = r;
+            dtorHead_ = r;
+        }
+    }
+
+public:
     // -------------------------------------------------------------------
     // evokeDestructor(void*) — explicitly runs AND unlinks a single
     // record ahead of the arena's own full teardown, identified by its
@@ -1750,6 +1904,13 @@ public:
     Entity* findNextCandidateScope(Pred&& pred, Entity* exclude = nullptr)
     {
         ::std::lock_guard<::std::mutex> lock(allocationMutex_);
+        return findCandidateLocked(pred, exclude);
+    }
+
+private:
+    template<typename Pred>
+    Entity* findCandidateLocked(Pred&& pred, Entity* exclude) const
+    {
         for (DestructorRecord* rec = dtorHead_; rec; rec = rec->prev)
         {
             if (!rec->as_entity) continue;
@@ -1759,6 +1920,7 @@ public:
         }
         return nullptr;
     }
+public:
  
     void cleanupTypedEntities()
     {
@@ -1767,17 +1929,49 @@ public:
  
         DestructorRecord* rec = dtorHead_;
         while (rec) { runRecordDtor(rec); rec = rec->prev; }
-        dtorHead_ = nullptr;
+        dtorHead_ = dtorTail_ = nullptr;
     }
  
-    void reset()
+    /*
+     * AN ENTITY'S OWN ARENA. Its tags, flags, values and child lists are
+     * allocated here (Entity's constructor), so the arena IS the owner's state:
+     * it ends when the owner is deleted, never under it. Set once, by Entity.
+     */
+    void markOwned() { owned_ = true; }
+
+    /*
+     * RESET IS AN UNLOAD AND A RELOAD WITHOUT THE dlclose. The causal model
+     * cannot tell the two apart, so reset is legal exactly where an unload is:
+     * nothing holds the arena's lifetime. Refused, and said so, when the arena
+     * belongs to an owner (delete the owner) or when the lifetime election
+     * would still find a survivor: every entity whose record is on this chain
+     * is root-level here and externally referenced, so each one is a holder
+     * the token can pass to -- the same search, the same answer
+     * (findNextCandidateScope, run_entity_delete). A movable child's bytes may
+     * sit here with its record in its parent's chain, but its parent's line
+     * ends at a root on this chain, so it never stands here alone. Returns
+     * whether it reset.
+     */
+    bool reset()
     {
         DestructorRecord* rec;
         {
             ::std::lock_guard<::std::mutex> lock(allocationMutex_);
-            if (isTeardown_) return;
+            if (isTeardown_) return false;
+            if (owned_)
+            {
+                ETCS_LOG("MemoryArena", "reset refused: this arena is an entity's own "
+                         "state -- delete the owner, and the arena goes with it.");
+                return false;
+            }
+            if (findCandidateLocked([](Entity*) { return true; }, nullptr))
+            {
+                ETCS_LOG("MemoryArena", "reset refused: a root-level entity still holds "
+                         "its lifetime -- the same condition an unload waits on.");
+                return false;
+            }
             rec = dtorHead_;
-            dtorHead_ = nullptr;
+            dtorHead_ = dtorTail_ = nullptr;
         }
  
         // Runs UNLOCKED -- see allocate<T>()'s own "constructor runs
@@ -1819,36 +2013,86 @@ public:
         }
  
         current_ = head_;
+        return true;
     }
  
+    /*
+     * The whole teardown: the records, newest first, then the pages. A
+     * NESTED ARENA'S RECORD IS WALKED INTO, not recursed through: its own
+     * chain is taken and run here, in place, before its ~MemoryArena runs
+     * (which then finds its chain gone and only releases its pages). So an
+     * arena per entity, an entity per level, costs this one frame whatever
+     * the depth of the tree -- the recursion that was left over after the
+     * cascade became a loop (deleteEntity). The order every destructor sees
+     * is the recursive one's exactly: a nested arena's records run at the
+     * point its record stands in its parent's chain.
+     *
+     * The records run UNLOCKED -- see reset()'s own identical comment for
+     * the full reasoning: a destructor legitimately calling back into this
+     * same arena's own allocation machinery (which itself takes
+     * allocationMutex_) would otherwise re-lock a non-recursive
+     * ::std::mutex from the same thread -- undefined behavior, and exactly
+     * what a real, reproduced SIGFPE inside ::std::unordered_map's own
+     * operator[] traced back to.
+     */
     void memoryTeardown()
+    {
+        ETCS_LOG("MemoryArena", "[" << scope_tag_ << "] teardown attempt, already clean: " << isTeardown_);
+        if (DestructorRecord* rec = takeChain())
+        {
+            // Everything in here dies: a retire under this walk tells no
+            // ancestor (etcs_cascade_depth), as under a cascade.
+            struct InCascade { InCascade() { ++etcs_cascade_depth; } ~InCascade() { --etcs_cascade_depth; } } in_cascade;
+            struct Frame { DestructorRecord* rec; DestructorRecord* after; };
+            ::std::vector<Frame> stack;
+            stack.push_back(Frame{ rec, nullptr });
+            while (!stack.empty())
+            {
+                DestructorRecord* r = stack.back().rec;
+                if (!r)
+                {
+                    // This chain is done: the nested arena whose chain it
+                    // was is destroyed now, after its contents, as before.
+                    DestructorRecord* after = stack.back().after;
+                    stack.pop_back();
+                    if (after) runRecordDtor(after);
+                    continue;
+                }
+                stack.back().rec = r->prev;
+                if (r->as_arena)
+                    if (DestructorRecord* inner = r->as_arena(r->ptr)->takeChain())
+                    {
+                        stack.push_back(Frame{ inner, r });
+                        continue;
+                    }
+                runRecordDtor(r);
+            }
+        }
+        releasePages();
+    }
+
+    // The chain, once: null when it was already taken (a nested arena whose
+    // parent's teardown walked it, or a second call).
+    DestructorRecord* takeChain()
+    {
+        ::std::lock_guard<::std::mutex> lock(allocationMutex_);
+        if (isTeardown_) return nullptr;
+        isTeardown_ = true;
+        DestructorRecord* rec = dtorHead_;
+        dtorHead_ = dtorTail_ = nullptr;
+        return rec;
+    }
+
+    void releasePages()
     {
         const int columns = 5;
  
         const ::std::string RED_START = "\033[1;31m";
         const ::std::string RESET     = "\033[0m";
- 
-        ETCS_LOG("MemoryArena", "[" << scope_tag_ << "] teardown attempt, already clean: " << isTeardown_);
- 
-        DestructorRecord* rec;
-        {
-            ::std::lock_guard<::std::mutex> lock(allocationMutex_);
-            if (isTeardown_) return;
-            isTeardown_ = true;
-            rec = dtorHead_;
-            dtorHead_ = nullptr;
-        }
- 
-        // Runs UNLOCKED -- see reset()'s own identical comment (above)
-        // for the full reasoning: a destructor legitimately calling back
-        // into this same arena's own allocation machinery (which itself
-        // takes allocationMutex_) would otherwise re-lock a non-recursive
-        // ::std::mutex from the same thread -- undefined behavior, and
-        // exactly what a real, reproduced SIGFPE inside ::std::
-        // unordered_map's own operator[] traced back to.
-        while (rec) { runRecordDtor(rec); rec = rec->prev; }
- 
+
         ::std::lock_guard<::std::mutex> lock(allocationMutex_);
+        if (pagesReleased_) return;
+        pagesReleased_ = true;
         free_blocks_.clear(); // every chunk backing these addresses is about
                                // to be freed below regardless -- cleared here
                                // for explicitness, matching this method's own

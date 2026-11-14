@@ -43,8 +43,8 @@ struct WindowSize
  *
  * Polled: the follower asks, on its own tick. For anything with a clock, and
  * mandatory for anything whose ResizeTo must not run on a foreign thread --
- * VulkanSurface rebuilds a swapchain, so its resize belongs to the frame
- * thread and nowhere else.
+ * a window surface on a device rebuilds a swapchain, so its resize belongs
+ * to the frame thread and nowhere else.
  *
  * Pushed: the source calls PollResize on the follower once the size has
  * SETTLED. For a follower with no clock of its own -- a layout solver, which

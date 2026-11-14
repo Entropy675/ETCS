@@ -6,6 +6,7 @@
 #include "Drawable2D.h"
 #include "Drawable3D.h"
 #include "Device.h"
+#include <cmath>
 #include <cstdint>
 #include <vector>
 
@@ -42,6 +43,42 @@ struct ViewFrustum
     float near_plane;
     float far_plane;
 };
+
+/*
+ * THE LINE THROUGH A POINT OF THE IMAGE: where a pointer on a camera's frame
+ * is looking, as a ray from the eye. fx, fy are the point as fractions of the
+ * frame (0..1, y down, the way pixels are counted) and aspect is the frame's
+ * width over its height; the basis is the one a scene projects with --
+ * right = up x forward, then up = forward x right -- so the ray through a
+ * pixel is exactly the inverse of where that scene put a point on it. False
+ * for a pose with no basis (the eye on its target, or up along the view).
+ * The direction is unit. Floats, as the pose is: a pointer is an input, and
+ * what a game does with the ray goes onto the rows as a recorded verb.
+ */
+inline bool ViewRay(const ViewFrustum& v, float fx, float fy, float aspect, Point3D& origin, Point3D& dir)
+{
+    auto norm = [](Point3D& p) {
+        const float l = ::std::sqrt(p.x * p.x + p.y * p.y + p.z * p.z);
+        if (l <= 0.0f) return false;
+        p.x /= l; p.y /= l; p.z /= l;
+        return true;
+    };
+    auto cross = [](const Point3D& a, const Point3D& b) {
+        return Point3D{ a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x };
+    };
+    Point3D f{ v.look_at.x - v.position.x, v.look_at.y - v.position.y, v.look_at.z - v.position.z };
+    if (!norm(f)) return false;
+    Point3D r = cross(v.up, f);
+    if (!norm(r)) return false;
+    const Point3D u = cross(f, r);
+    const float t  = ::std::tan(v.fov_y_radians * 0.5f);
+    const float nx = (fx * 2.0f - 1.0f) * t * aspect;
+    const float ny = (1.0f - fy * 2.0f) * t;
+    dir = Point3D{ f.x + r.x * nx + u.x * ny, f.y + r.y * nx + u.y * ny, f.z + r.z * nx + u.z * ny };
+    if (!norm(dir)) return false;
+    origin = v.position;
+    return true;
+}
 
 // ---------------------------------------------------------------
 // Camera
@@ -157,6 +194,19 @@ public:
     virtual bool DeviceProjectionRequested() const = 0;
 
     /*
+     * WHETHER THE DEVICE PICTURE HAS ANYWHERE TO LAND. A device projection is
+     * not pixels: it is a scene the device draws when the camera is blitted
+     * into a surface that draws through that device. Blitted into host pixels
+     * -- a compositor, an offscreen layer -- there is nothing to take it, and
+     * the camera has produced no picture at all. The leaf asks its
+     * destination where it is drawn (DrawInto), every time, since a surface
+     * moves on and off its device by itself; yes is the default, because
+     * the host is the fallback rather than the assumption. A third fact
+     * about the graph, derived like the second, never a mode.
+     */
+    virtual bool DeviceProjectionLands() const = 0;
+
+    /*
  * THE DEVICE THIS CAMERA CAN REACH, or null.
  *
  * Concrete and here rather than dispatched, for the reason Drawable.h gives
@@ -187,9 +237,13 @@ public:
         return nullptr;
     }
 
-    // Wanted AND still available. This is what a projection branches on, and
-    // the only thing that should be: it is a fact about the graph right now.
-    bool DeviceProjection() { return DeviceProjectionRequested() && DeviceSource() != nullptr; }
+    // Wanted, landing somewhere, AND still available. This is what a
+    // projection branches on, and the only thing that should be: it is a
+    // fact about the graph right now.
+    bool DeviceProjection()
+    {
+        return DeviceProjectionRequested() && DeviceProjectionLands() && DeviceSource() != nullptr;
+    }
 };
 
 #endif

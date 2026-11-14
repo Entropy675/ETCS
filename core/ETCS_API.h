@@ -612,19 +612,22 @@ public: \
 #define ETCS_DISPATCH_CONCAT3(a,b,c)  ETCS_DISPATCH_CONCAT3_(a,b,c)
 // --- Underlying zero-arg / N-arg implementations (not called directly —
 // use ETCS_DISPATCH_METHOD / ETCS_DISPATCH_METHOD_CONST below) ---
+// The wrapper is `override`: it answers the family's pure virtual of the
+// same name, always, and saying so keeps a base that marks its other
+// overrides from drawing clang's inconsistent-override warning on these.
 #define ETCS_DISPATCH_METHOD_0(RetType, Name) \
     virtual RetType Name##Concrete() = 0; \
-    RetType Name() { return static_cast<Derived*>(this)->Name##Concrete(); }
+    RetType Name() override { return static_cast<Derived*>(this)->Name##Concrete(); }
 #define ETCS_DISPATCH_METHOD_N(RetType, Name, ...) \
     virtual RetType Name##Concrete(FOR_EACH_COMMA(_PARAM, __VA_ARGS__)) = 0; \
-    RetType Name(FOR_EACH_COMMA(_PARAM, __VA_ARGS__)) \
+    RetType Name(FOR_EACH_COMMA(_PARAM, __VA_ARGS__)) override \
     { return static_cast<Derived*>(this)->Name##Concrete(FOR_EACH_COMMA(_ARGNAME, __VA_ARGS__)); }
 #define ETCS_DISPATCH_METHOD_0_CONST(RetType, Name) \
     virtual RetType Name##Concrete() const = 0; \
-    RetType Name() const { return static_cast<const Derived*>(this)->Name##Concrete(); }
+    RetType Name() const override { return static_cast<const Derived*>(this)->Name##Concrete(); }
 #define ETCS_DISPATCH_METHOD_N_CONST(RetType, Name, ...) \
     virtual RetType Name##Concrete(FOR_EACH_COMMA(_PARAM, __VA_ARGS__)) const = 0; \
-    RetType Name(FOR_EACH_COMMA(_PARAM, __VA_ARGS__)) const \
+    RetType Name(FOR_EACH_COMMA(_PARAM, __VA_ARGS__)) const override \
     { return static_cast<const Derived*>(this)->Name##Concrete(FOR_EACH_COMMA(_ARGNAME, __VA_ARGS__)); }
 // --- Public entry points: arity is inferred, const-ness is not (it's a
 // genuine semantic choice, not derivable from the argument list) ---
@@ -796,6 +799,7 @@ public: \
                      "data=" << data.buf); \
             return; \
         } \
+        ETCS_ACTION_SCOPE(handler, Name, data, ctx); \
         ETCS_CAUSAL_SCOPE(Type, Name); \
         _implWork_##Type##_##Name(*static_cast<Type*>(handler->getTrueType()), ctx, \
                                     FOR_EACH_COMMA(_ARGNAME, __VA_ARGS__)); \
@@ -866,7 +870,62 @@ public: \
 // CONSUME gets no such guard: the consumer is the READ side. On Pipe it
 // does hold a write_fd_ (the ack channel, see makePair), and closing that
 // would be wrong.
-#define DEFINE_STREAM_FUNC_PRODUCE(Type, Name) \
+/*
+ * WHERE A PRODUCE BODY RUNS. On the module's pool, ordinarily: a body that
+ * answers and returns is a task. But a body that STANDS -- follows a record,
+ * watches a listing, emits a page's changes for as long as the session
+ * lasts -- would hold a pool worker for the life of its edge, and on a web
+ * build a module's pool is two workers (DEFAULT_THREAD_POOL_THREADS): two
+ * standing bodies were the pool, and every produce enqueued after them
+ * never ran, silently. So:
+ *
+ *   DEFINE_STREAM_FUNC_PRODUCE_STANDING  the body gets a thread of its own
+ *                                        (etcs_standing_start), never a worker
+ *   MirrorBuffer::produceHere            a caller that already holds a thread
+ *                                        for this body -- a link's edge running
+ *                                        a far pair's half (Entity::produceOnto)
+ *                                        -- has it run there, whichever kind
+ */
+namespace ETCS
+{
+// This image's standing bodies: started on their own threads, finished ones
+// joined as new ones start, the rest at exit -- so none outlives the module.
+class StandingThreads
+{
+public:
+    static StandingThreads& get() { static StandingThreads s; return s; }
+    template<class F>
+    void start(F&& body)
+    {
+        ::std::lock_guard<::std::mutex> lock(mu_);
+        reapLocked();
+        auto done = ::std::make_shared<::std::atomic<bool>>(false);
+        threads_.push_back({ ::std::thread([body = ::std::forward<F>(body), done]() mutable { body(); done->store(true); }), done });
+    }
+    ~StandingThreads()
+    {
+        ::std::lock_guard<::std::mutex> lock(mu_);
+        for (auto& t : threads_) if (t.th.joinable()) t.th.join();
+    }
+private:
+    struct Entry { ::std::thread th; ::std::shared_ptr<::std::atomic<bool>> done; };
+    void reapLocked()
+    {
+        for (auto it = threads_.begin(); it != threads_.end(); )
+        {
+            if (it->done->load()) { it->th.join(); it = threads_.erase(it); }
+            else ++it;
+        }
+    }
+    ::std::mutex       mu_;
+    ::std::vector<Entry> threads_;
+};
+} // namespace ETCS
+
+#define DEFINE_STREAM_FUNC_PRODUCE(Type, Name)          ETCS_DEFINE_STREAM_FUNC_PRODUCE_(Type, Name, false)
+#define DEFINE_STREAM_FUNC_PRODUCE_STANDING(Type, Name) ETCS_DEFINE_STREAM_FUNC_PRODUCE_(Type, Name, true)
+
+#define ETCS_DEFINE_STREAM_FUNC_PRODUCE_(Type, Name, Standing) \
     void _implProduce_##Type##_##Name(Type& self, ETCS::MirrorBuffer& stream, ETCS::Buffer data, ETCS::SignalContext ctx); \
     ETCS_CAUSAL_EDGE_STORE(Type, Name) \
     \
@@ -883,6 +942,7 @@ public: \
             return; \
         } \
         ETCS::Buffer config = stream.getConfig(); \
+        ETCS_ACTION_SCOPE(handler, Name, config, ctx); \
         \
         /* Both masks come off the stream, where unpack() just put them. The \
          * TAG one goes to the ScopeTag, whose TagModifyEvent stays in this \
@@ -900,14 +960,28 @@ public: \
          * ProducerLiveGuard around the body, so an exception leaving counts \
          * as leaving. */ \
         ETCS::SharedPage* _live_token = stream.producerEnter(); \
-        try { \
-        self->getThreadPool().enqueue(ETCS::Priority::Medium, ctx, [self, stream = ::std::move(stream), config, _pair_mod, _live_token, _auto_scope = ::std::move(_auto_scope)]() mutable { \
+        const bool _here = stream.produceHere(); \
+        /* The action this pair runs inside goes with the body to its thread, \
+         * by value -- the frame above ends with this trampoline -- so what \
+         * the body changes is credited to the line that started it \
+         * (core/Provenance.h). */ \
+        if (ETCS::current_action_frame()) ETCS::current_action_frame()->settle(); \
+        ETCS::ActionFrame _action_frame = ETCS::current_action_frame() \
+            ? *ETCS::current_action_frame() : ETCS::ActionFrame{}; \
+        auto _body = [self, stream = ::std::move(stream), config, _pair_mod, _live_token, _action_frame, _auto_scope = ::std::move(_auto_scope)]() mutable { \
             ETCS::ProducerLiveGuard _auto_live(_live_token); \
+            ETCS::ActionFrame* const _action_saved = ETCS::current_action_frame(); \
+            if (_action_frame.id) ETCS::current_action_frame() = &_action_frame; \
+            struct _ActionRestore { ETCS::ActionFrame* s; ~_ActionRestore() { ETCS::current_action_frame() = s; } } _action_restore{ _action_saved }; \
             ETCS::PairScope _pair_scope(_pair_mod); \
             ETCS_CAUSAL_SCOPE(Type, Name); \
             ETCS::StreamWriteGuard _auto_close(stream); \
             _implProduce_##Type##_##Name(*self, stream, config, _auto_scope.ctx()); \
-        }); \
+        }; \
+        if (_here) { _body(); return; } \
+        try { \
+        if (Standing) ETCS::StandingThreads::get().start(::std::move(_body)); \
+        else self->getThreadPool().enqueue(ETCS::Priority::Medium, ctx, ::std::move(_body)); \
         } catch (...) { \
             /* enqueue throws once the pool is stopping. The body will never \
              * run, so release the raise here rather than leaving the pair's \
@@ -940,6 +1014,7 @@ public: \
             return; \
         } \
         ETCS::Buffer config = stream.getConfig(); \
+        ETCS_ACTION_SCOPE(handler, Name, config, ctx); \
         Type* self = static_cast<Type*>(handler->getTrueType()); \
         ETCS::ScopeTag _auto_scope(self, #Name, ctx, stream.pairTagMask()); \
         stream.bindContext(_auto_scope.ctx()); \
@@ -978,6 +1053,11 @@ public: \
     ETCS::CausalScope _causal_edge_scope( \
         _edge_w_##Type##_##Name, &_edge_set_##Type##_##Name)
 
+// The action the body runs inside (core/Provenance.h): the one the caller
+// carried in on ctx, or -- reached from outside any -- this call itself.
+#define ETCS_ACTION_SCOPE(handler, Name, payload, ctx) \
+    ETCS::ActionScope _action_scope((ctx).frame, (handler)->getRID(), ETCS::Buffer(#Name), (payload))
+
 #define DEFINE_WORK_FUNC(Type, Name) \
     void _implWork_##Type##_##Name(Type& self, ETCS::Buffer& data, ETCS::SignalContext ctx); \
     ETCS_CAUSAL_EDGE_STORE(Type, Name) \
@@ -989,6 +1069,7 @@ public: \
                      "to dispatch."); \
             return; \
         } \
+        ETCS_ACTION_SCOPE(handler, Name, data, ctx); \
         ETCS_CAUSAL_SCOPE(Type, Name); \
         _implWork_##Type##_##Name(*static_cast<Type*>(handler->getTrueType()), data, ctx); \
     } \

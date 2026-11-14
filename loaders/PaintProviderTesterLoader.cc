@@ -329,12 +329,12 @@ int main()
     // funnel. A divergence here is a hole in a provider, not in the hash.
     std::cout << "\n== 5b. the runtime hash audits clean over the document ==\n";
     {
-        (void)doc->getHash();
+        (void)doc->identityHash();
         ETCS::Entity::HashAudit a = etcs_root_hash(doc);
         std::printf("        (nodes %zu, diverged %zu, skipped %zu)\n", a.nodes, a.diverged, a.skipped);
         check(a.nodes >= 1, "the audit walked the document");
         check(a.diverged == 0, "no cache under the document disagrees with its state");
-        check(doc->getHash() == a.top_hash, "the lazy pull agrees with the audit");
+        check(doc->identityHash() == a.top_hash, "the lazy pull agrees with the audit");
     }
 
     // ── 6 ────────────────────────────────────────────────────────────────

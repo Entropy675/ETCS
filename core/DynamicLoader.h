@@ -748,6 +748,7 @@ void ETCS::MirrorBuffer::buildWrapManifest(ETCS::Entity* owner)
         wrap_manifest_[wrap_manifest_len_].tag    = child->getSourceTag();
         ++wrap_manifest_len_;
     }
+    wrap_owner_rid_ = owner->getRID();
     /*
  * LMAX-strategy responsibility, additionally: allocate the scratch
  * pool exactly once here, alongside the manifest walk that just
@@ -768,6 +769,47 @@ void ETCS::MirrorBuffer::buildWrapManifest(ETCS::Entity* owner)
         for (long long i = 0; i < count; ++i)
             new (&wrap_scratch_pool_[i]) MBuffer();
     }
+}
+size_t ETCS::MirrorBuffer::chainOf(ETCS::Entity* owner, WireScope scope, IWireWrapper** out, size_t max)
+{
+    size_t n = 0;
+    if (!owner) return 0;
+    ::std::vector<::std::pair<ETCS::Buffer, RID>> children;
+    owner->getTypedChildren(children);
+    for (auto& [tag, rid] : children)
+    {
+        if (n >= max) break;
+        Entity* child = owner->getTypedChild(tag, rid);
+        if (!child || !child->hasTag(ETCS::Buffer("Wrapper"))) continue;
+        void* raw = child->getInterfacePointer(ETCS::Buffer("Wrapper"));
+        if (!raw) continue;
+        IWireWrapper* w = static_cast<IWireWrapper*>(raw);
+        if (!scopeApplies(w->Scope(), scope)) continue;
+        out[n++] = w;
+    }
+    return n;
+}
+inline bool ETCS::MirrorBuffer::localFrame(ETCS::Entity* e)
+{
+    return e && (e->hasTag(ETCS::Buffer("Database")) || e->hasTag(ETCS::Buffer("Local")));
+}
+::std::string ETCS::MirrorBuffer::manifestOf(ETCS::Entity* owner, WireScope scope)
+{
+    ::std::string out;
+    if (!owner) return out;
+    ::std::vector<::std::pair<ETCS::Buffer, RID>> children;
+    owner->getTypedChildren(children);
+    for (auto& [tag, rid] : children)
+    {
+        Entity* child = owner->getTypedChild(tag, rid);
+        if (!child || !child->hasTag(ETCS::Buffer("Wrapper"))) continue;
+        void* raw = child->getInterfacePointer(ETCS::Buffer("Wrapper"));
+        if (!raw || !scopeApplies(static_cast<IWireWrapper*>(raw)->Scope(), scope)) continue;
+        const ETCS::Buffer t = child->getSourceTag();
+        out += child->getSourceModule().toString() + ":" + t.toString() + "#"
+             + ::std::to_string(child->tagHash(t)) + ";";
+    }
+    return out;
 }
 /*
  * resolveWrapChain - populates wrap_chain_ (the LIVE, resolved
@@ -795,13 +837,19 @@ void ETCS::MirrorBuffer::resolveWrapChain(ETCS::Entity* handler)
  * uniformity (both sides always carry it), not actually
  * consulted for resolution on this side.
  */
-        if (!handler) return;
+        // The chain's owner, when makePair named one other than the handler
+        // (wrap_owner_rid_'s comment): a remote pair's authority layer.
+        Entity* owner = handler;
+        if (wrap_owner_rid_ && (!handler || handler->getRID() != wrap_owner_rid_))
+            if (Entity* o = ETCS::etcs_resolve_rid_anywhere(&ETCS::getLoader(), wrap_owner_rid_))
+                owner = o;
+        if (!owner) return;
         ::std::vector<::std::pair<ETCS::Buffer, RID>> children;
-        handler->getTypedChildren(children);
+        owner->getTypedChildren(children);
         for (auto& [tag, rid] : children)
         {
             if (wrap_chain_len_ >= MAX_WRAP_STAGES) break;
-            Entity* child = handler->getTypedChild(tag, rid);
+            Entity* child = owner->getTypedChild(tag, rid);
             if (!child || !child->hasTag(ETCS::Buffer("Wrapper"))) continue;
             void* raw = child->getInterfacePointer(ETCS::Buffer("Wrapper"));
             if (!raw) continue;
@@ -835,6 +883,51 @@ void ETCS::MirrorBuffer::resolveWrapChain(ETCS::Entity* handler)
  * so a partial chain from a failed negotiation is still cleaned up
  * correctly with no special-casing needed here.
  */
+    /*
+ * A SOCKET PAIR UNWRAPS WITH ITS OWNER'S OWN STAGES. Such a pair is one half
+ * of a stream whose other half is in another runtime (Entity::produceOnto /
+ * consumeFrom), and its owner is the entity whose authority layer the frames
+ * must pass here -- the far node's own, or the surface that mirrors it. A
+ * stage there may hold what a fresh one cannot (a key, NetworkProvider's
+ * Seal), and it is THAT stage the far side's frames must satisfy. Nothing
+ * else on this side shares the instances: the local pair's producer object
+ * is never used. The owner must still carry exactly the manifest's stages,
+ * or the pair is refused like any unfulfilled one.
+ */
+    if (active_ == ActiveStrategy::Socket && wrap_owner_rid_)
+    {
+        Entity* owner = ETCS::etcs_resolve_rid_anywhere(&ETCS::getLoader(), wrap_owner_rid_);
+        IWireWrapper* live[MAX_WRAP_STAGES] = {};
+        const size_t n = owner ? chainOf(owner, WireScope::Socket, live, MAX_WRAP_STAGES) : 0;
+        bool same = owner && n == wrap_manifest_len_;
+        if (same)
+        {
+            ::std::vector<::std::pair<ETCS::Buffer, RID>> children;
+            owner->getTypedChildren(children);
+            size_t k = 0;
+            for (auto& [tag, rid] : children)
+            {
+                Entity* child = owner->getTypedChild(tag, rid);
+                if (!child || !child->hasTag(ETCS::Buffer("Wrapper"))) continue;
+                void* raw = child->getInterfacePointer(ETCS::Buffer("Wrapper"));
+                if (!raw || !scopeApplies(static_cast<IWireWrapper*>(raw)->Scope(), WireScope::Socket)) continue;
+                if (k >= wrap_manifest_len_
+                    || child->getSourceModule().toString() != wrap_manifest_[k].module.toString()
+                    || child->getSourceTag().toString()    != wrap_manifest_[k].tag.toString())
+                { same = false; break; }
+                ++k;
+            }
+        }
+        if (!same)
+        {
+            ETCS_LOG("MirrorBuffer", "resolveWrapChain: this side's authority layer does not carry "
+                     "the pair's wrappers -- refusing to unwrap.");
+            unwrap_failed_ = true;
+            return;
+        }
+        for (size_t i = 0; i < n; ++i) wrap_chain_[wrap_chain_len_++] = live[i];
+        return;
+    }
     ETCS::Root boot_root(bound_ctx_);
     for (size_t i = 0; i < wrap_manifest_len_; ++i)
     {
@@ -1002,6 +1095,8 @@ bool ETCS::WorkBundle::operator()(ETCS_RID_SIZE rid, const ETCS::Buffer& conjuga
         << " takes action " << this->work_tag << " with data: " << tagbuff.toString());
     ETCS_LOG("WorkBundle::operator()", "about to invoke raw workFunc pointer " << (void*)workFunc << "...");
 #endif
+    // The action this call is part of goes with it (SignalContext::frame).
+    ctx.frame = ETCS::current_action_frame();
     reinterpret_cast<ETCS::WorkFunc>(const_cast<void*>(workFunc))(child, tagbuff, ctx);
 #ifdef ETCS_LOG_FUNCTION_EVOCATION_PATH
     ETCS_LOG("WorkBundle::operator()", "EXIT -- workFunc(...) returned normally for "
@@ -1055,6 +1150,7 @@ bool ETCS::WorkBundle::operator()(ETCS_RID_SIZE rid, const ETCS::Buffer& conjuga
             << "." << work_tag << " -- would have crashed on the call below.");
         return false;
     }
+    ctx.frame = ETCS::current_action_frame();   // as above
     reinterpret_cast<ETCS::StreamFunc>(const_cast<void*>(workFunc))(child, tagbuff, ctx);
 #ifdef ETCS_LOG_FUNCTION_EVOCATION_PATH
     ETCS_LOG("WorkBundle::operator()", "EXIT -- streamFunc(...) returned normally for "
@@ -1150,6 +1246,72 @@ bool ETCS::ModuleBundle::operator()(ETCS_RID_SIZE rid, const ETCS::Buffer& conju
     if (it != actions.end()) pass = it->second(rid, conjugate_key, data, ctx);
     else etcs_report_unreached_action(this->tag, work, actions, rid, true);
     return pass;
+}
+/*
+ * THE TARGET OF A FLAG CHANGE, FOUND AGAIN WHERE THE CHANGE IS APPLIED.
+ *
+ * The emitter names the entity -- its RID and the key its type's list is
+ * published under -- and the ordering thread resolves that name here, at the
+ * moment the change lands. The resolution IS the liveness check, as it is for a
+ * work function (WorkBundle::operator()): an entity retired while the event sat
+ * in the ring is simply not found, and the change is refused rather than written
+ * into memory the arena may already have handed to somebody else.
+ *
+ * Keyed on TYPE, as every ordinary RID lookup is -- per-provider-type is the
+ * uniqueness the generator guarantees (Entity.h, resolve_in_family).
+ *
+ * Both handlers call this -- the loader's and a module's -- so there is one
+ * place that decides what "still there" means for a flag.
+ */
+/*
+ * WHETHER A TYPE CAN BE ASKED ABOUT AT ALL: some list, in the loader's own map
+ * or mirrored from a module, published under this key. A type with none -- a
+ * test's local leaf, an internal type added without a tag block -- is outside
+ * the registry, and "not found" would say nothing about whether it is alive.
+ */
+inline bool etcs_type_published(const ETCS::Buffer& key)
+{
+    if (key.written == 0) return false;
+    ETCS::EventNode* owner = ETCS::etcs_loader_event_node();
+    if (!owner) return false;
+    const ETCS::Buffer bare = ETCS::etcs_bare_family_key(key);
+    if (owner->ridMap.find(bare) != owner->ridMap.end()) return true;
+    auto m = owner->ridMirror.find(bare);
+    return m != owner->ridMirror.end() && !m->second.empty();
+}
+
+inline ETCS::Entity* etcs_tagmodify_resolve(const ETCS::DLInEvent& evt, const ETCS::Buffer& type,
+                                            ETCS::RID rid, ETCS::Entity* given)
+{
+    // Unlisted: nothing to check against, so the emitter's word stands.
+    if (!etcs_type_published(type)) return given;
+
+    ETCS::Entity* live = ETCS::etcs_resolve_by_key(type, rid);
+    if (!live)
+        ETCS_LOG("TagModify", "'" << evt.conjugate_key << "' "
+                 << (evt.tagmodify_is_remove ? "off" : "on") << " " << type
+                 << " RID:" << rid << " -- refused: its type's list no longer "
+                    "holds it, so it was retired while the change was queued.");
+    return live;
+}
+inline ETCS::Entity* etcs_tagmodify_target(const ETCS::DLInEvent& evt)
+{
+    return etcs_tagmodify_resolve(evt, evt.tagmodify_type, evt.tagmodify_rid, evt.tagmodify_target);
+}
+// What a TagModify does, on either stream: the flag, or a move. A move's new
+// parent is resolved the way its target is -- a RID resolution is the
+// liveness check for both.
+inline bool etcs_tagmodify_apply(const ETCS::DLInEvent& evt)
+{
+    ETCS::Entity* live = etcs_tagmodify_target(evt);
+    if (!live) return false;
+    if (evt.tagmodify_move_impl)
+    {
+        ETCS::Entity* to = etcs_tagmodify_resolve(evt, evt.tagmodify_move_to_type,
+                                                  evt.tagmodify_move_to_rid, evt.tagmodify_move_to);
+        return to && evt.tagmodify_move_impl(live, to);
+    }
+    return evt.tagmodify_impl(live, evt.conjugate_key, evt.tagmodify_is_remove, evt.tagmodify_value);
 }
 /*
  * -- LoaderStream method bodies ------------------------------------------------
@@ -1370,8 +1532,7 @@ ETCS::DispatchResult ETCS::EventNode::LoaderStream::on_event(
  * for the very reason the discipline existed -- a caller cannot pop
  * its frame while spinning on a flag nobody has set.
  */
-            evt.release_value = evt.tagmodify_impl(evt.tagmodify_target, evt.conjugate_key,
-                                                  evt.tagmodify_is_remove) ? 1 : 0;
+            evt.release_value = etcs_tagmodify_apply(evt) ? 1 : 0;
             return {ETCS::DispatchKind::Inline, &evt};
         }
         case DLInEvent::Kind::PairMask:
@@ -1563,6 +1724,74 @@ void ETCS::EventNode::LoaderStream::registerTypeOwnership(
         type_owner_index[tag_str] = module_name;
     }
 }
+/*
+ * claimLifetime - the election, for any module root attaching to a loaded
+ * module: a global-scope entity or Root (attachModule), or a child made
+ * under another module's entity (addTagImpl) -- which is a root of its own
+ * module's arena and so holds its module exactly as a global one would.
+ */
+void ETCS::EventNode::LoaderStream::claimLifetime(ETCS::Module* global_mod, ETCS::LifetimeOwner entity)
+{
+    /*
+ * Claim the lifetime-owner slot iff it's currently vacant -- either
+ * this is the very first entity/Root ever to touch this module
+ * (right after its bootstrap), or the previous owner's own
+ * ~Module() already vacated it (a RequestUnloadEvent either already
+ * fired or about to be) and this attach is what saves it from
+ * actually unloading: RequestUnloadEvent's own delayed recheck will
+ * see lifetime_owner non-vacant again and do nothing.
+ */
+    if (!global_mod->lifetime_owner)
+    {
+        entity.module().is_lifetime_owner = true;
+        global_mod->lifetime_owner        = entity;
+        ETCS_LOG("DynamicLoader", "Module '" << global_mod->name
+                 << "' lifetime_owner claimed by entity RID:" << entity.getRID());
+    }
+    else if (global_mod->lifetime_owner.kind == LifetimeOwner::Kind::Root
+             && entity.kind == LifetimeOwner::Kind::Entity)
+    {
+        /*
+ * Explicit hand-off, not a search result: the current owner
+ * being Root-kind means it was never spawned through the
+ * ontology dispatch system at all -- i.e. it's a bootstrap
+ * entity, not a real, dispatchable type. This is the direct,
+ * structural version of a check that used to be inferred from a
+ * side-channel string field (whether the current owner's own
+ * source tag was empty) -- now that Root and Entity are
+ * genuinely distinct types rather than one polymorphically
+ * masquerading as the other, "is the current owner a bootstrap
+ * Root" is something LifetimeOwner::kind can just say directly,
+ * with no heuristic involved.
+ *
+ * Root always lives either on the stack or wherever its own
+ * caller constructed it (never in any module's own arena), while
+ * every real entity spawned from this module lives in the
+ * MODULE's own arena -- two entirely disjoint homes. That means
+ * a bootstrap Root owner can NEVER be discovered as a sibling by
+ * the arena-level search in MemoryArena's own run_entity_delete
+ * callback, and, symmetrically, nothing in the module's own
+ * arena could ever be found from root_registry's side either.
+ * Leaving the token with the Root until its own destruction
+ * would mean promoteOrVacate has nothing to search and no
+ * sibling to find, vacating the module while THIS entity (which
+ * genuinely was spawned/dispatched) is still alive and depending
+ * on it. So the transfer happens here instead, unconditionally,
+ * the moment any real, dispatched entity ever attaches while a
+ * Root still holds the token -- this only ever fires once,
+ * since after the first real entity takes over, lifetime_owner's
+ * own kind is no longer Root and this branch can never match
+ * again.
+ */
+        global_mod->lifetime_owner.module().is_lifetime_owner = false;
+        entity.module().is_lifetime_owner = true;
+        global_mod->lifetime_owner        = entity;
+        ETCS_LOG("DynamicLoader", "Module '" << global_mod->name
+                 << "' lifetime_owner handed off from bootstrap Root to entity RID:"
+                 << entity.getRID());
+    }
+}
+
 /*
  * attachModule - THE single entry point for giving any entity or Root a
  * Module reference for module_name. Current design:
@@ -1811,65 +2040,8 @@ bool ETCS::EventNode::LoaderStream::attachModule(
     if (entity.kind == LifetimeOwner::Kind::Root)
         registerRoot(module_name, &entity.asRoot());
  
-    /*
- * Claim the lifetime-owner slot iff it's currently vacant -- either
- * this is the very first entity/Root ever to touch this module
- * (right after the bootstrap above), or the previous owner's own
- * ~Module() already vacated it (a RequestUnloadEvent either already
- * fired or about to be) and this attach is what saves it from
- * actually unloading: RequestUnloadEvent's own delayed recheck will
- * see lifetime_owner non-vacant again and do nothing.
- */
-    if (!global_mod->lifetime_owner)
-    {
-        entity.module().is_lifetime_owner = true;
-        global_mod->lifetime_owner        = entity;
-        ETCS_LOG("DynamicLoader", "Module '" << module_name
-                 << "' lifetime_owner claimed by entity RID:" << entity.getRID());
-    }
-    else if (global_mod->lifetime_owner.kind == LifetimeOwner::Kind::Root
-             && entity.kind == LifetimeOwner::Kind::Entity)
-    {
-        /*
- * Explicit hand-off, not a search result: the current owner
- * being Root-kind means it was never spawned through the
- * ontology dispatch system at all -- i.e. it's a bootstrap
- * entity, not a real, dispatchable type. This is the direct,
- * structural version of a check that used to be inferred from a
- * side-channel string field (whether the current owner's own
- * source tag was empty) -- now that Root and Entity are
- * genuinely distinct types rather than one polymorphically
- * masquerading as the other, "is the current owner a bootstrap
- * Root" is something LifetimeOwner::kind can just say directly,
- * with no heuristic involved.
- *
- * Root always lives either on the stack or wherever its own
- * caller constructed it (never in any module's own arena), while
- * every real entity spawned from this module lives in the
- * MODULE's own arena -- two entirely disjoint homes. That means
- * a bootstrap Root owner can NEVER be discovered as a sibling by
- * the arena-level search in MemoryArena's own run_entity_delete
- * callback, and, symmetrically, nothing in the module's own
- * arena could ever be found from root_registry's side either.
- * Leaving the token with the Root until its own destruction
- * would mean promoteOrVacate has nothing to search and no
- * sibling to find, vacating the module while THIS entity (which
- * genuinely was spawned/dispatched) is still alive and depending
- * on it. So the transfer happens here instead, unconditionally,
- * the moment any real, dispatched entity ever attaches while a
- * Root still holds the token -- this only ever fires once,
- * since after the first real entity takes over, lifetime_owner's
- * own kind is no longer Root and this branch can never match
- * again.
- */
-        global_mod->lifetime_owner.module().is_lifetime_owner = false;
-        entity.module().is_lifetime_owner = true;
-        global_mod->lifetime_owner        = entity;
-        ETCS_LOG("DynamicLoader", "Module '" << module_name
-                 << "' lifetime_owner handed off from bootstrap Root to entity RID:"
-                 << entity.getRID());
-    }
- 
+    claimLifetime(global_mod, entity);
+
     if (!spawn_tag.empty())
     {
         /*
@@ -2004,9 +2176,7 @@ void ETCS::EventNode::LoaderStream::changeModuleImpl(
  * now (via its own run_entity_delete callback -- see registerDtor<T>'s
  * own comment, MemoryArena.h). No root-vs-child branching needed here
  * anymore: deleteEntity's own callback handles both cases internally
- * (global-scope election-and-evoke, or non-global reparent-and-evoke),
- * keyed off target->getParent() itself, which is exactly what determines
- * which arena is "correct" here too. Always a genuine Entity* -- Root
+ * (module-root election-and-evoke, or child reparent-and-evoke). Always a genuine Entity* -- Root
  * never reaches this at all (see EntityUnloadEvent's own comment,
  * EventNode.h).
  *
@@ -2019,10 +2189,9 @@ void ETCS::EventNode::LoaderStream::changeModuleImpl(
  *   actually lives in -- the same cross-DSO hazard this session traced
  *   and fixed elsewhere for event routing.
  *
- *   CHILD (parent_ != nullptr): target's own parent arena is simply
- *   target->getParent()->getArena() -- no module involvement needed at
- *   all, since only root-level entities are ever module-lifetime-
- *   relevant.
+ *   CHILD (parent_ != nullptr): the arena its record is in -- its
+ *   parent's, or for a module root (a child made under another module's
+ *   entity) its own module's root arena. getOwningArena() is both.
  */
 void ETCS::EventNode::LoaderStream::entityUnloadImpl(ETCS::Entity* target, bool delete_children)
 {
@@ -2430,19 +2599,14 @@ ETCS::RID ETCS::EventNode::LoaderStream::addTagImpl(
         if (mod == nullptr)
         {
             /*
- * Vacant: bootstrap the module against parent's own ultimate
- * ancestor first (spawn_tag "" skips dispatch wiring - that
- * ancestor isn't of this type). No separate "root" concept
- * needed: whatever getRootAncestor() reaches becomes the
- * global instance's first lifetime_owner claimant, exactly
- * like any other first attach. child itself then gets its
- * own module_ populated as an ordinary proxy via the second
- * attachModule call below - a typed child is never itself
- * eligible to claim lifetime_owner (see attachModule's own
- * comment on why only root-level entities are election-
- * visible at all).
+ * Vacant: bootstrap the module. A module root (a child made under another
+ * module's entity -- Entity::crossesModule) bootstraps it itself and claims
+ * the token, as any first attach does. A same-module child's module is its
+ * parent's and already loaded, so reaching here without one means the
+ * parent chain was never attached: bootstrap against its ultimate ancestor
+ * first, which then holds the token.
  */
-            attachModule(mod_name, parent->getRootAncestor(), "");
+            if (!child->isModuleRoot()) attachModule(mod_name, parent->getRootAncestor(), "");
             attachModule(mod_name, child, child_type_tag);
         }
         else
@@ -2454,20 +2618,18 @@ ETCS::RID ETCS::EventNode::LoaderStream::addTagImpl(
                 child->setModuleSource(ETCS::Buffer(child_type_tag.c_str()), ETCS::Buffer(mod_name.c_str()));
                 child->addTag(cat_it->second);
                 /*
- * Populate child's own module_ as an ordinary proxy onto
- * the already-loaded global instance -- a plain pointer
- * assignment, deliberately NOT the full attachModule()
- * (which also runs lifetime_owner claim logic with no
- * way to suppress it for a typed child specifically). A
- * typed/addTag<T> child must never become lifetime_owner:
- * registerDtor<T>'s own non-global branch (MemoryArena.h)
- * reparents-or-cascades a child on destruction and NEVER
- * calls promoteOrVacate -- if a child ever held
- * lifetime_owner, destroying it would leave
- * global_mod->lifetime_owner permanently dangling, with
- * nothing left to ever clear it.
+ * Populate child's own module_ as a proxy onto the already-loaded global
+ * instance -- a plain pointer assignment, not the full attachModule().
+ *
+ * A MODULE ROOT then stands for the token like any global-scope entity: it
+ * is a root of its own module's arena (Entity::module_root_), and dying it
+ * hands the token to a sibling there or gives it up (registerDtor<T>'s
+ * module-root branch, MemoryArena.h). An ordinary child never claims: its
+ * module is held by the root above it, and its own death reparents or
+ * cascades without an election.
  */
                 child->module_.parent = mod;
+                if (child->isModuleRoot()) claimLifetime(mod, child);
             }
             else
                 ETCS_LOG("DynamicLoader", "addTagImpl: '" << child_type_tag
@@ -2495,6 +2657,7 @@ ETCS::RID ETCS::EventNode::LoaderStream::addTagImpl(
  */
     const ETCS::RID rid = trampoline(parent, child, tag);
     ETCS::Entity::markStateChange(parent, rid);
+    ETCS::Entity::noteDepth(child);
     return rid;
 }
  
@@ -2552,8 +2715,7 @@ ETCS::DispatchResult ETCS::EventNode::ModuleProxy::on_event(
  * EventNode::getInstance() resolves to THIS ModuleProxy -- which is
  * what lets a stream pair's tag mask reach a buffer that can read it.
  */
-        evt.release_value = evt.tagmodify_impl(evt.tagmodify_target, evt.conjugate_key,
-                                              evt.tagmodify_is_remove) ? 1 : 0;
+        evt.release_value = etcs_tagmodify_apply(evt) ? 1 : 0;
         return {ETCS::DispatchKind::Inline, &evt};
     }
  
@@ -2771,6 +2933,10 @@ extern "C" ETCS_API ETCS::EventNode* RegisterDynamicLoader(void* ptr)
  */
         ETCS::MemoryArena::getInstance(); // this may actaully be the real cleanup order
         ETCS_LOG("DynamicLoader", "Passed MemoryArena! ");
+        // The loader's Reclaimer, before this image reads any view: one set of
+        // reader slots for the runtime (core/Reclaim.h).
+        if (dynamicLoader.node && dynamicLoader.node->get_reclaimer)
+            ETCS::Reclaimer::adopt_shared(dynamicLoader.node->get_reclaimer());
 #if ETCS_SHARED_THREAD_POOL
         /*
  * ADOPT THE LOADER'S POOL, before this image's own getInstance() is asked for
@@ -2992,6 +3158,9 @@ inline bool ETCS::DestroyEvent::operator()()
  * to remember to signal-and-wait by hand, which is the whole point.
  */
     if (!ETCS::drainEntityScopes(target, "DestroyEvent")) return false;
+    // Read while the target is whole: a child leaving is its parent's change.
+    ETCS::Entity* const leaving_from = target ? target->getParent() : nullptr;
+    const ETCS::RID     leaving      = target ? target->getRID() : rid;
     DLInEvent evt{};
     evt.kind = DLInEvent::Kind::Destroy;
     evt.conjugate_key = conjugate_key;
@@ -3013,6 +3182,7 @@ inline bool ETCS::DestroyEvent::operator()()
 #else
     while ((r = result.load(::std::memory_order_acquire)) < 0);
 #endif
+    if (r != 0 && leaving_from) ETCS::Entity::recordEffect(leaving_from, ETCS::Entity::childKey(leaving), false, true);
     return r != 0;
 }
  
@@ -3048,7 +3218,11 @@ inline ETCS::RID ETCS::AddTagEvent::operator()()
 #else
     while (!ready.load(::std::memory_order_acquire));
 #endif
-    return result.load(::std::memory_order_relaxed);
+    // A child made inside an action is part of that action's effect on its
+    // parent (Entity::recordEffect, core/Provenance.h).
+    const ETCS::RID made = result.load(::std::memory_order_relaxed);
+    if (made && parent) ETCS::Entity::recordEffect(parent, ETCS::Entity::childKey(made), true, true);
+    return made;
 }
  
 /*
@@ -3058,7 +3232,7 @@ inline ETCS::RID ETCS::AddTagEvent::operator()()
  * ~Entity() no longer triggers anything itself (see entityUnloadImpl's
  * own comment for why). By the time this returns, entityUnloadImpl has
  * determined target's correct parent arena and MemoryArena::deleteEntity
- * has fully run: election-and-evoke (global scope) or reparent-and-evoke
+ * has fully run: election-and-evoke (module root) or reparent-and-evoke
  * (child), all decided synchronously, before target's own destructor
  * even starts, on the loader's own ordering thread.
  *
@@ -3175,9 +3349,19 @@ inline bool ETCS::TagModifyEvent::operator()()
     DLInEvent evt{};
     evt.kind                = DLInEvent::Kind::TagModify;
     evt.conjugate_key       = conjugate_key;
+    evt.tagmodify_rid       = target->getRID();
+    evt.tagmodify_type      = target->myConjugateKey();
     evt.tagmodify_target    = target;
     evt.tagmodify_is_remove = is_remove;
     evt.tagmodify_impl      = impl;
+    evt.tagmodify_value     = value;
+    if (move_impl && move_to)
+    {
+        evt.tagmodify_move_impl    = move_impl;
+        evt.tagmodify_move_to      = move_to;
+        evt.tagmodify_move_to_rid  = move_to->getRID();
+        evt.tagmodify_move_to_type = move_to->myConjugateKey();
+    }
     evt.tagmodify_done      = &done;
     evt.tagmodify_changed   = &changed;
     /*

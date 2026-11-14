@@ -123,20 +123,39 @@ public:
  */
     void collectDrawableChildren(::std::vector<Drawable_*>& out)
     {
-        ::std::vector<::std::pair<ETCS::Buffer, ETCS::RID>> kids;
-        getOrderedTypedChildren(kids);
+        ::std::vector<ETCS::Entity::ChildRef> kids;
+        getOrderedTypedChildRefs(kids);
         out.reserve(kids.size());
-        for (const auto& entry : kids)
+        for (const auto& [tag, rid] : kids)
         {
-            ETCS::Entity* child = getTypedChild(entry.first, entry.second);
+            ETCS::Entity* child = getTypedChild(*tag, rid);
             if (!child) continue;
-            void* iface = child->getInterfacePointer(ETCS::Buffer("Drawable"));
+            void* iface = child->getInterfacePointer(DrawableKey());
             if (!iface) continue;
             out.push_back(static_cast<Drawable_*>(iface));
         }
-        ::std::stable_sort(out.begin(), out.end(),
-                         [](Drawable_* a, Drawable_* b) { return a->Order() < b->Order(); });
+        // Usually already in order -- one tag, whose leaf order is this rank --
+        // and a pass that finds so is n comparisons instead of n log n.
+        if (!::std::is_sorted(out.begin(), out.end(), Below))
+            ::std::stable_sort(out.begin(), out.end(), Below);
     }
+    // The family key, made once: a Buffer per child per frame was most of
+    // what resolving a child cost.
+    static const ETCS::Buffer& DrawableKey() { static const ETCS::Buffer k("Drawable"); return k; }
+
+    /*
+ * THE CROSS-TYPE COMPARISON, stated once: hidden loses to anything shown, then
+ * Order(). The scalar every member can answer is Order(); whether it is shown
+ * is the one piece of tag state that outranks it. Order() itself stays the
+ * stated number -- FocusWindow reads it back and restores it -- so the
+ * projection lives here, in the comparison, and every reader ranking a mixed
+ * set asks this rather than comparing Order() on its own.
+ */
+    static ::std::pair<bool, int32_t> Rank(Drawable_* d)
+    {
+        return { !d->Hidden(), d->Order() };
+    }
+    static bool Below(Drawable_* a, Drawable_* b) { return Rank(a) < Rank(b); }
 
     /*
  * Will this subtree need composing again even if nobody marks it?
@@ -177,8 +196,10 @@ public:
     }
 
     /*
-     * PRESENT BUT NOT DRAWN -- answered by DrawableBase, which owns the flag and
-     * says why it exists (ontology/DrawableBase.h).
+     * PRESENT BUT NOT DRAWN -- the `hidden` flag, which DrawableBase raises,
+     * caches and says why it exists (ontology/DrawableBase.h). Read straight
+     * from the store here, uncached, so a drawable that does not come through
+     * DrawableBase still answers the flag rather than a hard-coded no.
      *
      * Declared here, on the interface, because the two things that must honour it
      * are a container's DRAW and a container's PICK, and the pick walks children
@@ -186,7 +207,7 @@ public:
      * would be the worst of the three arrangements this replaced: invisible and
      * in the way. If you cannot see it, you cannot hit it.
      */
-    virtual bool Hidden() const { return false; }
+    virtual bool Hidden() const { return hasTag(ETCS::Buffer("hidden")); }
 
     /*
  * The recursion the comment above calls the point, written once.
@@ -212,10 +233,15 @@ public:
  */
     bool anyChildNeedsFrame()
     {
-        ::std::vector<Drawable_*> ordered;
-        collectDrawableChildren(ordered);
-        for (Drawable_* child : ordered)
-            if (child->NeedsFrame()) return true;
+        // An OR asks no order: the children as they are listed.
+        ::std::vector<ETCS::Entity::ChildRef> kids;
+        getTypedChildRefs(kids);
+        for (const auto& [tag, rid] : kids)
+        {
+            ETCS::Entity* child = getTypedChild(*tag, rid);
+            void* iface = child ? child->getInterfacePointer(DrawableKey()) : nullptr;
+            if (iface && static_cast<Drawable_*>(iface)->NeedsFrame()) return true;
+        }
         return false;
     }
 
@@ -253,25 +279,27 @@ protected:
  * waiting for the first script that removes a layer mid-run.
  */
     // A child named the way the blit source is: by RID, resolved at the point
-    // of use. Order is snapshotted because only the sort needs it.
-    struct ChildRef { ETCS::Buffer tag; ETCS::RID rid; int32_t order; };
+    // of use. The rank is snapshotted because only the sort needs it.
+    // `tag` is this entity's own key (getOrderedTypedChildRefs): it lives as
+    // long as this does, and the walk below is this entity's own.
+    struct ChildRef { const ETCS::Buffer* tag; ETCS::RID rid; ::std::pair<bool, int32_t> rank; };
 
     void collectDrawableChildRefs(::std::vector<ChildRef>& out)
     {
-        ::std::vector<::std::pair<ETCS::Buffer, ETCS::RID>> kids;
-        getOrderedTypedChildren(kids);
+        ::std::vector<ETCS::Entity::ChildRef> kids;
+        getOrderedTypedChildRefs(kids);
         out.reserve(kids.size());
-        for (const auto& entry : kids)
+        for (const auto& [tag, rid] : kids)
         {
-            ETCS::Entity* child = getTypedChild(entry.first, entry.second);
+            ETCS::Entity* child = getTypedChild(*tag, rid);
             if (!child) continue;
-            void* iface = child->getInterfacePointer(ETCS::Buffer("Drawable"));
+            void* iface = child->getInterfacePointer(DrawableKey());
             if (!iface) continue;
-            out.push_back(ChildRef{entry.first, entry.second,
-                                   static_cast<Drawable_*>(iface)->Order()});
+            out.push_back(ChildRef{tag, rid, Rank(static_cast<Drawable_*>(iface))});
         }
-        ::std::stable_sort(out.begin(), out.end(),
-                         [](const ChildRef& a, const ChildRef& b) { return a.order < b.order; });
+        auto byRank = [](const ChildRef& a, const ChildRef& b) { return a.rank < b.rank; };
+        if (!::std::is_sorted(out.begin(), out.end(), byRank))
+            ::std::stable_sort(out.begin(), out.end(), byRank);
     }
 
     /*
@@ -291,9 +319,9 @@ protected:
         collectDrawableChildRefs(ordered);
         for (const ChildRef& c : ordered)
         {
-            ETCS::Entity* child = getTypedChild(c.tag, c.rid);
+            ETCS::Entity* child = getTypedChild(*c.tag, c.rid);
             if (!child) continue;
-            void* iface = child->getInterfacePointer(ETCS::Buffer("Drawable"));
+            void* iface = child->getInterfacePointer(DrawableKey());
             if (!iface) continue;
             static_cast<Drawable_*>(iface)->DrawInto(dst);
         }

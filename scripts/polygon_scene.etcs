@@ -25,7 +25,7 @@ spawn WindowProvider::Window main
 main.Create(1024, 768, 'ETCS polygon scene')
 
 main.spawn(RenderProvider::Surface view)
-view.Create(@gpu, modules/RenderProvider/shaders/)
+view.Create(@gpu)
 
 # ── the scene ────────────────────────────────────────────────────────────
 #

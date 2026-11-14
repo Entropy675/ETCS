@@ -12,6 +12,7 @@
 #   pkgconfig:NAME   pkg-config --exists NAME
 #   binary:NAME      found on PATH
 #   header:PATH      found under a standard include dir
+#   python:MODULE    python3 -c "import MODULE"  (same interpreter as ace)
 #   none             no probe available; presence is assumed, never checked
 #
 # Probes answer "is it here", NOT "will this tree compile here" -- see
@@ -25,7 +26,7 @@ pkg-config        binary:pkg-config     # every probe below leans on this
 binutils-gold     binary:ld.gold        # loaders/Makefile passes -fuse-ld=gold
 cmake             binary:cmake          # widely used build system in modules
 python3           binary:python3        # same as above
-python3-jsonschema none                 # same as above
+python3-jsonschema python:jsonschema    # same as above
 
 # --- Runtime libraries -------------------------------------------------
 liburing-dev      pkgconfig:liburing    # ThreadPool.h
