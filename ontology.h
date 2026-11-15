@@ -127,6 +127,13 @@
 // already resolves and applies -- so a pipeline is built by attaching, not by
 // wiring. See ontology/Matrix.h.
 #include "ontology/MatrixBase.h"
+// Relational: a law that applies a transformation to something else, naming
+// the tag-set it lands on. Symmetric refines it with a proved exact inverse;
+// Foreign refines it as a relation to a stranger outside ETCS determinism,
+// landing on a local stand-in. The two are exclusive. See ontology/Relational.h.
+#include "ontology/RelationalBase.h"
+#include "ontology/SymmetricBase.h"
+#include "ontology/ForeignBase.h"
 #include "ontology/GateBase.h"
 // A node in another runtime, seen through the families both sides share. The
 // runtime calls it (IWireRemote), so it is here with the other wired families.
