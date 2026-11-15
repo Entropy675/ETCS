@@ -29,6 +29,7 @@
 #include <functional>
 #include <iostream>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 
 static int g_fail = 0;
@@ -174,6 +175,49 @@ int main(int, char**)
     // lands on both without anyone remembering the second one exists.
     check(has(streamed, "ETCS_TAG_BLOCK") && has(hollow, "ETCS_TAG_BLOCK"),
           "every path through the report says the same thing");
+
+    std::printf("\n-- calls that must be refused, not mangled ---------------------\n");
+
+    // -- 7. a plain action dispatched as a stream half -------------------------
+    //
+    // workFunc is type-erased; isStream is the only record of which signature
+    // it has. `a.Plain() -> b.Plain()` reaches the MBuffer overload with a
+    // WorkFunc behind it, and calling through a StreamFunc pointer hands it an
+    // MBuffer where it reads a Buffer. Layout's actions are all plain, and this
+    // goes through the real bundle -- a non-null workFunc that WOULD be called.
+    ETCS::ModuleBundle* lb = e->safeBundleFor(ETCS::Buffer("Layout"), "test");
+    check(lb != nullptr, "Layout's live bundle resolves");
+    if (lb)
+    {
+        ETCS::MBuffer as_stream;
+        bool shape_ret = true;
+        const std::string shape = captured([&] {
+            shape_ret = (*lb)(e->getRID(), e->myConjugateKey(), ETCS::Buffer("SetGap"),
+                              as_stream, ctx);
+        });
+        check(has(shape, "is not a stream function"),
+              "a plain action dispatched as a stream half is refused by name");
+        check(shape_ret == false, "...and the dispatch reports false");
+    }
+
+    // -- 8. an argument too long for the buffer ---------------------------------
+    //
+    // Buffer's const char* ctor leaves an oversize string EMPTY. Dispatched, that
+    // runs the action with no arguments instead of failing -- the call must stop
+    // here, before anything runs.
+    const std::string longarg(ETCS::Buffer::bufsize + 44, '7');
+    const std::string toolong = captured([&] { e->call("Layout.SetGap", longarg.c_str(), ctx); });
+    check(has(toolong, "refused"), "an oversize argument is refused, not sent empty");
+    check(!has(toolong, "does not provide"), "...before it reaches dispatch at all");
+
+    // -- 9. a key with nothing after the dot -------------------------------------
+    //
+    // "Tag." used to parse as an empty action: the end check compared against
+    // one past the dot. Malformed keys throw from the parser, as "NoDot" does.
+    bool threw = false;
+    try { e->call("Layout.", "", ctx); }
+    catch (const std::runtime_error&) { threw = true; }
+    check(threw, "'Layout.' is a malformed key, not an empty action");
 
     e->call("Layout.Delete", "", ctx);
     ETCS::PendingUnloadRegistry::getInstance().join_all();
