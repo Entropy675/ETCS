@@ -249,31 +249,49 @@ struct PendingUnloadRegistry
         ::std::lock_guard<::std::mutex> lock(mutex_);
         threads_.push_back(::std::move(t));
     }
-    void join_all()
-    {
-        ::std::lock_guard<::std::mutex> lock(mutex_);
-        for (auto& t : threads_)
-            if (t.joinable()) t.join();
-        threads_.clear();
-        closed_ = true;
-    }
+    /*
+ * JOINED WITH THE LOCK RELEASED. A recheck finishes only when the loader's
+ * ordering thread handles its event, and that thread takes this lock itself
+ * whenever an initial RequestUnload reaches it (spawn). Joining under the
+ * lock was a three-way deadlock: main holding the lock and joining a
+ * recheck, the recheck spinning on an event queued behind the ordering
+ * thread, the ordering thread waiting for the lock. Reproduced at the end
+ * of PaintRouterKeysTesterLoader, rarely: DatabaseProvider's initial fire
+ * still in flight when main reached here, RenderProvider's recheck pending.
+ *
+ * So each round takes the threads out under the lock and joins them
+ * outside it. A recheck spawned meanwhile is accepted (the barrier is not
+ * closed yet) and joined on the next round; the barrier closes, under the
+ * lock, only when a round finds nothing left -- so spawn's refusal still
+ * means exactly "nobody is left to join this".
+ */
+    void join_all() { drain(true); }
     /*
  * Belt and braces. With spawn()'s guard nothing can be added after
- * join_all(), so this loop is empty in every ordering the guard covers
- * -- it exists so that a future call site reaching for track() directly
- * still cannot end a run by destroying a joinable thread.
+ * join_all(), so this is empty in every ordering the guard covers -- it
+ * exists so that a future call site reaching for track() directly still
+ * cannot end a run by destroying a joinable thread.
  */
-    ~PendingUnloadRegistry()
-    {
-        ::std::lock_guard<::std::mutex> lock(mutex_);
-        for (auto& t : threads_)
-            if (t.joinable()) t.join();
-        threads_.clear();
-    }
+    ~PendingUnloadRegistry() { drain(false); }
     static PendingUnloadRegistry& getInstance()
     {
         static PendingUnloadRegistry instance;
         return instance;
+    }
+private:
+    void drain(bool close)
+    {
+        for (;;)
+        {
+            ::std::vector<::std::thread> round;
+            {
+                ::std::lock_guard<::std::mutex> lock(mutex_);
+                if (threads_.empty()) { if (close) closed_ = true; return; }
+                round.swap(threads_);
+            }
+            for (auto& t : round)
+                if (t.joinable()) t.join();
+        }
     }
 };
 /*
