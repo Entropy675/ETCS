@@ -2654,10 +2654,23 @@ ETCS::RID ETCS::EventNode::LoaderStream::addTagImpl(
                          << "' but missing from its type_catalog.");
         }
     }
-    else
+    else if (child->myTagMask().any())
     {
-        ETCS_LOG("DynamicLoader", "addTagImpl: no loaded module provides type '"
-                 << child_type_tag << "' -- child will have no callable actions.");
+        /*
+ * A TAG BLOCK WITH NO OWNER. TAG_MASK is set only by ETCS_TAG_DECLARE, so
+ * this type declares actions, and the binary that built it has its tag
+ * block -- yet no loaded module's catalog answers to its contract name. That
+ * is drift between CONTRACT_TAG and the catalog (a renamed contract, a
+ * typedef pointed elsewhere), and every call on this child will fail.
+ *
+ * A type with NO tag block lands in neither branch and says nothing: a
+ * loader-local or module-internal leaf (an ad-hoc addTag<T>, see
+ * module_registry_key_ in Entity.h) has no actions by design, and the
+ * test loaders build tens of thousands of them.
+ */
+        ETCS_LOG("DynamicLoader", "addTagImpl: '" << child_type_tag
+                 << "' has a tag block, but no loaded module provides it -- "
+                 "contract name and catalog disagree; its actions are unreachable.");
     }
  
     /*
