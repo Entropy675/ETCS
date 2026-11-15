@@ -3,7 +3,8 @@
 #include "Symmetric.h"
 #include "RelationalBase.h"
 
-// Lineage in the base (MatrixBase's pattern): RelationalBase is reached once.
+// Lineage in the base: RelationalBase is reached once, so Relational_ is in
+// the object once (the rule Drawable.h and Thread.h state).
 // Invert is written out for the same reason Apply is: the landing check is the
 // family's, so InvertConcrete only ever sees a target Apply could have seen.
 ETCS_SUPERTYPE_BASE(Symmetric), public RelationalBase<Derived>

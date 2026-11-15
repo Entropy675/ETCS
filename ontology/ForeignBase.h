@@ -5,7 +5,8 @@
 
 #include <atomic>
 
-// Lineage in the base: RelationalBase is reached once.
+// Lineage in the base: RelationalBase is reached once, so Relational_ is in
+// the object once (the rule Drawable.h and Thread.h state).
 //
 // The family answers the reference: BindStandIn resolves the RID, refuses an
 // entity that doesn't land (Targets), and keeps the RID; StandIn reads it.

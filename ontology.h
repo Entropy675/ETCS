@@ -122,15 +122,14 @@
 #include "ontology/CausalBase.h"
 #include "ontology/ParserBase.h"
 #include "ontology/WrapperBase.h"
-// Matrix refines Wrapper: one step, and a forward link, in a transform chain.
-// The chain is the owner's Wrapper children in attach order, which MirrorBuffer
-// already resolves and applies -- so a pipeline is built by attaching, not by
-// wiring. See ontology/Matrix.h.
-#include "ontology/MatrixBase.h"
 // Relational: a law that applies a transformation to something else, naming
 // the tag-set it lands on. Symmetric refines it with a proved exact inverse;
 // Foreign refines it as a relation to a stranger outside ETCS determinism,
-// landing on a local stand-in. The two are exclusive. See ontology/Relational.h.
+// landing on a local stand-in. The two are exclusive. A transform stage on the
+// wire is a leaf claiming Wrapper AND Relational: the chain is still the
+// owner's Wrapper children in attach order, which MirrorBuffer resolves and
+// applies. The values a stage keeps are a Mat<R,C> (ontology/Mat.h) -- how one
+// relation is written down, not a family. See ontology/Relational.h.
 #include "ontology/RelationalBase.h"
 #include "ontology/SymmetricBase.h"
 #include "ontology/ForeignBase.h"
