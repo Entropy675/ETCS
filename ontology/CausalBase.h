@@ -1,6 +1,7 @@
 #ifndef BASE_Causal_H__
 #define BASE_Causal_H__
 #include "Causal.h"
+#include "RelationalBase.h"
 #include <algorithm>
 #include <atomic>
 #include <memory>
@@ -36,9 +37,55 @@
  * ontology/etcs_causal_constraints.md; loaders/CausalTesterLoader.cc runs
  * them against a tree of plain bodies.
  */
-ETCS_SUPERTYPE_BASE(Causal)
+// RELATIONAL, BECAUSE EVERY SPACE IS A LAW FOR WHAT IS IN IT. Lineage in the
+// base (RelationalBase reached once). The law is the field: stated here
+// (SetGravity, the value behind "gravity"), inherited otherwise, nothing at the
+// open boundary -- FieldUnder is that walk. It lands on Causal members; the
+// space says what it does (FieldOnUnder: the field over the span, the work
+// counted in its own ledger) and the body says what it lets through
+// (AccelerateUnder: resting takes only the part along its surface). Same
+// arithmetic, same order as when the two were one function.
+ETCS_SUPERTYPE_BASE(Causal), public RelationalBase<Derived>
 {
     ETCS_MAKE_INSTANCE(Causal)
+
+    // --- Relational: the space's law --------------------------------------
+    std::string TargetsConcrete() const override final { return "Causal"; }
+
+    // One step of this space's law on one of its members, over the span this
+    // space last stepped with. The public entry: takes the tree's lock. False
+    // for anything not directly inside this space, or before any step.
+    bool ApplyConcrete(ETCS::Entity& target, ETCS::SignalContext ctx) override final
+    {
+        (void)ctx;
+        Causal_* member = static_cast<Causal_*>(target.getInterfacePointer(causalKey()));
+        if (!member) return false;
+        ::std::lock_guard<::std::recursive_mutex> lk(TreeMutex());
+        if (member->Environment() != static_cast<Causal_*>(this) || !m_step_dt.IsPositive()) return false;
+        FieldOnUnder(*member, m_step_dt);
+        return true;
+    }
+
+    void FieldOnUnder(Causal_& member, Fixed dt) override final
+    {
+        Fixed gx, gy, gz;
+        Causal_* src = FieldUnder(gx, gy, gz);
+        if (!src) return;
+        src->CountFieldWorkUnder(member.AccelerateUnder(gx, gy, gz, dt));
+    }
+
+    // The body's half: what it lets through. Resting on a surface takes only
+    // the part along it; nothing left is nothing done.
+    Fixed AccelerateUnder(Fixed gx, Fixed gy, Fixed gz, Fixed dt) override final
+    {
+        if (m_resting)
+        {
+            const Fixed gn = gx * m_snx + gy * m_sny + gz * m_snz;
+            if (gn.raw < 0) { gx -= m_snx * gn; gy -= m_sny * gn; gz -= m_snz * gn; }
+        }
+        if (gx.IsZero() && gy.IsZero() && gz.IsZero()) return Fixed::Zero();
+        return m_ov.Accelerate(gx, gy, gz, dt, static_cast<Derived*>(this)->MassConcrete());
+    }
 
     /*
      * THE ROWS ARE ON THE TAG SURFACE, behind the family's own tag: the
@@ -114,6 +161,7 @@ ETCS_SUPERTYPE_BASE(Causal)
         if (commitLocked(commit_dt, e)) crossTo(container(), e);
         if (step_dt.IsPositive())
         {
+            m_step_dt = step_dt;   // the span this space's law last ran over (ApplyConcrete)
             fieldLocked(step_dt);
             static_cast<Derived*>(this)->AdvanceConcrete(step_dt);
         }
@@ -647,21 +695,14 @@ private:
         ETCS::Entity::putWord(v, friction.raw);
         this->addTag("solid", v);
     }
+    // The container's law on this body (Relational: FieldOnUnder), after the
+    // body's own hold: an anchored body takes nothing and rests.
     void fieldLocked(Fixed dt)
     {
         if (m_anchored) { m_ov.Rest(); return; }
         Causal_* up = container();
         if (!up) return;
-        Fixed gx, gy, gz;
-        Causal_* src = up->FieldUnder(gx, gy, gz);
-        if (!src) return;
-        if (m_resting)
-        {
-            const Fixed gn = gx * m_snx + gy * m_sny + gz * m_snz;
-            if (gn.raw < 0) { gx -= m_snx * gn; gy -= m_sny * gn; gz -= m_snz * gn; }
-        }
-        if (gx.IsZero() && gy.IsZero() && gz.IsZero()) return;
-        src->CountFieldWorkUnder(m_ov.Accelerate(gx, gy, gz, dt, static_cast<Derived*>(this)->MassConcrete()));
+        up->FieldOnUnder(*this, dt);
     }
 
     /*
@@ -974,6 +1015,7 @@ private:
     Fixed       m_space;   // zero: solid, holds nothing by fit (SetSpace)
     Fixed       m_emitted_out;
     Fixed       m_field_work;   // what the field this space states did (CountFieldWorkUnder)
+    Fixed       m_step_dt;      // the span of this space's last step (Relational Apply)
     Fixed       m_gx, m_gy, m_gz;   // the stated field (SetGravity), when m_gravity_set
     bool        m_gravity_set = false;
     CausalSolid m_solid;        // the step's copy of "solid" (shape Off: not solid)

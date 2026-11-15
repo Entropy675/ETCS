@@ -214,6 +214,14 @@ public:
     virtual OrderVector& RowsUnder() = 0;
     virtual Fixed MassUnder() = 0;
     virtual void SupportUnder(bool resting, Fixed nx, Fixed ny, Fixed nz) = 0;
+    // The field as a relation (Causal is Relational: every space is a law for
+    // what is in it). FieldOnUnder is the space's half: resolve the field
+    // (FieldUnder), hand it to the member, count the work where it is stated.
+    // AccelerateUnder is the body's half: what it lets through (resting takes
+    // only the part along its surface), returning the work done. Both from
+    // under the lock.
+    virtual void FieldOnUnder(Causal_& member, Fixed dt) = 0;
+    virtual Fixed AccelerateUnder(Fixed gx, Fixed gy, Fixed gz, Fixed dt) = 0;
 };
 
 #endif // SUPERTYPE_CAUSAL_H__
