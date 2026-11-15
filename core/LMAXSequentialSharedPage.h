@@ -235,6 +235,20 @@ struct LMAXSequentialSharedPage
 
         frame->ready.store(true, ::std::memory_order_release);
 
+        // STORE -> LOAD, and it must not reorder. Two producers on adjacent
+        // sequences are a Dekker pair: each stores its own ready, then reads
+        // the other's (the higher one's fast path reads the lower frame, the
+        // lower one's walk reads the higher). Release/acquire does not order a
+        // store before a later load -- x86's store buffer reorders exactly this,
+        // ARM more freely -- so both could miss the other and neither advance
+        // publisher_cursor_ past the gap. A later write heals it; the LAST
+        // writes of a burst have none, and the consumer never sees them: an
+        // async completion that "never arrives" (a REORDER STALL holding running
+        // slots that will not clear), or an enqueued event that never runs.
+        // With a seq_cst fence here on every producer, at least one of the pair
+        // sees the other's frame and does the advance.
+        ::std::atomic_thread_fence(::std::memory_order_seq_cst);
+
         tryAdvancePublisher(seq);
         return seq;
     }

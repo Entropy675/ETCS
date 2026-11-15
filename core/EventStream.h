@@ -5,6 +5,7 @@
 #include <cstring>
 #include <thread>
 #include <stdexcept>
+#include <string>
 #include <type_traits>
 #include "ETCS_API.h"
 #include "LMAXSequentialSharedPage.h"
@@ -378,10 +379,24 @@ public:
         }
         constexpr uint64_t MAX_REPORTS = 8;
         ++stall_reports_;
+        // The rings' own counters tell a fourth case from the three above:
+        // written > published means a frame is ready but publisher_cursor_ has
+        // not reached it -- a lost publish, not a dependency. Running slots then
+        // look like work that never finished when their completions are in fact
+        // sitting in the ring.
+        auto ring_state = [](const LMAXSequentialSharedPage* r, uint64_t read) {
+            if (!r) return ::std::string("-");
+            const uint64_t pub = r->publishedUpTo();
+            return "written=" + ::std::to_string(r->frameCount())
+                 + " published=" + ::std::to_string(pub == UINT64_MAX ? 0 : pub + 1)
+                 + " read=" + ::std::to_string(read);
+        };
         ETCS_LOG("EventStream", why << " in=" << in_seq_
                  << " tail=" << tail_seq_ << " cmp=" << cmp_seq_
                  << " pending=" << pending << " running=" << running
                  << " complete=" << complete << " blocked=" << blocked
+                 << " | input " << ring_state(input_ring_, in_seq_)
+                 << " | completion " << ring_state(completion_ring_, cmp_seq_)
                  << (stall_reports_ >= MAX_REPORTS
                      ? " (further stall reports suppressed)" : ""));
     }
