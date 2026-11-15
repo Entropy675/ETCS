@@ -1741,11 +1741,16 @@ inline ExecuteResult execute_command(const Command& cmd,
                         "producer sends."};
 
                 ETCS::Buffer prod_buf, cons_buf, config;
-                prod_buf.write((r->binding.tag + "." + c.action).c_str());
-                cons_buf.write((cons->binding.tag + "." + c.consumer_action).c_str());
-
                 ::std::string payload = ETCS::substitute_name_tokens(c.payload, ctx);
-                if (!payload.empty()) config.write(payload.c_str());
+                // Buffer::write refuses an oversize string and leaves the buffer
+                // as it was -- empty here -- so an unchecked write ran the
+                // producer with NO config rather than the one written.
+                if (!prod_buf.write((r->binding.tag + "." + c.action).c_str())
+                    || !cons_buf.write((cons->binding.tag + "." + c.consumer_action).c_str())
+                    || (!payload.empty() && !config.write(payload.c_str())))
+                    return {ExecuteStatus::Error, "stream: '" + c.receiver + "." + c.action
+                        + "' payload or action name exceeds a work buffer ("
+                        + ::std::to_string(MAX_TAG_BUFFER_SIZE - 1) + " bytes) -- refused, not truncated."};
 
                 ETCS_LOG("CommandExecutor", c.receiver << "." << c.action
                          << " -> " << c.consumer_receiver << "." << c.consumer_action
@@ -1773,7 +1778,9 @@ inline ExecuteResult execute_command(const Command& cmd,
 
             // ---- ordinary action -----------------------------------------
             ETCS::Buffer act_buf;
-            act_buf.write((r->binding.tag + "." + c.action).c_str());
+            if (!act_buf.write((r->binding.tag + "." + c.action).c_str()))
+                return {ExecuteStatus::Error, "action name '" + r->binding.tag + "." + c.action
+                    + "' exceeds a work buffer -- refused."};
 
             try
             {
@@ -1783,7 +1790,12 @@ inline ExecuteResult execute_command(const Command& cmd,
                 ::std::string payload = ETCS::substitute_name_tokens(c.payload, ctx);
 
                 ETCS::Buffer payload_buf;
-                if (!payload.empty()) payload_buf.write(payload.c_str());
+                // As the stream case: an oversize payload used to arrive EMPTY,
+                // and the action ran with no arguments instead of failing.
+                if (!payload.empty() && !payload_buf.write(payload.c_str()))
+                    return {ExecuteStatus::Error, "action '" + c.action + "' on " + c.receiver
+                        + ": payload is " + ::std::to_string(payload.size()) + " bytes, a work buffer holds "
+                        + ::std::to_string(MAX_TAG_BUFFER_SIZE - 1) + " -- refused, not truncated."};
 
                 ETCS_LOG("CommandExecutor", c.receiver << "." << c.action
                          << "(" << payload << ")  [" << r->binding.module

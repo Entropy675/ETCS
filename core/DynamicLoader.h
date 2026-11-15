@@ -1089,6 +1089,14 @@ bool ETCS::WorkBundle::operator()(ETCS_RID_SIZE rid, const ETCS::Buffer& conjuga
             << " -- would have crashed on the call below.");
         return false;
     }
+    // workFunc is type-erased; isStream says which signature it really has.
+    // A stream body called as a work function reads a Buffer as an MBuffer.
+    if (isStream)
+    {
+        ETCS_LOG("WorkBundle::operator()", module_tag << "." << work_tag
+            << " is a stream function -- refusing a plain (Buffer) dispatch.");
+        return false;
+    }
 #ifdef ETCS_LOG_FUNCTION_EVOCATION_PATH
     ETCS_LOG("WorkBundle::operator()", "[" << module_tag << "." << this->work_tag
         << "::" << this->hash << "] Entity " << child->myTag()
@@ -1148,6 +1156,15 @@ bool ETCS::WorkBundle::operator()(ETCS_RID_SIZE rid, const ETCS::Buffer& conjuga
     {
         ETCS_LOG("WorkBundle::operator()", "!!! workFunc is NULL for stream " << module_tag
             << "." << work_tag << " -- would have crashed on the call below.");
+        return false;
+    }
+    // The converse of the Buffer overload's check: a plain work function named
+    // as a stream half (`a.Foo -> b.Bar` with Foo not a stream) would be called
+    // through a StreamFunc pointer with an MBuffer where it expects a Buffer.
+    if (!isStream)
+    {
+        ETCS_LOG("WorkBundle::operator()", module_tag << "." << work_tag
+            << " is not a stream function -- refusing a stream (MBuffer) dispatch.");
         return false;
     }
     ctx.frame = ETCS::current_action_frame();   // as above
@@ -1213,12 +1230,12 @@ bool ETCS::ModuleBundle::operator()(ETCS_RID_SIZE rid, const ETCS::Buffer& conju
 {
 #ifdef ETCS_LOG_FUNCTION_EVOCATION_PATH
     ETCS_LOG("ModuleBundle::operator()", "ENTER tag=" << this->tag << " work=" << work
-        << " child=" << (void*)child);
+        << " rid=" << rid);
 #endif
     auto it = actions.find(work);
 #ifdef ETCS_LOG_FUNCTION_EVOCATION_PATH
-    ETCS_LOG("ModuleBundle::operator()", "[" << this->tag << "::" << this->hash << "] Entity "
-        << child->myTag() << " (RID: " << child->getRID() << ")"
+    ETCS_LOG("ModuleBundle::operator()", "[" << this->tag << "::" << this->hash << "] RID: "
+        << rid << " (" << conjugate_key << ")"
         << " [" << this->tag << "] attempting action: " << work
         << " -- found=" << (it != actions.end()));
 #endif
