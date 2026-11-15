@@ -30,11 +30,15 @@ binutils-gold     binary:ld.gold        # loaders/Makefile passes -fuse-ld=gold
 cmake             binary:cmake          # widely used build system in modules
 python3           binary:python3        # same as above
 python3-jsonschema python:jsonschema    # same as above
+git               binary:git            # submodules + module vendor fetch
 
 # --- Runtime libraries -------------------------------------------------
 liburing-dev      pkgconfig:liburing    # ThreadPool.h
-libsqlite3-dev    pkgconfig:sqlite3     # database scripting layer
-libmbedtls-dev    header:mbedtls/ssl.h  # MbedTLSContext (no .pc file on 2.x)
+#
+# Not here on purpose: sqlite and mbedtls. Their modules vendor them at
+# pinned refs (ACE-Build-Tools/manifests). A system libmbedtls-dev is a
+# hazard, not a dependency: its headers in /usr/include can shadow the
+# vendored 4.x copy for any loader built without inherits_modules.
 
 # --- Development ------------------------------------------------------
 gdb               binary:gdb            optional
