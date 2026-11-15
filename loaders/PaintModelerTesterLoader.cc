@@ -102,6 +102,16 @@ static bool hidden(ETCS::Entity* e)
     auto* d = static_cast<Drawable_*>(e->getInterfacePointer(ETCS::Buffer("Drawable")));
     return d && d->Hidden();
 }
+// The pool: the container's DRAWN children. The shapes live there too, as
+// Mesh children beside the parts (a part names its shape by where it is,
+// Scene3D::SetMesh), and a mesh is drawn by nothing but the parts that use it.
+static std::vector<ETCS::Entity*> pool_of(ETCS::Entity* parts)
+{
+    std::vector<ETCS::Entity*> out;
+    for (ETCS::Entity* k : children(parts))
+        if (k->getInterfacePointer(ETCS::Buffer("Drawable"))) out.push_back(k);
+    return out;
+}
 
 int main(int, char**)
 {
@@ -151,7 +161,7 @@ int main(int, char**)
         const Status s = status(m);
         check(s.mode == "alone" && s.tool == "select" && s.axis == "none" && s.sel == -1 && s.parts == 0 && s.undo == 0,
               "an empty model: alone, nothing selected, nothing to undo");
-        const auto pool = children(a.parts);
+        const auto pool = pool_of(a.parts);
         bool all_hidden = pool.size() == 48;
         for (ETCS::Entity* n : pool) all_hidden = all_hidden && hidden(n);
         check(all_hidden, "the pool is forty-eight nodes, none shown");
@@ -162,7 +172,7 @@ int main(int, char**)
         check(p.there && p.shape == "box" && near(p.x, 0) && near(p.y, 0.5) && near(p.z, 0) && near(p.w, 1) && near(p.h, 1) && near(p.d, 1)
               && near(p.r, 0.8) && near(p.b, 0.85), "the part is what the line said");
         ETCS::Entity* shown = nullptr; int n_shown = 0;
-        for (ETCS::Entity* n : children(a.parts)) if (!hidden(n)) { shown = n; ++n_shown; }
+        for (ETCS::Entity* n : pool_of(a.parts)) if (!hidden(n)) { shown = n; ++n_shown; }
         check(n_shown == 1, "one node of the pool is shown for it");
         if (shown)
         {
@@ -266,7 +276,7 @@ int main(int, char**)
     gesture(400, 300, 500, 300);
     {
         ETCS::Entity* shown = nullptr;
-        for (ETCS::Entity* n : children(a.parts)) if (!hidden(n)) shown = n;
+        for (ETCS::Entity* n : pool_of(a.parts)) if (!hidden(n)) shown = n;
         auto* c = shown ? static_cast<Causal_*>(shown->getInterfacePointer(ETCS::Buffer("Causal"))) : nullptr;
         double qy = 0, qw = 0, qx = 1, qz = 1;
         if (c) { std::lock_guard<std::recursive_mutex> lk(c->TreeMutex()); qy = c->Order4().qy.ToDouble(); qw = c->Order4().qw.ToDouble(); qx = c->Order4().qx.ToDouble(); qz = c->Order4().qz.ToDouble(); }
@@ -536,6 +546,54 @@ int main(int, char**)
     }
     std::error_code ec;
     fs::remove_all(dir, ec);
+
+    // -- 7. the shape, by where it is ------------------------------------------
+    std::cout << "\n-- 7. the shape, by where it is --\n";
+    {
+        // The sphere part, found as the one pool node with a shape on it.
+        auto shaped = [&](ETCS::Entity* parts, std::vector<int64_t>& words_out) -> ETCS::Entity* {
+            for (ETCS::Entity* n : pool_of(parts))
+            {
+                std::string v;
+                if (!n->valueOf(ETCS::Buffer("mesh"), v)) continue;
+                size_t at = 0; int64_t w0 = -9, w1 = -9;
+                ETCS::Entity::getWord(v, at, w0); ETCS::Entity::getWord(v, at, w1);
+                words_out = { w0, w1, static_cast<int64_t>(v.size()) };
+                return n;
+            }
+            return nullptr;
+        };
+        std::vector<int64_t> wc, wd;
+        ETCS::Entity* sc = shaped(c.parts, wc);
+        Rig d;
+        const bool made = make(d);
+        if (made)
+        {
+            verb(d.model, "PaintModeler.Do", add(0, "box", 0, 0.5, 0, 2, 1, 1, 0.9, 0.1, 0.1));
+            verb(d.model, "PaintModeler.Do", add(1, "sphere", 3, 0.5, 2, 1, 1, 1, 0.1, 0.1, 0.9));
+        }
+        ETCS::Entity* sd = made ? shaped(d.parts, wd) : nullptr;
+        check(sc && wc.size() == 3 && wc[0] == 1 && wc[1] == 0 && wc[2] == 16,
+              "a part drawn as the sphere carries where the sphere is: one generation up, the first Mesh there");
+        check(sd && wc == wd && sc->getRID() != sd->getRID(),
+              "...the same two words in another runtime, where every RID is different");
+        // Placed elsewhere, a mesh has no address from this node: refused, and
+        // the shape it had is the shape it keeps.
+        ETCS::Entity* loose = ETCS::spawn_entity("RenderProvider", "Mesh", env, loader);
+        if (loose) verb(loose, "Mesh.Create");
+        if (loose) verb(loose, "Mesh.Box");
+        std::vector<int64_t> after;
+        if (sc && loose) verb(sc, "Scene3D.SetMesh", std::to_string(loose->getRID()));
+        check(loose && sc && shaped(c.parts, after) == sc && after == wc,
+              "a Mesh that is no child of the node's line is refused, and the part keeps its shape");
+        // The address resolves to the shape: an export of the twin draws the
+        // sphere's triangles, not a box's.
+        const std::string glb = (fs::temp_directory_path() / ("etcs_pm_twin_" + std::to_string(static_cast<long long>(::getpid())) + ".glb")).string();
+        check(made && verb(d.model, "PaintModeler.Export", glb) == "2 " + std::to_string(12 + sphere_tris),
+              "...and it resolves to that shape: the twin's export draws a sphere's triangles for it");
+        fs::remove(glb, ec);
+        if (made) verb(d.model, "PaintModeler.Delete");
+    }
 
     for (Rig* r : { &a, &b, &c }) verb(r->model, "PaintModeler.Delete");
     ETCS::PendingUnloadRegistry::getInstance().join_all();
