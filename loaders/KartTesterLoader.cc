@@ -21,20 +21,22 @@
 //   3. THE SETTINGS. In the lobby the host's `config` brings out another map
 //      at once and respawns everyone on it.
 //   4. A ROUND ABANDONED WITH A SCORE, ONE COMPLETED. An elimination in a
-//      round the host abandons is discarded with it. Flat out the tyres roll
-//      and mark nothing; a kart at its top speed turns its wheels only to a
-//      smaller lock, an arc -- more than the tyres hold, so it drifts, its
-//      tyres hot and marking the road. Then: the sniper dead on
+//      round the host abandons is discarded with it. Speed builds gradually
+//      and in a straight line the tyres roll and mark nothing; braked to a
+//      stop every tyre leaves a dark mark, a rope of eighteen units of road,
+//      kept while it stands and wiped from the far end as it goes on; at
+//      speed it turns its wheels only to a smaller lock, an arc -- more than
+//      the tyres hold, so it drifts, keeping its speed, its tyres hot and
+//      marking the road. Then: the sniper dead on
 //      takes a whole kart, back three seconds later. A rocket bursts on a kart for up to 40; a fuse hurts
 //      all but its own kart; the minigun fires while held, a tap between two
 //      ticks still fires, a boost outruns a kart's top; a power-up hands over
 //      a weapon. The clock runs out into the results, then the lobby, which
 //      keeps the round's scores; the next round starts them afresh.
 //   5. THE GROUND. On the skatepark a kart climbs a ramp at the ramp's
-//      height, flies off its lip and lands beyond it, and braked to a stop
-//      leaves four dark marks, ropes of six units, kept while it stands and
-//      wiped as it goes on; another driven at a lip from the drop side is
-//      stopped by it.
+//      height, flies off its lip and lands beyond it, and backing off over
+//      the marks its brake left leaves them as they were laid; another driven
+//      at a lip from the drop side is stopped by it.
 //   6. A MAP FROM A SEED. The same layout on every runtime; a new seed, a new
 //      layout, still the same everywhere; every kart on the ground at a spawn.
 //   7. THE SAME BATTLE. Each guest at the host's tick has the host's hash --
@@ -235,7 +237,7 @@ int main(int, char**)
     key(host, 'W', true);
     run(55);
     const Kart h1 = where(host, "host");
-    check(h1.z - h0.z > 5.0f && h1.speed > 9.0f && near(h1.x, 0, 0.05f), "W: toward the middle, quickly, in a straight line");
+    check(h1.z - h0.z > 5.0f && h1.speed > 8.0f && near(h1.x, 0, 0.05f), "W: toward the middle, quickly, in a straight line");
     run(240);
     key(host, 'W', false);
     const Kart h2 = where(host, "host");
@@ -337,16 +339,38 @@ int main(int, char**)
     fire(host);
     const int counted = score(g1, "host").elims;
     {
-        // The wheel at speed: the host up the road to the junction at its top
-        // speed, then D held -- the lock is smaller the faster it goes, so it
-        // carves an arc rather than spinning.
+        // Up the road, braked to a stop, on up the road again, then D held at
+        // speed: the marks the brake leaves, kept while it stands and wiped as
+        // it goes on; the lock smaller the faster it goes; and a drift.
         key(host, 'W', true);
-        run(130);
+        run(100);
         const Kart k0 = where(host, "host");
         const Tyres c0 = tyres(host, "host");
-        std::printf("        (straight at %.1f u/s: sliding %.3f, %d mark segments)\n", k0.speed, k0.slide, c0.shown());
-        check(k0.speed > 15.5f && std::fabs(k0.slide) < 0.01f && c0.shown() == 0,
-              "flat out in a straight line the tyres roll: no slide, no marks");
+        std::printf("        (straight at %.1f u/s after 2 s, %.1f along: sliding %.3f, %d mark segments)\n",
+                    k0.speed, k0.z + 27.0f, k0.slide, c0.shown());
+        check(k0.speed > 12.0f && k0.speed < 15.0f && std::fabs(k0.slide) < 0.01f && c0.shown() == 0,
+              "speed builds gradually; in a straight line the tyres roll: no slide, no marks");
+        key(host, 'W', false);
+        key(host, 'S', true);
+        for (int t = 0; t < 120 && where(host, "host").speed > 0.05f; ++t) run(1);
+        key(host, 'S', false);
+        const Tyres b0 = tyres(host, "host");
+        run(50);
+        const Tyres b1 = tyres(host, "host");
+        std::printf("        (braked: ropes %.2f %.2f %.2f %.2f, marks %d %d %d %d, darkest %.2f %.2f %.2f %.2f)\n",
+                    b0.t[0].rope, b0.t[1].rope, b0.t[2].rope, b0.t[3].rope, b0.t[0].shown, b0.t[1].shown, b0.t[2].shown,
+                    b0.t[3].shown, b0.t[0].darkest, b0.t[1].darkest, b0.t[2].darkest, b0.t[3].darkest);
+        bool four = true;
+        for (const Tyre& t : b0.t) four = four && t.rope >= 18.0f && t.rope < 22.5f && t.shown >= 2 && t.darkest >= 0.75f;
+        check(four, "braked to a stop: every tyre leaves a dark mark, on a rope of eighteen units of road");
+        check(b1.shown() == b0.shown(), "...which stays while the kart stands");
+        key(host, 'W', true);
+        run(120);
+        const Tyres w0 = tyres(host, "host");
+        const Kart k2 = where(host, "host");
+        std::printf("        (on %.1f units: %d mark segments, ropes %.2f)\n", k2.z - k0.z, w0.shown(), w0.t[0].rope);
+        check(w0.shown() == 0 && w0.t[0].rope >= 18.0f && w0.t[0].rope < 22.5f,
+              "...and is wiped from the far end as it goes on: the rope keeps its length");
         key(host, 'D', true);
         run(35);
         const Kart k1 = where(host, "host");
@@ -354,7 +378,7 @@ int main(int, char**)
         key(host, 'D', false);
         key(host, 'W', false);
         const float lock = 0.45f / (1.0f + k1.speed / 10.0f);
-        const float turned = std::acos(std::max(-1.0f, std::min(1.0f, k0.hx * k1.hx + k0.hz * k1.hz)));
+        const float turned = std::acos(std::max(-1.0f, std::min(1.0f, k2.hx * k1.hx + k2.hz * k1.hz)));
         std::printf("        (at %.1f u/s the wheel is %.3f, the lock there %.3f; 0.7 s turned %.2f rad, sliding %.2f u/s)\n",
                     k1.speed, k1.wheel, lock, turned, k1.slide);
         std::printf("        (tyres fl fr rl rr: heat %.1f %.1f %.1f %.1f, marks %d %d %d %d, darkest %.2f %.2f %.2f %.2f)\n",
@@ -364,6 +388,8 @@ int main(int, char**)
               "at speed the wheel turns only to the smaller lock for that speed");
         check(turned > 0.3f && turned < 1.4f, "...so D at speed is an arc, not a spin");
         check(k1.slide > 0.5f, "...and more than the tyres can hold: the kart slides out of the turn -- a drift");
+        std::printf("        (into the drift at %.1f u/s, %.1f in it)\n", k2.speed, k1.speed);
+        check(k1.speed > k2.speed, "...which keeps its speed: the pedal still gains on it");
         check(c1.shown() > 0 && c1.t[0].heat + c1.t[1].heat + c1.t[2].heat + c1.t[3].heat > 0.0f,
               "...its tyres hot with the slide, and marking the road");
         run(50);
@@ -427,11 +453,11 @@ int main(int, char**)
     verb(host, "KartBattle.Give", "host boost");
     key(host, 'W', true);
     fire(host);
-    run(60);
+    run(65);
     const float boosted = where(host, "host").speed;
     key(host, 'W', false);
     std::printf("        (boosted to %.1f)\n", boosted);
-    check(boosted > 17.0f, "a boost takes a kart past its own top speed");
+    check(boosted > 22.0f, "a boost takes a kart past its own top speed");
 
     run(static_cast<uint32_t>(status(host).left) * 50 + 2);
     const Status s6 = status(g1);
@@ -475,22 +501,20 @@ int main(int, char**)
         key(host, 'S', false);
         std::printf("        (on the ramp %.3f off its height; off the lip at z %.2f, up to y %.2f, down at z %.2f)\n",
                     onRampErr, liftZ, topY, landZ);
-        // The brake to a stop: four dark marks, each a rope of the same length.
-        const Tyres m0 = tyres(host, "host");
+        // Braked to a stop, then backed off over its own marks: what was laid
+        // stays laid -- the way back is new road at the rope's front.
         run(50);
-        const Tyres m1 = tyres(host, "host");
+        const Tyres m0 = tyres(host, "host");
         key(host, 'S', true);
-        run(100);
+        run(80);
         key(host, 'S', false);
+        run(30);
         const Tyres m2 = tyres(host, "host");
-        std::printf("        (braked: ropes %.2f %.2f %.2f %.2f, marks %d %d %d %d, darkest %.2f; a second on %d; backed off %.1f: %d)\n",
-                    m0.t[0].rope, m0.t[1].rope, m0.t[2].rope, m0.t[3].rope, m0.t[0].shown, m0.t[1].shown, m0.t[2].shown,
-                    m0.t[3].shown, m0.t[0].darkest, m1.shown(), where(host, "host").z, m2.shown());
-        bool four = true;
-        for (const Tyre& t : m0.t) four = four && near(t.rope, 6.0f, 0.01f) && t.shown >= 3 && t.darkest >= 0.75f;
-        check(four, "braked to a stop: every tyre leaves a dark mark, on a rope six units long");
-        check(m1.shown() == m0.shown(), "...which stays while the kart stands");
-        check(m2.shown() == 0 && near(m2.t[0].rope, 6.0f, 0.01f), "...and is wiped as it goes on: the rope keeps its length");
+        std::printf("        (braked: marks %d, darkest %.2f; backed off to z %.1f: marks %d, darkest %.2f, ropes %.2f)\n",
+                    m0.shown(), m0.t[0].darkest, where(host, "host").z, m2.shown(), m2.t[0].darkest, m2.t[0].rope);
+        bool kept = m0.shown() >= 4 && m2.shown() == m0.shown();
+        for (int t = 0; t < 4; ++t) kept = kept && m2.t[t].darkest == m0.t[t].darkest && m2.t[t].rope >= 18.0f && m2.t[t].rope < 22.5f;
+        check(kept, "backing off over its own marks leaves them as they were laid, the rope its length");
         check(onRampErr >= 0.0f && onRampErr < 0.03f, "up the ramp, the kart rides at the ramp's height");
         check(flew && liftZ > -11.6f && liftZ < -10.4f && topY > 1.8f, "...leaves the ground at the lip and climbs higher still");
         check(landed && landZ > -9.0f, "...and lands beyond it");
