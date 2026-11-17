@@ -361,9 +361,11 @@ of the rows it left (`doc/etcs_specification.md`, **The frame edge**).
 across it). `CausalTester` §6 (observed spans are the whole of what a clock
 contributed: the same spans into a fresh tree, the same rows) and §7 (a
 reader and a driver take turns on a tree, never inside a step). `HashTester` (a
-pull recomputes the paths that moved and no others). The smear and its
-cut, a look on the edge, observation by relation and a gap filled past its
-cap have no line yet: they are the first four entries below.
+pull recomputes the paths that moved and no others). `GolfTester` §6 (a
+picture leaves the rows it drew, and a putt stepped by looks alone is holed:
+fit's move is made outside the picture's hold). The smear and its cut,
+observation by relation and a gap filled past its cap have no line yet: they
+are the first three entries below.
 
 ---
 
@@ -376,10 +378,6 @@ cap have no line yet: they are the first four entries below.
   frame longer than 25 ms. The same one level up: fit moves a member one
   container an interaction (§11), so a body that leaves a space within a step
   is asked about its old siblings for that step.
-- **A look on the edge.** The look's step is taken inside the picture
-  (`Scene3D::ProjectConcrete`), under the present's hold, and a fit move there
-  asserts: the ball dropping into the cup when a frame is what steps it. A
-  world that must fit under a picture today is driven (§2).
 - **Observation by relation.** Only a driver's line and a look step a tree. A
   query (`DepthFor`, `Order4`) or a pulled hash reads the rows the last
   interaction left.
@@ -400,7 +398,9 @@ cap have no line yet: they are the first four entries below.
   order, and a move is handed up to it. A move has two halves, the new parent
   (its module's order) and the position restated in the new frame (the tree's
   rows); they stay one change to a reader. Readers take committed rows, before
-  or after a step and never during.
+  or after a step and never during. Until the consumer stops waiting on a
+  move, an observer under a hold cannot be it, which is why a look is stepped
+  after its picture (§14).
 - **Moving frames.** A member's position is relative to its container's, so
   it goes where the container goes; its motion is not. A move restates the
   position, never the velocity -- doing so would change kinetic energy, and

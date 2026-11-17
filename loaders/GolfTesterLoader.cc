@@ -20,6 +20,9 @@
 //   5. HOLED. A ball sent at the cup at a putting pace drops through the gap,
 //      fit takes it into the cup's space, and it rests on the cup's floor; the
 //      game, advanced at the frame edge, sets it back on the tee.
+//   6. HOLED BY BEING LOOKED AT. The same putt with no driver: the camera's
+//      pictures step the world, as a frame does. A picture is drawn under a
+//      hold and only notes its look; the step, and fit's move, come after it.
 //
 //   ./Run_GolfTesterLoader
 //
@@ -249,6 +252,30 @@ int main(int, char**)
     where(ball, b);
     check(static_cast<ETCS::Entity*>(ball)->getParent() == world && std::fabs(b[2]) < 0.01f && b[1] > 0.0f,
           "the game sets a holed ball back on the tee");
+
+    // -- 6. holed by being looked at ---------------------------------------------------
+    std::cout << "\n-- 6. holed by being looked at --\n";
+    verb(be, "Scene3D.Halt");
+    verb(be, "Scene3D.SetPosition", "0, 0.15, 19");
+    step(60);
+    verb(eye, "Camera3D.Render");   // the first look: the clocks start, nothing is owed
+    verb(be, "Scene3D.Impulse", "0, 0, 1, 4");
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    // The picture alone, as a walk asks for it (the interface, not the verb):
+    // drawn under the camera's hold on the scene, where a move cannot be made.
+    const uint64_t drawn = wc->CausalHash();
+    cam->Render();
+    check(wc->CausalHash() == drawn, "a picture reads: the rows after it are the rows it drew");
+    verb(eye, "Camera3D.Render");
+    check(wc->CausalHash() != drawn, "...and its look is stepped once the picture is done");
+    holed = false;
+    for (int i = 0; i < 1500 && !holed; ++i)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(4));
+        verb(eye, "Camera3D.Render");
+        holed = be->getParent() == static_cast<ETCS::Entity*>(cup);
+    }
+    check(holed, "a putt stepped by looks alone is holed: fit's move is made outside the picture's hold");
 
     verb(game, "GolfGame.Delete");
     ETCS::PendingUnloadRegistry::getInstance().join_all();
