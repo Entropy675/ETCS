@@ -11,7 +11,8 @@
 //   2. THE PULL. A press on the ball (a camera ray through the middle of the
 //      frame, where the game put the ball) starts a pull; dragging down pulls
 //      the shot away from the camera and up -- the view plane's slingshot --
-//      as long as the drag, to the cap.
+//      as long as the drag, to the cap. The arrow's shadow lies flat on the
+//      ground under it.
 //   3. THE SHOT. Letting go is the ball's own Impulse along the pull: the ball
 //      moves that way, and the card counts a stroke.
 //   4. THE CAMERA. A drag off the ball turns the camera about it and leaves
@@ -94,6 +95,7 @@ int main(int, char**)
     verb(eye, "Camera3D.SetScene", std::to_string(world->getRID()));
 
     // The course, run as a script with the session's names handed in.
+    ETCS::RID shadow_rid = 0;
     {
         ETCS::ExecutionContext course(&root, &ctx);
         course.names["anchor"] = ETCS::NameBinding{ world->getRID(), "RenderProvider", "Scene3D" };
@@ -102,6 +104,7 @@ int main(int, char**)
         const std::string path = std::string(ETCS_ACE_ROOT) + "/modules/GolfProvider/scripts/golf_course.etcs";
         std::ifstream in(path);
         check(in.is_open() && ETCS::run_script(in, path, course), "the course script runs");
+        if (course.names.count("arrow_shadow")) shadow_rid = course.names["arrow_shadow"].rid;
     }
 
     auto* wc  = static_cast<Causal_*>(world->getInterfacePointer(ETCS::Buffer("Causal")));
@@ -109,7 +112,7 @@ int main(int, char**)
     auto* anim = static_cast<Animated_*>(game->getInterfacePointer(ETCS::Buffer("Animated")));
     // The ball and the cup, found as what they are: the free solid sphere, and
     // the container with a space of its own.
-    Causal_* ball = nullptr; Causal_* cup = nullptr;
+    Causal_* ball = nullptr; Causal_* cup = nullptr; Causal_* shadow = nullptr;
     {
         std::vector<ETCS::Entity::ChildRef> kids;
         world->getTypedChildRefs(kids);
@@ -118,6 +121,7 @@ int main(int, char**)
             ETCS::Entity* k = world->getTypedChild(*tag, rid);
             auto* c = k ? static_cast<Causal_*>(k->getInterfacePointer(ETCS::Buffer("Causal"))) : nullptr;
             if (!c) continue;
+            if (rid == shadow_rid) shadow = c;
             if (c->Solid().shape == CausalSolid::Sphere) ball = c;
             if (c->Space().IsPositive()) cup = c;
         }
@@ -148,6 +152,31 @@ int main(int, char**)
     verb(game, "GolfGame.Drag", "512, 760");
     std::sscanf(verb(game, "GolfGame.Pull").c_str(), "%f %f %f %f %15s", &px, &py, &pz, &plen, mode);
     check(plen > short_len && std::fabs(plen - 3.0f) < 1e-3f, "a longer drag is a longer pull, to the cap");
+    // The arrow's shadow: the arrow laid flat on the ground under it. Its
+    // length (the mesh's +y) runs along the pull's ground track, its depth
+    // (+z) is vertical, and it sits where the ball stands, not where the
+    // arrow rises to.
+    {
+        check(shadow != nullptr, "the course makes the arrow a shadow");
+        if (shadow)
+        {
+            float at[3];
+            where(shadow, at);
+            Fixed lx = Fixed::Zero(), ly = Fixed::One(), lz = Fixed::Zero();
+            Fixed dx = Fixed::Zero(), dy = Fixed::Zero(), dz = Fixed::One();
+            {
+                std::lock_guard<std::recursive_mutex> lk(shadow->TreeMutex());
+                shadow->Order4().RotateVector(lx, ly, lz);
+                shadow->Order4().RotateVector(dx, dy, dz);
+            }
+            const float run = std::sqrt(px * px + pz * pz);
+            check(std::fabs(lx.ToFloat() - px / run) < 1e-3f && std::fabs(ly.ToFloat()) < 1e-3f && std::fabs(lz.ToFloat() - pz / run) < 1e-3f,
+                  "the shadow lies along the pull's track over the ground");
+            check(std::fabs(std::fabs(dy.ToFloat()) - 1.0f) < 1e-3f, "...flat: its depth is the vertical");
+            check(at[1] > 0.0f && at[1] < 0.05f && std::fabs(at[2] - (b[2] + (0.15f + plen * 0.5f) * pz / plen)) < 1e-2f,
+                  "...on the ground the ball stands on, straight under the arrow's middle");
+        }
+    }
     verb(game, "GolfGame.Drag", "512, 440");
 
     // -- 3. the shot -------------------------------------------------------------
