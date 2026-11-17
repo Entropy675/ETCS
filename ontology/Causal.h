@@ -153,10 +153,11 @@ public:
     // container provides (Space; zero, solid, holds nothing); after the
     // contacts each interaction, a member that no longer fits moves to its
     // container's container, and one that fits inside a sibling's space
-    // moves into the smallest such sibling (CausalBase::fitLocked). A move
-    // is the entity changing parents (Entity::moveTo), its position restated
-    // in the new frame -- frames are translations: a member's position is
-    // relative to its container's.
+    // moves into the smallest such sibling (CausalBase::fitLocked); an
+    // anchored member is held where it was put, and fit moves it nowhere. A
+    // move is the entity changing parents (Entity::moveTo), its position
+    // restated in the new frame -- frames are translations: a member's
+    // position is relative to its container's.
 
     // The environment this one is in: its container, or null at the open
     // boundary.

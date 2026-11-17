@@ -332,8 +332,10 @@ ETCS_SUPERTYPE_BASE(Causal), public RelationalBase<Derived>
     }
     /*
      * ANCHORED: held where it is in its container -- the field moves it not,
-     * a contact moves it not, motion handed to it becomes heat. What a place
-     * is, as against a thing: a green, a wall, a cup. A container that is not
+     * a contact moves it not, motion handed to it becomes heat, and fit moves
+     * it to no other container (fitLocked). What a place is, as against a
+     * thing: a green, a wall, a cup -- and a part fixed to a thing, a wheel
+     * to a kart, that the thing's space need not hold. A container that is not
      * anchored is a thing, and falls in its own container's field carrying
      * what is inside it (frames are translations); its members feel the field
      * in that frame too. The value behind "anchored".
@@ -897,7 +899,8 @@ private:
      * before anything moves, applied in canonical order; a member something
      * is moving into stays put this time, so no pair can swap into each
      * other. One level per interaction: a member still outside goes on up at
-     * its new container's next one.
+     * its new container's next one. An anchored member is held where it was
+     * put, and fit leaves it there: it moves only by Contain.
      */
     void fitLocked(const ::std::vector<Causal_*>& kids)
     {
@@ -923,6 +926,7 @@ private:
         ::std::vector<::std::pair<size_t, Causal_*>> moves;
         for (size_t a = 0; a < n; ++a)
         {
+            if (kids[a]->Solid().anchored) continue;
             if (!into.empty() && into[a] != n) moves.emplace_back(a, kids[into[a]]);
             else if (up && !kids[a]->Order4().InsideOf(Fixed::Zero(), Fixed::Zero(), Fixed::Zero(), m_space))
                 moves.emplace_back(a, up);

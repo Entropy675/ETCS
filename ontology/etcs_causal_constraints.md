@@ -199,7 +199,11 @@ contacts, every interaction, from the rows alone: a member inside a
 sibling's space moves into the smallest such sibling; one outside its
 container's space moves up to the container's container; the open boundary
 keeps what fits nowhere. Decided before anything moves, applied in canonical
-order, and a member something moves into stays put that time. A move keeps
+order, and a member something moves into stays put that time. An anchored
+member is held where it was put (§12's anchored: a place, or a part fixed
+to a thing -- a wheel to a kart), and fit moves it nowhere: its container
+need not provide room for it, so a thing with fixed parts can stay solid and
+take in nothing else. A move keeps
 where the thing is in the world exactly (frames are translations: a member's
 position is relative to its container's) and touches no energy, so §3 holds
 across it.
@@ -221,7 +225,8 @@ of the frame), `Adjacent` (what shares its environment and touches its
 reach).
 
 **Check.** `CausalTester` §10 (a solid thing's member moves up to the same
-place; the pen leaves the pocket into the person, then the world; the ball
+place, an anchored one stays, and an anchored thing inside a sibling's space
+is not taken in; the pen leaves the pocket into the person, then the world; the ball
 rolls into a hollow box's space and out the far side; the ledger every tick;
 `Contain` keeps the world position to the bit and refuses a cycle; the same
 lines twice, the same moves and hash; deleting the old parent leaves it, the
