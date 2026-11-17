@@ -12,13 +12,16 @@
 //      the others, facing the middle, whole and unarmed -- and parked: W moves
 //      nobody, and a guest sets nothing.
 //   2. A ROUND. Started, its settings are locked. The pedal takes the host
-//      toward the middle and the bowl's bumper stops it; a moving kart turns
-//      with its wheels, one standing still does not, its front wheels seen
-//      turned and the rear square. The host abandons it: back to the lobby.
+//      toward the middle and the bowl's bumper stops it. A held key turns the
+//      wheels slowly at first, faster while held, up to the lock, and a tap
+//      barely; let go they come back. One standing still does not turn, its
+//      front wheels seen turned and the rear square. The host abandons it:
+//      back to the lobby.
 //   3. THE SETTINGS. In the lobby the host's `config` brings out another map
 //      at once and respawns everyone on it.
 //   4. A ROUND ABANDONED WITH A SCORE, ONE COMPLETED. An elimination in a
-//      round the host abandons is discarded with it. Then: the sniper dead on
+//      round the host abandons is discarded with it, and a kart at its top
+//      speed turns its wheels only to a smaller lock: an arc. Then: the sniper dead on
 //      takes a whole kart, back three seconds later. A rocket bursts on a kart for up to 40; a fuse hurts
 //      all but its own kart; the minigun fires while held, a tap between two
 //      ticks still fires, a boost outruns a kart's top; a power-up hands over
@@ -61,15 +64,15 @@ static std::string verb(ETCS::Entity* e, const std::string& action, const std::s
     return d.toString();
 }
 
-// KartBattle.Kart: "<slot> <x> <z> <hx> <hz> <speed> <hp> <weapon> <ammo> <y> <air|ground>".
-struct Kart { int slot = -1; float x = 0, z = 0, hx = 0, hz = 0, speed = 0; int hp = -1; std::string weapon; int ammo = 0; float y = 0; std::string air; };
+// KartBattle.Kart: "<slot> <x> <z> <hx> <hz> <speed> <hp> <weapon> <ammo> <y> <air|ground> <wheel>".
+struct Kart { int slot = -1; float x = 0, z = 0, hx = 0, hz = 0, speed = 0; int hp = -1; std::string weapon; int ammo = 0; float y = 0; std::string air; float wheel = 0; };
 static Kart where(ETCS::Entity* b, const std::string& who)
 {
     Kart k;
     const std::string row = verb(b, "KartBattle.Kart", who);
     if (row == "-") return k;   // not driving (a failed >> would read a 0)
     std::istringstream in(row);
-    in >> k.slot >> k.x >> k.z >> k.hx >> k.hz >> k.speed >> k.hp >> k.weapon >> k.ammo >> k.y >> k.air;
+    in >> k.slot >> k.x >> k.z >> k.hx >> k.hz >> k.speed >> k.hp >> k.weapon >> k.ammo >> k.y >> k.air >> k.wheel;
     return k;
 }
 // KartBattle.Status: "<tick> <seq> <mode> <me> <slot> <phase> <secs left> <map> <round secs> <layout>".
@@ -195,15 +198,15 @@ int main(int, char**)
     const Kart h0 = where(host, "host"), a0 = where(host, "g1"), b0 = where(host, "g2");
     std::printf("        (host %.1f,%.1f  g1 %.1f,%.1f  g2 %.1f,%.1f)\n", h0.x, h0.z, a0.x, a0.z, b0.x, b0.z);
     check(h0.slot == 0 && a0.slot == 1 && b0.slot == 2, "three drivers, each in a kart of their own");
-    check(near(h0.x, 0, 0.01f) && near(h0.z, -24, 0.01f) && near(h0.hz, 1, 1e-3f) && h0.speed == 0.0f && near(h0.y, 0.25f, 1e-3f),
+    check(near(h0.x, 0, 0.01f) && near(h0.z, -19, 0.01f) && near(h0.hz, 1, 1e-3f) && h0.speed == 0.0f && near(h0.y, 0.25f, 1e-3f),
           "the host at the bowl's first spawn, on the ground, facing the middle, still");
-    check(near(a0.z, 24, 0.01f) && near(a0.hz, -1, 1e-3f), "g1 at the spawn furthest from the host, facing it across the middle");
-    check(near(b0.x, 24, 0.01f) && near(b0.z, 0, 0.01f) && near(b0.hx, -1, 1e-3f), "g2 at the spawn furthest from both");
+    check(near(a0.z, 19, 0.01f) && near(a0.hz, -1, 1e-3f), "g1 at the spawn furthest from the host, facing it across the middle");
+    check(near(b0.x, 19, 0.01f) && near(b0.z, 0, 0.01f) && near(b0.hx, -1, 1e-3f), "g2 at the spawn furthest from both");
     check(h0.hp == 100 && a0.weapon == "-" && status(g2).phase == "lobby", "whole and unarmed, in the lobby");
     key(host, 'W', true);
     run(50);
     key(host, 'W', false);
-    check(near(where(host, "host").z, -24, 1e-3f), "in the lobby the karts are parked: W moves nobody");
+    check(near(where(host, "host").z, -19, 1e-3f), "in the lobby the karts are parked: W moves nobody");
     check(verb(g1, "KartBattle.Configure", "pillars 60") == "refused" && verb(g1, "KartBattle.StartRound") == "refused",
           "a guest sets nothing: the map, the length and the round are the host's");
 
@@ -215,22 +218,39 @@ int main(int, char**)
     check(verb(host, "KartBattle.Configure", "crossroads 60") == "refused" && status(host).map == "bowl",
           "its settings are locked: no config while it runs");
     key(host, 'W', true);
-    run(60);
+    run(55);
     const Kart h1 = where(host, "host");
     check(h1.z - h0.z > 5.0f && h1.speed > 9.0f && near(h1.x, 0, 0.05f), "W: toward the middle, quickly, in a straight line");
     run(240);
     key(host, 'W', false);
     const Kart h2 = where(host, "host");
     std::printf("        (stopped at z %.2f)\n", h2.z);
-    check(h2.z > -11.3f && h2.z < -10.3f, "the bumper in its way stops it: solid meets solid");
-    proposed(g1, 'W', true);
-    run(40);
-    proposed(g1, 'A', true);
-    run(25);
-    const Kart a1 = where(host, "g1");
-    proposed(g1, 'A', false);
-    proposed(g1, 'W', false);
-    check(a1.hx < -0.3f && a1.speed > 5.0f, "A while moving: the wheels turn left, and the kart with them");
+    check(h2.z > -13.1f && h2.z < -12.1f, "the bumper in its way stops it: solid meets solid");
+    {
+        // The wheel, standing still: its turn gathers pace while A is held,
+        // and reaches the full lock.
+        proposed(g2, 'A', true);
+        run(10);
+        const float w10 = where(host, "g2").wheel;
+        run(10);
+        const float w20 = where(host, "g2").wheel;
+        run(30);
+        const float w50 = where(host, "g2").wheel;
+        proposed(g2, 'A', false);
+        std::printf("        (wheel held: %.3f at 0.2 s, %.3f at 0.4 s, %.3f at 1 s)\n", w10, w20, w50);
+        check(w10 > 0.0f && w10 < 0.1f && w20 - w10 > 2.0f * w10 && near(w50, 0.45f, 0.002f),
+              "A held: the wheel starts slow, gathers pace, and comes to the full lock standing still");
+        run(25);
+        const float back = where(host, "g2").wheel;
+        proposed(g2, 'A', true);
+        run(4);
+        proposed(g2, 'A', false);
+        const float tap = where(host, "g2").wheel;
+        run(25);
+        std::printf("        (let go: %.3f after 0.5 s; a tap of 4 ticks: %.3f; then %.3f)\n", back, tap, where(host, "g2").wheel);
+        check(near(back, 0, 1e-3f) && tap > 0.0f && tap < 0.03f && near(where(host, "g2").wheel, 0, 1e-3f),
+              "let go, it comes back to the middle; a tap turns it only a little");
+    }
     proposed(g2, 'A', true);
     run(50);
     const Kart b1 = where(host, "g2");
@@ -265,7 +285,7 @@ int main(int, char**)
     }
     verb(host, "KartBattle.Abandon");
     run(2);
-    check(status(g1).phase == "lobby" && near(where(host, "host").z, -24, 0.01f),
+    check(status(g1).phase == "lobby" && near(where(host, "host").z, -19, 0.01f),
           "the host abandons the round: back in the lobby on every runtime, everyone respawned, parked");
 
     // -- 3. the settings -----------------------------------------------------
@@ -282,7 +302,7 @@ int main(int, char**)
         // The bowl's bumper the host stopped at is gone from where it stood.
         Causal_* wc = static_cast<Causal_*>(worlds[1]->getInterfacePointer(ETCS::Buffer("Causal")));
         std::vector<Causal_*> by;
-        wc->Near(Fixed::Zero(), Fixed::From(0.4), Fixed::From(-9.0), Fixed::From(0.5), by);
+        wc->Near(Fixed::Zero(), Fixed::From(0.4), Fixed::From(-11.0), Fixed::From(0.5), by);
         bool bump = false;
         // A bumper by its size: a reach of |(2, 0.4, 0.6)|.
         for (Causal_* c : by)
@@ -297,6 +317,27 @@ int main(int, char**)
     verb(host, "KartBattle.Give", "host sniper");
     fire(host);
     const int counted = score(g1, "host").elims;
+    {
+        // The wheel at speed: the host up the road to the junction at its top
+        // speed, then D held -- the lock is smaller the faster it goes, so it
+        // carves an arc rather than spinning.
+        key(host, 'W', true);
+        run(130);
+        const Kart k0 = where(host, "host");
+        key(host, 'D', true);
+        run(25);
+        const Kart k1 = where(host, "host");
+        key(host, 'D', false);
+        key(host, 'W', false);
+        const float lock = 0.45f / (1.0f + k1.speed / 10.0f);
+        const float turned = std::acos(std::max(-1.0f, std::min(1.0f, k0.hx * k1.hx + k0.hz * k1.hz)));
+        std::printf("        (at %.1f u/s the wheel is %.3f, the lock there %.3f; half a second turned %.2f rad)\n",
+                    k1.speed, k1.wheel, lock, turned);
+        check(k1.speed > 13.0f && k1.wheel < 0.0f && -k1.wheel < lock + 0.005f && -k1.wheel > lock - 0.03f,
+              "at speed the wheel turns only to the smaller lock for that speed");
+        check(turned > 0.2f && turned < 1.0f, "...so half a second of D at speed is an arc, not a spin");
+        run(50);
+    }
     verb(host, "KartBattle.Abandon");
     run(2);
     std::printf("        (an elimination counted: %d; after the abandon: %d)\n", counted, score(g2, "host").elims);
@@ -381,7 +422,7 @@ int main(int, char**)
           "a round on the skatepark: two jumps down the middle");
     run(2);
     const Kart h5 = where(host, "host");
-    check(near(h5.z, -27, 0.01f) && near(h5.hz, 1, 1e-3f), "the host at the foot of the near jump, facing it");
+    check(near(h5.z, -22, 0.01f) && near(h5.hz, 1, 1e-3f), "the host at the foot of the near jump, facing it");
     {
         // W down; watched a tick at a time: up the ramp at the ramp's height,
         // off the lip, through the air, down again beyond it.
