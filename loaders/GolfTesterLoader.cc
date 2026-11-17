@@ -33,6 +33,7 @@
 #include <fstream>
 #include <string>
 #include <thread>
+#include <unistd.h>
 
 static int g_fail = 0;
 static void check(bool ok, const char* what)
@@ -207,6 +208,10 @@ int main(int, char**)
     verb(be, "Scene3D.Halt");
     verb(be, "Scene3D.SetPosition", "0, 0.15, 19");
     step(60);
+    // What the world is made of, as an export counts it: the same walk and the
+    // same shape lookup a picture makes (Scene3D::collectSubtree).
+    const std::string shapes = "/tmp/etcs_golf_tester_" + std::to_string(::getpid()) + ".stl";
+    const std::string on_green = verb(world, "Scene3D.Export", shapes);
     verb(be, "Scene3D.Impulse", "0, 0, 1, 4");
     bool holed = false;
     for (int i = 0; i < 900 && !holed; ++i)
@@ -218,6 +223,22 @@ int main(int, char**)
     step(120);
     where(ball, b);
     check(holed && speed(ball) == 0.0f && b[1] < -0.5f, "...and rests on the cup's own floor");
+    // The cup holds no meshes, and "one up" from the ball is now the cup: the
+    // ball is drawn by the RID it was given, not by where it has got to.
+    const std::string in_cup = verb(world, "Scene3D.Export", shapes);
+    ::unlink(shapes.c_str());
+    check(holed && !on_green.empty() && on_green.find("refused") == std::string::npos && in_cup == on_green,
+          "...still the sphere it was on the green (the mesh is anchored by RID inside the run)");
+    // A store hands every value back after the lines that set them (etcs_restore_values):
+    // the address as SetMesh wrote it on the green, to a ball that is now in the cup.
+    {
+        std::string kept;
+        const bool had = be->valueOf(ETCS::Buffer("mesh"), kept);
+        check(had && be->restoreValue(ETCS::Buffer("mesh"), kept)
+              && verb(world, "Scene3D.Export", shapes) == on_green,
+              "...and still when its stored value is handed back (the line's RID stands)");
+        ::unlink(shapes.c_str());
+    }
     // The game sets it back once the card has been read: 2.5 s of frames, as
     // the frame edge would visit (the base measures the time between visits).
     for (int i = 0; i < 80 && static_cast<ETCS::Entity*>(ball)->getParent() != world; ++i)
