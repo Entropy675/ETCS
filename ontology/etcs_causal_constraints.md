@@ -53,7 +53,7 @@ the one fact the lines carry about them.
 
 **What that means for runtimes sharing one world.** The lines must be all
 that steps it. A picture steps a scene by the wall clock (being looked at
-is an interaction, §7), and the clock and each runtime's own eye are what
+is an observation, §14), and the clock and each runtime's own eye are what
 two runtimes do not share -- so a world replayed from one record is stepped
 by its driver alone (RenderProvider's `Scene3D.SetDriven`), with the ticks
 as lines of that record (KartProvider's battle).
@@ -293,10 +293,108 @@ by pair, through the kd-tree, and twice; the ledger), §9 (a ball rolled at a
 gap in an anchored green drops into a cup -- a container with its own space
 and floor -- is taken in by fit and rests on the cup's floor).
 
+## 14. A crossing is a step, and it happens on an observation
+
+**Constraint.** Nothing in a tree moves, cools or meets anything except in an
+interaction, and an interaction is something observing the tree. There is no
+clock underneath stepping what nobody asked about. Three things observe, and
+they are one relation at three reaches:
+
+- **a collision** -- two members whose reaches touch observe each other, and
+  the crossing between them is what each learns (§8, §13);
+- **a look** -- a camera's, or a driver's line: something outside asks for the
+  rows as they are now, with the span it measured or states (§9, §10);
+- **an informational relation** -- anything that holds a copy derived from the
+  tree and is asked for it: an `Observable` edge (`ontology/Observable.h`), a
+  hash pulled over the subtree (`Entity::getHash`).
+
+What an observation finds is the tree as its last one left it, and what it
+owes is the gap between the two, settled lazily and exactly. One commit over
+the gap is the commits it skipped (§7). The motion over the gap is one segment
+per body, from where it was pegged to where the step puts it: its **smear**. A
+body nothing pushed has one as well. A crossing inside a gap is found on the
+smears, not on where they end: where two cross, the step is cut there, the
+contact settled (§13), and what is left of each smear goes on from it.
+
+**Whose peg.** Each body has its own: its rows, its clock (§6), the span its
+last crossing settled. They resolve together. An interaction hands one span to
+every body of the tree, under the tree's one lock (§9), in canonical order
+(§2), so no two bodies of a tree are ever at different moments and the order
+of the pairs (§8) never depends on who looked. Per body, to the extent of
+per tree -- and a tree is a causal domain. So a gap, and a smear, lies between
+two observations of a tree, never between two of its bodies.
+
+**Where time comes in.** At a domain's edge, and there are two kinds
+(`doc/module_memory_model.md` §8). A foreign type observes the tree as its
+last interaction left it, and is ordered against it by module. A foreign
+relation is the only thing that brings a span nobody inside stated: what a
+clock measured is an answer from outside the deterministic scope, kept as its
+result (§10). A driver's span is in its line.
+
+**How it spreads.** As a hash is resolved (`core/Entity.h`, "THE RUNTIME
+HASH"): a change marks every ancestor with one increment and computes
+nothing, and whoever next pulls pays, down the paths that moved since they
+last pulled; a branch nobody reads costs nothing. An observation is that
+pull. It goes down from the observer into what it looks at, and its crossings
+go back up as the marks the next observer reads -- a decoherence front, which
+passes through what is related to it and nothing else. So the work arrives in
+bursts, where something looked, as everything owed since the last look. The
+ring every stream and ordering domain rests on
+(`core/LMAXSequentialSharedPage.h`) is built for that shape: whatever was
+published since a reader's cursor is there, in order, when it comes back.
+
+**Where a look is taken.** A picture is drawn under a hold on the tree it
+walks -- the present's -- and nothing under a hold may emit, while a step
+may: fit's move is an ordered event (§11). So a picture only notes that it
+looked, and its observer steps what it looked at once it is outside that
+hold: the frame edge when the tick's visits are done (`Surface.RunFrames`), a
+script after its own `Render`. A frame edge is an observer like any other.
+The step lands after the picture that asked for it, and the next picture is
+of the rows it left (`doc/etcs_specification.md`, **The frame edge**).
+
+**Check.** `OrderVectorTester` §2 (one commit over a gap is the commits
+across it). `CausalTester` §6 (observed spans are the whole of what a clock
+contributed: the same spans into a fresh tree, the same rows) and §7 (a
+reader and a driver take turns on a tree, never inside a step). `HashTester` (a
+pull recomputes the paths that moved and no others). The smear and its
+cut, a look on the edge, observation by relation and a gap filled past its
+cap have no line yet: they are the first four entries below.
+
 ---
 
 ## Not promised (yet)
 
+- **The smear.** A contact is decided where a step leaves the bodies (§8,
+  §13), not along the way, so a sphere that moves more than its radius plus
+  half the other's thickness in one step is through it: a golf ball (radius
+  0.15) against a wall 0.3 thick, at the game's 12 units a second, on any
+  frame longer than 25 ms. The same one level up: fit moves a member one
+  container an interaction (§11), so a body that leaves a space within a step
+  is asked about its old siblings for that step.
+- **A look on the edge.** The look's step is taken inside the picture
+  (`Scene3D::ProjectConcrete`), under the present's hold, and a fit move there
+  asserts: the ball dropping into the cup when a frame is what steps it. A
+  world that must fit under a picture today is driven (§2).
+- **Observation by relation.** Only a driver's line and a look step a tree. A
+  query (`DepthFor`, `Order4`) or a pulled hash reads the rows the last
+  interaction left.
+- **The gap is capped, not filled.** A look credits at most a tenth of a
+  second of motion and a second of cooling (Scene3D's two clocks). What lies
+  beyond is dropped, not swept.
+- **One history is still a lock.** §9's total order is the tree's
+  `TreeMutex`, and a foreign type that reads or drives a tree takes that lock
+  by reference (KartProvider, GolfProvider). A tree is a causal domain (§14)
+  and is to order as one: an event stream of its own in the lock's place
+  (`core/EventStream.h`, what every `EventNode` runs on -- it was meant for
+  local state machines), kept by the Causal family, where a tree's events
+  already come together. Whatever writes to the tree or looks at it produces
+  into the stream. It has no thread: whoever observes the tree runs its loop,
+  one at a time -- a driver waiting on its own line, a frame edge. Its one
+  consumer is the only thing that touches the rows, and is in turn the tree's
+  one producer into the stream above it -- the output ring `EventStream::start`
+  allocates for a single producer, which nothing reads yet -- so a step never
+  waits on its module's order, and a move is handed up to it. Readers take
+  committed rows, before or after a step and never during.
 - **Moving frames.** A member's position is relative to its container's, so
   it goes where the container goes; its motion is not. A move restates the
   position, never the velocity -- doing so would change kinetic energy, and

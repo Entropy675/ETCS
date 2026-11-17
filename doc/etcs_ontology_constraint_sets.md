@@ -256,6 +256,12 @@ optional: the device path (`RenderProvider/OS/DeviceFrame.h`) is the same
 rows handed to a GPU as a matrix per node, and choosing not to render costs
 the physics nothing.
 
+What the fold-in did not change is that nothing steps unobserved. The fault
+in the old arrangement was that a picture was the only observation there was,
+and that it kept the state. A driver's line, a look and a contact are each an
+observation now, and the rows are there between them
+(`ontology/etcs_causal_constraints.md` §14).
+
 The containment itself carries constraints, and they run the same way the
 lineage's do: cumulative by default, down the parent/child relation. A
 Causal container states what its space is like -- how much room it provides

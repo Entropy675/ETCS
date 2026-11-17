@@ -384,11 +384,38 @@ its own token fields.
 
 ## 8. Ordering and Synchronization
 
-Three graduated tiers of causal weight, not a flat local/global split:
+**A module is two things at once: a type provider and a causal domain.** It
+gives its types their tag bits (its Tags string, `ETCS_TAG_DECLARE`), and it
+owns the stream those bits are ordered on (its `EventNode`). That the two
+coincide is the internal boundary. Inside it, an event waits for exactly the
+live events whose masks meet its own (`GapReorderBuffer::acquire`: the
+dependency mask, decided at admission, before the handler runs), and its mask
+is the emitting type's own bit plus the types the running work function has
+been seen to reach (`CausalEdgeMask`) -- edges, not a closure: what a callee
+touches is the callee's own event.
 
-- **`TagModify`** — mask is `1 << <this entity's own type bit>`
-  (`GetTagBit`). Same-type operations serialize against each other via
-  the reorder buffer's collision logic; different types commit
+A tag bit means nothing outside the module that assigned it, so what lies
+outside is foreign, and there are two kinds:
+
+- **A foreign type** is another module's type. It is still ETCS, on the
+  surface every module shares: families by name, tags, a `requires` bracket,
+  the hashes. So it can be held, called and nested -- a Causal member of any
+  provider takes its container's crossings through the family. What it cannot
+  do is lend its bits: its `TAG_MASK` reads empty here, and whatever touches
+  both sides is ordered at the loader by the two MODULE bits
+  (`resolvePairModuleMask`), failing shut to `all()`.
+- **A foreign relation** (`ontology/Foreign.h`) leaves the deterministic
+  scope. The far side is a stranger: nothing past it replays, hashes or
+  witnesses anything, and what comes back is an input -- kept as a value,
+  never asked for again by a replay.
+
+Which gives three graduated tiers of causal weight, not a flat local/global
+split:
+
+- **`TagModify`** — mask is this entity's own type bit plus the types the
+  running work function reaches (above; the type's whole closure until that
+  has settled). Same-type operations serialize against each other via
+  the reorder buffer's collision logic; types that do not meet commit
   independently. Never forwarded to the loader at all — resolved locally
   within the emitting entity's own module.
 - **`Resolve` / `Destroy` / `AddTag`** — mask is `1 << <the module's own
