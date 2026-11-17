@@ -16,20 +16,25 @@
 //      wheels slowly at first, faster while held, up to the lock, and a tap
 //      barely; let go they come back. One standing still does not turn, its
 //      front wheels seen turned and the rear square. The host abandons it:
-//      back to the lobby.
+//      back to the lobby. The tyres are the kart's members, seen at its
+//      corners.
 //   3. THE SETTINGS. In the lobby the host's `config` brings out another map
 //      at once and respawns everyone on it.
 //   4. A ROUND ABANDONED WITH A SCORE, ONE COMPLETED. An elimination in a
-//      round the host abandons is discarded with it, and a kart at its top
-//      speed turns its wheels only to a smaller lock: an arc. Then: the sniper dead on
+//      round the host abandons is discarded with it. Flat out the tyres roll
+//      and mark nothing; a kart at its top speed turns its wheels only to a
+//      smaller lock, an arc -- more than the tyres hold, so it drifts, its
+//      tyres hot and marking the road. Then: the sniper dead on
 //      takes a whole kart, back three seconds later. A rocket bursts on a kart for up to 40; a fuse hurts
 //      all but its own kart; the minigun fires while held, a tap between two
 //      ticks still fires, a boost outruns a kart's top; a power-up hands over
 //      a weapon. The clock runs out into the results, then the lobby, which
 //      keeps the round's scores; the next round starts them afresh.
 //   5. THE GROUND. On the skatepark a kart climbs a ramp at the ramp's
-//      height, flies off its lip and lands beyond it; another driven at a lip
-//      from the drop side is stopped by it.
+//      height, flies off its lip and lands beyond it, and braked to a stop
+//      leaves four dark marks, ropes of six units, kept while it stands and
+//      wiped as it goes on; another driven at a lip from the drop side is
+//      stopped by it.
 //   6. A MAP FROM A SEED. The same layout on every runtime; a new seed, a new
 //      layout, still the same everywhere; every kart on the ground at a spawn.
 //   7. THE SAME BATTLE. Each guest at the host's tick has the host's hash --
@@ -64,16 +69,26 @@ static std::string verb(ETCS::Entity* e, const std::string& action, const std::s
     return d.toString();
 }
 
-// KartBattle.Kart: "<slot> <x> <z> <hx> <hz> <speed> <hp> <weapon> <ammo> <y> <air|ground> <wheel>".
-struct Kart { int slot = -1; float x = 0, z = 0, hx = 0, hz = 0, speed = 0; int hp = -1; std::string weapon; int ammo = 0; float y = 0; std::string air; float wheel = 0; };
+// KartBattle.Kart: "<slot> <x> <z> <hx> <hz> <speed> <hp> <weapon> <ammo> <y> <air|ground> <wheel> <slide>".
+struct Kart { int slot = -1; float x = 0, z = 0, hx = 0, hz = 0, speed = 0; int hp = -1; std::string weapon; int ammo = 0; float y = 0; std::string air; float wheel = 0, slide = 0; };
 static Kart where(ETCS::Entity* b, const std::string& who)
 {
     Kart k;
     const std::string row = verb(b, "KartBattle.Kart", who);
     if (row == "-") return k;   // not driving (a failed >> would read a 0)
     std::istringstream in(row);
-    in >> k.slot >> k.x >> k.z >> k.hx >> k.hz >> k.speed >> k.hp >> k.weapon >> k.ammo >> k.y >> k.air >> k.wheel;
+    in >> k.slot >> k.x >> k.z >> k.hx >> k.hz >> k.speed >> k.hp >> k.weapon >> k.ammo >> k.y >> k.air >> k.wheel >> k.slide;
     return k;
+}
+// KartBattle.Tyres, per tyre (fl fr rl rr): "<heat> <rope> <shown> <darkest>".
+struct Tyre { float heat = 0, rope = 0; int shown = 0; float darkest = 0; };
+struct Tyres { Tyre t[4]; int shown() const { return t[0].shown + t[1].shown + t[2].shown + t[3].shown; } };
+static Tyres tyres(ETCS::Entity* b, const std::string& who)
+{
+    Tyres r;
+    std::istringstream in(verb(b, "KartBattle.Tyres", who));
+    for (Tyre& t : r.t) in >> t.heat >> t.rope >> t.shown >> t.darkest;
+    return r;
 }
 // KartBattle.Status: "<tick> <seq> <mode> <me> <slot> <phase> <secs left> <map> <round secs> <layout>".
 struct Status { uint64_t tick = 0, seq = 0; std::string mode, me; int slot = -1; std::string phase; int left = 0; std::string map; int secs = 0; uint64_t layout = 0; };
@@ -257,12 +272,16 @@ int main(int, char**)
     proposed(g2, 'A', false);
     check(near(b1.hx, -1, 1e-3f) && b1.speed == 0.0f, "A standing still: the wheels turn, the kart does not");
     {
-        // The wheels seen: g2's four, found as the drawn things at its kart's
-        // corners, each axle (its cylinder's axis) across the kart -- the
-        // front two turned left by the lock, the rear two square.
+        // The wheels seen: g2's four, its kart's members (found as the drawn
+        // things round the middle of its frame), each axle (its cylinder's
+        // axis) across the kart -- the front two turned left by the lock, the
+        // rear two square.
         Causal_* wc = static_cast<Causal_*>(worlds[0]->getInterfacePointer(ETCS::Buffer("Causal")));
-        std::vector<Causal_*> by;
-        wc->Near(Fixed::From(b1.x), Fixed::From(0.25), Fixed::From(b1.z), Fixed::From(1.4), by);
+        std::vector<Causal_*> karts, by;
+        wc->Near(Fixed::From(b1.x), Fixed::From(0.25), Fixed::From(b1.z), Fixed::From(0.1), karts);
+        Causal_* body = nullptr;
+        for (Causal_* c : karts) if (c->Solid().shape == CausalSolid::Sphere) body = c;
+        if (body) body->Near(Fixed::Zero(), Fixed::Zero(), Fixed::Zero(), Fixed::From(1.4), by);
         float front = 0, rear = 0; int nf = 0, nr = 0;
         for (Causal_* c : by)
         {
@@ -276,12 +295,12 @@ int main(int, char**)
             // How far the axle is off the kart's own across (hz, -hx), either end.
             const float dot = std::fabs(ax.ToFloat() * b1.hz - az.ToFloat() * b1.hx);
             const float a = std::acos(dot > 1.0f ? 1.0f : dot);
-            const float along = (r.x.ToFloat() - b1.x) * b1.hx + (r.z.ToFloat() - b1.z) * b1.hz;
+            const float along = r.x.ToFloat() * b1.hx + r.z.ToFloat() * b1.hz;   // in the kart's frame
             if (along > 0) { front += a; ++nf; } else { rear += a; ++nr; }
         }
         std::printf("        (axles off square: front %.3f rad, rear %.3f rad, %d+%d wheels)\n", nf ? front / nf : -1.f, nr ? rear / nr : -1.f, nf, nr);
         check(nf == 2 && nr == 2 && std::fabs(front / nf - 0.45f) < 0.02f && rear / nr < 0.01f,
-              "...and the front wheels are seen turned to the lock, the rear ones square");
+              "...and the front wheels, the kart's own members, are seen turned to the lock, the rear ones square");
     }
     verb(host, "KartBattle.Abandon");
     run(2);
@@ -324,18 +343,29 @@ int main(int, char**)
         key(host, 'W', true);
         run(130);
         const Kart k0 = where(host, "host");
+        const Tyres c0 = tyres(host, "host");
+        std::printf("        (straight at %.1f u/s: sliding %.3f, %d mark segments)\n", k0.speed, k0.slide, c0.shown());
+        check(k0.speed > 15.5f && std::fabs(k0.slide) < 0.01f && c0.shown() == 0,
+              "flat out in a straight line the tyres roll: no slide, no marks");
         key(host, 'D', true);
-        run(25);
+        run(35);
         const Kart k1 = where(host, "host");
+        const Tyres c1 = tyres(host, "host");
         key(host, 'D', false);
         key(host, 'W', false);
         const float lock = 0.45f / (1.0f + k1.speed / 10.0f);
         const float turned = std::acos(std::max(-1.0f, std::min(1.0f, k0.hx * k1.hx + k0.hz * k1.hz)));
-        std::printf("        (at %.1f u/s the wheel is %.3f, the lock there %.3f; half a second turned %.2f rad)\n",
-                    k1.speed, k1.wheel, lock, turned);
-        check(k1.speed > 13.0f && k1.wheel < 0.0f && -k1.wheel < lock + 0.005f && -k1.wheel > lock - 0.03f,
+        std::printf("        (at %.1f u/s the wheel is %.3f, the lock there %.3f; 0.7 s turned %.2f rad, sliding %.2f u/s)\n",
+                    k1.speed, k1.wheel, lock, turned, k1.slide);
+        std::printf("        (tyres fl fr rl rr: heat %.1f %.1f %.1f %.1f, marks %d %d %d %d, darkest %.2f %.2f %.2f %.2f)\n",
+                    c1.t[0].heat, c1.t[1].heat, c1.t[2].heat, c1.t[3].heat, c1.t[0].shown, c1.t[1].shown, c1.t[2].shown,
+                    c1.t[3].shown, c1.t[0].darkest, c1.t[1].darkest, c1.t[2].darkest, c1.t[3].darkest);
+        check(k1.speed > 12.0f && k1.wheel < 0.0f && -k1.wheel < lock + 0.005f && -k1.wheel > lock - 0.03f,
               "at speed the wheel turns only to the smaller lock for that speed");
-        check(turned > 0.2f && turned < 1.0f, "...so half a second of D at speed is an arc, not a spin");
+        check(turned > 0.3f && turned < 1.4f, "...so D at speed is an arc, not a spin");
+        check(k1.slide > 0.5f, "...and more than the tyres can hold: the kart slides out of the turn -- a drift");
+        check(c1.shown() > 0 && c1.t[0].heat + c1.t[1].heat + c1.t[2].heat + c1.t[3].heat > 0.0f,
+              "...its tyres hot with the slide, and marking the road");
         run(50);
     }
     verb(host, "KartBattle.Abandon");
@@ -441,10 +471,26 @@ int main(int, char**)
         }
         key(host, 'W', false);
         key(host, 'S', true);
-        run(80);
+        for (int t = 0; t < 120 && where(host, "host").speed > 0.05f; ++t) run(1);
         key(host, 'S', false);
         std::printf("        (on the ramp %.3f off its height; off the lip at z %.2f, up to y %.2f, down at z %.2f)\n",
                     onRampErr, liftZ, topY, landZ);
+        // The brake to a stop: four dark marks, each a rope of the same length.
+        const Tyres m0 = tyres(host, "host");
+        run(50);
+        const Tyres m1 = tyres(host, "host");
+        key(host, 'S', true);
+        run(100);
+        key(host, 'S', false);
+        const Tyres m2 = tyres(host, "host");
+        std::printf("        (braked: ropes %.2f %.2f %.2f %.2f, marks %d %d %d %d, darkest %.2f; a second on %d; backed off %.1f: %d)\n",
+                    m0.t[0].rope, m0.t[1].rope, m0.t[2].rope, m0.t[3].rope, m0.t[0].shown, m0.t[1].shown, m0.t[2].shown,
+                    m0.t[3].shown, m0.t[0].darkest, m1.shown(), where(host, "host").z, m2.shown());
+        bool four = true;
+        for (const Tyre& t : m0.t) four = four && near(t.rope, 6.0f, 0.01f) && t.shown >= 3 && t.darkest >= 0.75f;
+        check(four, "braked to a stop: every tyre leaves a dark mark, on a rope six units long");
+        check(m1.shown() == m0.shown(), "...which stays while the kart stands");
+        check(m2.shown() == 0 && near(m2.t[0].rope, 6.0f, 0.01f), "...and is wiped as it goes on: the rope keeps its length");
         check(onRampErr >= 0.0f && onRampErr < 0.03f, "up the ramp, the kart rides at the ramp's height");
         check(flew && liftZ > -11.6f && liftZ < -10.4f && topY > 1.8f, "...leaves the ground at the lip and climbs higher still");
         check(landed && landZ > -9.0f, "...and lands beyond it");
