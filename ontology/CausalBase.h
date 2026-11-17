@@ -124,9 +124,7 @@ ETCS_SUPERTYPE_BASE(Causal), public RelationalBase<Derived>
 
     void Interact(Fixed dt) override final
     {
-        if (!dt.IsPositive()) return;
-        ::std::lock_guard<::std::recursive_mutex> lk(TreeMutex());
-        InteractUnder(dt, dt);
+        if (dt.IsPositive()) post(dt, dt, 1);
     }
 
     /*
@@ -140,18 +138,15 @@ ETCS_SUPERTYPE_BASE(Causal), public RelationalBase<Derived>
      */
     void InteractObserved(Fixed commit_dt, Fixed step_dt)
     {
-        if (!commit_dt.IsPositive() && !step_dt.IsPositive()) return;
-        ::std::lock_guard<::std::recursive_mutex> lk(TreeMutex());
-        InteractUnder(commit_dt, step_dt);
+        if (commit_dt.IsPositive() || step_dt.IsPositive()) post(commit_dt, step_dt, 1);
     }
 
     // The driver: `ticks` interactions of `dt` each, no clock read. What a
-    // headless run does instead of being looked at.
+    // headless run does instead of being looked at. One event: nothing else
+    // in the tree's stream lands between its ticks.
     void Run(uint32_t ticks, Fixed dt)
     {
-        if (!dt.IsPositive()) return;
-        ::std::lock_guard<::std::recursive_mutex> lk(TreeMutex());
-        for (uint32_t i = 0; i < ticks; ++i) InteractUnder(dt, dt);
+        if (dt.IsPositive() && ticks) post(dt, dt, ticks);
     }
 
     void InteractUnder(Fixed commit_dt, Fixed step_dt) override final
@@ -196,6 +191,22 @@ ETCS_SUPERTYPE_BASE(Causal), public RelationalBase<Derived>
         Causal_* top = this;
         for (Causal_* env = container(); env; env = containerOf(env)) top = env;
         return top == this ? m_tree_mtx : top->TreeMutex();
+    }
+
+    // The tree's stream (Causal.h, CausalStream), found as the lock is. The
+    // top's, made by the first event posted to it: its rings are in the
+    // entity's own arena and end with it. Small rings -- a poster waits on its
+    // own event, so one is in flight a posting thread.
+    CausalStream& TreeStream() override final
+    {
+        Causal_* top = this;
+        for (Causal_* env = container(); env; env = containerOf(env)) top = env;
+        if (top != this) return top->TreeStream();
+        ::std::call_once(m_stream_once, [this] {
+            m_stream.reset(new CausalStream);
+            m_stream->start_driven(this->getArena(), 4);
+        });
+        return *m_stream;
     }
 
     void Impulse(Fixed dx, Fixed dy, Fixed dz, Fixed joules) override final
@@ -498,6 +509,28 @@ ETCS_SUPERTYPE_BASE(Causal), public RelationalBase<Derived>
     static size_t& BroadphaseFrom() { static size_t n = 16; return n; }   // measured: the tree wins from ~16 (CausalTester §9)
 
 private:
+    /*
+     * AN INTERACTION IS AN EVENT IN ITS TREE'S STREAM (Causal.h, CausalStream):
+     * posted, and its poster runs the stream's loop until its own event has
+     * committed. Under the tree's lock for now -- see there.
+     */
+    void post(Fixed commit_dt, Fixed step_dt, uint32_t ticks)
+    {
+        CausalStream& stream = TreeStream();
+        ::std::lock_guard<::std::recursive_mutex> lk(TreeMutex());
+        if (stream.Inside())
+        {
+            for (uint32_t i = 0; i < ticks; ++i) InteractUnder(commit_dt, step_dt);
+            return;
+        }
+        CausalEvent e;
+        e.at = this; e.commit = commit_dt; e.step = step_dt; e.ticks = ticks;
+        if (!stream.enqueue(CausalEventPtr{ &e })) return;   // the stream is ending with its tree
+        int retry = 0;
+        while (!e.done.load(::std::memory_order_acquire))
+            if (!stream.drive()) ETCS::LMAXSequentialSharedPage::progressiveYield(retry);
+    }
+
     /*
      * CANONICAL ORDER: tags in first-attachment order (that order is state;
      * the merkle hash composes by it), within a tag by the member's identity
@@ -1031,6 +1064,8 @@ private:
     ::std::vector<::std::pair<uint32_t, uint32_t>> m_solid_pairs;
     uint64_t    m_ticks = 0;
     ::std::recursive_mutex m_tree_mtx;   // the tree's, when this is its top (TreeMutex)
+    ::std::unique_ptr<CausalStream> m_stream;   // the tree's, when this is its top (TreeStream)
+    ::std::once_flag       m_stream_once;
 
     Fixed       m_share_dt, m_share_k, m_share;   // 1 - exp(-k dt) for the last (dt, k) seen
 

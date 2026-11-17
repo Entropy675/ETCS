@@ -155,12 +155,17 @@ order.
 
 **Constraint.** Every write to any rows in a tree is in one total order: a
 driver's `Run` and an observer's `Interact()` take turns on the tree, never
-interleaving inside a step. A read of the rows is of one state only under
-`TreeMutex()`; outside it a read may straddle a step, and the family says so
-(`Order4`).
+interleaving inside a step. An interaction is an event in the tree's own
+stream (`ontology/Causal.h`, `CausalStream`): the topmost entity's, with no
+thread -- whoever observes the tree runs its loop, one at a time, and a
+`Run` of any length is one event. A read of the rows is of one state only
+under `TreeMutex()`; outside it a read may straddle a step, and the family
+says so (`Order4`).
 
 **Check.** `CausalTester` §7 (a reader under the lock, a driver on another
-thread, 10,000 ticks: every read one state, every row holding).
+thread, 10,000 ticks: every read one state, every row holding) and §7c (two
+drivers on two threads, 2,000 single ticks each: the rows one driver's 4,000
+leave).
 
 ## 10. The rows are what is kept, and they are on the surface
 
@@ -381,20 +386,21 @@ cap have no line yet: they are the first four entries below.
 - **The gap is capped, not filled.** A look credits at most a tenth of a
   second of motion and a second of cooling (Scene3D's two clocks). What lies
   beyond is dropped, not swept.
-- **One history is still a lock.** §9's total order is the tree's
-  `TreeMutex`, and a foreign type that reads or drives a tree takes that lock
-  by reference (KartProvider, GolfProvider). A tree is a causal domain (§14)
-  and is to order as one: an event stream of its own in the lock's place
-  (`core/EventStream.h`, what every `EventNode` runs on -- it was meant for
-  local state machines), kept by the Causal family, where a tree's events
-  already come together. Whatever writes to the tree or looks at it produces
-  into the stream. It has no thread: whoever observes the tree runs its loop,
-  one at a time -- a driver waiting on its own line, a frame edge. Its one
-  consumer is the only thing that touches the rows, and is in turn the tree's
-  one producer into the stream above it -- the output ring `EventStream::start`
-  allocates for a single producer, which nothing reads yet -- so a step never
-  waits on its module's order, and a move is handed up to it. Readers take
-  committed rows, before or after a step and never during.
+- **One history is still a lock.** A tree has an event stream of its own and
+  an interaction is an event in it (§9), but the tree's `TreeMutex` is still
+  what excludes: verbs write the rows under it, readers read under it, a
+  foreign type drives a tree from inside it (KartProvider, GolfProvider), and
+  so the stream's consumer takes it around every event. A tree is a causal
+  domain (§14) and is to order as one. What is left is to move those onto the
+  stream (`core/EventStream.h`, what every `EventNode` runs on -- it was meant
+  for local state machines) until its one consumer is the only thing that
+  touches the rows. That consumer is then the tree's one producer into the
+  stream above it -- the output ring `EventStream` allocates for a single
+  producer, which nothing reads yet -- so a step never waits on its module's
+  order, and a move is handed up to it. A move has two halves, the new parent
+  (its module's order) and the position restated in the new frame (the tree's
+  rows); they stay one change to a reader. Readers take committed rows, before
+  or after a step and never during.
 - **Moving frames.** A member's position is relative to its container's, so
   it goes where the container goes; its motion is not. A move restates the
   position, never the velocity -- doing so would change kinetic energy, and

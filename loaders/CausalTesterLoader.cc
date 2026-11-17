@@ -303,6 +303,23 @@ int main()
         arena.deleteEntity(world, true);
     }
 
+    // -- 7c: two drivers ---------------------------------------------------------
+    {
+        std::cout << "\n-- 7c. two drivers, one stream --\n";
+        // Each Run is one event in the tree's stream, and here every event is
+        // the same line, so any order of them is one history.
+        Body* shared = build();
+        Body* alone  = build();
+        auto drive = [&]() { for (int i = 0; i < 2000; ++i) shared->Run(1, dt); };
+        std::thread a(drive), b(drive);
+        a.join(); b.join();
+        alone->Run(4000, dt);
+        check(shared->CausalHash() == alone->CausalHash() && shared->CausalTicks() == alone->CausalTicks(),
+              "two drivers on one tree: every tick whole, and the rows one driver's 4,000 leave");
+        arena.deleteEntity(shared, true);
+        arena.deleteEntity(alone, true);
+    }
+
     // -- 7b: what a store reads -------------------------------------------------
     {
         std::cout << "\n-- 7b. a frozen read under a driver --\n";

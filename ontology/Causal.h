@@ -5,7 +5,9 @@
 #include "OrderVector.h"
 #include "Plane.h"
 
+#include <atomic>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 /*
@@ -100,6 +102,8 @@
  * about the centre, row 3 facing it), or a half-space (one plane through the
  * centre, facing row 3's up; solid below).
  */
+struct CausalStream;   // a tree's own order, below the family
+
 struct CausalSolid
 {
     enum Shape : uint8_t { Off = 0, Sphere = 1, Box = 2, HalfSpace = 3 };
@@ -194,6 +198,8 @@ public:
 
     // ── the protocol (see above) ────────────────────────────────────────
     virtual ::std::recursive_mutex& TreeMutex() = 0;
+    // The tree's stream (CausalStream): the topmost entity's, as the lock is.
+    virtual CausalStream& TreeStream() = 0;
     // The interaction for a caller holding the tree's lock: the entropy owed
     // over `commit_dt`, the motion over `step_dt` (one span for a driver;
     // an observer measures the two with different ceilings), the members,
@@ -222,6 +228,62 @@ public:
     // under the lock.
     virtual void FieldOnUnder(Causal_& member, Fixed dt) = 0;
     virtual Fixed AccelerateUnder(Fixed gx, Fixed gy, Fixed gz, Fixed dt) = 0;
+};
+
+/*
+ * A TREE'S OWN ORDER. An interaction is an event in the stream of the tree it
+ * is in -- the topmost entity's, started by the first one posted -- and the
+ * stream has no thread: whoever observes the tree runs its loop
+ * (ETCS::EventStream::drive), one at a time. A driver waiting on its own line
+ * is one such observer; a frame edge stepping what its pictures looked at is
+ * another. Every event meets every other (the stream's default mask): one
+ * history a tree.
+ *
+ * THE LOCK IS STILL WHAT EXCLUDES. Verbs and readers are not on the stream
+ * yet, and a foreign type steps a tree from inside its lock
+ * (KartBattle::stepLocked), so the consumer takes the lock around an event and
+ * a poster takes it before it drives: a driver waiting on a poster's event
+ * would otherwise wait on the lock that poster holds.
+ */
+struct CausalEvent
+{
+    Causal_*            at = nullptr;   // whose interaction: it and everything Causal under it
+    Fixed               commit, step;   // the two spans (Causal_::InteractUnder)
+    uint32_t            ticks = 1;
+    ::std::atomic<bool> done{ false };  // the commit; its poster's frame is free after
+};
+// The event stays in its poster's frame, which waits on it: only the pointer
+// rides the ring.
+struct CausalEventPtr { CausalEvent* ptr; };
+struct CausalState {};
+
+struct CausalStream : ETCS::EventStream<CausalStream, CausalState, CausalEventPtr>
+{
+    ETCS::DispatchResult on_event(CausalState&, const CausalEventPtr& ref, uint64_t)
+    {
+        CausalEvent& e = *ref.ptr;
+        const ::std::thread::id outer = m_in.exchange(::std::this_thread::get_id(), ::std::memory_order_acq_rel);
+        {
+            ::std::lock_guard<::std::recursive_mutex> lk(e.at->TreeMutex());
+            for (uint32_t i = 0; i < e.ticks; ++i) e.at->InteractUnder(e.commit, e.step);
+        }
+        m_in.store(outer, ::std::memory_order_release);
+        return { ETCS::DispatchKind::Inline, &e };
+    }
+    void on_completion(CausalState&, ETCS::WorkResult*, uint64_t) {}
+    void on_emit(CausalState&, ETCS::GapSlot& slot)
+    {
+        if (CausalEvent* e = static_cast<CausalEvent*>(slot.result))
+            e->done.store(true, ::std::memory_order_release);
+    }
+
+    // Is the calling thread inside one of this stream's events? An interaction
+    // asked for from inside a step is part of that step: posted, it would
+    // wait behind the event it was asked from.
+    bool Inside() const { return m_in.load(::std::memory_order_acquire) == ::std::this_thread::get_id(); }
+
+private:
+    ::std::atomic<::std::thread::id> m_in{ ::std::thread::id{} };
 };
 
 #endif // SUPERTYPE_CAUSAL_H__

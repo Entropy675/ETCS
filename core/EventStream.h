@@ -210,15 +210,14 @@ protected:
     ::std::thread               ordering_thread_;
     bool                        pending_start_ = false;
     bool                        sync_emscripten_ = false;
-#if defined(__EMSCRIPTEN__)
-    // Which thread currently DRIVES emscripten_poll, and how deep it is in.
-    // There is no ordering thread in the browser, so the loop runs inline in a
-    // waiter -- and more than one waiter is the normal case. See
-    // emscripten_poll. poll_depth_ is only ever touched by the owner, so it
-    // needs no atomicity of its own.
+    // No ordering thread, on any platform: whoever observes this stream runs
+    // its loop (start_driven, drive).
+    bool                        driven_ = false;
+    // Which thread currently runs the loop inline, and how deep it is in
+    // (pass). poll_depth_ is only ever touched by the owner, so it needs no
+    // atomicity of its own.
     ::std::atomic<::std::thread::id> poll_owner_{ ::std::thread::id{} };
     int                              poll_depth_ = 0;
-#endif
     MemoryArena*                pending_arena_ = nullptr;
     int                         pending_producer_count_ = 1;
     ::std::atomic<bool>         stop_{ false };
@@ -410,6 +409,7 @@ public:
     ~EventStream()
     {
         is_cleaning_up_.store(true, ::std::memory_order_release);
+        if (driven_) return;   // no thread to join
         ETCS_LOG("EventStream", "dtor called, joining ordering thread...");
         if (ordering_thread_.joinable())
         {
@@ -609,7 +609,39 @@ public:
 #if defined(__EMSCRIPTEN__)
         if (!input_ring_ || !sync_emscripten_) return false;
         if (stop_.load(::std::memory_order_acquire)) return false;
+        return pass();
+#else
+        return false;
+#endif
+    }
 
+    /*
+     * A STREAM WITH NO THREAD OF ITS OWN, on any platform: a local state
+     * machine whose loop is run by whoever observes it. start_driven in
+     * start's place, drive wherever a caller would otherwise wait. The loop is
+     * the one above, under the same claim -- one driver at a time, its owner
+     * free to re-enter -- so a driver serves every producer's events and a
+     * second caller is told false and tries again.
+     */
+    void start_driven(MemoryArena& arena, int producer_count = 16)
+    {
+        input_ring_      = allocateTunedRing(arena, 0, producer_count);
+        completion_ring_ = allocateTunedRing(arena, 1, producer_count);
+        output_ring_     = allocateTunedRing(arena, 2, 1);
+        stop_.store(false, ::std::memory_order_relaxed);
+        is_cleaning_up_.store(false, ::std::memory_order_relaxed);
+        driven_ = true;
+    }
+    bool drive()
+    {
+        if (!driven_ || !input_ring_ || stop_.load(::std::memory_order_acquire)) return false;
+        return pass();
+    }
+
+protected:
+    // One pass of the loop on the calling thread (emscripten_poll, drive).
+    bool pass()
+    {
         const ::std::thread::id self = ::std::this_thread::get_id();
         if (poll_owner_.load(::std::memory_order_acquire) != self)
         {
@@ -662,11 +694,9 @@ public:
             drain_completions();
         }
         return true;
-#else
-        return false;
-#endif
     }
 
+public:
     void stop()
     {
         is_cleaning_up_.store(true, ::std::memory_order_release);
