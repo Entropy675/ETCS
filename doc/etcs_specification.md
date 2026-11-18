@@ -785,6 +785,59 @@ caller.
 `GenerateEnvironmentSignature` — name plus the whole manifest — still exists and still answers
 the first question. It is no longer what any `_GetHash` export returns.
 
+**Who witnessed these bytes** — the signature, a third question and checked first: `dlopen` runs a
+module's static initialisers, so nothing of it may run before it is known. Every module binary
+carries a certificate chain (`core/Signature.h`) in a place the platform's loader never maps —
+`.etcs.sig` in ELF, an `etcs.sig` custom section in wasm, a trailer after a PE image. Its leaf names
+a digest of the bytes the platform does map, under the module's name, and the epochs it is
+witnessed in: the epoch is the contract and lib keys of the manifest, hashed together, so libs
+count here and stay `[DIFF]` above — two layers of hashing.
+
+The check is a wrap chain, the one the `Wrapper` family already is (`core/Trust.h`). A load is a
+frame that refers to the module's bytes; each stage passes it or refuses it, and a refusal is a
+failed attach. The loader's own two stages are wired in core, before any module can provide a
+type. **Signature**: the chain names these bytes under this name in this epoch, and climbs through
+strictly higher roles to the root; passing, it says who signed. **Own**: a module signed by a
+loader's key is taken only by that loader, and only in a session where it has proven the key is
+its own; the marketplace's are taken by any loader under a root that is ACE's, and under any other
+root only by the loader that is that marketplace. Any `Wrapper` child
+of the gate's entity stands outside those two, like any chain, and signing is the same chain
+wrapped: `ace` signs every module it builds by asking `bin/etcs --sign`, and holds no key. The
+bytes checked are the bytes mapped — a sealed memfd on Linux, a file held against writers on
+Windows.
+
+A loader is one installation as it runs, and its key is what makes it that one. The key is made on
+first use and kept in the OS keystore (`core/Keystore.h`) — the Secret Service, the Credential
+Manager — which is the medium `Private` names. A session begins with a handshake: the store's
+files say what the loader claims to be, the keystore says whether the claim is its own, and a
+loader that cannot prove it takes nothing a loader signed. It does not fall back. A browser holds
+no key and is told at link time which loader built it.
+
+The keys are three, one above the next: a super-root that exists only as shards, an active key it
+certifies, and the marketplace key under that — which is simply the key of the loader that signs
+builds, registered as `Marketplace` where a developer's is registered as `Loader`. A registration
+is issued elsewhere and injected (`etcs --registration`): the place the certificates above a
+loader enter its store.
+
+A loader is the one binary nothing else checks, so it attests itself: at the handshake it puts its
+own bytes through its own two stages. That is what makes a **lineage**. The loader going out signs
+the one that replaces it, and each such signing appends an edge to `lineage.log` in the store —
+parent digest, child digest, the epoch on either side, the signer, and the signer's word for when
+and where. Under a root that is ACE's, only a loader that attests signs, so every etcs is signed by
+a valid etcs back to the one that signed itself, which a store allows once.
+
+`DatabaseProvider::Keystore` is that same store as a `Database` claiming `Private`: where a script
+keeps a secret, and the one place a `Keypair` goes whole. Its `Wrapper` children guard it as they
+would a node on a link, so a secret kept under a `CryptProvider::Envelope` — a stage that seals
+under the key its own `Private` child holds, given by no verb — is reached only by an entity
+carrying the same one. Naming it is not enough.
+
+Unbuilt: the super-root's key in `ace_root()`. Until it is there any root will do — the one a loader
+makes for itself on first use, or one a test authority issues — and such a root vouches for that
+loader only. Also unbuilt: anything that refuses a loader binary outside the lineage (the lineage
+is a record until then), the entitlement stage, and the stage that takes another loader's modules
+(the untrusted scanning mode).
+
 ## Shutdown
 
 Loader unload and the root's own vacate are ordered so a module is never unloaded while a call
@@ -825,6 +878,7 @@ and then writes nothing more, so a half torn-down runtime is never what the next
 | Passing a local down | `detach child.etcs k=name` / `run child.etcs k=name` |
 | Comments | `#` prefix |
 | Sub-script search path | `#IMPORT` / `#EXPORT` on line two |
+| Module signature | automatic at module load, before anything of the module runs |
 | ABI check | automatic at module load |
 | Whole-tree check | automatic at invocation, before any line runs |
 
