@@ -7,14 +7,16 @@
 // headless run does (Scene3D::Run). What is held to account:
 //
 //   1. THE COURSE STANDS. Built by the script, stepped, the ball comes to rest
-//      on the tee: the world's field pulls it down, the green holds it up.
+//      on the tee: the world's field pulls it down, the green holds it up, and
+//      its shadow lies on the green straight under it.
 //   2. THE PULL. A press on the ball (a camera ray through the middle of the
 //      frame, where the game put the ball) starts a pull; dragging down pulls
 //      the shot away from the camera and up -- the view plane's slingshot --
 //      as long as the drag, to the cap. The arrow's shadow lies flat on the
 //      ground under it.
 //   3. THE SHOT. Letting go is the ball's own Impulse along the pull: the ball
-//      moves that way, and the card counts a stroke.
+//      moves that way, and the card counts a stroke. In the air its shadow
+//      stays on the green under it.
 //   4. THE CAMERA. A drag off the ball turns the camera about it and leaves
 //      the ball alone; the wheel brings it closer. With nothing moving, the
 //      turned eye is still drawn again (and an unturned one is not).
@@ -95,7 +97,7 @@ int main(int, char**)
     verb(eye, "Camera3D.SetScene", std::to_string(world->getRID()));
 
     // The course, run as a script with the session's names handed in.
-    ETCS::RID shadow_rid = 0;
+    ETCS::RID shadow_rid = 0, under_rid = 0;
     {
         ETCS::ExecutionContext course(&root, &ctx);
         course.names["anchor"] = ETCS::NameBinding{ world->getRID(), "RenderProvider", "Scene3D" };
@@ -105,6 +107,7 @@ int main(int, char**)
         std::ifstream in(path);
         check(in.is_open() && ETCS::run_script(in, path, course), "the course script runs");
         if (course.names.count("arrow_shadow")) shadow_rid = course.names["arrow_shadow"].rid;
+        if (course.names.count("ball_shadow")) under_rid = course.names["ball_shadow"].rid;
     }
 
     auto* wc  = static_cast<Causal_*>(world->getInterfacePointer(ETCS::Buffer("Causal")));
@@ -112,7 +115,7 @@ int main(int, char**)
     auto* anim = static_cast<Animated_*>(game->getInterfacePointer(ETCS::Buffer("Animated")));
     // The ball and the cup, found as what they are: the free solid sphere, and
     // the container with a space of its own.
-    Causal_* ball = nullptr; Causal_* cup = nullptr; Causal_* shadow = nullptr;
+    Causal_* ball = nullptr; Causal_* cup = nullptr; Causal_* shadow = nullptr; Causal_* under = nullptr;
     {
         std::vector<ETCS::Entity::ChildRef> kids;
         world->getTypedChildRefs(kids);
@@ -122,6 +125,7 @@ int main(int, char**)
             auto* c = k ? static_cast<Causal_*>(k->getInterfacePointer(ETCS::Buffer("Causal"))) : nullptr;
             if (!c) continue;
             if (rid == shadow_rid) shadow = c;
+            if (rid == under_rid) under = c;
             if (c->Solid().shape == CausalSolid::Sphere) ball = c;
             if (c->Space().IsPositive()) cup = c;
         }
@@ -137,6 +141,14 @@ int main(int, char**)
     where(ball, b);
     check(std::fabs(b[1] - 0.15f) < 0.003f && speed(ball) == 0.0f, "the ball comes to rest on the tee: the field down, the green up");
     check(!wc->Moving(), "...and the world says nothing is moving");
+    check(under != nullptr, "the course makes the ball a shadow");
+    if (under)
+    {
+        float u[3];
+        where(under, u);
+        check(std::fabs(u[0] - b[0]) < 1e-3f && std::fabs(u[2] - b[2]) < 1e-3f && u[1] > 0.02f && u[1] < 0.05f,
+              "...lying on the green straight under the ball");
+    }
 
     // -- 2. the pull ---------------------------------------------------------------
     std::cout << "\n-- 2. the pull --\n";
@@ -192,6 +204,21 @@ int main(int, char**)
     check(verb(game, "GolfGame.Strokes") == "1", "...and the card counts a stroke");
     step(1);
     check(wc->Moving(), "...and the world says something is moving: a frame edge keeps drawing");
+    if (under)
+    {
+        // The ball in the air: its shadow stays on the green, under it.
+        float top[3] = { 0, 0, 0 }, low[3] = { 0, 0, 0 };
+        for (int i = 0; i < 40; ++i)
+        {
+            step(1);
+            float at[3];
+            where(ball, at);
+            if (at[1] > top[1]) { top[0] = at[0]; top[1] = at[1]; top[2] = at[2]; where(under, low); }
+        }
+        std::printf("        (the ball up to y %.2f at z %.2f; its shadow there at y %.3f, z %.2f)\n", top[1], top[2], low[1], low[2]);
+        check(top[1] > 0.2f && low[1] > 0.02f && low[1] < 0.05f && std::fabs(low[0] - top[0]) < 1e-3f && std::fabs(low[2] - top[2]) < 1e-3f,
+              "the ball in the air has its shadow on the green straight under it");
+    }
     step(600);
 
     // -- 4. the camera -------------------------------------------------------------
