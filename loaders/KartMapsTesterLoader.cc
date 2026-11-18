@@ -12,7 +12,10 @@
 //   2. FURNISHED. Every one has its eight spawns, a deck, two springs or
 //      more, a pad, a second box, and three or more of blocks, ramps and
 //      hills; about one in two has a pit.
-//   3. THE SAME AGAIN. A seed makes the same map twice.
+//   3. BIG LEVELS. The storey is over a tenth of the arena or more; the low
+//      ground, where there is any, is a third of it or more, with two ramps
+//      out or more.
+//   4. THE SAME AGAIN. A seed makes the same map twice.
 //
 // It also prints how much of each thing a map has on average and at most: the
 // numbers to look at after a change to the generator. A few layouts seen in
@@ -51,7 +54,7 @@ static std::string numbers(const KartArena::Map& m)
     for (const auto& d : m.decks)   { put(d.x); put(d.z); put(d.w); put(d.d); put(d.h); st += "|"; }
     for (const auto& p : m.pits)    { put(p.x); put(p.z); put(p.w); put(p.d); put(p.depth); st += "|"; }
     for (const auto& p : m.spawns)  { put(p.x); put(p.z); }
-    for (const auto& p : m.pickups) { put(p.x); put(p.z); }
+    for (const auto& p : m.pickups) { put(p.x); put(p.z); if (p.up) st += "u"; }
     return st;
 }
 
@@ -65,7 +68,8 @@ int main(int argc, char** argv)
     static const char* const kinds[] = { "blocks", "ramps", "hills", "pads", "springs", "decks", "pits", "boxes" };
     enum { Kinds = sizeof kinds / sizeof kinds[0] };
     long none[Kinds] = {}, sum[Kinds] = {}, most[Kinds] = {};
-    int faulty = 0, bare = 0, differs = 0;
+    int faulty = 0, bare = 0, differs = 0, small = 0;
+    long climbs = 0, stairless = 0, exits = 0;
     uint64_t dice = 0x9e3779b97f4a7c15ull;
     for (int i = 0; i < seeds; ++i)
     {
@@ -80,6 +84,22 @@ int main(int argc, char** argv)
             sum[k] += static_cast<long>(has[k]);
             if (static_cast<long>(has[k]) > most[k]) most[k] = static_cast<long>(has[k]);
         }
+        // The levels: how much of the arena's 64 x 64 each takes, the ramps
+        // up to the storey and the ramps out of the low ground.
+        double storey = 0.0, low = 0.0;
+        for (const auto& d : m.decks) storey += static_cast<double>((d.w * d.d).ToFloat()) / 4096.0;
+        for (const auto& p : m.pits)  low += static_cast<double>((p.w * p.d).ToFloat()) / 4096.0;
+        long up = 0, out = 0;
+        for (const auto& a : m.ramps)
+        {
+            up += a.height == KartArena::StoreyHeight();
+            out += !m.pits.empty() && a.base.raw < 0 && a.height == KartArena::LowDepth();
+        }
+        climbs += up; stairless += up == 0; exits += out;
+        const bool big = storey >= 0.09 && (m.pits.empty() || (low >= 0.3 && out >= 2));
+        if (!big && small++ < 5)
+            std::printf("        seed %llu: a storey over %.0f%%, low ground %.0f%% with %ld ramps out\n",
+                        static_cast<unsigned long long>(seed), storey * 100.0, low * 100.0, out);
         const std::string faults = KartArena::Faults(m);
         if (!faults.empty() && faulty++ < 5) std::printf("        seed %llu:\n%s\n", static_cast<unsigned long long>(seed), faults.c_str());
         const bool furnished = m.spawns.size() == 8 && !m.decks.empty() && m.springs.size() >= 2 && !m.pads.empty()
@@ -98,9 +118,13 @@ int main(int argc, char** argv)
     for (int k = 0; k < Kinds; ++k)
         std::printf("        %-8s %5.2f a map, at most %ld, none on %ld (%.1f%%)\n", kinds[k],
                     static_cast<double>(sum[k]) / seeds, most[k], none[k], 100.0 * static_cast<double>(none[k]) / seeds);
-    std::printf("        (%d with a fault, %d short of something)\n", faulty, bare);
+    std::printf("        ramps up to the storey %.2f a map, none on %ld (%.1f%%); ramps out of the low ground %.2f where there is any\n",
+                static_cast<double>(climbs) / seeds, stairless, 100.0 * static_cast<double>(stairless) / seeds,
+                seeds > none[6] ? static_cast<double>(exits) / static_cast<double>(seeds - none[6]) : 0.0);
+    std::printf("        (%d with a fault, %d short of something, %d with a level too small)\n", faulty, bare, small);
     check(faulty == 0, "every map is sound: nothing on it where it cannot be reached or used");
     check(bare == 0, "every map has eight spawns, a deck, two springs, a pad, a second box and three things to drive round");
+    check(small == 0, "every storey is over a tenth of the arena or more; low ground is a third or more, with two ramps out or more");
     const double pits = static_cast<double>(seeds - none[6]) / seeds;
     check(seeds < 1000 || (pits > 0.4 && pits < 0.6), "about one in two has a pit");
     check(differs == 0, "a seed makes the same map twice");

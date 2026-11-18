@@ -1,10 +1,10 @@
 // GolfTesterLoader.cc
 //
-// ONE HOLE, PLAYED WITHOUT A WINDOW. The course script (GolfProvider/scripts/
-// golf_course.etcs) builds the hole under a world and hands its pieces to a
-// GolfGame; this plays it the way a pointer would -- through the game's
-// Press/Drag/Release verbs -- and steps the world with its driver, the way a
-// headless run does (Scene3D::Run). What is held to account:
+// A COURSE, PLAYED WITHOUT A WINDOW. The course script (GolfProvider/scripts/
+// golf_course.etcs) builds its three holes under a world and hands their
+// pieces to a GolfGame; this plays the first the way a pointer would --
+// through the game's Press/Drag/Release verbs -- and steps the world with its
+// driver, the way a headless run does (Scene3D::Run). What is held to account:
 //
 //   1. THE COURSE STANDS. Built by the script, stepped, the ball comes to rest
 //      on the tee: the world's field pulls it down, the green holds it up, and
@@ -22,8 +22,15 @@
 //      turned eye is still drawn again (and an unturned one is not).
 //   5. HOLED. A ball sent at the cup at a putting pace drops through the gap,
 //      fit takes it into the cup's space, and it rests on the cup's floor; the
-//      game, advanced at the frame edge, sets it back on the tee.
-//   6. HOLED BY BEING LOOKED AT. The same putt with no driver: the camera's
+//      game, advanced at the frame edge, sets it on the next hole's tee.
+//   6. THE COURSE AND ITS LEVELS. Hole 2 starts on a terrace: a ball rolled
+//      off it runs down the slope and comes to rest a level down, where a
+//      putt holes it. Hole 3 climbs: a soft putt at the slope rolls back, a
+//      firm one rests on the terrace a level up; a ball dropped into the sand
+//      trap rests half a unit down, its shadow on the sand. Holed, the round
+//      is done and the first hole comes round again; a hole can be gone to by
+//      its number, and N goes on to the next.
+//   7. HOLED BY BEING LOOKED AT. The same putt with no driver: the camera's
 //      pictures step the world, as a frame does. A picture is drawn under a
 //      hold and only notes its look; the step, and fit's move, come after it.
 //
@@ -33,12 +40,14 @@
 
 #include "../ETCS.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <fstream>
 #include <string>
 #include <thread>
+#include <vector>
 #include <unistd.h>
 
 static int g_fail = 0;
@@ -82,7 +91,7 @@ static void velocity(Causal_* c, float v[3])
 int main(int, char**)
 {
     WIRE_CONTEXT();
-    std::cout << "=== One hole, without a window ===\n";
+    std::cout << "=== A course, without a window ===\n";
 
     // The session's half: a world, a camera on it, a game -- what a page or a
     // window script makes before it runs the course.
@@ -113,9 +122,11 @@ int main(int, char**)
     auto* wc  = static_cast<Causal_*>(world->getInterfacePointer(ETCS::Buffer("Causal")));
     auto* cam = static_cast<Camera_*>(eye->getInterfacePointer(ETCS::Buffer("Camera")));
     auto* anim = static_cast<Animated_*>(game->getInterfacePointer(ETCS::Buffer("Animated")));
-    // The ball and the cup, found as what they are: the free solid sphere, and
-    // the container with a space of its own.
+    // The ball and the cups, found as what they are: the free solid sphere,
+    // and the containers with a space of their own -- each hole's, west to
+    // east, which is the order they are played in.
     Causal_* ball = nullptr; Causal_* cup = nullptr; Causal_* shadow = nullptr; Causal_* under = nullptr;
+    std::vector<Causal_*> cups;
     {
         std::vector<ETCS::Entity::ChildRef> kids;
         world->getTypedChildRefs(kids);
@@ -127,11 +138,14 @@ int main(int, char**)
             if (rid == shadow_rid) shadow = c;
             if (rid == under_rid) under = c;
             if (c->Solid().shape == CausalSolid::Sphere) ball = c;
-            if (c->Space().IsPositive()) cup = c;
+            if (c->Space().IsPositive()) cups.push_back(c);
         }
     }
-    check(wc && cam && anim && ball && cup, "the hole has a ball and a cup");
-    if (!(wc && cam && anim && ball && cup)) { std::printf("FAILED\n"); return 1; }
+    std::sort(cups.begin(), cups.end(), [](Causal_* a, Causal_* b) { float p[3], q[3]; where(a, p); where(b, q); return p[0] < q[0]; });
+    if (!cups.empty()) cup = cups[0];
+    check(wc && cam && anim && ball && cups.size() == 3, "the course has a ball and three holes, a cup to each");
+    if (!(wc && cam && anim && ball && cups.size() == 3)) { std::printf("FAILED\n"); return 1; }
+    check(verb(game, "GolfGame.Card") == "1 3 0 0", "...the first in play, the card clear");
     auto step = [&](int ticks) { for (int i = 0; i < ticks; ++i) { verb(world, "Scene3D.Run", "1, 16"); anim->Advance(); } };
 
     // -- 1. the course stands ----------------------------------------------------
@@ -306,11 +320,93 @@ int main(int, char**)
         anim->Advance();
     }
     where(ball, b);
-    check(static_cast<ETCS::Entity*>(ball)->getParent() == world && std::fabs(b[2]) < 0.01f && b[1] > 0.0f,
-          "the game sets a holed ball back on the tee");
+    std::printf("        (the card: %s; the ball at %.2f %.2f %.2f)\n", verb(game, "GolfGame.Card").c_str(), b[0], b[1], b[2]);
+    check(static_cast<ETCS::Entity*>(ball)->getParent() == world && std::fabs(b[0] - 14.0f) < 0.01f && std::fabs(b[2]) < 0.01f && b[1] > 1.5f,
+          "the game sets a holed ball on the next hole's tee");
+    check(verb(game, "GolfGame.Card") == "2 3 0 1", "...the card on hole 2, the first hole's stroke kept for the round");
 
-    // -- 6. holed by being looked at ---------------------------------------------------
-    std::cout << "\n-- 6. holed by being looked at --\n";
+    // -- 6. the course and its levels ---------------------------------------------------
+    std::cout << "\n-- 6. the course and its levels --\n";
+    // A putt from three short of a cup, as in 5, and the frames the game reads the card over.
+    auto hole_out = [&](Causal_* into, const char* from) {
+        verb(be, "Scene3D.Halt");
+        verb(be, "Scene3D.SetPosition", from);
+        step(60);
+        verb(be, "Scene3D.Impulse", "0, 0, 1, 4");
+        bool in = false;
+        for (int i = 0; i < 900 && !in; ++i) { step(1); in = be->getParent() == static_cast<ETCS::Entity*>(into); }
+        return in;
+    };
+    auto read_card = [&]() {
+        for (int i = 0; i < 80 && be->getParent() != world; ++i) { std::this_thread::sleep_for(std::chrono::milliseconds(50)); anim->Advance(); }
+    };
+    auto rest = [&](int most) { for (int i = 0; i < most; ++i) { step(10); if (speed(ball) == 0.0f) break; } where(ball, b); };
+    {
+        // Hole 2. On its terrace; rolled off it, down the slope to the green.
+        rest(30);
+        check(std::fabs(b[1] - 1.65f) < 0.003f && speed(ball) == 0.0f, "hole 2's tee is on a terrace: the ball rests a unit and a half up");
+        verb(be, "Scene3D.Impulse", "0, 0, 1, 9");
+        float lowest = b[1], furthest = b[2];
+        for (int i = 0; i < 150; ++i) { step(10); where(ball, b); lowest = std::min(lowest, b[1]); furthest = std::max(furthest, b[2]); if (speed(ball) == 0.0f) break; }
+        std::printf("        (rolled off the terrace: down to y %.2f, as far as z %.2f; at rest at %.2f %.2f %.2f)\n", lowest, furthest, b[0], b[1], b[2]);
+        check(speed(ball) == 0.0f && std::fabs(b[1] - 0.15f) < 0.003f && b[2] > 14.0f && b[2] < 26.0f,
+              "...and rolled off it, it runs down the slope and comes to rest on the green, a level down");
+        const bool in2 = hole_out(cups[1], "14, 0.15, 19");
+        check(in2, "a putt on that green is holed in hole 2's cup");
+        read_card();
+        where(ball, b);
+        std::printf("        (the card: %s; the ball at %.2f %.2f %.2f)\n", verb(game, "GolfGame.Card").c_str(), b[0], b[1], b[2]);
+        check(be->getParent() == world && std::fabs(b[0] - 28.0f) < 0.01f && std::fabs(b[2]) < 0.01f && verb(game, "GolfGame.Card").compare(0, 5, "3 3 0") == 0,
+              "...and the game goes on to hole 3's tee");
+
+        // Hole 3. A soft putt at the slope rolls back; a firm one stays up.
+        verb(be, "Scene3D.Halt");
+        verb(be, "Scene3D.SetPosition", "26, 0.15, 7");
+        step(30);
+        verb(be, "Scene3D.Impulse", "0, 0, 1, 4");
+        float highest = 0.0f;
+        for (int i = 0; i < 150; ++i) { step(10); where(ball, b); highest = std::max(highest, b[1]); if (speed(ball) == 0.0f) break; }
+        std::printf("        (a soft putt at the slope: up to y %.2f, at rest at z %.2f, y %.2f)\n", highest, b[2], b[1]);
+        check(speed(ball) == 0.0f && highest > 0.2f && highest < 1.0f && std::fabs(b[1] - 0.15f) < 0.003f && b[2] < 8.0f,
+              "hole 3 climbs: a soft putt goes part way up the slope and rolls back to the green");
+        verb(be, "Scene3D.Halt");
+        verb(be, "Scene3D.SetPosition", "26, 0.15, 7");
+        step(30);
+        verb(be, "Scene3D.Impulse", "0, 0, 1, 20");
+        rest(150);
+        std::printf("        (a firm one: at rest at z %.2f, y %.2f)\n", b[2], b[1]);
+        check(speed(ball) == 0.0f && std::fabs(b[1] - 1.15f) < 0.003f && b[2] > 14.0f && b[2] < 26.0f,
+              "...a firm one tops it and rests on the terrace, a level up");
+        // The trap, in the straight line from the tee.
+        verb(be, "Scene3D.Halt");
+        verb(be, "Scene3D.SetPosition", "28, 0.4, 5");
+        rest(60);
+        float u[3] = { 0, 0, 0 };
+        if (under) where(under, u);
+        std::printf("        (dropped into the trap: at rest at y %.2f, its shadow at y %.3f)\n", b[1], u[1]);
+        check(speed(ball) == 0.0f && std::fabs(b[1] + 0.35f) < 0.003f && u[1] > -0.5f && u[1] < -0.44f,
+              "...and the sand trap before the slope is half a unit down: a ball in it rests there, its shadow on the sand");
+        const std::string before = verb(game, "GolfGame.Card");
+        const bool in3 = hole_out(cups[2], "28, 1.15, 19");
+        check(in3, "a putt on the terrace is holed in hole 3's cup");
+        read_card();
+        where(ball, b);
+        std::printf("        (the card before: %s, after: %s; the ball at %.2f %.2f %.2f)\n", before.c_str(), verb(game, "GolfGame.Card").c_str(), b[0], b[1], b[2]);
+        check(be->getParent() == world && std::fabs(b[0]) < 0.01f && std::fabs(b[2]) < 0.01f && verb(game, "GolfGame.Card") == "1 3 0 0",
+              "the last hole holed, the round is done: the first hole again, the card clear");
+        // By number, and on with N.
+        verb(game, "GolfGame.PlayHole", "2");
+        where(ball, b);
+        const bool second = std::fabs(b[0] - 14.0f) < 0.01f && verb(game, "GolfGame.Card") == "2 3 0 0";
+        verb(game, "GolfGame.Key", "78, 1");
+        where(ball, b);
+        check(second && std::fabs(b[0] - 28.0f) < 0.01f && verb(game, "GolfGame.Card") == "3 3 0 0", "a hole is gone to by its number, and N goes on to the next");
+        verb(game, "GolfGame.Reset");
+        step(60);
+    }
+
+    // -- 7. holed by being looked at ---------------------------------------------------
+    std::cout << "\n-- 7. holed by being looked at --\n";
     verb(be, "Scene3D.Halt");
     verb(be, "Scene3D.SetPosition", "0, 0.15, 19");
     step(60);
