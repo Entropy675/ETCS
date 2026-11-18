@@ -21,10 +21,12 @@
 //   5. CERTIFICATES. Signature.h round-trips and refuses trailing bytes; a
 //      root is its own issuer and nothing else may be; a chain verifies link
 //      by link and a flipped bit or a stranger's key does not.
-//   6. THE CEREMONY AS WRITTEN. root_ceremony.etcs, with only its paths
-//      changed, leaves every custodian a share of each key and both
-//      certificates; any three custodians rebuild the root, whose public key
-//      is the root certificate's subject.
+//   6. THE CEREMONY AS WRITTEN. root_ceremony.etcs, with only its paths and
+//      keys filled in, leaves every custodian a share of the root and of the
+//      active key, and every custodian and the public directory the three-step
+//      chain; any three custodians rebuild the root, whose public key is the
+//      root certificate's subject; certify.etcs rebuilds the active key from
+//      three and certifies one more key under the same root.
 //   7. A KEY KEPT. A Keypair goes whole only into a Database that claims
 //      Private -- DatabaseProvider's Keystore, the OS keystore -- and comes
 //      back as the same key; a LocalDatabase is refused; nothing is replaced;
@@ -32,9 +34,14 @@
 //   8. THE ENVELOPE. A Wrapper stage that seals, keyed by its Private child
 //      and by no verb: a changed byte, another key, or no key is a refusal.
 //      Standing on a Keystore, it makes naming a secret not enough to read it.
-//   9. A TEST AUTHORITY AS WRITTEN. test_authority.etcs leaves a marketplace
-//      certificate, its active key's and a root's: a registration the loader
-//      accepts for that key, from two keys that do not outlive the script.
+//   9. A TEST AUTHORITY AS WRITTEN. test_authority.etcs leaves marketplace,
+//      release and registrar certificates for three keys under one active key,
+//      and the root's: three registrations the loader accepts, each for its
+//      own key and no other, from two keys that do not outlive the script.
+//  10. THE REGISTRAR, as a site's route: it takes only a chain that certifies
+//      its own key up to a root; a loader's ask, signed, gets a Loader
+//      certificate the loader accepts; an unsigned ask, or one made of another
+//      registrar, is refused.
 //
 //   ./Run_CryptProviderTesterLoader
 //
@@ -72,6 +79,20 @@ static std::string verb(ETCS::Entity* e, const std::string& action, const std::s
     return d.toString();
 }
 static bool yes(const std::string& s) { return s.find('1') != std::string::npos; }
+// A route's answer, inline or by reference (NetworkProvider's RouteRef frame).
+static std::string route(ETCS::Entity* e, const std::string& path)
+{
+    ETCS::Buffer a("Registrar.Request"), d(path.c_str());
+    e->call(a, d);
+    if (d.written == 64 && std::memcmp(d.buf, "ETCSREF\0", 8) == 0)
+    {
+        uint64_t p = 0, n = 0;
+        std::memcpy(&p, d.buf + 8, 8);
+        std::memcpy(&n, d.buf + 16, 8);
+        return std::string(reinterpret_cast<const char*>(static_cast<uintptr_t>(p)), static_cast<size_t>(n));
+    }
+    return d.toString();
+}
 
 static std::string hex(const uint8_t* p, size_t n)
 {
@@ -406,27 +427,58 @@ int main(int, char**)
         verb(entity("to_a"), "FileRelation.Delete");
         verb(entity("a"), "Custody.Delete");
         verb(entity("embassy"), "Embassy.Delete");
+        namespace sig = ETCS::sig;
+        namespace tr = ETCS::trust;
         std::string script = slurp(std::string(ETCS_ACE_ROOT) + "/modules/CryptProvider/scripts/root_ceremony.etcs");
+        auto put = [](std::string& text, const std::string& what, const std::string& with) {
+            for (size_t at = text.find(what); at != std::string::npos; at = text.find(what, at + with.size()))
+                text.replace(at, what.size(), with);
+        };
+        auto fresh_dir = [] { char t[] = "/tmp/etcs_ceremony_XXXXXX"; return ::mkdtemp(t) ? std::string(t) : std::string(); };
         std::vector<std::string> dirs;
         for (const char* who : { "a", "b", "c", "d", "e" })
         {
-            char t[] = "/tmp/etcs_ceremony_XXXXXX";
-            dirs.push_back(::mkdtemp(t) ? std::string(t) : std::string());
-            const std::string from = std::string("/media/custodian-") + who;
-            const size_t at = script.find(from);
-            if (at != std::string::npos) script.replace(at, from.size(), dirs.back());
+            dirs.push_back(fresh_dir());
+            put(script, std::string("/media/custodian-") + who, dirs.back());
         }
+        const std::string pub_dir = fresh_dir();
+        uint8_t seed[32], secret[64];
+        sig::Key role_keys[3] = {};
+        for (sig::Key& k : role_keys) { tr::random_bytes(seed, 32); mc::crypto_ed25519_key_pair(secret, k.data(), seed); }
+        put(script, "PUBLIC_DIR", pub_dir);
+        put(script, "MARKETPLACE_KEY", hex(role_keys[0].data(), 32));
+        put(script, "RELEASE_KEY", hex(role_keys[1].data(), 32));
+        put(script, "REGISTRAR_KEY", hex(role_keys[2].data(), 32));
         ETCS::ExecutionContext c2(&root, &ctx);
         std::istringstream in(script);
         const bool ran = ETCS::run_script(in, std::string(ETCS_ACE_ROOT) + "/modules/CryptProvider/scripts/root_ceremony.etcs", c2);
+        const char* certs[] = { "root.cert", "active.cert", "marketplace.cert", "release.cert", "registrar.cert" };
         bool all = ran;
         for (const std::string& d : dirs)
-            for (const char* f : { "root.shard.private", "intermediate.shard.private", "root.cert", "intermediate.cert" })
+            for (const char* f : { "root.shard.private", "active.shard.private" })
             {
                 struct stat fs{};
                 all = all && ::stat((d + "/" + f).c_str(), &fs) == 0;
             }
-        check(all, "the ceremony runs as written: every custodian holds both shares and both certificates");
+        for (const std::string& d : dirs)
+            for (const char* f : certs)
+            {
+                struct stat fs{};
+                all = all && ::stat((d + "/" + f).c_str(), &fs) == 0;
+            }
+        check(all, "the ceremony runs as written: every custodian holds a share of the root and of the active key, and the chain");
+        const char* roles[] = { "marketplace.cert", "release.cert", "registrar.cert" };
+        bool chained = true;
+        sig::Key root_pub{};
+        for (int i = 0; i < 3; ++i)
+        {
+            std::vector<sig::Certificate> reg;
+            chained = chained && tr::read_certificates(pub_dir + "/" + roles[i], reg)
+                      && tr::read_certificates(pub_dir + "/active.cert", reg) && tr::read_certificates(pub_dir + "/root.cert", reg)
+                      && reg.size() == 3 && tr::registration_valid(reg, role_keys[i], reg[2].subject);
+            if (chained) root_pub = reg[2].subject;
+        }
+        check(chained, "the public directory holds the three-step chain: each role's key <- active <- root");
 
         // Three custodians, after the fact: a fresh runtime's view of their media.
         std::string recall =
@@ -457,8 +509,43 @@ int main(int, char**)
         check(!rebuilt_pub.empty() && rebuilt_pub == verb(entity("back_rc"), "Certificate.Subject")
               && yes(verb(entity("back_rc"), "Certificate.Verify")),
               "three custodians rebuild the root, and it is the root certificate's subject");
-        // The ceremony's Embassy is a global; the next root script names its own.
-        verb(ETCS::etcs_resolve_rid_anywhere(&ETCS::getLoader(), c2.names["embassy"].rid), "Embassy.Delete");
+        // The ceremony's names are globals; certify.etcs spawns some of the same.
+        auto gone = [&](const char* name, const char* tag) {
+            if (c2.names.count(name)) verb(ETCS::etcs_resolve_rid_anywhere(&ETCS::getLoader(), c2.names[name].rid), std::string(tag) + ".Delete");
+        };
+        for (const char* n : { "a", "b", "c", "d", "e", "out" }) gone(n, "Custody");
+        for (const char* n : { "to_a", "to_b", "to_c", "to_d", "to_e", "to_out" }) gone(n, "FileRelation");
+        for (const char* n : { "root_cert", "active_cert", "marketplace_cert", "release_cert", "registrar_cert" }) gone(n, "Certificate");
+        gone("embassy", "Embassy");
+
+        // Later: one more key, certified by the active key rebuilt from three custodians.
+        std::string certify = slurp(std::string(ETCS_ACE_ROOT) + "/modules/CryptProvider/scripts/certify.etcs");
+        const std::string pub2 = fresh_dir();
+        sig::Key later{};
+        tr::random_bytes(seed, 32);
+        mc::crypto_ed25519_key_pair(secret, later.data(), seed);
+        mc::crypto_wipe(secret, 64);
+        put(certify, "/media/custodian-a", dirs[1]);
+        put(certify, "/media/custodian-b", dirs[3]);
+        put(certify, "/media/custodian-c", dirs[4]);
+        put(certify, "PUBLIC_DIR", pub2);
+        put(certify, "ROLE", "registrar");
+        put(certify, "SUBJECT_KEY", hex(later.data(), 32));
+        ETCS::ExecutionContext c3(&root, &ctx);
+        std::istringstream cin_(certify);
+        const bool certified = ETCS::run_script(cin_, std::string(ETCS_ACE_ROOT) + "/modules/CryptProvider/scripts/certify.etcs", c3);
+        std::vector<sig::Certificate> reg;
+        check(certified && tr::read_certificates(pub2 + "/registrar.cert", reg)
+              && tr::read_certificates(pub_dir + "/active.cert", reg) && tr::read_certificates(pub_dir + "/root.cert", reg)
+              && tr::registration_valid(reg, later, root_pub),
+              "certify.etcs: three custodians rebuild the active key, which certifies one more key under the same root");
+        auto gone3 = [&](const char* name, const char* tag) {
+            if (c3.names.count(name)) verb(ETCS::etcs_resolve_rid_anywhere(&ETCS::getLoader(), c3.names[name].rid), std::string(tag) + ".Delete");
+        };
+        for (const char* n : { "a", "b", "c", "out" }) gone3(n, "Custody");
+        for (const char* n : { "to_a", "to_b", "to_c", "to_out" }) gone3(n, "FileRelation");
+        for (const char* n : { "active_cert", "cert" }) gone3(n, "Certificate");
+        gone3("embassy", "Embassy");
     }
 
     // -- 7. a key kept ------------------------------------------------------------------
@@ -583,9 +670,8 @@ int main(int, char**)
     {
         namespace tr = ETCS::trust;
         uint8_t seed[32], secret[64];
-        ETCS::sig::Key loader{};
-        tr::random_bytes(seed, 32);
-        mc::crypto_ed25519_key_pair(secret, loader.data(), seed);
+        ETCS::sig::Key keys[3] = {};                            // marketplace, release, registrar: three loaders
+        for (ETCS::sig::Key& k : keys) { tr::random_bytes(seed, 32); mc::crypto_ed25519_key_pair(secret, k.data(), seed); }
         const std::string out = dir + "/authority";
         ::mkdir(out.c_str(), 0700);
         std::string script = slurp(std::string(ETCS_ACE_ROOT) + "/modules/CryptProvider/scripts/test_authority.etcs");
@@ -594,25 +680,100 @@ int main(int, char**)
                 script.replace(at, what.size(), with);
         };
         put("AUTHORITY_DIR", out);
-        put("LOADER_KEY", hex(loader.data(), 32));
+        put("MARKETPLACE_KEY", hex(keys[0].data(), 32));
+        put("RELEASE_KEY", hex(keys[1].data(), 32));
+        put("REGISTRAR_KEY", hex(keys[2].data(), 32));
         ETCS::ExecutionContext c3(&root, &ctx);                 // a root script, as it will be run
         std::istringstream in(script);
         check(ETCS::run_script(in, std::string(ETCS_ACE_ROOT) + "/modules/CryptProvider/scripts/test_authority.etcs", c3),
-              "test_authority.etcs runs as written, with its two placeholders filled");
-        std::vector<ETCS::sig::Certificate> reg;
-        const bool read = tr::read_certificates(out + "/marketplace.cert", reg)
-                       && tr::read_certificates(out + "/active.cert", reg)
-                       && tr::read_certificates(out + "/root.cert", reg);
-        check(read && reg.size() == 3 && reg[0].role == ETCS::sig::Role::Marketplace
-              && reg[1].role == ETCS::sig::Role::Intermediate && reg[2].role == ETCS::sig::Role::Root,
-              "it leaves three certificates: marketplace, active, root");
-        check(read && tr::registration_valid(reg, loader, reg[2].subject),
-              "which are a registration of that loader's key, as the loader will check it");
+              "test_authority.etcs runs as written, with its placeholders filled");
+        const char* names[3] = { "marketplace", "release", "registrar" };
+        const ETCS::sig::Role roles[3] = { ETCS::sig::Role::Marketplace, ETCS::sig::Role::Release, ETCS::sig::Role::Registrar };
+        std::vector<ETCS::sig::Certificate> reg[3];
+        bool read = true, shaped = true, valid = true, crossed = false;
+        for (int i = 0; i < 3; ++i)
+        {
+            read = read && tr::read_certificates(out + "/" + names[i] + ".cert", reg[i])
+                        && tr::read_certificates(out + "/active.cert", reg[i])
+                        && tr::read_certificates(out + "/root.cert", reg[i]);
+            shaped = shaped && reg[i].size() == 3 && reg[i][0].role == roles[i]
+                     && reg[i][1].role == ETCS::sig::Role::Intermediate && reg[i][2].role == ETCS::sig::Role::Root;
+        }
+        check(read && shaped && reg[0][1].subject == reg[1][1].subject && reg[1][1].subject == reg[2][1].subject,
+              "it leaves marketplace, release and registrar certificates under one active key, and the root's");
+        for (int i = 0; read && shaped && i < 3; ++i)
+        {
+            valid = valid && tr::registration_valid(reg[i], keys[i], reg[i][2].subject);
+            crossed = crossed || tr::registration_valid(reg[i], keys[(i + 1) % 3], reg[i][2].subject);
+        }
+        check(read && shaped && valid && !crossed,
+              "each is a registration of its own loader's key and of no other, as the loader will check it");
         auto forgotten = [&](const char* n) {
             ETCS::Entity* e = c3.names.count(n) ? ETCS::etcs_resolve_rid_anywhere(&ETCS::getLoader(), c3.names[n].rid) : nullptr;
             return !e || !yes(verb(e, "Keypair.Holds"));
         };
         check(forgotten("super_root") && forgotten("active"), "and neither key outlives it");
+    }
+
+    // -- 10. the registrar -------------------------------------------------------------
+    std::cout << "\n-- 10. the registrar --\n";
+    {
+        namespace sig = ETCS::sig;
+        namespace tr = ETCS::trust;
+        check(run("spawn CryptProvider::Keypair reg_root\nreg_root.Generate()\n"
+                  "spawn CryptProvider::Keypair reg_active\nreg_active.Generate()\n"
+                  "spawn CryptProvider::Keypair reg_key\nreg_key.Generate()\n"
+                  "spawn CryptProvider::Certificate reg_rc\nreg_rc.Issue(@reg_root root @reg_root)\n"
+                  "spawn CryptProvider::Certificate reg_ic\nreg_ic.Issue(@reg_root intermediate @reg_active)\n"
+                  "spawn CryptProvider::Certificate reg_gc\nreg_gc.Issue(@reg_active registrar @reg_key)\n"
+                  "spawn CryptProvider::Certificate reg_mc\nreg_mc.Issue(@reg_active marketplace @reg_key)\n"
+                  "spawn CryptProvider::Registrar pki\n"), "a registrar, its key, and an authority above it");
+        ETCS::Entity* pki = entity("pki");
+        auto rid = [&](const char* n) { return entity(n) ? std::to_string(entity(n)->getRID()) : std::string("0"); };
+        check(pki && !yes(verb(pki, "Registrar.Above", rid("reg_gc"))), "nothing goes above it before it uses a key");
+        check(pki && yes(verb(pki, "Registrar.Use", rid("reg_key"))), "it uses a Keypair");
+        check(pki && !yes(verb(pki, "Registrar.Above", rid("reg_mc"))) && !yes(verb(pki, "Registrar.Above", rid("reg_ic"))),
+              "a marketplace certificate for its key, or one for another key, does not go above it");
+        check(pki && route(pki, "pki/registrar").find("not set up") != std::string::npos,
+              "until the chain above reaches a root, it is not set up");
+        check(pki && yes(verb(pki, "Registrar.Above", rid("reg_gc"))) && yes(verb(pki, "Registrar.Above", rid("reg_ic")))
+              && yes(verb(pki, "Registrar.Above", rid("reg_rc"))), "registrar <- active <- root go above it, in order");
+        const std::string key = pki ? verb(pki, "Registrar.Key") : "";
+        check(pki && key.size() == 64 && route(pki, "pki/registrar") == key + "\n"
+              && key == verb(entity("reg_key"), "Keypair.PublicKey"), "it says its key");
+
+        uint8_t seed[32], secret[64], sg[64];
+        sig::Key loader{}, registrar{}, root{}, other{};
+        tr::random_bytes(seed, 32);
+        mc::crypto_ed25519_key_pair(secret, loader.data(), seed);
+        unhex(key, registrar.data(), 32);
+        unhex(verb(entity("reg_root"), "Keypair.PublicKey"), root.data(), 32);
+        auto ask = [&](const sig::Key& of) {
+            const std::string m = sig::registration_statement(loader, of);
+            mc::crypto_ed25519_sign(sg, secret, reinterpret_cast<const uint8_t*>(m.data()), m.size());
+            return "pki/register/" + hex(loader.data(), 32) + "/" + hex(sg, 64);
+        };
+        const std::string path = ask(registrar);
+        const std::string answer = pki ? route(pki, path) : "";
+        std::vector<sig::Certificate> chain;
+        check(tr::parse_certificates(answer, chain) && chain.size() == 4 && chain[0].role == sig::Role::Loader
+              && chain[0].subject == loader && chain[1].role == sig::Role::Registrar,
+              "a loader's signed ask gets a Loader certificate and the chain above it");
+        check(!chain.empty() && tr::registration_valid(chain, loader, root),
+              "which the loader takes as its registration under that root");
+        check(pki && route(pki, path) == answer, "the same ask gets the same answer");
+        std::string bad = path;
+        bad[bad.size() - 1] = bad.back() == '0' ? '1' : '0';
+        check(pki && route(pki, bad).rfind("refused", 0) == 0, "an ask the key did not sign is refused");
+        other[0] = 1;
+        check(pki && route(pki, ask(other)).rfind("refused", 0) == 0, "an ask made of another registrar is refused here");
+        check(pki && route(pki, "pki/nothing") == "no such path\n" && route(pki, "chess/registrar") == "no such path\n",
+              "a path it does not serve is answered as one");
+        ETCS::Buffer fa("Registrar.Filter"), f1("pki/register/x"), f2("chess/pki");
+        if (pki) { pki->call(fa, f1); pki->call(fa, f2); }
+        check(pki && f1.toString() == "pki" && f2.written == 0, "its filter claims the paths under its mount and no others");
+        mc::crypto_wipe(secret, 64);
+        run("pki.Delete()\nreg_root.Delete()\nreg_active.Delete()\nreg_key.Delete()\n");
     }
 
     ETCS::PendingUnloadRegistry::getInstance().join_all();

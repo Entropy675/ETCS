@@ -1,0 +1,19 @@
+#!/usr/bin/env etcs
+#IMPORT ACE_ROOT/modules
+
+# ── THE REGISTRAR'S KEY, ONCE ────────────────────────────────────────────────
+#
+#     etcs scripts/site_registrar_key.etcs
+#
+# Made in this machine's keystore as `registrar`, under the store the site
+# runs with, and never replaced (the keystore refuses). Its public half, printed
+# here, is what the active key certifies as registrar: test_authority.etcs's
+# REGISTRAR_KEY, or the ceremony's. That certificate, the active key's and the
+# root's go in ACE_ROOT/pki as registrar.cert, active.cert and root.cert.
+
+spawn DatabaseProvider::Keystore pki_secret
+pki_secret.Connect(registrar)
+spawn CryptProvider::Keypair pki_key
+pki_key.Generate()
+pki_key.StoreTo(@pki_secret)
+pki_key.PublicKey()

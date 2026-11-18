@@ -28,9 +28,39 @@ namespace sig
 using Key   = std::array<uint8_t, 32>;
 using Epoch = std::array<uint8_t, 32>;
 
-enum class Role : uint8_t { Root = 1, Intermediate = 2, Marketplace = 3, Loader = 4, Module = 5 };
+/*
+ * A CHAIN IS TWO HALVES joined at a loader's key. ACE's half is a tree: the
+ * root certifies the active key, and the active key the keys that share it as
+ * parent -- one per loader that acts for ACE (the build server's, the release
+ * machine's, the site's registrar). The local half is a loader's own key and
+ * what it signs. A registrar's certificate for a loader's key is the join.
+ *
+ * Who may certify whom is the table below, and nothing else: a key holds one
+ * role, and two roles are two keys under one parent.
+ */
+enum class Role : uint8_t
+{
+    Root = 1, Intermediate = 2, Marketplace = 3, Loader = 4, Module = 5, Release = 6, Registrar = 7
+};
 
-inline bool role_valid(uint8_t r) { return r >= 1 && r <= 5; }
+inline bool role_valid(uint8_t r) { return r >= 1 && r <= 7; }
+
+inline bool may_issue(Role issuer, Role subject)
+{
+    switch (issuer)
+    {
+        case Role::Root:         return subject == Role::Root || subject == Role::Intermediate;
+        case Role::Intermediate: return subject == Role::Marketplace || subject == Role::Release
+                                     || subject == Role::Registrar;
+        case Role::Registrar:    return subject == Role::Loader;
+        case Role::Marketplace:
+        case Role::Release:
+        case Role::Loader:       return subject == Role::Module;
+        case Role::Module:       return false;
+    }
+    return false;
+}
+
 inline const char* role_name(Role r)
 {
     switch (r)
@@ -40,12 +70,14 @@ inline const char* role_name(Role r)
         case Role::Marketplace:  return "marketplace";
         case Role::Loader:       return "loader";
         case Role::Module:       return "module";
+        case Role::Release:      return "release";
+        case Role::Registrar:    return "registrar";
     }
     return "?";
 }
 inline bool role_from_name(const std::string& s, Role& out)
 {
-    for (uint8_t r = 1; r <= 5; ++r)
+    for (uint8_t r = 1; r <= 7; ++r)
         if (s == role_name(static_cast<Role>(r))) { out = static_cast<Role>(r); return true; }
     return false;
 }
@@ -135,6 +167,36 @@ inline bool decode_chain(const void* p, size_t len, std::vector<Certificate>& ch
     if (at != len) { chain.clear(); return false; }
     return true;
 }
+
+/*
+ * WHAT A LOADER SIGNS TO ASK FOR ACE'S HALF, and what a registrar checks:
+ *
+ *   "ETCSREG1" | the loader's key | the registrar's key
+ *
+ * A fixed form, so a loader's key signs nothing else this way, and a request
+ * made of one registrar is no request of another.
+ */
+inline std::string registration_statement(const Key& loader, const Key& registrar)
+{
+    std::string out("ETCSREG1", 8);
+    out.append(reinterpret_cast<const char*>(loader.data()), loader.size());
+    out.append(reinterpret_cast<const char*>(registrar.data()), registrar.size());
+    return out;
+}
+
+/*
+ * THE SITE'S LIST OF WHAT IT SERVES (core/Trust.h publish, survey):
+ *
+ *   etcs-dist 1 epoch=<hex>
+ *   <name> <file> <digest hex> <epoch hex>[,<epoch hex>...]
+ *   ...
+ *   etcs-dist-sig <signer's chain, hex> <signature hex>
+ *
+ * The signature is the marketplace's, over "ETCSDST1" and every byte before
+ * the last line.
+ */
+constexpr char kDistMagic[] = "etcs-dist 1 ";
+constexpr char kDistSig[]   = "etcs-dist-sig ";
 
 /*
  * WHERE A BINARY CARRIES ITS CHAIN, AND WHICH OF ITS BYTES ARE SIGNED.
