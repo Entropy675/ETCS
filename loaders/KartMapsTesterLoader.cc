@@ -84,11 +84,12 @@ int main(int argc, char** argv)
             sum[k] += static_cast<long>(has[k]);
             if (static_cast<long>(has[k]) > most[k]) most[k] = static_cast<long>(has[k]);
         }
-        // The levels: how much of the arena's 64 x 64 each takes, the ramps
-        // up to the storey and the ramps out of the low ground.
+        // The levels: how much of the arena each takes, the ramps up to the
+        // storey and the ramps out of the low ground.
+        const double side = static_cast<double>(KartArena::Half().ToFloat()) * 2.0, arena = side * side;
         double storey = 0.0, low = 0.0;
-        for (const auto& d : m.decks) storey += static_cast<double>((d.w * d.d).ToFloat()) / 4096.0;
-        for (const auto& p : m.pits)  low += static_cast<double>((p.w * p.d).ToFloat()) / 4096.0;
+        for (const auto& d : m.decks) storey += static_cast<double>((d.w * d.d).ToFloat()) / arena;
+        for (const auto& p : m.pits)  low += static_cast<double>((p.w * p.d).ToFloat()) / arena;
         long up = 0, out = 0;
         for (const auto& a : m.ramps)
         {

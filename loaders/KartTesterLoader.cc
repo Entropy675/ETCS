@@ -52,9 +52,14 @@
 //      and drifts back, slowly; a kart below a deck drives under it, its eye
 //      with it, and on up a long ramp onto a storey; one driven into a pit
 //      falls to its floor, its eye down there with it, and climbs the ramp
-//      out; a spring throws one up, it comes down on a deck in the air, and
-//      off the deck's edge it falls back to the floor.
-//   8. THE SAME BATTLE. Each guest at the host's tick has the host's hash --
+//      out; a spring throws one up -- higher the faster it comes at it --
+//      it comes down on a deck in the air, and off the deck's edge it falls
+//      back to the floor.
+//   8. THE EDGES. On a map of the test's own: a kart driven into lava is
+//      out; a spring taken at speed throws a kart over the arena's wall, and
+//      out there it falls and is out; a pad on a bank's slope pushes a kart
+//      up it.
+//   9. THE SAME BATTLE. Each guest at the host's tick has the host's hash --
 //      the karts' rows, the shots, the dice and the scores, to the bit -- and
 //      the same snapshot to advertise.
 //
@@ -162,8 +167,8 @@ int main(int, char**)
     ETCS::Entity* host = battle[0];
     ETCS::Entity* g1 = battle[1];
     ETCS::Entity* g2 = battle[2];
-    check(verb(host, "KartBattle.Maps") == "bowl\npillars\ncrossroads\nhills\nskatepark\nrandom\n",
-          "the arena has its six maps, in order");
+    check(verb(host, "KartBattle.Maps") == "bowl\npillars\ncrossroads\nhills\nskatepark\nlava\nrandom\n",
+          "the arena has its seven maps, in order");
     {
         const std::string faults = verb(host, "KartBattle.Faults");
         if (faults != "none") std::printf("%s\n", faults.c_str());
@@ -177,7 +182,7 @@ int main(int, char**)
     {
         verb(b, "KartBattle.AddMap", "course");
         verb(b, "KartBattle.AddSpring", "0, -18");
-        verb(b, "KartBattle.AddDeck", "0, -8.5, 6, 8, 3.5");
+        verb(b, "KartBattle.AddDeck", "0, -8.5, 6, 8, 2.5");
         verb(b, "KartBattle.AddPit", "0, 15, 8, 14, 2.5");
         verb(b, "KartBattle.AddRamp", "0, 11, 180, 4, 6, 0, 0, 2.5");
         verb(b, "KartBattle.AddDeck", "12, 0, 8, 6, 3.5");
@@ -187,6 +192,17 @@ int main(int, char**)
         verb(b, "KartBattle.AddSpawn", "0, 24");
         verb(b, "KartBattle.AddSpawn", "24, 0");
         verb(b, "KartBattle.AddPickup", "0, -8.5");
+        // An eighth, the edges: three lanes. South, lava across the host's;
+        // west from the east, a spring at the far wall; south from the north,
+        // a bank up to a jump with a pad on its slope.
+        verb(b, "KartBattle.AddMap", "edges");
+        verb(b, "KartBattle.AddLava", "0, -35, 10, 10, 3");
+        verb(b, "KartBattle.AddSpring", "-55, 0");
+        verb(b, "KartBattle.AddRamp", "0, 38, 180, 8, 12, 0, 0, 2");
+        verb(b, "KartBattle.AddPad", "0, 38, 180");
+        verb(b, "KartBattle.AddSpawn", "0, -50");
+        verb(b, "KartBattle.AddSpawn", "30, 0");
+        verb(b, "KartBattle.AddSpawn", "0, 50");
     }
     {
         const std::string faults = verb(host, "KartBattle.Faults");
@@ -259,15 +275,15 @@ int main(int, char**)
     const Kart h0 = where(host, "host"), a0 = where(host, "g1"), b0 = where(host, "g2");
     std::printf("        (host %.1f,%.1f  g1 %.1f,%.1f  g2 %.1f,%.1f)\n", h0.x, h0.z, a0.x, a0.z, b0.x, b0.z);
     check(h0.slot == 0 && a0.slot == 1 && b0.slot == 2, "three drivers, each in a kart of their own");
-    check(near(h0.x, 0, 0.01f) && near(h0.z, -20.5f, 0.01f) && near(h0.hz, 1, 1e-3f) && h0.speed == 0.0f && near(h0.y, 0.25f, 1e-3f),
+    check(near(h0.x, 0, 0.01f) && near(h0.z, -41.0f, 0.01f) && near(h0.hz, 1, 1e-3f) && h0.speed == 0.0f && near(h0.y, 0.25f, 1e-3f),
           "the host at the bowl's first spawn, on the ground, facing the middle, still");
-    check(near(a0.z, 20.5f, 0.01f) && near(a0.hz, -1, 1e-3f), "g1 at the spawn furthest from the host, facing it across the middle");
-    check(near(b0.x, 20.5f, 0.01f) && near(b0.z, 0, 0.01f) && near(b0.hx, -1, 1e-3f), "g2 at the spawn furthest from both");
+    check(near(a0.z, 41.0f, 0.01f) && near(a0.hz, -1, 1e-3f), "g1 at the spawn furthest from the host, facing it across the middle");
+    check(near(b0.x, 41.0f, 0.01f) && near(b0.z, 0, 0.01f) && near(b0.hx, -1, 1e-3f), "g2 at the spawn furthest from both");
     check(h0.hp == 100 && a0.weapon == "-" && status(g2).phase == "lobby", "whole and unarmed, in the lobby");
     key(host, 'W', true);
     run(50);
     key(host, 'W', false);
-    check(near(where(host, "host").z, -20.5f, 1e-3f), "in the lobby the karts are parked: W moves nobody");
+    check(near(where(host, "host").z, -41.0f, 1e-3f), "in the lobby the karts are parked: W moves nobody");
     check(verb(g1, "KartBattle.Configure", "pillars 60") == "refused" && verb(g1, "KartBattle.StartRound") == "refused",
           "a guest sets nothing: the map, the length and the round are the host's");
 
@@ -288,7 +304,7 @@ int main(int, char**)
     const Kart h2 = where(host, "host");
     std::printf("        (stopped at z %.2f, y %.2f)\n", h2.z, h2.y);
     check(near(h2.y, -2.25f, 0.01f), "...over the ring road's edge and down the ramp into the bowl's low ground");
-    check(h2.z > -9.8f && h2.z < -8.8f, "the bumper in its way there stops it: solid meets solid");
+    check(h2.z > -18.1f && h2.z < -17.1f, "the bumper in its way there stops it: solid meets solid");
     {
         // The wheel, standing still: A puts it at the lock at once -- to the
         // left, the wheel's minus -- and held, it eases on to twice the lock.
@@ -372,7 +388,7 @@ int main(int, char**)
     }
     verb(host, "KartBattle.Abandon");
     run(2);
-    check(status(g1).phase == "lobby" && near(where(host, "host").z, -20.5f, 0.01f),
+    check(status(g1).phase == "lobby" && near(where(host, "host").z, -41.0f, 0.01f),
           "the host abandons the round: back in the lobby on every runtime, everyone respawned, parked");
 
     // -- 3. the settings -----------------------------------------------------
@@ -383,17 +399,17 @@ int main(int, char**)
     const Kart h3 = where(host, "host"), a3 = where(host, "g1"), b3 = where(host, "g2");
     std::printf("        (host %.1f,%.1f  g1 %.1f,%.1f  g2 %.1f,%.1f)\n", h3.x, h3.z, a3.x, a3.z, b3.x, b3.z);
     check(s3.map == "crossroads" && s3.secs == 30 && s3.phase == "lobby", "...and the map is out at once, on every runtime");
-    check(near(h3.z, -27, 0.01f) && near(a3.z, 27, 0.01f) && near(b3.x, -27, 0.01f) && near(a3.hz, -1, 1e-3f),
+    check(near(h3.z, -54, 0.01f) && near(a3.z, 54, 0.01f) && near(b3.x, -54, 0.01f) && near(a3.hz, -1, 1e-3f),
           "...with everyone respawned on it: the host and g1 face to face down a road");
     {
         // The bowl's bumper the host stopped at is gone from where it stood.
         Causal_* wc = static_cast<Causal_*>(worlds[1]->getInterfacePointer(ETCS::Buffer("Causal")));
         std::vector<Causal_*> by;
-        wc->Near(Fixed::Zero(), Fixed::From(0.4), Fixed::From(-11.0), Fixed::From(0.5), by);
+        wc->Near(Fixed::Zero(), Fixed::From(-2.1), Fixed::From(-15.4), Fixed::From(0.5), by);
         bool bump = false;
-        // A bumper by its size: a reach of |(2, 0.4, 0.6)|.
+        // A bumper by its size: a reach of |(4, 0.4, 1.2)|.
         for (Causal_* c : by)
-            if (c->Solid().shape == CausalSolid::Box && std::fabs(c->Order4().radius.ToFloat() - 2.126f) < 0.01f) bump = true;
+            if (c->Solid().shape == CausalSolid::Box && std::fabs(c->Order4().radius.ToFloat() - 4.195f) < 0.01f) bump = true;
         check(!bump, "...and the last map's blocks are out of the way (here on g1's world)");
     }
 
@@ -413,7 +429,7 @@ int main(int, char**)
         const Kart k0 = where(host, "host");
         const Tyres c0 = tyres(host, "host");
         std::printf("        (straight at %.1f u/s after 2 s, %.1f along: sliding %.3f, %d mark segments)\n",
-                    k0.speed, k0.z + 27.0f, k0.slide, c0.shown());
+                    k0.speed, k0.z + 54.0f, k0.slide, c0.shown());
         check(k0.speed > 12.0f && k0.speed < 15.0f && std::fabs(k0.slide) < 0.01f && c0.shown() == 0,
               "speed builds gradually; in a straight line the tyres roll: no slide, no marks");
         key(host, 'W', false);
@@ -494,13 +510,13 @@ int main(int, char**)
     check(score(g2, "host").weapon == "-", "...and the sniper is spent with its one shot");
     run(149);
     const Kart a5 = where(host, "g1");
-    check(a5.hp == 100 && near(a5.z, 27, 0.01f) && score(host, "g1").state == "alive",
+    check(a5.hp == 100 && near(a5.z, 54, 0.01f) && score(host, "g1").state == "alive",
           "three seconds later g1 is back, whole, at the spawn furthest from everyone");
 
     verb(host, "KartBattle.Give", "host rocket");
     fire(host);
     check(where(host, "host").weapon == "rocket" && where(host, "host").ammo == 1, "a rocket fired, one left");
-    for (int i = 0; i < 60 && where(host, "g1").hp == 100; ++i) run(2);
+    for (int i = 0; i < 120 && where(host, "g1").hp == 100; ++i) run(2);   // 108 units at 30 u/s
     const int rocket = 100 - where(host, "g1").hp;
     std::printf("        (the rocket did %d)\n", rocket);
     check(rocket >= 37 && rocket <= 40, "it bursts on the kart it meets: up to 40 at the burst's centre");
@@ -525,7 +541,7 @@ int main(int, char**)
     }
     proposed(g2, 'W', false);
     std::printf("        (g2 over the pad: %.1f u/s gained in two ticks at x %.1f, up to %.1f u/s)\n", gain, padX, fastest);
-    check(gain > 1.2f && padX > -23.5f && padX < -18.0f && fastest > 14.0f,
+    check(gain > 1.2f && padX > -44.5f && padX < -39.0f && fastest > 14.0f,
           "a pad pushes a kart that drives over it the way it points: more than any pedal");
     std::printf("        (g2 drove over a box and got a %s)\n", got.c_str());
     check(got != "-" && where(g2, "g2").weapon == got, "a power-up hands over a weapon off the record's dice, the same everywhere");
@@ -572,7 +588,7 @@ int main(int, char**)
           "a round on the skatepark: two jumps down the middle");
     run(2);
     const Kart h5 = where(host, "host");
-    check(near(h5.z, -22, 0.01f) && near(h5.hz, 1, 1e-3f), "the host at the foot of the near jump, facing it");
+    check(near(h5.z, -44, 0.01f) && near(h5.hz, 1, 1e-3f), "the host at the foot of the near jump, facing it");
     {
         // W down; watched a tick at a time: up the ramp at the ramp's height,
         // off the lip, through the air, down again beyond it.
@@ -583,8 +599,8 @@ int main(int, char**)
         {
             run(1);
             const Kart k = where(host, "host");
-            if (k.air == "ground" && k.z > -16.0f && k.z < -12.0f && onRampErr < 0.0f)
-                onRampErr = std::fabs(k.y - (0.25f + 1.5f * (k.z + 17.0f) / 6.0f));
+            if (k.air == "ground" && k.z > -32.0f && k.z < -24.0f && onRampErr < 0.0f)
+                onRampErr = std::fabs(k.y - (0.25f + 3.0f * (k.z + 34.0f) / 12.0f));
             if (k.air == "air" && !flew) { flew = true; liftZ = k.z; }
             if (flew) topY = std::max(topY, k.y);
             if (flew && k.air == "ground") { landed = true; landZ = k.z; }
@@ -610,8 +626,8 @@ int main(int, char**)
         for (int t = 0; t < 4; ++t) kept = kept && m2.t[t].darkest == m0.t[t].darkest && m2.t[t].rope < 44.5f;
         check(kept, "backing off over its own marks leaves them as they were laid, the rope its length");
         check(onRampErr >= 0.0f && onRampErr < 0.03f, "up the ramp, the kart rides at the ramp's height");
-        check(flew && liftZ > -11.6f && liftZ < -10.4f && topY > 1.8f, "...leaves the ground at the lip and climbs higher still");
-        check(landed && landZ > -9.0f, "...and lands beyond it");
+        check(flew && liftZ > -22.6f && liftZ < -21.4f && topY > 3.3f, "...leaves the ground at the lip and climbs higher still");
+        check(landed && landZ > -20.0f, "...and lands beyond it");
     }
     {
         // g1 down the middle the other way, at the far jump's lip from below.
@@ -620,7 +636,7 @@ int main(int, char**)
         const Kart k = where(host, "g1");
         proposed(g1, 'W', false);
         std::printf("        (g1 stopped at z %.2f, y %.2f)\n", k.z, k.y);
-        check(k.z > 17.4f && k.z < 18.6f && near(k.y, 0.25f, 0.01f) && k.speed < 0.5f,
+        check(k.z > 34.4f && k.z < 35.6f && near(k.y, 0.25f, 0.01f) && k.speed < 0.5f,
               "a lip met from the drop side is a wall: g1 stops at it, on the ground");
     }
     verb(host, "KartBattle.Abandon");
@@ -762,12 +778,13 @@ int main(int, char**)
         check(out, "...and the ramp as high as the pit is deep is the way back up");
         // The host up its lane: onto the spring, up, and down on the deck.
         key(host, 'W', true);
-        float peak = 0.0f, onZ = 0.0f, onY = 0.0f, upZ = 0.0f; bool thrown = false, on = false;
+        float peak = 0.0f, onZ = 0.0f, onY = 0.0f, upZ = 0.0f, upV = 0.0f, was = 0.0f; bool thrown = false, on = false;
         for (int t = 0; t < 300 && !on; ++t)
         {
             run(1);
             const Kart k = where(host, "host");
-            if (k.air == "air" && !thrown) { thrown = true; upZ = k.z; }
+            if (k.air == "air" && !thrown) { thrown = true; upZ = k.z; upV = was; }
+            was = k.speed;
             peak = std::max(peak, k.y);
             if (thrown && k.air == "ground") { on = true; onZ = k.z; onY = k.y; }
         }
@@ -776,9 +793,13 @@ int main(int, char**)
         for (int t = 0; t < 120 && where(host, "host").speed > 0.05f; ++t) run(1);
         key(host, 'S', false);
         const Kart d0 = where(host, "host");
-        std::printf("        (thrown up at z %.1f to y %.2f; down at z %.1f, y %.2f; stopped at z %.1f, y %.2f)\n", upZ, peak, onZ, onY, d0.z, d0.y);
-        check(thrown && upZ > -19.6f && upZ < -16.4f && peak > 4.5f, "a spring throws a kart up, as hard as a pad pushes one along");
-        check(on && near(onY, 3.75f, 0.01f) && onZ > -12.5f && onZ < -4.5f && near(d0.y, 3.75f, 0.01f),
+        // Up at 7.5 u/s standing and half the kart's speed more: as high as that goes under 20 u/s/s.
+        const float kick = 7.5f + 0.5f * upV, high = 0.25f + kick * kick / 40.0f;
+        std::printf("        (thrown up at z %.1f at %.1f u/s to y %.2f (%.2f for a kick of %.1f); down at z %.1f, y %.2f; stopped at z %.1f, y %.2f)\n",
+                    upZ, upV, peak, high, kick, onZ, onY, d0.z, d0.y);
+        check(thrown && upZ > -19.6f && upZ < -16.4f && std::fabs(peak - high) < 0.15f,
+              "a spring throws a kart up: a hop standing, and half the kart's speed more");
+        check(on && near(onY, 2.75f, 0.01f) && onZ > -12.5f && onZ < -4.5f && near(d0.y, 2.75f, 0.01f),
               "...and it comes down on the deck: a level plane in the air, and it stands on it");
         key(host, 'W', true);
         bool off = false;
@@ -791,8 +812,60 @@ int main(int, char**)
         check(off && where(host, "host").z > -4.5f, "...and off its edge it falls back to the floor");
     }
 
-    // -- 8. the same battle --------------------------------------------------
-    std::cout << "\n-- 8. the same battle --\n";
+    // -- 8. the edges ---------------------------------------------------------
+    std::cout << "\n-- 8. the edges --\n";
+    verb(host, "KartBattle.Abandon");
+    run(2);
+    check(verb(host, "KartBattle.Configure", "edges 60") == "ok" && verb(host, "KartBattle.StartRound") == "ok",
+          "a round on the edges: lava, a spring by the wall, a pad on a bank");
+    run(2);
+    {
+        const Kart e0 = where(host, "host"), e1 = where(host, "g1"), e2 = where(host, "g2");
+        check(near(e0.z, -50, 0.01f) && near(e1.z, 50, 0.01f) && near(e2.x, 30, 0.01f), "...each kart at the head of its lane");
+        // The host down its lane into the lava.
+        key(host, 'W', true);
+        int ticks = 0;
+        for (; ticks < 300 && score(host, "host").state == "alive"; ++ticks) run(1);
+        key(host, 'W', false);
+        const std::string lava = verb(host, "KartBattle.Note");
+        std::printf("        (the host out after %d ticks: \"%s\")\n", ticks, lava.c_str());
+        check(score(g1, "host").deaths == 1 && score(g1, "host").state == "out" && lava == "the lava took out host",
+              "a kart driven into lava is out, on every runtime: the lava took it");
+        // g2 the length of the arena at the spring by the far wall.
+        proposed(g2, 'W', true);
+        float peak = 0.0f, fast = 0.0f, lastX = 0.0f;
+        for (ticks = 0; ticks < 600 && score(host, "g2").state == "alive"; ++ticks)
+        {
+            run(1);
+            const Kart k = where(host, "g2");
+            if (k.slot < 0 || k.hp == 0) break;
+            peak = std::max(peak, k.y); lastX = k.x;
+            if (k.x > -52.0f) fast = k.speed;
+        }
+        proposed(g2, 'W', false);
+        const std::string drop = verb(host, "KartBattle.Note");
+        std::printf("        (g2 at the spring at %.1f u/s, up to y %.2f, last seen at x %.1f: \"%s\")\n", fast, peak, lastX, drop.c_str());
+        check(fast > 18.0f && peak > 7.0f, "a spring taken at speed throws a kart higher than the arena's wall");
+        check(lastX < -64.5f && score(g1, "g2").state == "out" && drop == "the drop took out g2",
+              "...and over it, out there it falls, and is out");
+        // g1 up the bank: the pad on its slope pushes it up it.
+        proposed(g1, 'W', true);
+        float gain = 0.0f, gainY = 0.0f, last = 0.0f;
+        for (int t = 0; t < 80; ++t)
+        {
+            run(2);
+            const Kart k = where(host, "g1");
+            if (k.air == "ground" && k.y > 0.3f && k.speed - last > gain) { gain = k.speed - last; gainY = k.y; }
+            last = k.speed;
+            if (k.z < 30.0f) break;
+        }
+        proposed(g1, 'W', false);
+        std::printf("        (g1 up the bank: %.2f u/s gained in two ticks at y %.2f)\n", gain, gainY);
+        check(gain > 1.0f && gainY > 0.5f && gainY < 2.25f, "a pad on a bank's slope pushes a kart up it: more than any pedal");
+    }
+
+    // -- 9. the same battle --------------------------------------------------
+    std::cout << "\n-- 9. the same battle --\n";
     run(250 - status(host).tick % 250);
     const std::string hh = verb(host, "KartBattle.Hash"), h1s = verb(g1, "KartBattle.Hash"), h2s = verb(g2, "KartBattle.Hash");
     std::printf("        (host %s / g1 %s / g2 %s)\n", hh.c_str(), h1s.c_str(), h2s.c_str());
