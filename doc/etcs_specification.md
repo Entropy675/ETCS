@@ -819,6 +819,15 @@ builds, registered as `Marketplace` where a developer's is registered as `Loader
 is issued elsewhere and injected (`etcs --registration`): the place the certificates above a
 loader enter its store.
 
+The root itself is built in. Its public key is pinned in ACE-Build-Tools (`ACE_ROOT_KEY`) and
+generated into `core/AceRoot.h` — a core header, so the root is in the epoch, and a loader built
+for another root is in another epoch. This is the bootstrap: a loader checking itself proves
+nothing to someone who holds no root, so the first trust comes from where the binary was obtained,
+and the root inside it is what every later check stands on — its own bytes first, then every
+module, with an empty store and no key. Such a loader takes what the marketplace signed, and signs
+nothing until its own key is registered under that root. While the pin is empty there is no root,
+and a loader works under the one its store was given.
+
 A loader is the one binary nothing else checks, so it attests itself: at the handshake it puts its
 own bytes through its own two stages. That is what makes a **lineage**. The loader going out signs
 the one that replaces it, and each such signing appends an edge to `lineage.log` in the store —
@@ -832,11 +841,14 @@ would a node on a link, so a secret kept under a `CryptProvider::Envelope` — a
 under the key its own `Private` child holds, given by no verb — is reached only by an entity
 carrying the same one. Naming it is not enough.
 
-Unbuilt: the super-root's key in `ace_root()`. Until it is there any root will do — the one a loader
-makes for itself on first use, or one a test authority issues — and such a root vouches for that
-loader only. Also unbuilt: anything that refuses a loader binary outside the lineage (the lineage
-is a record until then), the entitlement stage, and the stage that takes another loader's modules
-(the untrusted scanning mode).
+Unbuilt: the pin's value, which is the super-root's public key and waits on the ceremony. Until it
+is there any root will do — the one a loader makes for itself on first use, or one a test authority
+issues — and such a root vouches for that loader only. Also unbuilt: the lineage published beside
+the download; a running loader checking a successor from a later epoch (it takes only its own
+epoch's); signing and attesting the web loader, whose trust is its page's connection; anything
+that refuses a loader binary outside the lineage (the lineage is a record until then); the
+entitlement stage; and the stage that takes another loader's modules (the untrusted scanning
+mode).
 
 ## Shutdown
 

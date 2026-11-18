@@ -113,7 +113,8 @@ are the proofs.
 TODO:
 - Identity system (over the state hash). Binary signatures are built
   (`core/Trust.h`, `Run_ModuleSignatureTesterLoader`); still to come: the ACE
-  root's key, loader-key registration, entitlement.
+  root's key (its place is built: `ACE_ROOT_KEY` in ACE-Build-Tools),
+  loader-key registration, entitlement.
 - Merge the Local/Remote Database ontology types
 - Every module's verb-set state on the value surface. Scene3D is done; the
   other Set* verbs (Paint, Render's 2D types, Network, Chess, Layout, Window)
