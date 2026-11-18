@@ -111,7 +111,9 @@ what a resume, a reflection and a signature compare. The Persistence tag
 are the proofs.
 
 TODO:
-- Identity system / binary signage (over the state hash)
+- Identity system (over the state hash). Binary signatures are built
+  (`core/Trust.h`, `Run_ModuleSignatureTesterLoader`); still to come: the ACE
+  root's key, loader-key registration, entitlement.
 - Merge the Local/Remote Database ontology types
 - Every module's verb-set state on the value surface. Scene3D is done; the
   other Set* verbs (Paint, Render's 2D types, Network, Chess, Layout, Window)

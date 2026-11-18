@@ -485,8 +485,8 @@ public:
      * Database -- a resource of a locale, whose surface is this runtime's
      * own (ontology/Database.h) -- and anything else that says it is only
      * here with the bare `Local` tag (DatabaseProvider's Persistence: the
-     * verbs of this loader's store). A transport refuses to bind or open a
-     * pair onto one, on either side.
+     * verbs of this loader's store), and anything Private (ontology/Private.h).
+     * A transport refuses to bind or open a pair onto one, on either side.
      */
     static bool localFrame(Entity* e);   // Defined in DynamicLoader.h.
     // -----------------------------------------------------------------------
