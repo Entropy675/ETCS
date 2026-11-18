@@ -252,6 +252,17 @@ container that states the field, so §3 holds with it. An anchored body
 handed to it becomes heat. A container that is not anchored is a thing and
 falls in its own container's field carrying its members.
 
+The speed of light is a third (`SetLightSpeed`, the value behind "light"):
+the fastest anything inside moves. Stated, inherited and taken back as the
+field is (`InheritLightSpeed`), and where no space states one up to the open
+boundary it is 2^16 units a second -- far enough off that a scene meets it
+only by approaching it on purpose. A body the field or a push leaves faster
+is slowed to it before its step, and the motion it loses stays in it as heat,
+so §3 holds. A step of span `dt` therefore moves nothing further than
+`c·dt`: that is what bounds how far a contact has to be looked for (§14).
+A scene with thin walls and long steps states a low one; a power of two is a
+convenient number, since a multiple of it is a shift.
+
 **Check.** `SolidTester` §2 (a room that states nothing passes the world's
 field in; a pocket stating zero holds its member still; taken back, it
 inherits; a body thrown up and falling back; the ledger each time).
@@ -269,11 +280,26 @@ centre, row 3 facing them) or a half-space (one plane through its centre,
 facing row 3's up). Each pair, after the pass's transmissions, from the pairs
 the gate found on the rows the pass started with -- so the kd path and the
 pair-by-pair path meet the same pairs in the same order (a half-space has no
-reach and meets every solid):
+reach and meets every solid; two solids the step moved are a pair when their
+reaches come within twice what it moved them, the smear and what an earlier
+contact may turn back of it):
 
+- **the cut**: the contact is looked for on the smears (§14), not where the
+  step left the two. Apart when the interaction began, they are put back to
+  the first moment of the step their gap closes -- the gap along a straight
+  path to a sphere, a box or a plane dips once at most, so that moment is
+  found by halving, after finding where the gap is least when both ends are
+  apart. Touching when it began, they are put back to that beginning if the
+  step drove the sphere further in, and are otherwise settled where the step
+  left them (a body resting or rolling on another). The contact is settled
+  there, with the normal of the face, edge or corner actually met, and what
+  is left of the step is then moved with the motion the contact left: the
+  part of the smear that comes back, at the angle it comes back at. Each of
+  the two is pegged again at the cut, so a later pair of the pass reads the
+  rest of its smear from there;
 - **apart**: the sphere is pushed out along the normal by how deep it is
-  (both, by inverse mass, when neither is anchored) -- positions move here
-  and only here;
+  (both, by inverse mass, when neither is anchored) -- with the cut, the only
+  places positions move;
 - **bounce**: the closing motion along the normal is turned back times the
   restitution -- of the approach less one step of the field, since the push
   out undoes that step -- and a bounce smaller than two steps of the field is
@@ -301,7 +327,14 @@ friction it does not; `Moving` while it rolls, not after), §5 (a slope), §6 (t
 §7 (a half-space far from its centre), §8 (a crowd of 60: the same rows pair
 by pair, through the kd-tree, and twice; the ledger), §9 (a ball rolled at a
 gap in an anchored green drops into a cup -- a container with its own space
-and floor -- is taken in by fit and rests on the cup's floor).
+and floor -- is taken in by fit and rests on the cup's floor), §10 (the
+smear: a ball whose step would carry it through a thin wall, or the ground,
+meets it; off a wall at an angle, and off a box's edge, it leaves from where
+it met it at the angle it met it; two free balls that cross inside a step
+meet; a fast crowd lands on the same rows pair by pair and through the
+kd-tree), §11 (the speed of light: stated, inherited, a pocket's own, taken
+back, the default; a body pushed past it moves at it and the ledger holds).
+`GolfTester` §7 (a lob and a drive stepped a tenth of a second at a time).
 
 ## 14. A crossing is a step, and it happens on an observation
 
@@ -366,9 +399,10 @@ of the rows it left (`doc/etcs_specification.md`, **The frame edge**).
 across it). `CausalTester` §6 (observed spans are the whole of what a clock
 contributed: the same spans into a fresh tree, the same rows) and §7 (a
 reader and a driver take turns on a tree, never inside a step). `HashTester` (a
-pull recomputes the paths that moved and no others). `GolfTester` §6 (a
+pull recomputes the paths that moved and no others). `GolfTester` §8 (a
 picture leaves the rows it drew, and a putt stepped by looks alone is holed:
-fit's move is made outside the picture's hold). The smear and its cut,
+fit's move is made outside the picture's hold). `SolidTester` §10 (the smear
+and its cut, between solids: §13). The smear between a member and a space,
 observation by relation and a gap filled past its cap have no line yet: they
 are the first three entries below.
 
@@ -376,13 +410,16 @@ are the first three entries below.
 
 ## Not promised (yet)
 
-- **The smear.** A contact is decided where a step leaves the bodies (§8,
-  §13), not along the way, so a sphere that moves more than its radius plus
-  half the other's thickness in one step is through it: a golf ball (radius
-  0.15) against a wall 0.3 thick, at the game's 12 units a second, on any
-  frame longer than 25 ms. The same one level up: fit moves a member one
-  container an interaction (§11), so a body that leaves a space within a step
-  is asked about its old siblings for that step.
+- **The smear, past one cut a pair.** Two solids meet on their smears (§13),
+  once a pair a pass and in the pairs' order: a body turned back by one
+  contact is asked about the pairs after it with what is left of its smear,
+  not about the pairs before it again, so the second wall of a corner
+  reached inside the same step is met at the next step, from inside its
+  face if the rest of the step went that far. Transmissions (§8) are still
+  decided where a step leaves the bodies. And one level up: fit moves a
+  member one container an interaction (§11), so a body that leaves a space
+  within a step is asked about its old siblings for that step, and one that
+  crosses a small space whole within a step is never taken in by it.
 - **Observation by relation.** Only a driver's line and a look step a tree. A
   query (`DepthFor`, `Order4`) or a pulled hash reads the rows the last
   interaction left.
