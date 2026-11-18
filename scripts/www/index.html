@@ -46,6 +46,14 @@
   a.card .path { color:var(--dim); font-size:11px; float:right; }
   a.card .what { color:var(--light); margin-top:6px; font-size:13px; }
   a.card .why  { color:var(--dim); margin-top:5px; font-size:12px; max-width:70ch; }
+  /* The words that say what a thing is, picked out so a glance is enough. */
+  a.card .what b, a.card .why b { color:var(--sel); font-weight:normal; }
+  /* The one to try first. */
+  a.card.feature { border-color:#6b5f2a; background:#1f1f13; padding:18px 16px; }
+  a.card.feature .name { font-size:16px; }
+  a.card.feature .what { font-size:15px; }
+  a.card .tag { display:inline-block; margin-left:10px; padding:0 6px; font-size:10px;
+                letter-spacing:.12em; color:var(--bg); background:var(--sel); }
   footer { border-top:1px solid var(--line); padding:14px 20px;
            color:var(--dim); font-size:11px; }
   code { color:var(--sel); }
@@ -76,55 +84,54 @@
   </div>
   <h2>Running here</h2>
 
-  <a class="card" href="https://anticurrententropy.com/chess/">
-    <span class="path">/chess/</span>
-    <span class="name">CHESS</span>
-    <div class="what">Two players, a board each, no account.</div>
+  <!-- Relative where the thing is the runtime compiled to wasm (kart, golf,
+       paint): served from whichever host is serving this page, so a local run
+       stays local. Chess and the forum are the site's own. -->
+  <a class="card feature" href="/kart/">
+    <span class="path">/kart/</span>
+    <span class="name">KART</span><span class="tag">PLAY WITH FRIENDS</span>
+    <div class="what"><b>Multiplayer kart battles</b> for up to <b>8 players</b>, right in your browser.</div>
     <div class="why">
-      The lobby list: join someone, or quick match. The game runs in your browser.
-    </div>
-  </a>
-
-  <a class="card" href="https://anticurrententropy.com/forum.html">
-    <span class="path">/forum.html</span>
-    <span class="name">FORUM</span>
-    <div class="what">Threads, basic bulletin board.</div>
-    <div class="why">
-      Simple anon style forum implementation.
-    </div>
-  </a>
-
-  <!-- Relative, not absolute like the two above: paint, golf and kart are the same
-       runtime compiled to wasm and served from whichever host is serving this
-       page, so hardcoding anticurrententropy.com would send a local run
-       off-machine. -->
-  <a class="card" href="/paint/">
-    <span class="path">/paint/</span>
-    <span class="name">PAINT</span>
-    <div class="what">The runtime itself, in the tab, drawing.</div>
-    <div class="why">
-      Five providers compiled to wasm, a canvas, a palette and a live shell.
-      Nothing on the server draws anything.
+      <b>Drift</b>, grab <b>weapons</b> (rockets, mines, a sniper...), launch off
+      <b>ramps</b>, <b>boost pads</b> and <b>springs</b>, and take out everyone else.
+      Hand-made arenas and endless <b>random</b> ones. Host a game, send the link -- no account.
     </div>
   </a>
 
   <a class="card" href="/golf/">
     <span class="path">/golf/</span>
     <span class="name">GOLF</span>
-    <div class="what">One hole: drag the ball back, let go.</div>
+    <div class="what"><b>Mini golf</b>, <b>3 holes</b>: pull back, let go.</div>
     <div class="why">
-      Gravity is the course's space, the bounce and the roll are solid contact,
-      and the cup is a container the ball fits into. None of it is golf's.
+      Terraces, slopes and a <b>sand trap</b>, with real <b>physics</b> -- gravity, bounces,
+      and a cup the ball actually drops into.
     </div>
   </a>
 
-  <a class="card" href="/kart/">
-    <span class="path">/kart/</span>
-    <span class="name">KART</span>
-    <div class="what">Host a battle; anyone joins and gets a kart. Gold boxes arm it, ramps throw it.</div>
+  <a class="card" href="https://anticurrententropy.com/chess/">
+    <span class="path">/chess/</span>
+    <span class="name">CHESS</span>
+    <div class="what"><b>Online chess</b> for two. <b>No account</b>.</div>
     <div class="why">
-      Every tab steps its own copy of the arena from the host's record of
-      keys, ticks and dice, and they agree to the bit -- every shot too.
+      Join someone from the list, or <b>quick match</b>.
+    </div>
+  </a>
+
+  <a class="card" href="/paint/">
+    <span class="path">/paint/</span>
+    <span class="name">PAINT</span>
+    <div class="what">A <b>drawing app</b>: canvas, palette, and a <b>live shell</b>.</div>
+    <div class="why">
+      The <b>whole runtime</b> running in your tab -- the server draws nothing.
+    </div>
+  </a>
+
+  <a class="card" href="https://anticurrententropy.com/forum.html">
+    <span class="path">/forum.html</span>
+    <span class="name">FORUM</span>
+    <div class="what">A simple <b>anonymous forum</b>.</div>
+    <div class="why">
+      Post <b>threads</b> and replies, no sign-up.
     </div>
   </a>
 
