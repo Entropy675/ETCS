@@ -20,3 +20,6 @@ bin/
 core/AirtyMacros_Generated.h
 libs/monocypher.h
 core/AceRoot.h
+# What the site serves at /dist (ace publish) and the certificates above its registrar.
+dist/
+pki/

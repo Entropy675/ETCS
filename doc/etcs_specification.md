@@ -813,27 +813,64 @@ files say what the loader claims to be, the keystore says whether the claim is i
 loader that cannot prove it takes nothing a loader signed. It does not fall back. A browser holds
 no key and is told at link time which loader built it.
 
-The keys are three, one above the next: a super-root that exists only as shards, an active key it
-certifies, and the marketplace key under that — which is simply the key of the loader that signs
-builds, registered as `Marketplace` where a developer's is registered as `Loader`. A registration
-is issued elsewhere and injected (`etcs --registration`): the place the certificates above a
-loader enter its store.
+A chain is a linked list in two halves, joined at a loader's key. The **local half** is that key
+and what it signs: it is all a loader needs to run its own builds, it needs no root, and nothing
+but that loader takes it. **ACE's half** is a tree: a super-root that exists only as shards, the
+active key it certifies, and under the active key the keys of the loaders that act for ACE — one
+role each, sharing that parent. The build server's loader is `Marketplace` and signs modules any
+loader takes; the release machine's is `Release` and signs the loader binaries a download attests;
+the site's is `Registrar` and certifies other loaders' keys as `Loader`. That certificate is the
+join: pulled from anticurrententropy.com and installed (`etcs --registration`), it puts ACE's half
+above a developer's key, so what that loader signs says whose it is. It still runs only there.
+Who may certify whom is a table (`sig::may_issue`), and a key never holds two roles.
 
-The root itself is built in. Its public key is pinned in ACE-Build-Tools (`ACE_ROOT_KEY`) and
-generated into `core/AceRoot.h` — a core header, so the root is in the epoch, and a loader built
-for another root is in another epoch. This is the bootstrap: a loader checking itself proves
+The root itself is built in. Its public key is pinned in ACE-Build-Tools (`manifests/root.pub`,
+written by `ace pin` from the ceremony's `root.cert`) and generated into `core/AceRoot.h` — a core
+header, so the root is in the epoch, and a loader built for another root is in another epoch. This is the bootstrap: a loader checking itself proves
 nothing to someone who holds no root, so the first trust comes from where the binary was obtained,
 and the root inside it is what every later check stands on — its own bytes first, then every
-module, with an empty store and no key. Such a loader takes what the marketplace signed, and signs
-nothing until its own key is registered under that root. While the pin is empty there is no root,
-and a loader works under the one its store was given.
+module, with an empty store and no key. Such a loader takes what the marketplace signed and
+attests a release.
+
+A loader trusts what was compiled into it: the root, and the key of the loader that built it
+(`ETCS_BUILDER_KEY`, which ace compiles into every loader), besides its own key proven at the
+handshake. Those keys, and the certificates of its registration, are **its chain**, and a module
+runs only if its own chain meets it, at any length. A module signed by another loader's key with
+nothing above it meets nothing, and is the case refused by default. What meets below the root —
+this loader's own build, its builder's — runs **local**: no transport bridges its entities
+(`MirrorBuffer::localFrame`). What reaches the root is the **global surface**: the marketplace's
+modules, and a registered loader's, on any loader that holds the same root. With ACE's root built
+in a loader is in the **guild**; with none it is **experimental**, everything it runs is local, and
+nothing places its epoch among anyone else's — which is what the expanding multiplayer needs. A
+builder's key compiled in is also what lets a loader run with no keystore at all: `ace bundle` puts
+`bin/etcs` and a few modules on a machine with nothing else, and they load.
+
+The root is made by etcs itself, on such a machine: `root_ceremony.etcs` makes the super-root, the
+active key it certifies, and the marketplace, release and registrar certificates the active key
+issues, splits both keys 3 of 5 to five custodians, writes the certificates out, and forgets both
+keys. `certify.etcs` rebuilds the active key from any three custodians to certify another key later.
+Once the root is in the loader, what is handed on is the loader's own key, its registration, and
+its lineage.
+
+The site is where the two halves meet. It serves **ACE's half on one path** (`/pki`): its registrar
+is a `CryptProvider::Registrar` route whose key is a `Keypair` kept in the site's keystore, and a
+loader that signs `"ETCSREG1" | its key | the registrar's key` gets a `Loader` certificate and the
+chain above it. It serves **the binaries on another** (`/dist`): each module and the last release,
+with a list of their digests and epochs and the epoch the site is in, signed by the marketplace. A
+loader reads that list through `CryptProvider::Upstream` and fetches whatever the site has moved
+past, unless its own key signed it, in which case it belongs to the developer. A module never
+holds the loader's key or writes its store: everything that does is the loader's own code, reached
+through a `TrustEvent` on the loader's ordering thread. A fetched binary is put in place only if it
+is the bytes the list names and passes the loader's own stages in the site's epoch, and it is the
+next session's.
 
 A loader is the one binary nothing else checks, so it attests itself: at the handshake it puts its
 own bytes through its own two stages. That is what makes a **lineage**. The loader going out signs
 the one that replaces it, and each such signing appends an edge to `lineage.log` in the store —
 parent digest, child digest, the epoch on either side, the signer, and the signer's word for when
-and where. Under a root that is ACE's, only a loader that attests signs, so every etcs is signed by
-a valid etcs back to the one that signed itself, which a store allows once.
+and where. Each edge names the root its signer was built with. In the guild only a loader that
+attests signs, so every etcs is signed by a valid etcs back to the one that signed itself, which a
+store allows once per root: an experimental lineage does not stop a guild's from beginning.
 
 `DatabaseProvider::Keystore` is that same store as a `Database` claiming `Private`: where a script
 keeps a secret, and the one place a `Keypair` goes whole. Its `Wrapper` children guard it as they
@@ -841,11 +878,12 @@ would a node on a link, so a secret kept under a `CryptProvider::Envelope` — a
 under the key its own `Private` child holds, given by no verb — is reached only by an entity
 carrying the same one. Naming it is not enough.
 
-Unbuilt: the pin's value, which is the super-root's public key and waits on the ceremony. Until it
-is there any root will do — the one a loader makes for itself on first use, or one a test authority
-issues — and such a root vouches for that loader only. Also unbuilt: the lineage published beside
-the download; a running loader checking a successor from a later epoch (it takes only its own
-epoch's); signing and attesting the web loader, whose trust is its page's connection; anything
+Unbuilt: the pin's value, which waits on the ceremony being run for real (a rehearsal's root, or a
+test authority's, stands in). A link that carries a local module's entities is refused (the
+local frame); nothing yet resolves one epoch against another. An account behind a registration: the registrar certifies any key
+that proves itself, and binds it to no one. Also unbuilt: the lineage published beside
+the download; a successor from a later epoch checked by the lineage (it is checked by the release
+key's signature, in the epoch the site's list names); signing and attesting the web loader, whose trust is its page's connection; anything
 that refuses a loader binary outside the lineage (the lineage is a record until then); the
 entitlement stage; and the stage that takes another loader's modules (the untrusted scanning
 mode).

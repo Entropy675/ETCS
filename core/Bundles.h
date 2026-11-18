@@ -953,6 +953,10 @@ public:
     // token's destruction triggers an election at all -- a token that was only
     // ever a proxy has nothing to do.
     bool is_lifetime_owner = false;
+    // GLOBAL-INSTANCE-ONLY: its chain met this loader's below ACE's root -- this
+    // loader's own build, or its builder's (core/Trust.h). Its entities are of
+    // the local frame: no transport bridges them (MirrorBuffer::localFrame).
+    bool local_only = false;
     SignalFlag interrupt{0}; // SIGINT
     SignalFlag terminate{0}; // SIGTERM
     SignalFlag hangup   {0}; // SIGHUP

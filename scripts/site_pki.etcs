@@ -1,0 +1,52 @@
+#!/usr/bin/env etcs
+#IMPORT ACE_ROOT/modules
+
+# ── ACE'S HALF, AND WHAT THE SITE SERVES ─────────────────────────────────────
+#
+#     run site_pki.etcs web=web tree=tree
+#
+#   /pki    the registrar (CryptProvider::Registrar): a loader's key, proven,
+#           gets a Loader certificate and the chain above it
+#   /dist   the binaries a download takes, and the marketplace's signed list
+#           of them (`ace publish` writes ACE_ROOT/dist)
+#
+# The registrar's key is a Keypair kept in this machine's keystore as
+# `registrar` (site_registrar_key.etcs makes it once). The certificates above
+# it are ACE_ROOT/pki/{registrar,active,root}.cert, as the authority left them.
+# Without them the registrar answers that it is not set up, and the rest of
+# the site runs.
+
+requires web [HttpServer]
+requires tree [FileHtmlPage]
+
+tree.MountTree(dist ACE_ROOT/dist)
+
+spawn DatabaseProvider::Keystore pki_secret
+pki_secret.Connect(registrar)
+spawn CryptProvider::Keypair pki_key
+pki_key.LoadFrom(@pki_secret)
+
+spawn NetworkProvider::Embassy pki_embassy
+spawn CryptProvider::Custody pki_files
+spawn NetworkProvider::FileRelation pki_dir
+pki_dir.Root(ACE_ROOT/pki)
+pki_dir.Target(Directory)
+pki_dir.Activate(@pki_files)
+pki_embassy.Advertise(pki file @pki_dir)
+pki_embassy.Open()
+pki_files.SetEmbassy(@pki_embassy)
+pki_files.SetRelation(pki)
+spawn CryptProvider::Certificate pki_registrar_cert
+pki_files.Recall(registrar @pki_registrar_cert)
+spawn CryptProvider::Certificate pki_active_cert
+pki_files.Recall(active @pki_active_cert)
+spawn CryptProvider::Certificate pki_root_cert
+pki_files.Recall(root @pki_root_cert)
+pki_embassy.Close()
+
+spawn CryptProvider::Registrar pki
+pki.Use(@pki_key)
+pki.Above(@pki_registrar_cert)
+pki.Above(@pki_active_cert)
+pki.Above(@pki_root_cert)
+web.AddRoute(@pki Request @pki Filter)

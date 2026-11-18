@@ -15,6 +15,7 @@
 namespace ETCS {
 // Forward declarations
 struct Module;
+struct TrustEvent;
 class  EventNode;
 class  Entity;
 class  Root;   // defined at the bottom of Entity.h, after this header --
@@ -29,7 +30,7 @@ class  Root;   // defined at the bottom of Entity.h, after this header --
 struct DLInEvent
 {
     enum class Kind : uint8_t { Load, Resolve, Destroy, AddTag, EntityUnload, TagModify,
-                                 RequestUnload, Ack, ChangeModule, PairMask };
+                                 RequestUnload, Ack, ChangeModule, PairMask, Trust };
     Kind                        kind;
     ETCS::Buffer                conjugate_key;   // Load/Resolve: module:tag key.
                                                    // AddTag: the child's tag name (reused —
@@ -100,6 +101,8 @@ struct DLInEvent
     ETCS::Buffer       pairmask_tag_b;
     ETCS::TagMask*     pairmask_out  = nullptr;
     ::std::atomic<bool>* pairmask_done = nullptr;
+    // Trust only -- the caller's event: its inputs, and where the answer goes.
+    ETCS::TrustEvent*  trust = nullptr;
     // MODULE-SCOPE bits the ORIGIN wants added, on top of the origin module's
     // own bit. Today that is exactly one thing: the module pair of a stream
     // call whose body this event was fired from inside
@@ -420,6 +423,27 @@ struct PairMaskEvent : Event
     PairMaskEvent(const ETCS::Buffer& tag_a, const ETCS::Buffer& b)
         : Event(tag_a), tag_b(b) {}
     void operator()();
+};
+// TrustEvent -- what a module asks of the loader's trust layer (core/Trust.h,
+// trust::answer). The loader's key and store are the loader's: a module that
+// needs one of them used asks here, and the asking is ordered on the loader's
+// thread like PairMask's. Blocking; `out` and `ok` are the handler's, published
+// by on_emit.
+//
+//   Request  a = the registrar's key, hex      out = "<this loader's key> <signature>"
+//   Install  a = a chain, binary or hex        out = what it registered as
+//   Survey   a = the site's list               out = the report, "fetch <name> <file>" lines
+//   Replace  a = the site's list, b = bytes    out = the path written
+//            name = which entry b is
+struct TrustEvent : Event
+{
+    enum class Op : uint8_t { Request, Install, Survey, Replace };
+    Op                  op;
+    ::std::string       name, a, b, out;
+    bool                ok = false;
+    ::std::atomic<bool> done{false};
+    explicit TrustEvent(Op o) : Event(""), op(o) {}
+    bool operator()();
 };
 // EntityUnloadEvent — the sole entry point into module-scope election and
 // arena reclamation, fired from exactly two places:
@@ -1063,6 +1087,9 @@ public:
                     break;
                 case DLInEvent::Kind::PairMask:
                     if (e->pairmask_done) e->pairmask_done->store(true, ::std::memory_order_release);
+                    break;
+                case DLInEvent::Kind::Trust:
+                    if (e->trust) e->trust->done.store(true, ::std::memory_order_release);
                     break;
                 case DLInEvent::Kind::Ack:
                     break;
