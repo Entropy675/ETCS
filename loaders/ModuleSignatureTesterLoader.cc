@@ -45,6 +45,10 @@
 //      believed; what is behind is fetched, what is the developer's is not;
 //      only the listed bytes are put in place. And a module's ask of this
 //      loader (TrustEvent) is answered on its ordering thread.
+//   9. WITNESSES: two builds that agree are witnessed by the loader among
+//      them, and only then; statements agree into a consensus only from
+//      distinct witnesses, unaltered, in one epoch, at the quorum, each root
+//      its own group; a directory is checked against it.
 //
 //   ./Run_ModuleSignatureTesterLoader
 
@@ -929,6 +933,66 @@ int main(int, char**)
         check(!bogus() && bogus.out == "not a chain of certificates", "an install of something that is not a chain is refused");
 
         for (const std::string& st : { ms, rs, ds }) ks::erase(st, "loader-key", kwhy);
+    }
+
+    // -- 9. witnesses ------------------------------------------------------------------
+    std::cout << "-- 9. witnesses --\n";
+    {
+        std::vector<uint8_t> me;
+        std::string my_name;
+        tr::own_binary(my_name, me);
+        const std::string a = dir + "/wa", b = dir + "/wb", c = dir + "/wc";
+        for (const std::string& d : { a, b, c })
+        {
+            ::mkdir(d.c_str(), 0700);
+            write_bytes(d + "/etcs", me);
+            write_bytes(d + "/Probe.wasm", tiny_wasm());
+            write_bytes(d + "/notes.txt", { 'h', 'i' });
+        }
+        auto other_wasm = tiny_wasm(); other_wasm.back() = 'x';
+        write_bytes(c + "/Probe.wasm", other_wasm);
+        std::string report, w1, w2;
+        check(!tr::witness_write(a, c, {}, dir + "/no.txt", report, why) && why.find("came out differently") != std::string::npos
+              && report.find("Probe.wasm differs") != std::string::npos,
+              "two builds that differ are not witnessed, and the binary that differs is named");
+        write_bytes(c + "/etcs", tiny_wasm());
+        check(!tr::witness_write(c, c, {}, dir + "/no.txt", report, why) && why.rfind("this loader is not the build", 0) == 0,
+              "a loader witnesses only a build it is part of");
+        check(tr::witness_write(a, b, { { "commit", "abc" }, { "path", "/x" } }, dir + "/w1.txt", report, why),
+              "two builds that agree are witnessed by the loader among them");
+        check(tr::witness_write(a, b, { { "commit", "abc" }, { "path", "/x" } }, dir + "/w2.txt", report, why), "(a second witness)");
+        w1 = slurp(dir + "/w1.txt"); w2 = slurp(dir + "/w2.txt");
+        tr::Witness ws;
+        check(tr::witness_read(w1, ws, why) && ws.files.size() == 2 && ws.files.count("etcs") && ws.files.count("Probe")
+              && ws.epoch == E && ws.arch == tr::build_arch() && ws.about["commit"] == "abc",
+              "the statement names each binary by digest, the epoch, the arch and what it was built from; not what is no binary");
+        std::string r;
+        check(tr::consensus({ w1, w2 }, { "w1", "w2" }, 2, "", r) && r.find(" at /x: 2 witnesses agree") != std::string::npos,
+              "two witnesses of one build, at one root, agree");
+        check(!tr::consensus({ w1, w2 }, { "w1", "w2" }, 3, "", r) && r.find("fewer than 3") != std::string::npos,
+              "but not to a quorum of three");
+        check(!tr::consensus({ w1, w1 }, { "w1", "w1'" }, 1, "", r) && r.find("are one witness") != std::string::npos,
+              "a statement twice is one witness");
+        std::string forged = w1;
+        forged[forged.find("Probe ") + 30] ^= 0x01;
+        check(!tr::consensus({ forged, w2 }, { "forged", "w2" }, 2, "", r) && r.find("does not verify") != std::string::npos,
+              "a statement altered after signing is refused");
+        write_bytes(c + "/etcs", me);
+        check(tr::witness_write(c, c, { { "commit", "abc" }, { "path", "/z" } }, dir + "/w3.txt", report, why), "(a witness at another root)");
+        const std::string w3 = slurp(dir + "/w3.txt");
+        check(!tr::consensus({ w1, w2, w3 }, { "w1", "w2", "w3" }, 2, "", r) && r.find(" at /x: 2 witnesses agree") != std::string::npos
+              && r.find(" at /z: 1 witness, fewer than 2") != std::string::npos,
+              "a witness at another root is a group of its own, held to the quorum on its own");
+        check(tr::consensus({ w1, w2, w3 }, { "w1", "w2", "w3" }, 1, "", r), "and each root with its quorum is its own consensus");
+        check(tr::witness_write(c, c, { { "commit", "abc" }, { "path", "/x" }, { "cc", "other" } }, dir + "/w4.txt", report, why),
+              "(a witness of another build at the first root)");
+        check(!tr::consensus({ w1, slurp(dir + "/w4.txt") }, { "w1", "w4" }, 2, "", r)
+              && r.find("Probe differs") != std::string::npos && r.find("they differ in cc: - / other") != std::string::npos,
+              "witnesses at one root that disagree are no consensus, and what their accounts differ in is named");
+        check(tr::consensus({ w1, w2 }, { "w1", "w2" }, 2, a, r) && r.find("check: Probe.wasm is the consensus build at /x") != std::string::npos,
+              "a directory of the agreed binaries checks against the consensus, and says whose root");
+        check(!tr::consensus({ w1, w2 }, { "w1", "w2" }, 2, c, r) && r.find("check: Probe.wasm is not the consensus build") != std::string::npos,
+              "and one of other binaries does not");
     }
 
     if (std::system(("rm -rf '" + dir + "'").c_str()) != 0) std::printf("  (could not remove %s)\n", dir.c_str());

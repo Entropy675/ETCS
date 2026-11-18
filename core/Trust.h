@@ -73,6 +73,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -1574,6 +1575,317 @@ inline bool open_verified(const std::string& name, const std::string& file, Open
 
 #if !defined(__EMSCRIPTEN__)
 /*
+ * WITNESSES: a build machine's word on what its build came to, and the
+ * agreement of several. A binary is compared by what a loader checks of it
+ * (digest), never as a file: each signer's section differs.
+ *
+ *   etcs-witness 1 epoch=<hex> arch=<arch> [<key>=<value> ...]
+ *   <name> <file> <digest hex>
+ *   ...
+ *   etcs-witness-sig <key hex> <signature hex>
+ *
+ * The signature is by a key made for the statement and forgotten, over
+ * "ETCSWIT1" and every byte before the last line: it ties the lines to one
+ * witness, and tells two witnesses apart. The <key>=<value>s are the builder's
+ * account of what it built from (ace witness: commit, commons, tools, path,
+ * cc) -- compared, not believed. A witness is the build it speaks for: the
+ * loader that writes the statement is one of the binaries in it.
+ *
+ * `path` is the ACE_ROOT the tree was built at, which is compiled into the
+ * loader and some modules: witnesses at one root build one thing, and
+ * witnesses at two roots are two groups, each agreed on by its own.
+ */
+constexpr char kWitnessMagic[] = "etcs-witness 1 ";
+constexpr char kWitnessSig[]   = "etcs-witness-sig ";
+
+inline const char* build_arch()
+{
+#  if defined(_WIN32)
+#    define ETCS_ARCH_OS "windows"
+#  elif defined(__APPLE__)
+#    define ETCS_ARCH_OS "darwin"
+#  else
+#    define ETCS_ARCH_OS "linux"
+#  endif
+#  if defined(__x86_64__) || defined(_M_X64)
+    return ETCS_ARCH_OS "-x86_64";
+#  elif defined(__aarch64__) || defined(_M_ARM64)
+    return ETCS_ARCH_OS "-aarch64";
+#  elif defined(__arm__)
+    return ETCS_ARCH_OS "-arm";
+#  elif defined(__riscv) && __riscv_xlen == 64
+    return ETCS_ARCH_OS "-riscv64";
+#  else
+    return ETCS_ARCH_OS "-unknown";
+#  endif
+#  undef ETCS_ARCH_OS
+}
+
+// The digest a loader checks of `file` as `name` (its file's name, less what
+// the platform adds, unless given). False if it is no binary a loader loads.
+inline bool file_digest(const std::string& file, std::string& name, sig::Key& d, std::string& why)
+{
+    std::vector<uint8_t> b;
+    sig::Layout L;
+    if (!read_file(file, b)) { why = "cannot read " + file; return false; }
+    if (!sig::layout(b.data(), b.size(), L, why)) return false;
+    if (name.empty())
+    {
+        name = file.substr(file.find_last_of("/\\") + 1);
+        name = dist_name(name);
+    }
+    if (!digest(name, b.data(), b.size(), L, d)) { why = "bad name " + name; return false; }
+    return true;
+}
+
+struct Witness
+{
+    sig::Epoch                                                  epoch{};
+    std::string                                                 arch;
+    std::map<std::string, std::string>                          about;
+    std::map<std::string, std::pair<std::string, sig::Key>>     files;      // name -> file, digest
+    sig::Key                                                    key{};
+};
+
+inline bool about_word(const std::string& s)
+{
+    if (s.empty() || s.size() > 256) return false;
+    for (char c : s) if (c <= ' ' || c == 0x7f) return false;
+    return true;
+}
+
+/*
+ * Two builds of one tree, `a` and `b`, and the statement that they came to
+ * the same thing -- written to `out` only if every binary in `a` is in `b`
+ * with the same digest, and this loader is one of them. `report` says what
+ * was compared, or what differed.
+ */
+inline bool witness_write(const std::string& a, const std::string& b, const std::map<std::string, std::string>& about,
+                          const std::string& out, std::string& report, std::string& why)
+{
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    std::vector<std::string> names;
+    for (const auto& e : fs::directory_iterator(a, ec))
+        if (e.is_regular_file()) names.push_back(e.path().filename().string());
+    if (ec) { why = "cannot read " + a + ": " + ec.message(); return false; }
+    std::sort(names.begin(), names.end());
+
+    Witness w;
+    int differ = 0;
+    for (const std::string& f : names)
+    {
+        std::string name, nb, wa, wb;
+        sig::Key da{}, db{};
+        if (!plain_file(f) || !file_digest(a + "/" + f, name, da, wa)) continue;      // not a binary
+        nb = name;
+        if (!file_digest(b + "/" + f, nb, db, wb)) { report += f + " is not in the second build\n"; ++differ; continue; }
+        if (da != db) { report += f + " differs: " + hex(da.data(), 32) + " / " + hex(db.data(), 32) + "\n"; ++differ; continue; }
+        report += f + " " + hex(da.data(), 32) + "\n";
+        w.files[name] = { f, da };
+    }
+    if (differ) { why = std::to_string(differ) + " binar" + (differ == 1 ? "y" : "ies") + " came out differently in two builds"; return false; }
+    if (w.files.empty()) { why = "no binaries in " + a; return false; }
+
+    std::vector<uint8_t> me;
+    std::string me_name;
+    sig::Layout L;
+    sig::Key mine{};
+    const auto it = w.files.find("etcs");
+    if (!own_binary(me_name, me) || !sig::layout(me.data(), me.size(), L, why) || !digest("etcs", me.data(), me.size(), L, mine)
+        || it == w.files.end() || it->second.second != mine)
+    { why = "this loader is not the build it witnesses: run " + a + "/etcs"; return false; }
+
+    std::string body = std::string(kWitnessMagic) + "epoch=" + hex(loader_epoch().data(), 32) + " arch=" + build_arch();
+    for (const auto& [k, v] : about)
+    {
+        if (k == "epoch" || k == "arch" || !about_word(k) || k.find('=') != std::string::npos || !about_word(v))
+        { why = "not a word: " + k + "=" + v; return false; }
+        body += " " + k + "=" + v;
+    }
+    body += "\n";
+    for (const auto& [name, fd] : w.files) body += name + " " + fd.first + " " + hex(fd.second.data(), 32) + "\n";
+
+    uint8_t seed[32], secret[64], s[sig::kSigBytes];
+    sig::Key pub{};
+    if (!random_bytes(seed, 32)) { why = "no randomness for the witness's key"; return false; }
+    mc::crypto_ed25519_key_pair(secret, pub.data(), seed);
+    const std::string m = "ETCSWIT1" + body;
+    mc::crypto_ed25519_sign(s, secret, reinterpret_cast<const uint8_t*>(m.data()), m.size());
+    mc::crypto_wipe(secret, 64);
+    const std::string text = body + kWitnessSig + hex(pub.data(), 32) + " " + hex(s, sizeof s) + "\n";
+    std::ofstream o(out, std::ios::binary | std::ios::trunc);
+    if (!o.write(text.data(), std::streamsize(text.size())) || !o.flush()) { why = "cannot write " + out; return false; }
+    report += "witness " + hex(pub.data(), 32) + "\n";
+    return true;
+}
+
+inline bool witness_read(const std::string& text, Witness& w, std::string& why)
+{
+    const std::string tag = kWitnessSig;
+    const size_t last = text.rfind("\n" + tag);
+    if (text.compare(0, sizeof kWitnessMagic - 1, kWitnessMagic) != 0 || last == std::string::npos)
+    { why = "not a witness statement"; return false; }
+    const std::string body = text.substr(0, last + 1);
+    std::istringstream sl(text.substr(last + 1 + tag.size()));
+    std::string key_hex, sig_hex;
+    uint8_t s[sig::kSigBytes];
+    sl >> key_hex >> sig_hex;
+    if (!unhex(key_hex, w.key.data(), 32) || !unhex(sig_hex, s, sizeof s)) { why = "the statement's signature is unreadable"; return false; }
+    const std::string m = "ETCSWIT1" + body;
+    if (mc::crypto_ed25519_check(s, w.key.data(), reinterpret_cast<const uint8_t*>(m.data()), m.size()) != 0)
+    { why = "the statement's signature does not verify"; return false; }
+
+    std::istringstream in(body);
+    std::string line;
+    std::getline(in, line);
+    std::istringstream hs(line.substr(sizeof kWitnessMagic - 1));
+    for (std::string kv; hs >> kv; )
+    {
+        const size_t eq = kv.find('=');
+        if (eq == std::string::npos) { why = "a header word is not key=value: " + kv; return false; }
+        w.about[kv.substr(0, eq)] = kv.substr(eq + 1);
+    }
+    if (!unhex(w.about["epoch"], w.epoch.data(), 32) || w.about["arch"].empty()) { why = "the statement names no epoch or arch"; return false; }
+    w.arch = w.about["arch"];
+    w.about.erase("epoch"); w.about.erase("arch");
+    while (std::getline(in, line))
+    {
+        if (line.empty()) continue;
+        std::istringstream ls(line);
+        std::string name, file, dg;
+        sig::Key d{};
+        if (!(ls >> name >> file >> dg) || !plain_file(name) || !plain_file(file) || !unhex(dg, d.data(), 32))
+        { why = "the statement has a line it cannot read: " + line; return false; }
+        w.files[name] = { file, d };
+    }
+    return !w.files.empty() || (why = "the statement names no binaries", false);
+}
+
+/*
+ * THE CONSENSUS: every statement read and verified; one epoch, and one account
+ * of the source (commit, commons, tools), across all of them; and per arch and
+ * root (`path`), every witness the same binaries with the same digests, from
+ * at least `quorum` distinct witnesses. Where two witnesses of one group
+ * disagree, the accounts they gave that differ are named -- the likely reason.
+ * `check`, when given, is a directory whose binaries must be the consensus
+ * build of one of this arch's roots.
+ */
+inline bool consensus(const std::vector<std::string>& texts, const std::vector<std::string>& names, size_t quorum,
+                      const std::string& check, std::string& report)
+{
+    std::vector<Witness> ws(texts.size());
+    bool ok = true;
+    for (size_t i = 0; i < texts.size(); ++i)
+    {
+        std::string why;
+        if (!witness_read(texts[i], ws[i], why)) { report += names[i] + ": " + why + "\n"; ok = false; }
+    }
+    if (!ok) return false;
+    for (size_t i = 0; i < ws.size(); ++i)
+        for (size_t j = i + 1; j < ws.size(); ++j)
+            if (ws[i].key == ws[j].key) { report += names[i] + " and " + names[j] + " are one witness\n"; ok = false; }
+    for (size_t i = 1; i < ws.size(); ++i)
+    {
+        if (ws[i].epoch != ws[0].epoch)
+        { report += names[i] + " is in epoch " + hex(ws[i].epoch.data(), 32) + ", " + names[0] + " in " + hex(ws[0].epoch.data(), 32) + "\n"; ok = false; }
+        for (const char* k : { "commit", "commons", "tools" })
+            if (ws[i].about[k] != ws[0].about[k])
+            { report += names[i] + " built " + k + " " + ws[i].about[k] + ", " + names[0] + " " + ws[0].about[k] + "\n"; ok = false; }
+    }
+    if (!ok) return false;
+
+    // A group: one arch at one root.
+    std::map<std::pair<std::string, std::string>, std::vector<size_t>> groups;
+    for (size_t i = 0; i < ws.size(); ++i) groups[{ ws[i].arch, ws[i].about["path"] }].push_back(i);
+    report += "epoch " + hex(ws[0].epoch.data(), 32) + "\n";
+    std::vector<const Witness*> agreed;
+    for (const auto& [group, idx] : groups)
+    {
+        const std::string arch = group.first + (group.second.empty() ? "" : " at " + group.second);
+        const Witness& r = ws[idx[0]];
+        bool agree = true;
+        for (size_t k = 1; k < idx.size(); ++k)
+        {
+            const Witness& o = ws[idx[k]];
+            std::string diff;
+            for (const auto& [n, fd] : r.files)
+            {
+                const auto it = o.files.find(n);
+                if (it == o.files.end()) diff += "  " + n + " is not in " + names[idx[k]] + "\n";
+                else if (it->second.second != fd.second) diff += "  " + n + " differs\n";
+            }
+            for (const auto& [n, fd] : o.files)
+                if (!r.files.count(n)) diff += "  " + n + " is not in " + names[idx[0]] + "\n";
+            if (diff.empty()) continue;
+            agree = false;
+            report += arch + ": " + names[idx[k]] + " disagrees with " + names[idx[0]] + "\n" + diff;
+            for (const auto& [key, v] : o.about)
+            {
+                const auto rv = r.about.find(key);
+                if (rv == r.about.end() || rv->second != v)
+                    report += "  they differ in " + key + ": " + (rv == r.about.end() ? "-" : rv->second) + " / " + v + "\n";
+            }
+        }
+        if (!agree) { ok = false; continue; }
+        if (idx.size() < quorum)
+        {
+            report += arch + ": " + std::to_string(idx.size()) + " witness" + (idx.size() == 1 ? "" : "es")
+                    + ", fewer than " + std::to_string(quorum) + "\n";
+            ok = false;
+            continue;
+        }
+        report += arch + ": " + (idx.size() == 1 ? std::string("1 witness") : std::to_string(idx.size()) + " witnesses agree") + "\n";
+        for (const auto& [n, fd] : r.files) report += "  " + n + " " + hex(fd.second.data(), 32) + "\n";
+        if (group.first == build_arch()) agreed.push_back(&r);
+    }
+    if (!ok || check.empty()) return ok;
+
+    if (agreed.empty()) { report += "check: no witness of " + std::string(build_arch()) + "\n"; return false; }
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    struct Bin { std::string file, name; sig::Key d; };
+    std::vector<Bin> here;
+    for (const auto& e : fs::directory_iterator(check, ec))
+    {
+        const std::string f = e.path().filename().string();
+        std::string name, why;
+        sig::Key d{};
+        if (!e.is_regular_file() || !plain_file(f) || !file_digest(check + "/" + f, name, d, why)) continue;
+        here.push_back({ f, name, d });
+    }
+    if (ec || here.empty()) { report += "check: no binaries in " + check + "\n"; return false; }
+    std::sort(here.begin(), here.end(), [](const Bin& x, const Bin& y) { return x.file < y.file; });
+    // The root whose consensus this directory is; else, against the first, what is not.
+    for (const Witness* r : agreed)
+    {
+        bool all = true;
+        for (const Bin& h : here)
+        {
+            const auto fd = r->files.find(h.name);
+            all = all && fd != r->files.end() && fd->second.second == h.d;
+        }
+        if (!all) continue;
+        const auto at = r->about.find("path");
+        for (const Bin& h : here)
+            report += "check: " + h.file + " is the consensus build" + (at == r->about.end() ? "" : " at " + at->second) + "\n";
+        return true;
+    }
+    const Witness& r = *agreed[0];
+    for (const Bin& h : here)
+    {
+        const auto fd = r.files.find(h.name);
+        report += "check: " + h.file + (fd == r.files.end() ? " was not witnessed"
+                                       : fd->second.second != h.d ? " is not the consensus build"
+                                       : " is the consensus build") + "\n";
+    }
+    if (agreed.size() > 1) report += "check: and it is no other root's consensus either\n";
+    return false;
+}
+#endif
+
+#if !defined(__EMSCRIPTEN__)
+/*
  * What ace asks of the loader that holds the key:
  *
  *   etcs --sign <module> <file> <epoch hex> <out>   0 signed, 3 already, 2 refused
@@ -1587,6 +1899,10 @@ inline bool open_verified(const std::string& name, const std::string& file, Open
  *   etcs --loader-key                               public key, made on first use
  *   etcs --root                                     the root built in; 2 when there is none
  *   etcs --epoch                                    this loader's epoch
+ *   etcs --digest <file> [name]                     the digest a loader checks of it
+ *   etcs --witness <a> <b> <out> [key=value]...     two builds came to the same; run as <a>/etcs
+ *   etcs --consensus [quorum=N] [check=<dir>] <statement>...
+ *                                                   what the witnesses agree on; 0 only if they do
  *
  * -1 when argv names none of these.
  */
@@ -1600,6 +1916,52 @@ inline int cli(int argc, char** argv)
     {
         std::printf("%s\n", hex(loader_epoch().data(), 32).c_str());
         return 0;
+    }
+    if (verb == "--digest" && (argc == 3 || argc == 4))
+    {
+        std::string name = argc == 4 ? argv[3] : "";
+        sig::Key d{};
+        if (!file_digest(argv[2], name, d, why)) { std::fprintf(stderr, "etcs: %s\n", why.c_str()); return 2; }
+        std::printf("%s %s\n", hex(d.data(), 32).c_str(), name.c_str());
+        return 0;
+    }
+    if (verb == "--witness" && argc >= 5)
+    {
+        std::map<std::string, std::string> about;
+        for (int i = 5; i < argc; ++i)
+        {
+            const std::string kv = argv[i];
+            const size_t eq = kv.find('=');
+            if (eq == std::string::npos || eq == 0) { std::fprintf(stderr, "etcs: not key=value: %s\n", argv[i]); return 2; }
+            about[kv.substr(0, eq)] = kv.substr(eq + 1);
+        }
+        std::string report;
+        const bool ok = witness_write(argv[2], argv[3], about, argv[4], report, why);
+        std::printf("%s", report.c_str());
+        if (!ok) { std::fprintf(stderr, "etcs: %s\n", why.c_str()); return 1; }
+        std::printf("witnessed %s\n", argv[4]);
+        return 0;
+    }
+    if (verb == "--consensus" && argc >= 3)
+    {
+        size_t quorum = 2;
+        std::string check;
+        std::vector<std::string> texts, names;
+        for (int i = 2; i < argc; ++i)
+        {
+            const std::string a = argv[i];
+            if (a.rfind("quorum=", 0) == 0) { quorum = std::strtoul(a.c_str() + 7, nullptr, 10); continue; }
+            if (a.rfind("check=", 0) == 0)  { check = a.substr(6); continue; }
+            std::vector<uint8_t> raw;
+            if (!read_file(a, raw)) { std::fprintf(stderr, "etcs: cannot read %s\n", a.c_str()); return 2; }
+            texts.emplace_back(raw.begin(), raw.end());
+            names.push_back(a);
+        }
+        if (texts.empty()) { std::fprintf(stderr, "usage: etcs --consensus [quorum=N] [check=<dir>] <statement>...\n"); return 2; }
+        std::string report;
+        const bool ok = consensus(texts, names, quorum, check, report);
+        std::printf("%s%s\n", report.c_str(), ok ? "consensus" : "no consensus");
+        return ok ? 0 : 1;
     }
     if (verb == "--root" && argc == 2)
     {

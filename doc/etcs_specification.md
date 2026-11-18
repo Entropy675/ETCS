@@ -854,6 +854,20 @@ keys. `certify.etcs` rebuilds the active key from any three custodians to certif
 Once the root is in the loader, what is handed on is the loader's own key, its registration, and
 its lineage.
 
+What the ceremony runs is agreed on before it runs. **Witnesses**: `ace source` packs this tree,
+Commons and ACE-Build-Tools, each with its `.git`, and the Monocypher pin into one tar a machine
+with no network builds from. On each machine, unpacked at the same path (it is compiled into the
+loader and some modules), `ace witness` builds the loader and the ceremony's modules twice from
+scratch with no builder key. The loader just built then writes a statement, `etcs --witness`, and
+only if both builds came to the same digests: the digest of each binary, the epoch, the arch, and
+the builder's account of what it built from (the commits, the path, the compiler), signed by a key
+made for it and forgotten. `etcs --consensus` agrees on statements: one epoch and one source across
+all of them; per arch, every witness the same digests, from at least a quorum of distinct
+witnesses. Where two disagree it names what their accounts differ in. With `check=<dir>` it says
+whether a directory's binaries are the consensus build, and `ace bundle --from` packs that build for
+the ceremony. Binaries are compared by the digest a loader checks (`etcs --digest`), never as
+files, since every signer's section differs.
+
 The site is where the two halves meet. It serves **ACE's half on one path** (`/pki`): its registrar
 is a `CryptProvider::Registrar` route whose key is a `Keypair` kept in the site's keystore, and a
 loader that signs `"ETCSREG1" | its key | the registrar's key` gets a `Loader` certificate and the
