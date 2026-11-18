@@ -30,9 +30,9 @@
 //      trap rests half a unit down, its shadow on the sand. Holed, the round
 //      is done and the first hole comes round again; a hole can be gone to by
 //      its number, and N goes on to the next.
-//   7. AT SPEED. Stepped a tenth of a second at a time, a lob comes down on
-//      the green and a drive is turned back by a bumper thinner than its
-//      step: a contact is found on the way, not where the step ends. A ball
+//   7. AT SPEED. Stepped a fifth of a second at a time, a lob comes down on
+//      a green thinner than its step and a drive is turned back by a bumper
+//      thinner than its step: a contact is found on the way, not where the step ends. A ball
 //      pushed past the course's speed of light moves at it.
 //   8. HOLED BY BEING LOOKED AT. The same putt with no driver: the camera's
 //      pictures step the world, as a frame does. A picture is drawn under a
@@ -299,7 +299,7 @@ int main(int, char**)
     // friction takes ~0.98 m/s^2, so 4 J (2.8 m/s) arrives at about 1.2.
     ETCS::Entity* be = static_cast<ETCS::Entity*>(ball);
     verb(be, "Scene3D.Halt");
-    verb(be, "Scene3D.SetPosition", "0, 0.15, 19");
+    verb(be, "Scene3D.SetPosition", "0, 0.15, 41");
     step(60);
     // What the world is made of, as an export counts it: the same walk and the
     // same shape lookup a picture makes (Scene3D::collectSubtree).
@@ -341,7 +341,7 @@ int main(int, char**)
     }
     where(ball, b);
     std::printf("        (the card: %s; the ball at %.2f %.2f %.2f)\n", verb(game, "GolfGame.Card").c_str(), b[0], b[1], b[2]);
-    check(static_cast<ETCS::Entity*>(ball)->getParent() == world && std::fabs(b[0] - 14.0f) < 0.01f && std::fabs(b[2]) < 0.01f && b[1] > 1.5f,
+    check(static_cast<ETCS::Entity*>(ball)->getParent() == world && std::fabs(b[0] - 28.0f) < 0.01f && std::fabs(b[2]) < 0.01f && b[1] > 3.0f,
           "the game sets a holed ball on the next hole's tee");
     check(verb(game, "GolfGame.Card") == "2 3 0 1", "...the card on hole 2, the first hole's stroke kept for the round");
 
@@ -364,42 +364,42 @@ int main(int, char**)
     {
         // Hole 2. On its terrace; rolled off it, down the slope to the green.
         rest(30);
-        check(std::fabs(b[1] - 1.65f) < 0.003f && speed(ball) == 0.0f, "hole 2's tee is on a terrace: the ball rests a unit and a half up");
-        verb(be, "Scene3D.Impulse", "0, 0, 1, 9");
+        check(std::fabs(b[1] - 3.15f) < 0.003f && speed(ball) == 0.0f, "hole 2's tee is on a terrace: the ball rests three units up");
+        verb(be, "Scene3D.Impulse", "0, 0, 1, 24");
         float lowest = b[1], furthest = b[2];
         for (int i = 0; i < 150; ++i) { step(10); where(ball, b); lowest = std::min(lowest, b[1]); furthest = std::max(furthest, b[2]); if (speed(ball) == 0.0f) break; }
         std::printf("        (rolled off the terrace: down to y %.2f, as far as z %.2f; at rest at %.2f %.2f %.2f)\n", lowest, furthest, b[0], b[1], b[2]);
-        check(speed(ball) == 0.0f && std::fabs(b[1] - 0.15f) < 0.003f && b[2] > 14.0f && b[2] < 26.0f,
+        check(speed(ball) == 0.0f && std::fabs(b[1] - 0.15f) < 0.003f && b[2] > 28.0f && b[2] < 52.0f,
               "...and rolled off it, it runs down the slope and comes to rest on the green, a level down");
-        const bool in2 = hole_out(cups[1], "14, 0.15, 19");
+        const bool in2 = hole_out(cups[1], "28, 0.15, 41");
         check(in2, "a putt on that green is holed in hole 2's cup");
         read_card();
         where(ball, b);
         std::printf("        (the card: %s; the ball at %.2f %.2f %.2f)\n", verb(game, "GolfGame.Card").c_str(), b[0], b[1], b[2]);
-        check(be->getParent() == world && std::fabs(b[0] - 28.0f) < 0.01f && std::fabs(b[2]) < 0.01f && verb(game, "GolfGame.Card").compare(0, 5, "3 3 0") == 0,
+        check(be->getParent() == world && std::fabs(b[0] - 56.0f) < 0.01f && std::fabs(b[2]) < 0.01f && verb(game, "GolfGame.Card").compare(0, 5, "3 3 0") == 0,
               "...and the game goes on to hole 3's tee");
 
         // Hole 3. A soft putt at the slope rolls back; a firm one stays up.
         verb(be, "Scene3D.Halt");
-        verb(be, "Scene3D.SetPosition", "26, 0.15, 7");
+        verb(be, "Scene3D.SetPosition", "52, 0.15, 14");
         step(30);
-        verb(be, "Scene3D.Impulse", "0, 0, 1, 4");
+        verb(be, "Scene3D.Impulse", "0, 0, 1, 6");
         float highest = 0.0f;
         for (int i = 0; i < 150; ++i) { step(10); where(ball, b); highest = std::max(highest, b[1]); if (speed(ball) == 0.0f) break; }
         std::printf("        (a soft putt at the slope: up to y %.2f, at rest at z %.2f, y %.2f)\n", highest, b[2], b[1]);
-        check(speed(ball) == 0.0f && highest > 0.2f && highest < 1.0f && std::fabs(b[1] - 0.15f) < 0.003f && b[2] < 8.0f,
+        check(speed(ball) == 0.0f && highest > 0.2f && highest < 1.0f && std::fabs(b[1] - 0.15f) < 0.003f && b[2] < 16.0f,
               "hole 3 climbs: a soft putt goes part way up the slope and rolls back to the green");
         verb(be, "Scene3D.Halt");
-        verb(be, "Scene3D.SetPosition", "26, 0.15, 7");
+        verb(be, "Scene3D.SetPosition", "52, 0.15, 14");
         step(30);
-        verb(be, "Scene3D.Impulse", "0, 0, 1, 20");
+        verb(be, "Scene3D.Impulse", "0, 0, 1, 45");
         rest(150);
         std::printf("        (a firm one: at rest at z %.2f, y %.2f)\n", b[2], b[1]);
-        check(speed(ball) == 0.0f && std::fabs(b[1] - 1.15f) < 0.003f && b[2] > 14.0f && b[2] < 26.0f,
+        check(speed(ball) == 0.0f && std::fabs(b[1] - 2.15f) < 0.003f && b[2] > 28.0f && b[2] < 52.0f,
               "...a firm one tops it and rests on the terrace, a level up");
         // The trap, in the straight line from the tee.
         verb(be, "Scene3D.Halt");
-        verb(be, "Scene3D.SetPosition", "28, 0.4, 5");
+        verb(be, "Scene3D.SetPosition", "56, 0.4, 10");
         rest(60);
         float u[3] = { 0, 0, 0 };
         if (under) where(under, u);
@@ -407,7 +407,7 @@ int main(int, char**)
         check(speed(ball) == 0.0f && std::fabs(b[1] + 0.35f) < 0.003f && u[1] > -0.5f && u[1] < -0.44f,
               "...and the sand trap before the slope is half a unit down: a ball in it rests there, its shadow on the sand");
         const std::string before = verb(game, "GolfGame.Card");
-        const bool in3 = hole_out(cups[2], "28, 1.15, 19");
+        const bool in3 = hole_out(cups[2], "56, 2.15, 41");
         check(in3, "a putt on the terrace is holed in hole 3's cup");
         read_card();
         where(ball, b);
@@ -417,10 +417,10 @@ int main(int, char**)
         // By number, and on with N.
         verb(game, "GolfGame.PlayHole", "2");
         where(ball, b);
-        const bool second = std::fabs(b[0] - 14.0f) < 0.01f && verb(game, "GolfGame.Card") == "2 3 0 0";
+        const bool second = std::fabs(b[0] - 28.0f) < 0.01f && verb(game, "GolfGame.Card") == "2 3 0 0";
         verb(game, "GolfGame.Key", "78, 1");
         where(ball, b);
-        check(second && std::fabs(b[0] - 28.0f) < 0.01f && verb(game, "GolfGame.Card") == "3 3 0 0", "a hole is gone to by its number, and N goes on to the next");
+        check(second && std::fabs(b[0] - 56.0f) < 0.01f && verb(game, "GolfGame.Card") == "3 3 0 0", "a hole is gone to by its number, and N goes on to the next");
         verb(game, "GolfGame.Reset");
         step(60);
     }
@@ -428,27 +428,29 @@ int main(int, char**)
     // -- 7. at speed ------------------------------------------------------------------
     std::cout << "\n-- 7. at speed --\n";
     {
-        // Long frames, a tenth of a second each: what a slow machine gives.
-        // A lob comes down at 0.57 a step, on a green 0.5 thick; a drive is
-        // 1.2 a step, at a bumper 0.3 thick.
-        auto slow = [&](int ticks) { for (int i = 0; i < ticks; ++i) { verb(world, "Scene3D.Run", "1, 100"); anim->Advance(); } };
+        // Long frames, a fifth of a second each: what a slow machine gives.
+        // A lob comes down at 1.1 a step, on a green a unit thick; a drive is
+        // over 2 a step, at a bumper 0.6 thick.
+        auto slow = [&](int ticks) { for (int i = 0; i < ticks; ++i) { verb(world, "Scene3D.Run", "1, 200"); anim->Advance(); } };
         verb(be, "Scene3D.Halt");
-        verb(be, "Scene3D.SetPosition", "2, 0.15, 2");
+        verb(be, "Scene3D.SetPosition", "-4, 0.15, 2");
         slow(3);
         verb(be, "Scene3D.Impulse", "0, 0.7071, 0.7071, 32");
         float lowest = 9.0f, highest = 0.0f;
         for (int i = 0; i < 80; ++i) { slow(1); where(ball, b); lowest = std::min(lowest, b[1]); highest = std::max(highest, b[1]); if (speed(ball) == 0.0f && i > 5) break; }
         std::printf("        (a lob on long frames: up to y %.2f, never below y %.3f; at rest at %.2f %.3f %.2f)\n", highest, lowest, b[0], b[1], b[2]);
         check(highest > 1.0f && lowest > 0.148f && speed(ball) == 0.0f && std::fabs(b[1] - 0.15f) < 0.003f && be->getParent() == world,
-              "a lob stepped a tenth of a second at a time comes down on the green, not through it");
+              "a lob stepped a fifth of a second at a time comes down on the green, not through it");
         verb(be, "Scene3D.Halt");
-        verb(be, "Scene3D.SetPosition", "2, 0.15, 20");
+        verb(be, "Scene3D.SetPosition", "2, 0.15, 40");
         slow(3);
         verb(be, "Scene3D.Impulse", "0, 0, 1, 72");
         float furthest = 0.0f;
         for (int i = 0; i < 120; ++i) { slow(1); where(ball, b); furthest = std::max(furthest, b[2]); if (speed(ball) == 0.0f && i > 5) break; }
         std::printf("        (a drive at the far bumper: as far as z %.3f; at rest at %.2f %.3f %.2f)\n", furthest, b[0], b[1], b[2]);
-        check(furthest < 26.0f && furthest > 25.5f && speed(ball) == 0.0f && std::fabs(b[1] - 0.15f) < 0.003f && b[2] < 25.9f,
+        // Seen only where each step ends, which may be on the way back: as far
+        // as the bumper (its face at 52, less the ball's 0.15) and no further.
+        check(furthest <= 51.851f && furthest > 49.5f && speed(ball) == 0.0f && std::fabs(b[1] - 0.15f) < 0.003f && b[2] < furthest,
               "a drive at a bumper thinner than its step is turned back by it, and stays on the green");
         // The course's speed of light: 16 a second.
         verb(be, "Scene3D.Halt");
@@ -466,7 +468,7 @@ int main(int, char**)
     // -- 8. holed by being looked at ---------------------------------------------------
     std::cout << "\n-- 8. holed by being looked at --\n";
     verb(be, "Scene3D.Halt");
-    verb(be, "Scene3D.SetPosition", "0, 0.15, 19");
+    verb(be, "Scene3D.SetPosition", "0, 0.15, 41");
     step(60);
     verb(eye, "Camera3D.Render");   // the first look: the clocks start, nothing is owed
     verb(be, "Scene3D.Impulse", "0, 0, 1, 4");
