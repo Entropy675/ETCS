@@ -9,9 +9,9 @@
 //
 // NOT A FAMILY, the same way Point2D/Rect2D/Point3D are not: this is
 // vocabulary. A family is something an entity can BE; this is something a
-// value can have. Matrix (ontology/Matrix.h) is the family, and it is a
-// participant in a transform chain -- a different claim entirely from "here
-// are R*C floats and how to multiply them".
+// value can have. A transform is the Relational family (ontology/Relational.h),
+// and a matrix is one way a relation is written down -- the ink, not the law.
+// A different claim entirely from "here are R*C floats and how to multiply them".
 //
 // THE SHAPE IS IN THE TYPE, WHICH IS WHERE THE CONSTRAINT LIVES. An n-by-m
 // may multiply an m-by-p and nothing else, and the interesting thing about
@@ -24,8 +24,8 @@
 // library you have to read. at(r, c) is the only accessor, so nothing outside
 // this file depends on the choice.
 //
-// WHY A TEMPLATE RATHER THAN A 4x4. Because the chain is the point (see
-// Matrix.h): a stage that takes n rows and yields m is a step in a pipeline
+// WHY A TEMPLATE RATHER THAN A 4x4. Because the chain is the point (a stage's
+// Targets, Relational.h): a stage that takes n rows and yields m is a step in a pipeline
 // whose ends have to agree, and a fixed 4x4 could express neither a
 // projection that drops a dimension nor a chain that widens one. The 4x4 is
 // the common case, named below, not the only one.

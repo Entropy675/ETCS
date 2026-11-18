@@ -249,31 +249,49 @@ struct PendingUnloadRegistry
         ::std::lock_guard<::std::mutex> lock(mutex_);
         threads_.push_back(::std::move(t));
     }
-    void join_all()
-    {
-        ::std::lock_guard<::std::mutex> lock(mutex_);
-        for (auto& t : threads_)
-            if (t.joinable()) t.join();
-        threads_.clear();
-        closed_ = true;
-    }
+    /*
+ * JOINED WITH THE LOCK RELEASED. A recheck finishes only when the loader's
+ * ordering thread handles its event, and that thread takes this lock itself
+ * whenever an initial RequestUnload reaches it (spawn). Joining under the
+ * lock was a three-way deadlock: main holding the lock and joining a
+ * recheck, the recheck spinning on an event queued behind the ordering
+ * thread, the ordering thread waiting for the lock. Reproduced at the end
+ * of PaintRouterKeysTesterLoader, rarely: DatabaseProvider's initial fire
+ * still in flight when main reached here, RenderProvider's recheck pending.
+ *
+ * So each round takes the threads out under the lock and joins them
+ * outside it. A recheck spawned meanwhile is accepted (the barrier is not
+ * closed yet) and joined on the next round; the barrier closes, under the
+ * lock, only when a round finds nothing left -- so spawn's refusal still
+ * means exactly "nobody is left to join this".
+ */
+    void join_all() { drain(true); }
     /*
  * Belt and braces. With spawn()'s guard nothing can be added after
- * join_all(), so this loop is empty in every ordering the guard covers
- * -- it exists so that a future call site reaching for track() directly
- * still cannot end a run by destroying a joinable thread.
+ * join_all(), so this is empty in every ordering the guard covers -- it
+ * exists so that a future call site reaching for track() directly still
+ * cannot end a run by destroying a joinable thread.
  */
-    ~PendingUnloadRegistry()
-    {
-        ::std::lock_guard<::std::mutex> lock(mutex_);
-        for (auto& t : threads_)
-            if (t.joinable()) t.join();
-        threads_.clear();
-    }
+    ~PendingUnloadRegistry() { drain(false); }
     static PendingUnloadRegistry& getInstance()
     {
         static PendingUnloadRegistry instance;
         return instance;
+    }
+private:
+    void drain(bool close)
+    {
+        for (;;)
+        {
+            ::std::vector<::std::thread> round;
+            {
+                ::std::lock_guard<::std::mutex> lock(mutex_);
+                if (threads_.empty()) { if (close) closed_ = true; return; }
+                round.swap(threads_);
+            }
+            for (auto& t : round)
+                if (t.joinable()) t.join();
+        }
     }
 };
 /*
@@ -1089,6 +1107,14 @@ bool ETCS::WorkBundle::operator()(ETCS_RID_SIZE rid, const ETCS::Buffer& conjuga
             << " -- would have crashed on the call below.");
         return false;
     }
+    // workFunc is type-erased; isStream says which signature it really has.
+    // A stream body called as a work function reads a Buffer as an MBuffer.
+    if (isStream)
+    {
+        ETCS_LOG("WorkBundle::operator()", module_tag << "." << work_tag
+            << " is a stream function -- refusing a plain (Buffer) dispatch.");
+        return false;
+    }
 #ifdef ETCS_LOG_FUNCTION_EVOCATION_PATH
     ETCS_LOG("WorkBundle::operator()", "[" << module_tag << "." << this->work_tag
         << "::" << this->hash << "] Entity " << child->myTag()
@@ -1148,6 +1174,15 @@ bool ETCS::WorkBundle::operator()(ETCS_RID_SIZE rid, const ETCS::Buffer& conjuga
     {
         ETCS_LOG("WorkBundle::operator()", "!!! workFunc is NULL for stream " << module_tag
             << "." << work_tag << " -- would have crashed on the call below.");
+        return false;
+    }
+    // The converse of the Buffer overload's check: a plain work function named
+    // as a stream half (`a.Foo -> b.Bar` with Foo not a stream) would be called
+    // through a StreamFunc pointer with an MBuffer where it expects a Buffer.
+    if (!isStream)
+    {
+        ETCS_LOG("WorkBundle::operator()", module_tag << "." << work_tag
+            << " is not a stream function -- refusing a stream (MBuffer) dispatch.");
         return false;
     }
     ctx.frame = ETCS::current_action_frame();   // as above
@@ -1213,12 +1248,12 @@ bool ETCS::ModuleBundle::operator()(ETCS_RID_SIZE rid, const ETCS::Buffer& conju
 {
 #ifdef ETCS_LOG_FUNCTION_EVOCATION_PATH
     ETCS_LOG("ModuleBundle::operator()", "ENTER tag=" << this->tag << " work=" << work
-        << " child=" << (void*)child);
+        << " rid=" << rid);
 #endif
     auto it = actions.find(work);
 #ifdef ETCS_LOG_FUNCTION_EVOCATION_PATH
-    ETCS_LOG("ModuleBundle::operator()", "[" << this->tag << "::" << this->hash << "] Entity "
-        << child->myTag() << " (RID: " << child->getRID() << ")"
+    ETCS_LOG("ModuleBundle::operator()", "[" << this->tag << "::" << this->hash << "] RID: "
+        << rid << " (" << conjugate_key << ")"
         << " [" << this->tag << "] attempting action: " << work
         << " -- found=" << (it != actions.end()));
 #endif
@@ -2637,10 +2672,23 @@ ETCS::RID ETCS::EventNode::LoaderStream::addTagImpl(
                          << "' but missing from its type_catalog.");
         }
     }
-    else
+    else if (child->myTagMask().any())
     {
-        ETCS_LOG("DynamicLoader", "addTagImpl: no loaded module provides type '"
-                 << child_type_tag << "' -- child will have no callable actions.");
+        /*
+ * A TAG BLOCK WITH NO OWNER. TAG_MASK is set only by ETCS_TAG_DECLARE, so
+ * this type declares actions, and the binary that built it has its tag
+ * block -- yet no loaded module's catalog answers to its contract name. That
+ * is drift between CONTRACT_TAG and the catalog (a renamed contract, a
+ * typedef pointed elsewhere), and every call on this child will fail.
+ *
+ * A type with NO tag block lands in neither branch and says nothing: a
+ * loader-local or module-internal leaf (an ad-hoc addTag<T>, see
+ * module_registry_key_ in Entity.h) has no actions by design, and the
+ * test loaders build tens of thousands of them.
+ */
+        ETCS_LOG("DynamicLoader", "addTagImpl: '" << child_type_tag
+                 << "' has a tag block, but no loaded module provides it -- "
+                 "contract name and catalog disagree; its actions are unreachable.");
     }
  
     /*

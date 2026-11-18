@@ -1353,6 +1353,88 @@ static void test_multi_producer(ETCS::MemoryArena& arena)
     TEST("all frames consumed in strict sequence order", consumed == TOTAL);
 }
 
+/*
+ * THE LAST WRITERS OF A BURST ARE NEVER STRANDED.
+ *
+ * Two producers publishing adjacent sequences are a Dekker pair: each stores
+ * its own frame->ready, then reads the OTHER's (the lower one in its walk, the
+ * higher one in its fast-path check). With release stores and acquire loads,
+ * store->load reordering -- x86's store buffer does exactly this -- lets BOTH
+ * miss the other, and neither advances publisher_cursor_ past the gap. A later
+ * write heals it, so a steady stream hides it; the LAST writes of a burst have
+ * no later write, and the consumer never sees them.
+ *
+ * Deterministic check, no timing: after every writer has returned, every frame
+ * is ready, so publishedUpTo() must already be the last sequence. Nothing else
+ * will ever advance it.
+ */
+static void test_burst_tail_publish(ETCS::MemoryArena& arena)
+{
+    section("Burst Tail — Last Writers Never Stranded");
+
+    // Two writers, two cores, adjacent sequences every round: the Dekker pair
+    // itself, with nothing else scheduled to blur it. A third spinning thread
+    // (a coordinator) halves the chance on a small machine, so the writers
+    // run their own two-party barrier and writer 0 does the checking.
+    constexpr int       ROUNDS = 1000000;
+    constexpr long long SLOTS  = 64;
+    auto* ring = ETCS::LMAXSequentialSharedPage::allocate(arena, 1, SLOTS);
+
+    alignas(64) std::atomic<int> arrive{0};
+    alignas(64) std::atomic<int> phase{0};
+    auto barrier = [&](int& local) {
+        local ^= 1;
+        if (arrive.fetch_add(1, std::memory_order_acq_rel) == 1)
+        {
+            arrive.store(0, std::memory_order_relaxed);
+            phase.store(local, std::memory_order_release);
+        }
+        else
+            while (phase.load(std::memory_order_acquire) != local) {}
+    };
+
+    const int CORES = get_core_count();
+    std::thread other([&, CORES]() {
+        pin_thread(1 % CORES);
+        int l = 0;
+        for (int r = 0; r < ROUNDS; ++r)
+        {
+            barrier(l);
+            ETCS::LBuffer b;
+            ring->write(1, b);
+            barrier(l);              // both writes returned
+            barrier(l);              // writer 0 has checked and reset
+        }
+    });
+
+    pin_thread(0);
+    int l = 0, stranded = 0;
+    for (int r = 0; r < ROUNDS; ++r)
+    {
+        barrier(l);
+        ETCS::LBuffer b;
+        ring->write(0, b);
+        barrier(l);
+        // Both frames are ready and both writers have returned: nothing will
+        // ever advance the cursor again, so it must already be at 1.
+        const uint64_t pub = ring->publishedUpTo();
+        if (pub == UINT64_MAX || pub < 1)
+        {
+            ++stranded;
+            ETCS::LBuffer heal;      // the next write sweeps the gap, as it would live
+            ring->write(9, heal);
+        }
+        for (uint64_t s = 0; s < ring->frameCount(); ++s)
+            if (ring->acquireRead(s)) ring->markConsumed(s);
+        ring->reset();
+        barrier(l);
+    }
+    other.join();
+
+    std::cout << "  rounds: " << ROUNDS << "  stranded: " << stranded << "\n";
+    TEST("no burst left a published frame behind the cursor", stranded == 0);
+}
+
 static void test_writer_rid_preserved(ETCS::MemoryArena& arena)
 {
     section("writer_rid Preservation");
@@ -1541,6 +1623,7 @@ int main(int argc, char* argv[])
     test_tombstone(arena);
     test_reset(arena);
     test_multi_producer(arena);
+    test_burst_tail_publish(arena);
     test_writer_rid_preserved(arena);
     test_lmax_blast_strict_consumer(arena);
     test_lmax_blast_strict_consumer(arena, 10000);

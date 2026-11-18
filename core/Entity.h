@@ -2633,6 +2633,7 @@ public:
     {
         for (auto const& [tag_name, entry] : tags)
         {
+            if (!entry.bundle) continue;   // a bare type-tag marker: no actions yet
             for (auto const& [action_name, work_bundle] : entry.bundle->actions)
             {
                 ETCS::Buffer conjugate;
@@ -2761,19 +2762,19 @@ public:
  * these type of calls cannot return to the data value, that return value is lost in this stack frame
  * acceptable as const char second param indicates return value is not needed.
  */
+    // Forwards only. Its own pre-checks used to run ahead of the Buffer&
+    // overload's: tags[tag_type] (operator[] -- inserts on a miss, a write on
+    // a read path) dereferenced ->bundle unguarded (null for a bare type-tag
+    // marker), and both ran before the remote-surface branch. The overload
+    // below already makes every one of those checks, in the right order.
     void call(const char* conjugateAction, const char* data = "", SignalContext ctx = {})
     {
-        auto [tag_type, action] = parseConjugateActionKey(ETCS::Buffer(conjugateAction));
-        if (!hasTag(tag_type))
+        // Buffer's ctor leaves an oversize string EMPTY; dispatching that would
+        // run the action with no arguments instead of the ones given.
+        if (data && ::std::strlen(data) >= MAX_TAG_BUFFER_SIZE)
         {
-            ETCS_LOG("Could not find tag " << tag_type << " within tag list, failed action: " << action);
-            return;
-        }
- 
-        if(tags[tag_type].bundle->isActionStream(action))
-        {
-            ETCS_LOG("Attempted to call stream tag " << tag_type << " within default call buffer, failed action: "
-                << action << "\n" << "Malformed function call? This should not be called like this, call via MirrorBuffer.");
+            ETCS_LOG("Entity::call", conjugateAction << ": data is " << ::std::strlen(data)
+                     << " bytes, a work buffer holds " << (MAX_TAG_BUFFER_SIZE - 1) << " -- refused.");
             return;
         }
         ETCS::Buffer dataBuff(data);
@@ -2787,6 +2788,12 @@ public:
     // 2. Action is a Buffer, but Data is a string (aka data return value is dropped in this stack frame)
     void call(const ETCS::Buffer& conjugateAction, const char* data, SignalContext ctx = {})
     {
+        if (data && ::std::strlen(data) >= MAX_TAG_BUFFER_SIZE)   // as above
+        {
+            ETCS_LOG("Entity::call", conjugateAction << ": data is " << ::std::strlen(data)
+                     << " bytes, a work buffer holds " << (MAX_TAG_BUFFER_SIZE - 1) << " -- refused.");
+            return;
+        }
         ETCS::Buffer dataBuff(data);
         call(conjugateAction, dataBuff, ctx);
     }
@@ -2821,7 +2828,11 @@ public:
                      int fd, SignalContext ctx = {}, Entity* chain_owner = nullptr)
     {
         if (fd < 0) return false;
-        auto [tag_type, action] = parseConjugateActionKey(conjugateAction);
+        ::std::pair<ETCS::Buffer, ETCS::Buffer> key;
+        try { key = parseConjugateActionKey(conjugateAction); }
+        catch (...) { ::close(fd); throw; }   // the fd is ours from here on
+        const ETCS::Buffer& tag_type = key.first;
+        const ETCS::Buffer& action   = key.second;
         ModuleBundle* b = hasTag(tag_type) ? safeBundleFor(tag_type, "producer") : nullptr;
         if (!b || !b->isActionStream(action))
         {
@@ -2857,7 +2868,11 @@ public:
                      int fd, SignalContext ctx = {}, Entity* chain_owner = nullptr)
     {
         if (fd < 0) return false;
-        auto [tag_type, action] = parseConjugateActionKey(conjugateActionRcv);
+        ::std::pair<ETCS::Buffer, ETCS::Buffer> key;
+        try { key = parseConjugateActionKey(conjugateActionRcv); }
+        catch (...) { ::close(fd); throw; }   // as produceOnto
+        const ETCS::Buffer& tag_type = key.first;
+        const ETCS::Buffer& action   = key.second;
         ModuleBundle* b = hasTag(tag_type) ? safeBundleFor(tag_type, "consumer") : nullptr;
         if (!b || !b->isActionStream(action))
         {
@@ -3342,8 +3357,11 @@ public:
     static ::std::pair<ETCS::Buffer, ETCS::Buffer> parseConjugateActionKey(const ETCS::Buffer& key)
     {
         const char* raw = key.c_str();
-        const char* dot = ::std::strchr(raw, '.');
-        if (!dot || dot == raw || dot == raw + key.written)
+        // Bounded by written: the action length below is computed from it, so
+        // a dot past it would underflow. "Tag." (empty action) is malformed too
+        // -- the old end check compared against one past the dot's position.
+        const char* dot = static_cast<const char*>(::std::memchr(raw, '.', key.written));
+        if (!dot || dot == raw || dot + 1 == raw + key.written)
             throw ::std::runtime_error(::std::string("Invalid component key format. Expected 'tag_type.action'. Received: ") + raw);
         ETCS::Buffer tag_type, action;
         size_t tag_len = static_cast<size_t>(dot - raw);
@@ -3533,6 +3551,9 @@ public:
         if (it == tags.end())
             throw ::std::runtime_error("mySelf(): no tags entry for source tag '"
                 + getSourceTag().toString() + "' on entity of type " + myTag());
+        if (!it->second.bundle)
+            throw ::std::runtime_error("mySelf(): source tag '" + getSourceTag().toString()
+                + "' has no bundle yet on entity of type " + myTag());
         return *(it->second.bundle);
     }
  

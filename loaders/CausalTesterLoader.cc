@@ -33,7 +33,7 @@
 //      kd-tree lands on the rows it lands on pair by pair, to the bit.
 //  10. WHAT HOLDS A THING IS WHAT IT FITS IN. A member leaving its
 //      container's space moves up, one entering a sibling's moves in, a solid
-//      one holds nothing; where it is in the world does not change, nor does
+//      one holds nothing, and an anchored one stays where it was put; where it is in the world does not change, nor does
 //      the ledger; the lifetime goes with it (deleting where it came from
 //      leaves it, deleting where it went takes it).
 //
@@ -303,6 +303,23 @@ int main()
         arena.deleteEntity(world, true);
     }
 
+    // -- 7c: two drivers ---------------------------------------------------------
+    {
+        std::cout << "\n-- 7c. two drivers, one stream --\n";
+        // Each Run is one event in the tree's stream, and here every event is
+        // the same line, so any order of them is one history.
+        Body* shared = build();
+        Body* alone  = build();
+        auto drive = [&]() { for (int i = 0; i < 2000; ++i) shared->Run(1, dt); };
+        std::thread a(drive), b(drive);
+        a.join(); b.join();
+        alone->Run(4000, dt);
+        check(shared->CausalHash() == alone->CausalHash() && shared->CausalTicks() == alone->CausalTicks(),
+              "two drivers on one tree: every tick whole, and the rows one driver's 4,000 leave");
+        arena.deleteEntity(shared, true);
+        arena.deleteEntity(alone, true);
+    }
+
     // -- 7b: what a store reads -------------------------------------------------
     {
         std::cout << "\n-- 7b. a frozen read under a driver --\n";
@@ -424,7 +441,7 @@ int main()
             x += b->Order4().x; y += b->Order4().y; z += b->Order4().z;
         };
         // A pen in a pocket in a person in a world, the pen heading out.
-        struct Scene { Body *world, *person, *pocket, *pen, *box, *ball, *lump, *chip, *far, *far2; };
+        struct Scene { Body *world, *person, *pocket, *pen, *box, *ball, *lump, *chip, *far, *far2, *pin, *post; };
         auto scene = [&]() {
             Scene s{};
             s.world  = arena.allocate<Body>();                s.world->SetSpace(Fixed::FromInt(1000));
@@ -439,6 +456,9 @@ int main()
             // Something solid with something in it; something past the world's space.
             s.lump   = s.world->addTag<Body>();               s.lump->Place(-20, 0, 0);
             s.chip   = s.lump->addTag<Body>();                s.chip->Place(0.1, 0, 0);
+            // A part fixed to the solid thing, and a fixed thing inside the box's space.
+            s.pin    = s.lump->addTag<Body>();                s.pin->Place(0, 0.1, 0); s.pin->SetAnchored(true);
+            s.post   = s.world->addTag<Body>();               s.post->Place(20, 2, 0); s.post->Reach(0.2); s.post->SetAnchored(true);
             s.far    = s.world->addTag<Body>();               s.far->Place(5000, 0, 0); s.far->Reach(1);
             s.far2   = s.world->addTag<Body>();               s.far2->Place(5001.5, 0, 0); s.far2->Reach(1);
             return s;
@@ -451,6 +471,8 @@ int main()
         check(a.chip->getParent() == a.world && cx2 == cx && cy2 == cy && cz2 == cz,
               "a solid thing holds nothing: its member moved up, to the same place in the world");
         check(a.far->getParent() == a.world, "the open boundary keeps what fits nowhere");
+        check(a.pin->getParent() == a.lump && a.post->getParent() == a.world,
+              "an anchored member stays where it was put: in the solid thing, and out of the box's space");
         // Each move as it happens: the pen out of the pocket into the person,
         // then out of the person into the world; the ball into the box, then
         // out through the far side.

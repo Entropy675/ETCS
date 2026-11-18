@@ -450,29 +450,46 @@ public:
 // ---------------------------------------------------------------------------
 // A transform stage: one step, and a forward link.
 //
-// Claims MatrixBase, which composes WrapperBase -- so it carries the "Wrapper"
-// tag and interface pointer without asking, and MirrorBuffer's chain
-// resolution finds it as an ordinary Wrapper child. Nothing here registers
-// anything.
+// Claims WrapperBase AND RelationalBase. Wrapper puts it on the wire -- the
+// "Wrapper" tag and interface pointer, found by MirrorBuffer's chain
+// resolution as an ordinary Wrapper child, nothing registered here. Relational
+// is the law: it names what it lands on, so the chain rule is the family's
+// LandsOn rather than a check this leaf writes.
 //
-// WRAP MULTIPLIES, UNWRAP DOES NOT, and that asymmetry is the point rather
-// than an omission: the two sides of the boundary are two spaces, so arriving
-// is not undoing (ontology/Matrix.h). Which side does the work is this leaf's
-// choice, not the family's.
+// THE SHAPE AS TAGS. A stage that takes R and yields C carries the flag
+// "in<R>" (what it accepts) and targets "in<C>" (what it feeds). So "my
+// columns are the next stage's rows" is "the next stage carries my target":
+// directed, checked when the chain is assembled, on entities rather than
+// numbers.
+//
+// NOT SYMMETRIC: wrap multiplies, unwrap does not. Arriving is not undoing,
+// and a stage that wanted a way back would claim Symmetric and prove one.
+// The values are a Mat<4,4> this leaf keeps -- how the relation is written,
+// not part of the family.
 // ---------------------------------------------------------------------------
-class Xform : public MatrixBase<Xform>
+class Xform : public WrapperBase<Xform>, public RelationalBase<Xform>
 {
 public:
     WIRE_TYPE_IDENTITY(Xform)
 
-    size_t wraps = 0, unwraps = 0;
+    size_t   wraps = 0, unwraps = 0, applied = 0;
+    Matrix4  m = Matrix4::Identity();
+    uint32_t rows_ = 0, cols_ = 0;
 
-    // The stage's own value, loaded through the typed bridge so the shape is
-    // stated once and checked by the compiler.
-    void Become(const Matrix4& m) { Load(m); }
-    void BecomeShape(uint32_t r, uint32_t c) { SetShape(r, c); }
+    // The value, and the shape it states.
+    void Become(const Matrix4& v) { m = v; BecomeShape(4, 4); }
+    void BecomeShape(uint32_t r, uint32_t c)
+    {
+        if (rows_) this->removeTag(ETCS::Buffer(("in" + std::to_string(rows_)).c_str()));
+        rows_ = r; cols_ = c;
+        this->addTag(ETCS::Buffer(("in" + std::to_string(rows_)).c_str()));
+    }
 
-    // The *Concrete half of the family's dispatch, as every other leaf owes.
+    // Relational: what it feeds, and feeding it.
+    std::string TargetsConcrete() const { return cols_ ? "in" + std::to_string(cols_) : std::string(); }
+    bool ApplyConcrete(ETCS::Entity&, ETCS::SignalContext) { ++applied; return true; }
+
+    // Wrapper: the wire's half.
     void WrapConcrete(ETCS::MBuffer&, ETCS::SignalContext)   { ++wraps; }
     void UnwrapConcrete(ETCS::MBuffer&, ETCS::SignalContext) { ++unwraps; }
     void CloseConcrete(ETCS::MBuffer&, ETCS::SignalContext)  {}
@@ -1950,22 +1967,21 @@ int main()
     }
 
     /*
-     * -- 31. Matrix: the shape is the constraint, twice ----------------------
+     * -- 31. A transform: the shape is the constraint, twice ------------------
      *
      * An n-by-m may feed an m-by-p and nothing else. That rule is stated at two
      * different TIMES, and neither is a weaker copy of the other:
      *
      *   COMPILE TIME  Mat<R,C>::operator* takes a Mat<C,P>, so a mismatched
      *                 product does not bind. Concrete code cannot write one.
-     *   RESOLVE TIME  ChainsInto compares a stage's columns to the next
-     *                 stage's rows. A chain assembled by ATTACHING children is
-     *                 not knowable statically, so this is the only form
-     *                 available where the chain is actually built.
+     *   RESOLVE TIME  Relational's LandsOn: a stage targets "in<C>" and the
+     *                 next stage carries "in<R>". A chain assembled by
+     *                 ATTACHING children is not knowable statically, so this is
+     *                 the only form available where the chain is built.
      *
-     * And the family owns the VALUE, not just the constraint -- m-by-n
-     * elements, the same division Raster_ makes for its buffer. A stage whose
-     * values lived elsewhere could disagree with its own shape, and the shape
-     * is the only thing the chain checks.
+     * The values are the leaf's (a Mat), not the family's: a matrix is how a
+     * relation is written down. The family is the law, and the law is what
+     * the chain checks.
      */
     {
         // The value type first: the product's shape is carried by the type.
@@ -2004,43 +2020,46 @@ int main()
               "which is the whole reason this is built rather than cast");
         check(ov.id == 12345, "...and the vector still knows what it is");
 
-        // Now the family: stages, their values, and the chain rule.
+        // Now the families: stages, their law, and the chain rule.
         Xform* first  = ETCS::MemoryArena::getInstance().allocate<Xform>();
         Xform* second = ETCS::MemoryArena::getInstance().allocate<Xform>();
         check(first && second, "two transform stages");
 
         if (first && second)
         {
-            check(first->getInterfacePointer(ETCS::Buffer("Matrix")) != nullptr,
-                  "a stage is a Matrix");
+            check(first->getInterfacePointer(ETCS::Buffer("Relational")) != nullptr,
+                  "a stage is Relational");
             check(first->getInterfacePointer(ETCS::Buffer("Wrapper")) != nullptr
                && first->hasTag(ETCS::Buffer("Wrapper")),
                   "AND A WRAPPER, with nothing registered here -- which is what "
                   "makes an attached stage part of a chain MirrorBuffer already "
                   "knows how to resolve and apply");
+            check(first->getInterfacePointer(ETCS::Buffer("Symmetric")) == nullptr,
+                  "and NOT Symmetric: it claims no way back");
 
             first->Become(t);
-            check(first->ShapeIs(4,4) && first->Count() == 16,
-                  "loading a Mat<4,4> gives the stage that shape");
-            check(first->At(0,3) == 5.0f,
-                  "and the family owns the elements, not an interface to them");
-            check(first->As<4,4>() == t,
-                  "which round-trip through the typed bridge unchanged");
-            check(first->As<2,3>() == Mat<2,3>{},
-                  "asking for the wrong shape yields zero rather than a lie");
+            check(first->m == t && first->Targets() == "in4",
+                  "loading a Mat<4,4> states the shape: it feeds in4");
+            check(first->hasTag(ETCS::Buffer("in4")),
+                  "and carries in4 itself, as what it accepts");
 
-            // The chain rule.
+            // The chain rule, as landing.
             second->Become(Matrix4::Identity());
-            check(first->ChainsInto(*second),
-                  "4x4 feeds 4x4 -- my columns are the next stage's rows");
+            check(first->LandsOn(*second),
+                  "4x4 feeds 4x4 -- my target is what the next stage is");
             second->BecomeShape(3, 3);
-            check(!first->ChainsInto(*second),
+            check(!first->LandsOn(*second),
                   "and a 4x4 does NOT feed a 3x3: the chain is dimensionally "
                   "constrained even though it was assembled at runtime");
+            check(!first->Apply(*second, ETCS::SignalContext{}) && first->applied == 0,
+                  "and Apply refuses a target it doesn't land on, before the leaf "
+                  "sees it -- the check is the family's");
             second->BecomeShape(4, 2);
-            check(first->ChainsInto(*second) && !second->ChainsInto(*first),
+            check(first->LandsOn(*second) && !second->LandsOn(*first),
                   "the relation is DIRECTED -- 4x4 into 4x2 composes, the "
                   "reverse does not, because a pipeline has a direction");
+            check(first->Apply(*second, ETCS::SignalContext{}) && first->applied == 1,
+                  "...and on a target it lands on, Apply reaches the leaf");
 
             // Wrap and Unwrap are not inverses, and nothing here says they are.
             ETCS::MBuffer io;

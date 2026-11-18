@@ -7,19 +7,25 @@
 // headless run does (Scene3D::Run). What is held to account:
 //
 //   1. THE COURSE STANDS. Built by the script, stepped, the ball comes to rest
-//      on the tee: the world's field pulls it down, the green holds it up.
+//      on the tee: the world's field pulls it down, the green holds it up, and
+//      its shadow lies on the green straight under it.
 //   2. THE PULL. A press on the ball (a camera ray through the middle of the
 //      frame, where the game put the ball) starts a pull; dragging down pulls
 //      the shot away from the camera and up -- the view plane's slingshot --
-//      as long as the drag, to the cap.
+//      as long as the drag, to the cap. The arrow's shadow lies flat on the
+//      ground under it.
 //   3. THE SHOT. Letting go is the ball's own Impulse along the pull: the ball
-//      moves that way, and the card counts a stroke.
+//      moves that way, and the card counts a stroke. In the air its shadow
+//      stays on the green under it.
 //   4. THE CAMERA. A drag off the ball turns the camera about it and leaves
 //      the ball alone; the wheel brings it closer. With nothing moving, the
 //      turned eye is still drawn again (and an unturned one is not).
 //   5. HOLED. A ball sent at the cup at a putting pace drops through the gap,
 //      fit takes it into the cup's space, and it rests on the cup's floor; the
 //      game, advanced at the frame edge, sets it back on the tee.
+//   6. HOLED BY BEING LOOKED AT. The same putt with no driver: the camera's
+//      pictures step the world, as a frame does. A picture is drawn under a
+//      hold and only notes its look; the step, and fit's move, come after it.
 //
 //   ./Run_GolfTesterLoader
 //
@@ -33,6 +39,7 @@
 #include <fstream>
 #include <string>
 #include <thread>
+#include <unistd.h>
 
 static int g_fail = 0;
 static void check(bool ok, const char* what)
@@ -90,6 +97,7 @@ int main(int, char**)
     verb(eye, "Camera3D.SetScene", std::to_string(world->getRID()));
 
     // The course, run as a script with the session's names handed in.
+    ETCS::RID shadow_rid = 0, under_rid = 0;
     {
         ETCS::ExecutionContext course(&root, &ctx);
         course.names["anchor"] = ETCS::NameBinding{ world->getRID(), "RenderProvider", "Scene3D" };
@@ -98,6 +106,8 @@ int main(int, char**)
         const std::string path = std::string(ETCS_ACE_ROOT) + "/modules/GolfProvider/scripts/golf_course.etcs";
         std::ifstream in(path);
         check(in.is_open() && ETCS::run_script(in, path, course), "the course script runs");
+        if (course.names.count("arrow_shadow")) shadow_rid = course.names["arrow_shadow"].rid;
+        if (course.names.count("ball_shadow")) under_rid = course.names["ball_shadow"].rid;
     }
 
     auto* wc  = static_cast<Causal_*>(world->getInterfacePointer(ETCS::Buffer("Causal")));
@@ -105,7 +115,7 @@ int main(int, char**)
     auto* anim = static_cast<Animated_*>(game->getInterfacePointer(ETCS::Buffer("Animated")));
     // The ball and the cup, found as what they are: the free solid sphere, and
     // the container with a space of its own.
-    Causal_* ball = nullptr; Causal_* cup = nullptr;
+    Causal_* ball = nullptr; Causal_* cup = nullptr; Causal_* shadow = nullptr; Causal_* under = nullptr;
     {
         std::vector<ETCS::Entity::ChildRef> kids;
         world->getTypedChildRefs(kids);
@@ -114,6 +124,8 @@ int main(int, char**)
             ETCS::Entity* k = world->getTypedChild(*tag, rid);
             auto* c = k ? static_cast<Causal_*>(k->getInterfacePointer(ETCS::Buffer("Causal"))) : nullptr;
             if (!c) continue;
+            if (rid == shadow_rid) shadow = c;
+            if (rid == under_rid) under = c;
             if (c->Solid().shape == CausalSolid::Sphere) ball = c;
             if (c->Space().IsPositive()) cup = c;
         }
@@ -129,6 +141,14 @@ int main(int, char**)
     where(ball, b);
     check(std::fabs(b[1] - 0.15f) < 0.003f && speed(ball) == 0.0f, "the ball comes to rest on the tee: the field down, the green up");
     check(!wc->Moving(), "...and the world says nothing is moving");
+    check(under != nullptr, "the course makes the ball a shadow");
+    if (under)
+    {
+        float u[3];
+        where(under, u);
+        check(std::fabs(u[0] - b[0]) < 1e-3f && std::fabs(u[2] - b[2]) < 1e-3f && u[1] > 0.02f && u[1] < 0.05f,
+              "...lying on the green straight under the ball");
+    }
 
     // -- 2. the pull ---------------------------------------------------------------
     std::cout << "\n-- 2. the pull --\n";
@@ -144,6 +164,31 @@ int main(int, char**)
     verb(game, "GolfGame.Drag", "512, 760");
     std::sscanf(verb(game, "GolfGame.Pull").c_str(), "%f %f %f %f %15s", &px, &py, &pz, &plen, mode);
     check(plen > short_len && std::fabs(plen - 3.0f) < 1e-3f, "a longer drag is a longer pull, to the cap");
+    // The arrow's shadow: the arrow laid flat on the ground under it. Its
+    // length (the mesh's +y) runs along the pull's ground track, its depth
+    // (+z) is vertical, and it sits where the ball stands, not where the
+    // arrow rises to.
+    {
+        check(shadow != nullptr, "the course makes the arrow a shadow");
+        if (shadow)
+        {
+            float at[3];
+            where(shadow, at);
+            Fixed lx = Fixed::Zero(), ly = Fixed::One(), lz = Fixed::Zero();
+            Fixed dx = Fixed::Zero(), dy = Fixed::Zero(), dz = Fixed::One();
+            {
+                std::lock_guard<std::recursive_mutex> lk(shadow->TreeMutex());
+                shadow->Order4().RotateVector(lx, ly, lz);
+                shadow->Order4().RotateVector(dx, dy, dz);
+            }
+            const float run = std::sqrt(px * px + pz * pz);
+            check(std::fabs(lx.ToFloat() - px / run) < 1e-3f && std::fabs(ly.ToFloat()) < 1e-3f && std::fabs(lz.ToFloat() - pz / run) < 1e-3f,
+                  "the shadow lies along the pull's track over the ground");
+            check(std::fabs(std::fabs(dy.ToFloat()) - 1.0f) < 1e-3f, "...flat: its depth is the vertical");
+            check(at[1] > 0.0f && at[1] < 0.05f && std::fabs(at[2] - (b[2] + (0.15f + plen * 0.5f) * pz / plen)) < 1e-2f,
+                  "...on the ground the ball stands on, straight under the arrow's middle");
+        }
+    }
     verb(game, "GolfGame.Drag", "512, 440");
 
     // -- 3. the shot -------------------------------------------------------------
@@ -159,6 +204,21 @@ int main(int, char**)
     check(verb(game, "GolfGame.Strokes") == "1", "...and the card counts a stroke");
     step(1);
     check(wc->Moving(), "...and the world says something is moving: a frame edge keeps drawing");
+    if (under)
+    {
+        // The ball in the air: its shadow stays on the green, under it.
+        float top[3] = { 0, 0, 0 }, low[3] = { 0, 0, 0 };
+        for (int i = 0; i < 40; ++i)
+        {
+            step(1);
+            float at[3];
+            where(ball, at);
+            if (at[1] > top[1]) { top[0] = at[0]; top[1] = at[1]; top[2] = at[2]; where(under, low); }
+        }
+        std::printf("        (the ball up to y %.2f at z %.2f; its shadow there at y %.3f, z %.2f)\n", top[1], top[2], low[1], low[2]);
+        check(top[1] > 0.2f && low[1] > 0.02f && low[1] < 0.05f && std::fabs(low[0] - top[0]) < 1e-3f && std::fabs(low[2] - top[2]) < 1e-3f,
+              "the ball in the air has its shadow on the green straight under it");
+    }
     step(600);
 
     // -- 4. the camera -------------------------------------------------------------
@@ -207,6 +267,10 @@ int main(int, char**)
     verb(be, "Scene3D.Halt");
     verb(be, "Scene3D.SetPosition", "0, 0.15, 19");
     step(60);
+    // What the world is made of, as an export counts it: the same walk and the
+    // same shape lookup a picture makes (Scene3D::collectSubtree).
+    const std::string shapes = "/tmp/etcs_golf_tester_" + std::to_string(::getpid()) + ".stl";
+    const std::string on_green = verb(world, "Scene3D.Export", shapes);
     verb(be, "Scene3D.Impulse", "0, 0, 1, 4");
     bool holed = false;
     for (int i = 0; i < 900 && !holed; ++i)
@@ -218,6 +282,22 @@ int main(int, char**)
     step(120);
     where(ball, b);
     check(holed && speed(ball) == 0.0f && b[1] < -0.5f, "...and rests on the cup's own floor");
+    // The cup holds no meshes, and "one up" from the ball is now the cup: the
+    // ball is drawn by the RID it was given, not by where it has got to.
+    const std::string in_cup = verb(world, "Scene3D.Export", shapes);
+    ::unlink(shapes.c_str());
+    check(holed && !on_green.empty() && on_green.find("refused") == std::string::npos && in_cup == on_green,
+          "...still the sphere it was on the green (the mesh is anchored by RID inside the run)");
+    // A store hands every value back after the lines that set them (etcs_restore_values):
+    // the address as SetMesh wrote it on the green, to a ball that is now in the cup.
+    {
+        std::string kept;
+        const bool had = be->valueOf(ETCS::Buffer("mesh"), kept);
+        check(had && be->restoreValue(ETCS::Buffer("mesh"), kept)
+              && verb(world, "Scene3D.Export", shapes) == on_green,
+              "...and still when its stored value is handed back (the line's RID stands)");
+        ::unlink(shapes.c_str());
+    }
     // The game sets it back once the card has been read: 2.5 s of frames, as
     // the frame edge would visit (the base measures the time between visits).
     for (int i = 0; i < 80 && static_cast<ETCS::Entity*>(ball)->getParent() != world; ++i)
@@ -228,6 +308,30 @@ int main(int, char**)
     where(ball, b);
     check(static_cast<ETCS::Entity*>(ball)->getParent() == world && std::fabs(b[2]) < 0.01f && b[1] > 0.0f,
           "the game sets a holed ball back on the tee");
+
+    // -- 6. holed by being looked at ---------------------------------------------------
+    std::cout << "\n-- 6. holed by being looked at --\n";
+    verb(be, "Scene3D.Halt");
+    verb(be, "Scene3D.SetPosition", "0, 0.15, 19");
+    step(60);
+    verb(eye, "Camera3D.Render");   // the first look: the clocks start, nothing is owed
+    verb(be, "Scene3D.Impulse", "0, 0, 1, 4");
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    // The picture alone, as a walk asks for it (the interface, not the verb):
+    // drawn under the camera's hold on the scene, where a move cannot be made.
+    const uint64_t drawn = wc->CausalHash();
+    cam->Render();
+    check(wc->CausalHash() == drawn, "a picture reads: the rows after it are the rows it drew");
+    verb(eye, "Camera3D.Render");
+    check(wc->CausalHash() != drawn, "...and its look is stepped once the picture is done");
+    holed = false;
+    for (int i = 0; i < 1500 && !holed; ++i)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(4));
+        verb(eye, "Camera3D.Render");
+        holed = be->getParent() == static_cast<ETCS::Entity*>(cup);
+    }
+    check(holed, "a putt stepped by looks alone is holed: fit's move is made outside the picture's hold");
 
     verb(game, "GolfGame.Delete");
     ETCS::PendingUnloadRegistry::getInstance().join_all();

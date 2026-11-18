@@ -485,6 +485,36 @@ history nobody replays, and a reader from before it restarts there.
 
 ---
 
+## The frame edge
+
+A session that shows anything has one tick, and two lines make it:
+
+```etcs
+view.Compose(@stage)                                         # what to draw: a root to walk
+detach RenderProvider/scripts/render_frames.etcs view=view   # the tick: view.RunFrames(16)
+```
+
+`RunFrames` visits every entity that claims **Animated** (`ontology/Animated.h`) once a tick,
+whichever module made it and in no order a leaf may rely on. A session needs exactly one caller
+of it. Presenting is one such visit, the surface's own: it holds the composed root for the length
+of the walk and draws what it finds.
+
+Where that hold sits is the whole of what a type needs to know about a frame:
+
+- **A walk reads.** Everything drawn in a frame is drawn inside the hold, and nothing inside a
+  lifetime hold may emit an ordered event — a tag or a value changing, a child made, moved or
+  deleted — because the delete it would queue behind may be waiting on that hold. Every such
+  event asserts it.
+- **A visit acts.** An Animated leaf's own visit is outside every hold. What a frame changes
+  about the graph it changes there, and the picture that follows shows it.
+
+So a thing that changes by being looked at — a scene whose bodies step, fit and move between
+containers — is stepped on the edge and never in a picture. A picture notes that it looked; the
+tick, once its visits are done, steps what they looked at; the next picture shows it
+(`ontology/etcs_causal_constraints.md` §14).
+
+---
+
 ## Children
 
 `spawn`, `attach`, and `ensure` on a receiver create or find a **typed child** of that entity:
@@ -513,6 +543,45 @@ reaches into `web`'s own children by accident.
 There is no receiver-scoped `requires`: a child is not something a caller can hand you, and an
 already-built child of a specific parent is not a slot description — it either is that parent's
 child or it is not, which `attach`/`ensure` on the receiver already say precisely.
+
+---
+
+## What a RID is, and where it stops
+
+A name is bound to a RID, `@name` hands one over, and no script ever shows one. What it is
+underneath is small, and it decides what a type may do with it.
+
+**What it is.** The hash of three things: the module, the type, and how many of that type this
+runtime had made before it (`generateRID`, `core/Entity.h`). No clock and no address. So the same
+lines in the same order give the same RIDs — and a RID says where and when something was made,
+nothing about what it is.
+
+**Inside a run it is the reference.** A binding holds one. A type handed one in a verb's payload
+keeps it and resolves it again at each use, through the family it needs (`resolve_held`,
+`resolve_in_family`): the resolution is the liveness check, the same one dispatch makes for every
+action. A RID orders nothing — events are ordered by which types they touch, not which entity.
+
+**It does not leave the run**, and three boundaries see to that, so a type never has to:
+
+- *the record* keeps a line as it was written, `@names` and all, beside the RIDs they meant
+  then, and the script made from it names each entity by where it sits in what is rebuilt
+  (**What is kept is how, not what**, below);
+- *the hashes* hold none: identity is what a thing is, state is that and its values;
+- *the store* finds a record by what the entity is, and hands its values back after the script
+  has run.
+
+**So a type that refers to another entity** takes the RID in a verb, keeps it, and puts a value
+through the funnel beside it. The value is what makes the funnel record the line — only a change
+is recorded — and the state hash reads it, so it names no RID and differs when the referent
+does. It is not how the referent is found again: the replayed line hands the verb a RID of the
+rebuilt graph, in the order the lines first ran. The value comes back afterwards
+(`Entity::restoreValue`, with no verb behind it) saying what that line just set, and the type
+keeps the RID it has.
+
+What a type must not do is build its own way back from a value to an entity. That is the record's
+rule in a second home, and the two disagree as soon as the graph changes after the line ran:
+`Scene3D.SetMesh` first resolved an address at every picture, and a ball that fit took into the
+cup lost its shape, because "one up" had become the cup.
 
 ---
 
@@ -745,9 +814,11 @@ and then writes nothing more, so a half torn-down runtime is never what the next
 | This parent's child, or new | `<parent>.ensure( Module::Tag <name> )` |
 | Action | `<name>.Action(payload)` — receiver and brackets both mandatory |
 | RID in a payload | `@name` |
+| What a RID is | module, type and order of making, hashed — the reference inside a run, in no record, hash or store |
 | Stream | `<a>.Produce(payload) -> <b>.Consume(payload)` — one line, both ends |
 | Entity in another runtime | a local instance of its type with a `NetworkProvider::Remote` child, bound to a published name — its actions and stream halves run there, on one link per pair of runtimes, through the node's `Wrapper` authority layer |
 | Keeping a scene | a `DatabaseProvider::Persistence` child on a global `Environmental` entity — its actions, compacted to a script, plus its values; offered back at the next start (`--resume` / `--fresh`) |
+| The frame edge | `view.Compose(@root)` and one detached `RunFrames` — every `Animated` leaf visited once a tick; a visit may change the graph, a walk under the present's hold only reads |
 | Interrupting work | `<name>.kill(<label> [index])` |
 | Removing a flag | `<name>.unflag(<flag>)` — the mutable set; a `requires` tag is fixed and out of reach |
 | Scope | local closure + the root script's names as globals; no ancestor chain |

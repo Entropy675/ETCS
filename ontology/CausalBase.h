@@ -1,6 +1,7 @@
 #ifndef BASE_Causal_H__
 #define BASE_Causal_H__
 #include "Causal.h"
+#include "RelationalBase.h"
 #include <algorithm>
 #include <atomic>
 #include <memory>
@@ -36,9 +37,55 @@
  * ontology/etcs_causal_constraints.md; loaders/CausalTesterLoader.cc runs
  * them against a tree of plain bodies.
  */
-ETCS_SUPERTYPE_BASE(Causal)
+// RELATIONAL, BECAUSE EVERY SPACE IS A LAW FOR WHAT IS IN IT. Lineage in the
+// base (RelationalBase reached once). The law is the field: stated here
+// (SetGravity, the value behind "gravity"), inherited otherwise, nothing at the
+// open boundary -- FieldUnder is that walk. It lands on Causal members; the
+// space says what it does (FieldOnUnder: the field over the span, the work
+// counted in its own ledger) and the body says what it lets through
+// (AccelerateUnder: resting takes only the part along its surface). Same
+// arithmetic, same order as when the two were one function.
+ETCS_SUPERTYPE_BASE(Causal), public RelationalBase<Derived>
 {
     ETCS_MAKE_INSTANCE(Causal)
+
+    // --- Relational: the space's law --------------------------------------
+    std::string TargetsConcrete() const override final { return "Causal"; }
+
+    // One step of this space's law on one of its members, over the span this
+    // space last stepped with. The public entry: takes the tree's lock. False
+    // for anything not directly inside this space, or before any step.
+    bool ApplyConcrete(ETCS::Entity& target, ETCS::SignalContext ctx) override final
+    {
+        (void)ctx;
+        Causal_* member = static_cast<Causal_*>(target.getInterfacePointer(causalKey()));
+        if (!member) return false;
+        ::std::lock_guard<::std::recursive_mutex> lk(TreeMutex());
+        if (member->Environment() != static_cast<Causal_*>(this) || !m_step_dt.IsPositive()) return false;
+        FieldOnUnder(*member, m_step_dt);
+        return true;
+    }
+
+    void FieldOnUnder(Causal_& member, Fixed dt) override final
+    {
+        Fixed gx, gy, gz;
+        Causal_* src = FieldUnder(gx, gy, gz);
+        if (!src) return;
+        src->CountFieldWorkUnder(member.AccelerateUnder(gx, gy, gz, dt));
+    }
+
+    // The body's half: what it lets through. Resting on a surface takes only
+    // the part along it; nothing left is nothing done.
+    Fixed AccelerateUnder(Fixed gx, Fixed gy, Fixed gz, Fixed dt) override final
+    {
+        if (m_resting)
+        {
+            const Fixed gn = gx * m_snx + gy * m_sny + gz * m_snz;
+            if (gn.raw < 0) { gx -= m_snx * gn; gy -= m_sny * gn; gz -= m_snz * gn; }
+        }
+        if (gx.IsZero() && gy.IsZero() && gz.IsZero()) return Fixed::Zero();
+        return m_ov.Accelerate(gx, gy, gz, dt, static_cast<Derived*>(this)->MassConcrete());
+    }
 
     /*
      * THE ROWS ARE ON THE TAG SURFACE, behind the family's own tag: the
@@ -77,9 +124,7 @@ ETCS_SUPERTYPE_BASE(Causal)
 
     void Interact(Fixed dt) override final
     {
-        if (!dt.IsPositive()) return;
-        ::std::lock_guard<::std::recursive_mutex> lk(TreeMutex());
-        InteractUnder(dt, dt);
+        if (dt.IsPositive()) post(dt, dt, 1);
     }
 
     /*
@@ -93,18 +138,15 @@ ETCS_SUPERTYPE_BASE(Causal)
      */
     void InteractObserved(Fixed commit_dt, Fixed step_dt)
     {
-        if (!commit_dt.IsPositive() && !step_dt.IsPositive()) return;
-        ::std::lock_guard<::std::recursive_mutex> lk(TreeMutex());
-        InteractUnder(commit_dt, step_dt);
+        if (commit_dt.IsPositive() || step_dt.IsPositive()) post(commit_dt, step_dt, 1);
     }
 
     // The driver: `ticks` interactions of `dt` each, no clock read. What a
-    // headless run does instead of being looked at.
+    // headless run does instead of being looked at. One event: nothing else
+    // in the tree's stream lands between its ticks.
     void Run(uint32_t ticks, Fixed dt)
     {
-        if (!dt.IsPositive()) return;
-        ::std::lock_guard<::std::recursive_mutex> lk(TreeMutex());
-        for (uint32_t i = 0; i < ticks; ++i) InteractUnder(dt, dt);
+        if (dt.IsPositive() && ticks) post(dt, dt, ticks);
     }
 
     void InteractUnder(Fixed commit_dt, Fixed step_dt) override final
@@ -114,6 +156,7 @@ ETCS_SUPERTYPE_BASE(Causal)
         if (commitLocked(commit_dt, e)) crossTo(container(), e);
         if (step_dt.IsPositive())
         {
+            m_step_dt = step_dt;   // the span this space's law last ran over (ApplyConcrete)
             fieldLocked(step_dt);
             static_cast<Derived*>(this)->AdvanceConcrete(step_dt);
         }
@@ -148,6 +191,22 @@ ETCS_SUPERTYPE_BASE(Causal)
         Causal_* top = this;
         for (Causal_* env = container(); env; env = containerOf(env)) top = env;
         return top == this ? m_tree_mtx : top->TreeMutex();
+    }
+
+    // The tree's stream (Causal.h, CausalStream), found as the lock is. The
+    // top's, made by the first event posted to it: its rings are in the
+    // entity's own arena and end with it. Small rings -- a poster waits on its
+    // own event, so one is in flight a posting thread.
+    CausalStream& TreeStream() override final
+    {
+        Causal_* top = this;
+        for (Causal_* env = container(); env; env = containerOf(env)) top = env;
+        if (top != this) return top->TreeStream();
+        ::std::call_once(m_stream_once, [this] {
+            m_stream.reset(new CausalStream);
+            m_stream->start_driven(this->getArena(), 4);
+        });
+        return *m_stream;
     }
 
     void Impulse(Fixed dx, Fixed dy, Fixed dz, Fixed joules) override final
@@ -273,8 +332,10 @@ ETCS_SUPERTYPE_BASE(Causal)
     }
     /*
      * ANCHORED: held where it is in its container -- the field moves it not,
-     * a contact moves it not, motion handed to it becomes heat. What a place
-     * is, as against a thing: a green, a wall, a cup. A container that is not
+     * a contact moves it not, motion handed to it becomes heat, and fit moves
+     * it to no other container (fitLocked). What a place is, as against a
+     * thing: a green, a wall, a cup -- and a part fixed to a thing, a wheel
+     * to a kart, that the thing's space need not hold. A container that is not
      * anchored is a thing, and falls in its own container's field carrying
      * what is inside it (frames are translations); its members feel the field
      * in that frame too. The value behind "anchored".
@@ -450,6 +511,28 @@ ETCS_SUPERTYPE_BASE(Causal)
     static size_t& BroadphaseFrom() { static size_t n = 16; return n; }   // measured: the tree wins from ~16 (CausalTester §9)
 
 private:
+    /*
+     * AN INTERACTION IS AN EVENT IN ITS TREE'S STREAM (Causal.h, CausalStream):
+     * posted, and its poster runs the stream's loop until its own event has
+     * committed. Under the tree's lock for now -- see there.
+     */
+    void post(Fixed commit_dt, Fixed step_dt, uint32_t ticks)
+    {
+        CausalStream& stream = TreeStream();
+        ::std::lock_guard<::std::recursive_mutex> lk(TreeMutex());
+        if (stream.Inside())
+        {
+            for (uint32_t i = 0; i < ticks; ++i) InteractUnder(commit_dt, step_dt);
+            return;
+        }
+        CausalEvent e;
+        e.at = this; e.commit = commit_dt; e.step = step_dt; e.ticks = ticks;
+        if (!stream.enqueue(CausalEventPtr{ &e })) return;   // the stream is ending with its tree
+        int retry = 0;
+        while (!e.done.load(::std::memory_order_acquire))
+            if (!stream.drive()) ETCS::LMAXSequentialSharedPage::progressiveYield(retry);
+    }
+
     /*
      * CANONICAL ORDER: tags in first-attachment order (that order is state;
      * the merkle hash composes by it), within a tag by the member's identity
@@ -647,21 +730,14 @@ private:
         ETCS::Entity::putWord(v, friction.raw);
         this->addTag("solid", v);
     }
+    // The container's law on this body (Relational: FieldOnUnder), after the
+    // body's own hold: an anchored body takes nothing and rests.
     void fieldLocked(Fixed dt)
     {
         if (m_anchored) { m_ov.Rest(); return; }
         Causal_* up = container();
         if (!up) return;
-        Fixed gx, gy, gz;
-        Causal_* src = up->FieldUnder(gx, gy, gz);
-        if (!src) return;
-        if (m_resting)
-        {
-            const Fixed gn = gx * m_snx + gy * m_sny + gz * m_snz;
-            if (gn.raw < 0) { gx -= m_snx * gn; gy -= m_sny * gn; gz -= m_snz * gn; }
-        }
-        if (gx.IsZero() && gy.IsZero() && gz.IsZero()) return;
-        src->CountFieldWorkUnder(m_ov.Accelerate(gx, gy, gz, dt, static_cast<Derived*>(this)->MassConcrete()));
+        up->FieldOnUnder(*this, dt);
     }
 
     /*
@@ -823,7 +899,8 @@ private:
      * before anything moves, applied in canonical order; a member something
      * is moving into stays put this time, so no pair can swap into each
      * other. One level per interaction: a member still outside goes on up at
-     * its new container's next one.
+     * its new container's next one. An anchored member is held where it was
+     * put, and fit leaves it there: it moves only by Contain.
      */
     void fitLocked(const ::std::vector<Causal_*>& kids)
     {
@@ -849,6 +926,7 @@ private:
         ::std::vector<::std::pair<size_t, Causal_*>> moves;
         for (size_t a = 0; a < n; ++a)
         {
+            if (kids[a]->Solid().anchored) continue;
             if (!into.empty() && into[a] != n) moves.emplace_back(a, kids[into[a]]);
             else if (up && !kids[a]->Order4().InsideOf(Fixed::Zero(), Fixed::Zero(), Fixed::Zero(), m_space))
                 moves.emplace_back(a, up);
@@ -974,6 +1052,7 @@ private:
     Fixed       m_space;   // zero: solid, holds nothing by fit (SetSpace)
     Fixed       m_emitted_out;
     Fixed       m_field_work;   // what the field this space states did (CountFieldWorkUnder)
+    Fixed       m_step_dt;      // the span of this space's last step (Relational Apply)
     Fixed       m_gx, m_gy, m_gz;   // the stated field (SetGravity), when m_gravity_set
     bool        m_gravity_set = false;
     CausalSolid m_solid;        // the step's copy of "solid" (shape Off: not solid)
@@ -989,6 +1068,8 @@ private:
     ::std::vector<::std::pair<uint32_t, uint32_t>> m_solid_pairs;
     uint64_t    m_ticks = 0;
     ::std::recursive_mutex m_tree_mtx;   // the tree's, when this is its top (TreeMutex)
+    ::std::unique_ptr<CausalStream> m_stream;   // the tree's, when this is its top (TreeStream)
+    ::std::once_flag       m_stream_once;
 
     Fixed       m_share_dt, m_share_k, m_share;   // 1 - exp(-k dt) for the last (dt, k) seen
 
