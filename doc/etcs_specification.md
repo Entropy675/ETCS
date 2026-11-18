@@ -825,8 +825,8 @@ above a developer's key, so what that loader signs says whose it is. It still ru
 Who may certify whom is a table (`sig::may_issue`), and a key never holds two roles.
 
 The root itself is built in. Its public key is pinned in ACE-Build-Tools (`manifests/root.pub`,
-written by `ace pin` from the ceremony's `root.cert`) and generated into `core/AceRoot.h` — a core
-header, so the root is in the epoch, and a loader built for another root is in another epoch. This is the bootstrap: a loader checking itself proves
+written by `ace pin` from the ceremony's `root.cert`) and generated into `core/AceIdentity.h` — ACE's
+identity at its shortest, and a core header, so the root is in the epoch, and a loader built for another root is in another epoch. This is the bootstrap: a loader checking itself proves
 nothing to someone who holds no root, so the first trust comes from where the binary was obtained,
 and the root inside it is what every later check stands on — its own bytes first, then every
 module, with an empty store and no key. Such a loader takes what the marketplace signed and
@@ -865,12 +865,18 @@ is the bytes the list names and passes the loader's own stages in the site's epo
 next session's.
 
 A loader is the one binary nothing else checks, so it attests itself: at the handshake it puts its
-own bytes through its own two stages. That is what makes a **lineage**. The loader going out signs
-the one that replaces it, and each such signing appends an edge to `lineage.log` in the store —
-parent digest, child digest, the epoch on either side, the signer, and the signer's word for when
-and where. Each edge names the root its signer was built with. In the guild only a loader that
-attests signs, so every etcs is signed by a valid etcs back to the one that signed itself, which a
-store allows once per root: an experimental lineage does not stop a guild's from beginning.
+own bytes through its own two stages. That is what makes a **lineage**. The loader going out
+**passes off** the one that replaces it: after the chain in the child's signature section it signs
+`"ETCSGEN1"` | parent digest | child digest | the epoch on either side | its root | whether it
+attested | its key. That is the one fragment a loader can sign for; the lineage behind it is the
+marketplace's to attest, at the site. A loader binary its own key (or its builder's) signed attests
+only if an attesting loader under the same root passed it off. A loader that passed itself off is a
+lineage beginning, which an experimental epoch takes and the guild does not: in the guild a lineage
+begins at a release, whose key's signature attests the binary by itself, and the build after it is
+passed off by the release. A loader that does not attest still runs, with a warning, and signs —
+its local half alone, since local authority is any loader's and global authority a signed build's.
+What it already signed with ACE's half is left as it is. `lineage.log` in the store is the signer's
+own trace of what it passed off: parent, child, epochs, root, and its word for when and where.
 
 `DatabaseProvider::Keystore` is that same store as a `Database` claiming `Private`: where a script
 keeps a secret, and the one place a `Keypair` goes whole. Its `Wrapper` children guard it as they
@@ -881,10 +887,10 @@ carrying the same one. Naming it is not enough.
 Unbuilt: the pin's value, which waits on the ceremony being run for real (a rehearsal's root, or a
 test authority's, stands in). A link that carries a local module's entities is refused (the
 local frame); nothing yet resolves one epoch against another. An account behind a registration: the registrar certifies any key
-that proves itself, and binds it to no one. Also unbuilt: the lineage published beside
-the download; a successor from a later epoch checked by the lineage (it is checked by the release
-key's signature, in the epoch the site's list names); signing and attesting the web loader, whose trust is its page's connection; anything
-that refuses a loader binary outside the lineage (the lineage is a record until then); the
+that proves itself, and binds it to no one. Also unbuilt: the marketplace's attestation of
+the whole lineage, beside the download; a successor from a later epoch checked by the lineage (it is
+checked by the release key's signature, in the epoch the site's list names); signing and attesting
+the web loader, whose trust is its page's connection; roots attesting each other; the
 entitlement stage; and the stage that takes another loader's modules (the untrusted scanning
 mode).
 

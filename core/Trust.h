@@ -21,10 +21,14 @@
  *              signs no module.
  *
  * THE LOADER IS THE ONE BINARY NOTHING ELSE CHECKS, so it attests itself: at
- * the handshake it puts its own bytes through its own two stages. What that
- * buys is the LINEAGE -- once the root is ACE's, only a loader that attests
- * signs, so the next etcs is signed by a valid etcs, and each such signing is
- * an edge appended to lineage.log beside the epochs it joins.
+ * the handshake it puts its own bytes through its own two stages. A loader
+ * binary signed by a loader's key attests only if the loader before it PASSED
+ * IT OFF (core/Signature.h): the parent signs the one fragment it can sign for
+ * into the child, and the lineage behind that is the marketplace's to attest.
+ * In the guild a lineage begins at a release. A loader passed off by itself,
+ * or by one that did not attest, runs with a warning, and what it signs carries
+ * its local half alone: local authority is any loader's, global authority a
+ * signed build's. lineage.log is the signer's own record of what it passed off.
  *
  * A CHAIN IS TWO HALVES (core/Signature.h). The local half -- this loader's key
  * and what it signs -- is taken by nothing but that loader. ACE's half is
@@ -54,7 +58,7 @@
  */
 
 #include "Signature.h"
-#include "AceRoot.h"
+#include "AceIdentity.h"
 #include "Provenance.h"
 #include "Keystore.h"
 #include "InterfaceWire.h"
@@ -134,8 +138,9 @@ inline bool unhex(const std::string& s, uint8_t* out, size_t n)
 
 /*
  * THE ROOT, built in: the super-root's public key, pinned in ACE-Build-Tools
- * and generated into core/AceRoot.h -- a core header, so the root is in the
- * epoch. It is what a downloaded loader holds before it holds anything else:
+ * and generated into core/AceIdentity.h -- a core header, so the root is in the
+ * epoch. It is ACE's identity at its shortest: every chain ACE attests ends at
+ * it. It is what a downloaded loader holds before it holds anything else:
  * every chain it takes ends here, its own binary's first.
  *
  * Zero is no root: the loader then has its local half and nothing else.
@@ -146,7 +151,7 @@ inline const sig::Key& ace_root()
 {
     static const sig::Key k = [] {
         sig::Key r{};
-        if (!unhex(ETCS_ACE_ROOT_KEY, r.data(), r.size())) r = sig::Key{};
+        if (!unhex(ETCS_ACE_IDENTITY_ROOT, r.data(), r.size())) r = sig::Key{};
         return r;
     }();
     return k;
@@ -278,12 +283,12 @@ struct Identity
     std::vector<sig::Certificate> reg;      // this key's cert <- ... <- root; empty: unregistered
     sig::Role   role = sig::Role::Loader;   // what reg[0] makes this key; Loader while unregistered
 
-    // This binary, by its own account (attest_self).
+    // This binary, by its own account (establish).
     std::string self_name;
     sig::Key    self{};
+    sig::Key    parent{};                   // the binary that passed this one off; zero: none
     bool        attested = false;
     std::string unattested;
-    bool        genesis = false;            // the store has no lineage yet: this loader may begin one
 };
 
 /*
@@ -291,10 +296,13 @@ struct Identity
  * frame REFERS to the bytes (the 256-byte rule, one size up). Going in:
  * name, bytes, epoch, and whether the bytes are a loader's own (`kernel`).
  * The Signature stage adds who signed -- role 0 when the chain is the local
- * half alone -- and whether the chain met this loader's below the root
- * (`local`); on the way out (signing) it fills `chain`, or says the bytes
- * already carry it.
+ * half alone -- whether the chain met this loader's below the root (`local`),
+ * and how the bytes were passed off (`passed`, a loader binary's); on the way
+ * out (signing) it fills `chain`, or says the bytes already carry it, and
+ * `local` says ACE's half was withheld.
  */
+enum class Passed : uint8_t { None, ByAttested, BySelf, ByUnattested, OtherRoot };
+
 struct LoadFrame
 {
     char           magic[8];
@@ -308,6 +316,7 @@ struct LoadFrame
     uint8_t        already;
     uint8_t        kernel;
     uint8_t        local;
+    uint8_t        passed;
 };
 
 inline bool load_frame(const std::string& name, const uint8_t* b, size_t n, const sig::Epoch& epoch, LoadFrame& f,
@@ -414,12 +423,37 @@ struct SignatureStage : Stage
         }
         if (top_role != sig::Role::Root && !sig::may_issue(at, top_role)) return refuse(io, "chain is broken");
         f.local = (zero(id->root) || top != id->root) ? 1 : 0;
+        if (L.has_pass)
+        {
+            sig::PassOff p;
+            if (!sig::decode(f.bytes + L.pass.at, L.pass.len, p) || p.child != d || p.key != leaf.issuer || p.to != f.epoch)
+                return refuse(io, "passed off as other bytes, or by another key");
+            if (!check(p)) return refuse(io, "bad signature on the pass-off");
+            f.passed = uint8_t(p.root != id->root ? Passed::OtherRoot : p.parent == p.child ? Passed::BySelf
+                               : p.attested ? Passed::ByAttested : Passed::ByUnattested);
+        }
         give(io, f);
     }
 
+    static bool check(const sig::PassOff& p)
+    {
+        const std::string m = sig::signed_part(p);
+        return mc::crypto_ed25519_check(p.signature, p.key.data(), reinterpret_cast<const uint8_t*>(m.data()), m.size()) == 0;
+    }
+    static bool check(const sig::Certificate& c) { return trust::check(c); }
+
+    // What this loader would accept of a pass-off into a binary of its own.
+    bool acceptable(const sig::PassOff& p) const
+    {
+        return p.root == id->root && (p.parent == p.child ? zero(id->root) : p.attested);
+    }
+
     // The chain for these bytes: this loader's leaf, and ACE's half above its
-    // key if it has one. A leaf by this key on these same bytes, under this
-    // same half, carries its epochs forward.
+    // key if it has one and attests -- or is a release key, where a lineage
+    // begins. A leaf by this key on these same bytes, under this same half,
+    // carries its epochs forward. A loader binary gets a pass-off from this
+    // loader, unless it carries one this loader would take and this loader's
+    // own would not do better.
     void Wrap(MBuffer& io, SignalContext) override
     {
         LoadFrame f;
@@ -434,16 +468,37 @@ struct SignatureStage : Stage
         if (id->role == sig::Role::Registrar) return refuse(io, "a registrar certifies loaders; it signs no binary");
         if (id->role == sig::Role::Release && !f.kernel) return refuse(io, "a release key signs loaders, not modules");
 
+        const bool global = zero(id->root) || id->attested || (id->role == sig::Role::Release && f.kernel);
+        static const std::vector<sig::Certificate> none;
+        const std::vector<sig::Certificate>& half = global ? id->reg : none;
         std::vector<sig::Certificate> old;
-        const bool carried =
-            L.has_chain && sig::decode_chain(f.bytes + L.chain.at, L.chain.len, old)
-            && old.size() == id->reg.size() + 1
-            && sig::encode_chain({ old.begin() + 1, old.end() }) == sig::encode_chain(id->reg)
-            && old[0].role == sig::Role::Module && old[0].issuer == id->pub && old[0].subject == c.subject && check(old[0]);
-        if (carried && has_epoch(old[0], f.epoch)) { f.already = 1; return give(io, f); }
+        const bool readable = L.has_chain && sig::decode_chain(f.bytes + L.chain.at, L.chain.len, old) && !old.empty()
+                              && old[0].role == sig::Role::Module && old[0].issuer == id->pub
+                              && old[0].subject == c.subject && check(old[0]);
+        auto under = [&](const std::vector<sig::Certificate>& h) {
+            return readable && old.size() == h.size() + 1
+                   && sig::encode_chain({ old.begin() + 1, old.end() }) == sig::encode_chain(h);
+        };
+        const bool carried = under(half);
+
+        sig::PassOff pass, had;
+        bool keep = false;
+        if (f.kernel)
+        {
+            pass.parent = id->self; pass.child = c.subject; pass.from = loader_epoch(); pass.to = f.epoch;
+            pass.root = id->root; pass.attested = id->attested; pass.key = id->pub;
+            keep = L.has_pass && sig::decode(f.bytes + L.pass.at, L.pass.len, had) && had.child == c.subject
+                   && had.key == id->pub && had.to == f.epoch && check(had) && (acceptable(had) || !acceptable(pass));
+        }
+        const bool full = under(id->reg);
+        if ((carried || full) && has_epoch(old[0], f.epoch) && (!f.kernel || keep))
+        {
+            f.already = 1;
+            f.local = full ? 0 : 1;                 // there, but without the half this key has
+            return give(io, f);
+        }
         if (!signer) return refuse(io, "the key is not here");
-        if (!zero(id->root) && !id->attested && !id->genesis)
-            return refuse(io, "only a loader in the lineage signs, and this one does not attest: " + id->unattested);
+        f.local = global ? 0 : 1;
         if (carried)
         {
             c.epochs = old[0].epochs;
@@ -454,8 +509,18 @@ struct SignatureStage : Stage
         const std::string m = sig::signed_part(c);
         signer(reinterpret_cast<const uint8_t*>(m.data()), m.size(), c.signature);
         std::vector<sig::Certificate> chain{ c };
-        chain.insert(chain.end(), id->reg.begin(), id->reg.end());
+        chain.insert(chain.end(), half.begin(), half.end());
         *f.chain = sig::encode_chain(chain);
+        if (f.kernel)
+        {
+            if (keep) pass = had;
+            else
+            {
+                const std::string pm = sig::signed_part(pass);
+                signer(reinterpret_cast<const uint8_t*>(pm.data()), pm.size(), pass.signature);
+            }
+            *f.chain += sig::encode(pass);
+        }
         give(io, f);
     }
 };
@@ -467,8 +532,20 @@ struct OwnStage : Stage
         LoadFrame f;
         if (!take(io, f) || !id) return refuse(io, "not a load this gate was set up for");
         const bool ours = (!zero(id->pub) && f.signer == id->pub) || (!zero(id->builder) && f.signer == id->builder);
-        if (f.kernel && f.signer_role != uint8_t(sig::Role::Release) && !ours)
-            return refuse(io, "a loader binary is taken from a release key, or from this loader's own");
+        if (f.kernel && f.signer_role != uint8_t(sig::Role::Release))
+        {
+            if (!ours) return refuse(io, "a loader binary is taken from a release key, or from this loader's own");
+            switch (Passed(f.passed))
+            {
+                case Passed::None:         return refuse(io, "no signed build passed this loader off");
+                case Passed::BySelf:       if (!zero(id->root))
+                                               return refuse(io, "it passed itself off: in the guild a lineage begins at a release");
+                                           break;
+                case Passed::ByUnattested: return refuse(io, "passed off by a loader that did not attest");
+                case Passed::OtherRoot:    return refuse(io, "passed off under another root: a loader enters the guild from a release");
+                case Passed::ByAttested:   break;
+            }
+        }
         if (!f.kernel && f.signer_role == uint8_t(sig::Role::Release))
             return refuse(io, "a release key signs loaders, not modules");
         give(io, f);
@@ -746,11 +823,11 @@ inline bool install_registration(const std::string& dir, const std::vector<sig::
 }
 
 /*
- * THE LINEAGE: one line per loader binary signed, appended to lineage.log in
- * the store, under the root the signer was built with -- a guild's lineage
- * begins once, whatever experimental history the store has. An edge says which binary's key signed which, across which
- * epochs, when and where -- the last two are the signer's word, for the
- * trace; nothing is valid or invalid by them. The signer signs the line.
+ * THE LINEAGE, as the signer keeps it: one line per loader binary it passed
+ * off, appended to lineage.log in its store. The pass-off itself is in the
+ * child (Signature.h); this is the trace, and nothing is valid or invalid by
+ * it. An edge says which binary's key signed which, across which epochs, when
+ * and where. The signer signs the line.
  *
  *   etcs-lineage 2 <name> root=<key|none> parent=<digest|genesis> attested=<0|1>
  *       child=<digest> from=<epoch> to=<epoch> key=<signer> at=<unix seconds> host=<name> sig=<hex>
@@ -931,16 +1008,18 @@ inline std::shared_ptr<const Identity> establish(const std::string& dir, bool pr
     // as the identity just established. Nothing else will check this binary.
     // Signed by a release key it asks nothing of the store -- a loader just
     // downloaded attests by the root it was built with.
-    std::vector<LineageEdge> edges;
     std::vector<uint8_t> me;
     std::string w;
-    id->genesis = lineage_read(dir, edges, w)
-                  && std::none_of(edges.begin(), edges.end(), [&](const LineageEdge& e) { return e.root == id->root; });
     if (!own_binary(id->self_name, me)) id->unattested = "this loader cannot read its own binary";
     else
     {
         sig::Layout L;
-        if (sig::layout(me.data(), me.size(), L, w)) digest(id->self_name, me.data(), me.size(), L, id->self);
+        sig::PassOff p;
+        if (sig::layout(me.data(), me.size(), L, w))
+        {
+            digest(id->self_name, me.data(), me.size(), L, id->self);
+            if (L.has_pass && sig::decode(me.data() + L.pass.at, L.pass.len, p)) id->parent = p.parent;
+        }
         id->attested = verify(id->self_name, me.data(), me.size(), loader_epoch(), *id, id->unattested, true);
     }
 #endif
@@ -952,7 +1031,19 @@ inline Gate& gate()
 {
     static Gate g;
     static std::once_flag once;
-    std::call_once(once, [] { g.use(establish(etcs_store_dir())); });
+    std::call_once(once, [] {
+        std::shared_ptr<const Identity> id = establish(etcs_store_dir());
+#if !defined(__EMSCRIPTEN__)
+        if (!id->attested)
+        {
+            std::fprintf(stderr, "etcs: warning: %s is not a signed build -- %s\n", id->self_name.c_str(), id->unattested.c_str());
+            if (!zero(id->root))
+                std::fprintf(stderr, "etcs: what it signs carries its local half alone; a signed etcs is the site's "
+                                     "(CryptProvider Upstream, Update)\n");
+        }
+#endif
+        g.use(std::move(id));
+    });
     return g;
 }
 
@@ -963,9 +1054,10 @@ Entity* gate_entity();
 #if !defined(__EMSCRIPTEN__)
 /*
  * Signs `file` as `name` under `epoch`: the gate, wrapped. 0 the chain is in
- * `out`, 3 already signed so (nothing written), 2 refused. What is already
- * there is judged from the public files alone; the key is asked for only when
- * there is something to sign.
+ * `out` (and `why` says so if ACE's half was withheld), 3 already signed so
+ * (nothing written), 2 refused. For a module, what is already there is judged
+ * from the public files alone, and the key is asked for only when there is
+ * something to sign; a loader binary is judged by the whole identity.
  *
  * `edge`, when given, is filled for a signing that happened: who this loader
  * is to the bytes it signed (succeed).
@@ -980,22 +1072,46 @@ inline int sign_module(const std::string& dir, const std::string& name, const st
     if (!read_file(file, b)) { why = "cannot read " + file; return 2; }
     if (!load_frame(name, b.data(), b.size(), epoch, f, kernel)) { why = "bad module name"; return 2; }
     f.chain = &chain;
+    if (!kernel)                                    // a loader binary's pass-off is judged by the signer's whole identity
     {
         Gate seen;
         LoadFrame probe = f;
         std::string ignored;
         seen.use(establish(dir, false, built_in));
-        if (seen.wrap(probe, ignored) && probe.already) return 3;
+        if (seen.wrap(probe, ignored) && probe.already && !probe.local) return 3;
     }
     uint8_t secret[64];
     sig::Key pub{};
     std::vector<sig::Certificate> reg;
     if (!identity(dir, secret, pub, reg, why, built_in)) return 2;      // makes the key on first use
     const std::shared_ptr<const Identity> id = establish(dir, true, built_in);
+    if (kernel)
+    {
+        // A loader binary that already attests here -- a release's, say -- is
+        // left as it is: signing it again could only make it this loader's.
+        std::string w;
+        if (verify(name, b.data(), b.size(), epoch, *id, w, true)) { mc::crypto_wipe(secret, 64); return 3; }
+        // A build of the very bytes this loader is carries what this loader carries.
+        sig::Layout L, M;
+        sig::Key d{};
+        std::vector<uint8_t> me;
+        std::string me_name;
+        if (id->attested && sig::layout(b.data(), b.size(), L, w) && digest(name, b.data(), b.size(), L, d) && d == id->self
+            && own_binary(me_name, me) && sig::layout(me.data(), me.size(), M, w) && M.has_chain)
+        {
+            mc::crypto_wipe(secret, 64);
+            const size_t len = M.chain.len + (M.has_pass ? M.pass.len : 0);
+            std::ofstream o(out, std::ios::binary | std::ios::trunc);
+            if (!o.write(reinterpret_cast<const char*>(me.data() + M.chain.at), std::streamsize(len)) || !o.flush())
+            { why = "cannot write " + out; return 2; }
+            return 0;
+        }
+    }
     Gate g;
     g.use(id);
     g.signature.signer = [&secret](const uint8_t* m, size_t n, uint8_t* sig64) { mc::crypto_ed25519_sign(sig64, secret, m, n); };
     const bool ok = g.wrap(f, why);
+    if (ok && !f.already && f.local) why = "its local half alone: this loader does not attest -- " + id->unattested;
     if (ok && !f.already && edge)
     {
         sig::Layout L;
@@ -1019,8 +1135,9 @@ inline int sign_module(const std::string& dir, const std::string& name, const st
 }
 
 /*
- * Signs the next loader binary and records the edge: this loader -> that one.
- * The same signing as any module's; what it adds is the line in lineage.log.
+ * Signs a loader binary and passes it off: this loader -> that one. The same
+ * signing as any module's, with the pass-off after the chain, and the edge
+ * appended to lineage.log.
  * The same edge -- this parent, this child, this epoch -- is not written twice,
  * and a loader signing its own bytes is an edge only where there is none yet.
  */
@@ -1030,7 +1147,7 @@ inline int succeed(const std::string& dir, const std::string& name, const std::s
 {
     LineageEdge e;
     const int rc = sign_module(dir, name, file, epoch, out, why, &e, built_in, true);
-    if (rc != 0) return rc;
+    if (rc != 0 || e.name.empty()) return rc;          // nothing passed off: this loader's own signature, copied
     std::vector<LineageEdge> had;
     std::string w;
     if (!lineage_read(dir, had, w)) { why = w; return 2; }
@@ -1066,8 +1183,7 @@ inline int issue(const std::string& dir, sig::Role role, const sig::Key& subject
     if (!sig::may_issue(reg[0].role, role))
         return refused(std::string("a ") + sig::role_name(reg[0].role) + " does not certify a " + sig::role_name(role));
     if (!id->proven) return refused("this loader has not proven its key: " + id->unproven);
-    if (!id->attested && !id->genesis)
-        return refused("only a loader in the lineage certifies, and this one does not attest: " + id->unattested);
+    if (!id->attested) return refused("only a signed build certifies, and this one does not attest: " + id->unattested);
     sig::Certificate c;
     c.role = role; c.subject = subject; c.issuer = pub;
     const std::string m = sig::signed_part(c);
@@ -1461,7 +1577,7 @@ inline bool open_verified(const std::string& name, const std::string& file, Open
  * What ace asks of the loader that holds the key:
  *
  *   etcs --sign <module> <file> <epoch hex> <out>   0 signed, 3 already, 2 refused
- *   etcs --succeed <name> <file> <epoch hex> <out>  the same, for the next loader binary: adds the lineage edge
+ *   etcs --succeed <name> <file> <epoch hex> <out>  the same, for a loader binary: passes it off, and logs the edge
  *   etcs --registration <cert>...                   install ACE's half for this key, leaf first
  *   etcs --issue <role> <key hex> <out>             a registrar certifies another loader's key; writes its chain
  *   etcs --request <registrar key hex>              "<this loader's key> <signature>": a registration's ask
@@ -1519,6 +1635,7 @@ inline int cli(int argc, char** argv)
         const int rc = verb == "--sign" ? sign_module(dir, argv[2], argv[3], e, argv[5], why)
                                         : succeed(dir, argv[2], argv[3], e, argv[5], why, &line);
         if (rc == 2) std::fprintf(stderr, "etcs: %s: %s\n", argv[3], why.c_str());
+        if (rc == 0 && !why.empty()) std::fprintf(stderr, "etcs: warning: %s: %s\n", argv[3], why.c_str());
         if (!line.empty()) std::printf("%s\n", line.c_str());
         return rc;
     }
@@ -1575,6 +1692,8 @@ inline int cli(int argc, char** argv)
         if (zero(id->root)) std::printf("root      none built in: an experimental epoch\n");
         else std::printf("root      %s (ACE, built in): the guild\n", hex(id->root.data(), 32).c_str());
         if (!zero(id->builder)) std::printf("builder   %s (built in)\n", hex(id->builder.data(), 32).c_str());
+        std::printf("passed    %s\n", zero(id->parent) ? "by no one" : id->parent == id->self ? "by itself"
+                                       : ("by " + hex(id->parent.data(), 32)).c_str());
         std::printf("attested  %s%s%s\n", id->attested ? "yes" : "no", id->attested ? "" : ": ",
                     id->attested ? "" : id->unattested.c_str());
         if (!id->proven) std::printf("unproven  %s\n", id->unproven.c_str());

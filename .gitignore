@@ -19,7 +19,7 @@ bin/
 # from pinned sources; byte-identical on every machine, hashed into the epoch.
 core/AirtyMacros_Generated.h
 libs/monocypher.h
-core/AceRoot.h
+core/AceIdentity.h
 # What the site serves at /dist (ace publish) and the certificates above its registrar.
 dist/
 pki/

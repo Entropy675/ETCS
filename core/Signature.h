@@ -14,6 +14,7 @@
  *
  *   cert   "ETCSCRT1" | role u8 | subject[32] | issuer[32] | n u16le | epoch[32] x n | signature[64]
  *   chain  "ETCSCHN1" | n u8 | cert x n, leaf first
+ *   pass   "ETCSGEN1" | parent[32] | child[32] | from[32] | to[32] | root[32] | attested u8 | key[32] | signature[64]
  *
  * The signature is Ed25519 (RFC 8032) by the issuer over everything before it,
  * magic included -- the magic is the domain separation. A root is its own
@@ -169,6 +170,57 @@ inline bool decode_chain(const void* p, size_t len, std::vector<Certificate>& ch
 }
 
 /*
+ * A GENERATION PASSED OFF: the loader binary `parent`, running in `from` under
+ * `root`, hands its place to the binary `child`, signed for `to`, with `key` --
+ * the key that signs the child's leaf. `attested` is whether the parent
+ * attested itself when it did. It rides in the child's signature section after
+ * the chain, so the child carries the one fragment its parent could sign for;
+ * the lineage before it is the marketplace's to attest. A parent that is its
+ * own child is a lineage beginning.
+ */
+constexpr char   kPassMagic[8] = { 'E', 'T', 'C', 'S', 'G', 'E', 'N', '1' };
+constexpr size_t kPassBytes    = 8 + 32 * 5 + 1 + 32 + kSigBytes;
+
+struct PassOff
+{
+    Key     parent{}, child{};
+    Epoch   from{}, to{};
+    Key     root{};
+    bool    attested = false;
+    Key     key{};
+    uint8_t signature[kSigBytes] = {};
+};
+
+inline std::string signed_part(const PassOff& p)
+{
+    std::string out(kPassMagic, sizeof kPassMagic);
+    for (const auto* k : { &p.parent, &p.child, &p.from, &p.to, &p.root })
+        out.append(reinterpret_cast<const char*>(k->data()), k->size());
+    out += static_cast<char>(p.attested ? 1 : 0);
+    out.append(reinterpret_cast<const char*>(p.key.data()), p.key.size());
+    return out;
+}
+
+inline std::string encode(const PassOff& p)
+{
+    std::string out = signed_part(p);
+    out.append(reinterpret_cast<const char*>(p.signature), kSigBytes);
+    return out;
+}
+
+inline bool decode(const void* q, size_t len, PassOff& p)
+{
+    const uint8_t* b = static_cast<const uint8_t*>(q);
+    if (!b || len != kPassBytes || std::memcmp(b, kPassMagic, sizeof kPassMagic) != 0 || b[8 + 32 * 5] > 1) return false;
+    size_t at = sizeof kPassMagic;
+    for (auto* k : { &p.parent, &p.child, &p.from, &p.to, &p.root }) { std::memcpy(k->data(), b + at, 32); at += 32; }
+    p.attested = b[at++] == 1;
+    std::memcpy(p.key.data(), b + at, 32); at += 32;
+    std::memcpy(p.signature, b + at, kSigBytes);
+    return true;
+}
+
+/*
  * WHAT A LOADER SIGNS TO ASK FOR ACE'S HALF, and what a registrar checks:
  *
  *   "ETCSREG1" | the loader's key | the registrar's key
@@ -216,7 +268,9 @@ constexpr char kDistSig[]   = "etcs-dist-sig ";
  *              table when it adds one, with a section below the image base,
  *              so a section is not something the build can add safely.)
  *
- * Exactly one chain; a second is malformed, not ignored.
+ * Exactly one chain; a second is malformed, not ignored. A loader binary's
+ * section may hold a pass-off after it (`pass`); the chain's span is then the
+ * chain alone.
  */
 enum class Format : uint8_t { Elf = 1, Wasm = 2, Pe = 3 };
 
@@ -233,6 +287,8 @@ struct Layout
     std::vector<Span> zeroed;           // read as zero inside any covered span
     bool              has_chain = false;
     Span              chain;
+    bool              has_pass = false;
+    Span              pass;
 };
 
 namespace detail
@@ -347,6 +403,35 @@ inline bool pe(const uint8_t* b, size_t n, Layout& L, std::string& why)
     L.covered = { { 0, body } };
     return true;
 }
+// The chain's own length at the front of a section: its count, then each
+// certificate's epochs. False if the section is shorter than that says.
+inline bool chain_length(const uint8_t* b, size_t len, size_t& out)
+{
+    if (len < sizeof kChainMagic + 1 || std::memcmp(b, kChainMagic, sizeof kChainMagic) != 0) return false;
+    const size_t n = b[sizeof kChainMagic], head = sizeof kCertMagic + 1 + 32 + 32 + 2;
+    size_t at = sizeof kChainMagic + 1;
+    for (size_t i = 0; i < n; ++i)
+    {
+        if (len - at < head) return false;
+        const size_t body = head + size_t(u16(b + at + head - 2)) * 32 + kSigBytes;
+        if (len - at < body) return false;
+        at += body;
+    }
+    out = at;
+    return true;
+}
+
+// A section that is a chain then exactly one pass-off is split in two;
+// anything else is left whole, for the chain's own decoding to refuse.
+inline void split_pass(const uint8_t* b, Layout& L)
+{
+    size_t c = 0;
+    if (!L.has_chain || !chain_length(b + L.chain.at, L.chain.len, c) || L.chain.len - c != kPassBytes
+        || std::memcmp(b + L.chain.at + c, kPassMagic, sizeof kPassMagic) != 0) return;
+    L.has_pass = true;
+    L.pass  = { L.chain.at + c, kPassBytes };
+    L.chain = { L.chain.at, c };
+}
 } // namespace detail
 
 // False: not a format a loader loads, or malformed; `why` says which.
@@ -354,11 +439,13 @@ inline bool layout(const uint8_t* b, size_t n, Layout& L, std::string& why)
 {
     L = Layout{};
     if (!b || n < 4) { why = "empty"; return false; }
-    if (std::memcmp(b, "\x7f" "ELF", 4) == 0) return detail::elf(b, n, L, why);
-    if (std::memcmp(b, "\0asm", 4) == 0)     return detail::wasm(b, n, L, why);
-    if (b[0] == 'M' && b[1] == 'Z')          return detail::pe(b, n, L, why);
-    why = "not ELF, wasm or PE";
-    return false;
+    bool ok = false;
+    if      (std::memcmp(b, "\x7f" "ELF", 4) == 0) ok = detail::elf(b, n, L, why);
+    else if (std::memcmp(b, "\0asm", 4) == 0)     ok = detail::wasm(b, n, L, why);
+    else if (b[0] == 'M' && b[1] == 'Z')          ok = detail::pe(b, n, L, why);
+    else { why = "not ELF, wasm or PE"; return false; }
+    if (ok) detail::split_pass(b, L);
+    return ok;
 }
 
 } // namespace sig
