@@ -266,7 +266,8 @@ The containment itself carries constraints, and they run the same way the
 lineage's do: cumulative by default, down the parent/child relation. A
 Causal container states what its space is like -- how much room it provides
 (`SetSpace`, what fits), what field everything inside falls along
-(`SetGravity`) -- and a member is subject to the space it is in. A container
+(`SetGravity`), the fastest anything inside moves (`SetLightSpeed`) -- and a
+member is subject to the space it is in. A container
 that states no field passes on the one it is in, so the earth's gravity
 reaches the pen in a pocket without the pocket saying so. But a statement is
 a parameter, not a law of the containment: a sub-container may state its own

@@ -154,10 +154,13 @@ ETCS_SUPERTYPE_BASE(Causal), public RelationalBase<Derived>
         refreshIdentityLocked();
         OrderVector e;
         if (commitLocked(commit_dt, e)) crossTo(container(), e);
+        // Pegged where the last interaction left it: the step's smear starts here.
+        m_peg_x = m_ov.x; m_peg_y = m_ov.y; m_peg_z = m_ov.z;
         if (step_dt.IsPositive())
         {
             m_step_dt = step_dt;   // the span this space's law last ran over (ApplyConcrete)
             fieldLocked(step_dt);
+            lightLocked();
             static_cast<Derived*>(this)->AdvanceConcrete(step_dt);
         }
         const auto& now = kidsLocked();
@@ -231,6 +234,8 @@ ETCS_SUPERTYPE_BASE(Causal), public RelationalBase<Derived>
 
     void PlaceUnder(Fixed x, Fixed y, Fixed z) override final { m_ov.PlaceAt(x, y, z); }
     OrderVector& RowsUnder() override final { return m_ov; }
+    void PegUnder(Fixed& x, Fixed& y, Fixed& z) override final { x = m_peg_x; y = m_peg_y; z = m_peg_z; }
+    void RepegUnder(Fixed x, Fixed y, Fixed z) override final { m_peg_x = x; m_peg_y = y; m_peg_z = z; }
     Fixed MassUnder() override final { return static_cast<Derived*>(this)->MassConcrete(); }
     void SupportUnder(bool resting, Fixed nx, Fixed ny, Fixed nz) override final
     {
@@ -313,6 +318,33 @@ ETCS_SUPERTYPE_BASE(Causal), public RelationalBase<Derived>
         return nullptr;
     }
     void CountFieldWorkUnder(Fixed joules) override final { m_field_work += joules; }
+
+    /*
+     * THE SPEED OF LIGHT THIS SPACE HAS, stated (Causal.h, "the space's
+     * parameters"): the fastest anything inside it moves. A verb's state, so
+     * the value behind "light"; stating it makes it this space's own, and
+     * InheritLightSpeed takes the statement back. Where none is stated up
+     * to the open boundary it is DefaultLightSpeed.
+     *
+     * A body the field or a push leaves faster than it is slowed to it at
+     * its next step, and the motion it loses stays in it as heat (lightLocked)
+     * -- so a step moves nothing further than light goes in its span, which
+     * is what bounds how far a contact has to be looked for (the smear).
+     */
+    void SetLightSpeed(Fixed c)
+    {
+        if (!c.IsPositive()) return;
+        ::std::string v;
+        ETCS::Entity::putWord(v, c.raw);
+        this->addTag("light", v);
+    }
+    void InheritLightSpeed() { this->removeTag(ETCS::Buffer("light")); }
+    Fixed LightUnder() override final
+    {
+        if (m_light_set) return m_light;
+        Causal_* up = container();
+        return up ? up->LightUnder() : DefaultLightSpeed();
+    }
 
     /*
      * MADE SOLID (CausalSolid): restitution and friction in [0,1]; the value
@@ -436,6 +468,16 @@ ETCS_SUPERTYPE_BASE(Causal), public RelationalBase<Derived>
             ::std::lock_guard<::std::recursive_mutex> lk(TreeMutex());
             m_gravity_set = set;
             m_gx = Fixed::FromRaw(w[0]); m_gy = Fixed::FromRaw(w[1]); m_gz = Fixed::FromRaw(w[2]);
+        }
+        else if (key == ETCS::Buffer("light"))
+        {
+            int64_t raw = 0;
+            size_t at = 0;
+            const bool set = value != nullptr;   // gone with its flag: inherited again
+            if (set && !ETCS::Entity::getWord(*value, at, raw)) return;
+            ::std::lock_guard<::std::recursive_mutex> lk(TreeMutex());
+            m_light_set = set;
+            m_light = Fixed::FromRaw(raw);
         }
         else if (key == ETCS::Buffer("solid"))
         {
@@ -645,16 +687,32 @@ private:
         // The solids, read once a pass. None (every scene before solids): the
         // pass is exactly what it was.
         m_solids.resize(n);
-        bool any = false, plane = false;
+        bool any = false, plane = false, swept = false;
         for (size_t i = 0; i < n; ++i)
         {
             m_solids[i] = kids[i]->Solid();
             any   |= m_solids[i].shape != CausalSolid::Off;
             plane |= m_solids[i].shape == CausalSolid::HalfSpace;
         }
+        // How far the step moved each free solid: its smear's length. Two
+        // solids meet where their smears cross (solidPairLocked), so a pair is
+        // one whose reaches the smears could have brought together -- which,
+        // for solids nothing moved, is the pair it always was.
+        m_sweeps.assign(any ? n : 0, Fixed::Zero());
+        for (size_t i = 0; any && i < n; ++i)
+        {
+            if (m_solids[i].shape == CausalSolid::Off || m_solids[i].anchored) continue;
+            Fixed px, py, pz;
+            kids[i]->PegUnder(px, py, pz);
+            const OrderVector& r = kids[i]->Order4();
+            if (px == r.x && py == r.y && pz == r.z) continue;
+            m_sweeps[i] = Fixed::Length(r.x - px, r.y - py, r.z - pz);
+            swept = true;
+        }
         m_solid_pairs.clear();
         auto pair = [&](size_t i, size_t j) {
-            if (contactLocked(kids[i], kids[j], any ? &m_solids[i] : nullptr, any ? &m_solids[j] : nullptr, span))
+            if (contactLocked(kids[i], kids[j], any ? &m_solids[i] : nullptr, any ? &m_solids[j] : nullptr, span,
+                              swept ? m_sweeps[i] + m_sweeps[j] : Fixed::Zero()))
                 m_solid_pairs.emplace_back(static_cast<uint32_t>(i), static_cast<uint32_t>(j));
         };
         if (n < BroadphaseFrom())
@@ -665,7 +723,7 @@ private:
         else
         {
             if (!m_broad) m_broad.reset(new Broadphase);
-            const auto& found = m_broad->pairs(kids);
+            const auto& found = m_broad->pairs(kids, swept ? &m_sweeps : nullptr);
             if (!plane) for (const auto& [i, j] : found) pair(i, j);
             else
             {
@@ -689,7 +747,7 @@ private:
     // True when the pair is two solids: they meet by shape (solidPassLocked),
     // after every transmission of the pass, so which pairs meet is decided
     // from the rows the pass started with on both walks.
-    static bool contactLocked(Causal_* ka, Causal_* kb, const CausalSolid* sa, const CausalSolid* sb, Fixed span)
+    static bool contactLocked(Causal_* ka, Causal_* kb, const CausalSolid* sa, const CausalSolid* sb, Fixed span, Fixed sweep)
     {
         const OrderVector& a = ka->Order4();
         const OrderVector& b = kb->Order4();
@@ -697,7 +755,16 @@ private:
         {
             const bool solidA = sa->shape != CausalSolid::Off, solidB = sb->shape != CausalSolid::Off;
             if (solidA && solidB)
-                return sa->shape == CausalSolid::HalfSpace || sb->shape == CausalSolid::HalfSpace || a.MayInteractWith(b);
+            {
+                if (sa->shape == CausalSolid::HalfSpace || sb->shape == CausalSolid::HalfSpace || a.MayInteractWith(b)) return true;
+                if (!sweep.IsPositive()) return false;
+                // Apart where the step left them, but it moved them: a pair if
+                // twice their smears reaches -- the step itself, and what an
+                // earlier contact of this pass may turn back of it.
+                OrderVector reach = a;
+                reach.radius += sweep * Fixed::FromInt(2);
+                return reach.MayInteractWith(b);
+            }
             // A solid meets only solids: what is not solid passes through it
             // (a marker, an arrow drawn in the scene), and the two contact
             // models never meet in one pair.
@@ -740,14 +807,34 @@ private:
         up->FieldOnUnder(*this, dt);
     }
 
+    // Nothing outruns its space's light: a body left faster is slowed to it,
+    // and what it loses of its motion is heat it keeps (SetVelocity holds E).
+    void lightLocked()
+    {
+        if (m_anchored || !m_ov.KineticEnergy().IsPositive()) return;
+        Causal_* up = container();
+        const Fixed c = up ? up->LightUnder() : LightUnder();
+        const Fixed m = static_cast<Derived*>(this)->MassConcrete();
+        Fixed vx, vy, vz;
+        m_ov.Velocity(m, vx, vy, vz);
+        const Fixed v = Fixed::Length(vx, vy, vz);
+        if (!(v > c)) return;
+        const Fixed k = c / v;
+        m_ov.SetVelocity(m, vx * k, vy * k, vz * k);
+    }
+
     /*
      * THE SOLID CONTACTS, after the transmissions, over the pairs of solids the
      * gate found (contactsLocked), in that order. Each pair, a sphere against
      * a sphere, a box or a half-space (two boxes do not meet yet):
      *
+     *   the cut   where the step moved the two together, they are put back to
+     *             where their smears first touch, the contact is settled
+     *             there, and what is left of the step is then moved with the
+     *             motion the contact left (solidPairLocked, THE SMEAR)
      *   apart     the sphere is pushed out along the contact normal by how deep
      *             it is (both, by their shares of the motion, when neither is
-     *             anchored) -- positions move here, and only here
+     *             anchored) -- with the cut, the only places positions move
      *   bounce    the motion along the normal, if closing, is turned back times
      *             the restitution; a closing speed below what the field adds in
      *             two steps is not a bounce but a landing, and stops
@@ -784,6 +871,93 @@ private:
         OrderVector& S = kS->RowsUnder();
         OrderVector& O = kO->RowsUnder();
         const Fixed slack = Fixed::FromRaw(Fixed::ONE >> 10);   // ~0.001: a resting body counts at zero depth
+        const Fixed zero = Fixed::Zero(), one = Fixed::One();
+
+        /*
+         * THE SMEAR (etcs_causal_constraints.md §14). The step moved each body
+         * along a segment, from its peg to where it is now, and where the step
+         * left them says little about whether they met: a ball that moves
+         * further in a step than a wall is thick is past it, or far enough in
+         * to be pushed out of the wrong face. So the contact is looked for
+         * along the segment -- the sphere's, as the other sees it:
+         *
+         *   apart at the peg     the first moment of the step their gap closes,
+         *                        if it does: the gap along a straight path to
+         *                        a sphere, a box or a plane dips once at most,
+         *                        so the moment is found by halving (and, where
+         *                        both ends are apart, by first finding where
+         *                        the gap is least)
+         *   touching at the peg  the peg itself, when the step drove the
+         *                        sphere further in; else where the step left
+         *                        them -- a body resting or rolling on another,
+         *                        as it has always been settled
+         *
+         * At that moment the two are put where they were, the contact is
+         * settled there -- the normal is of the face, edge or corner actually
+         * met -- and what is left of the step is moved with the motion the
+         * contact left: the part of the smear that comes back, at the angle it
+         * comes back at.
+         */
+        Fixed sx0, sy0, sz0, ox0, oy0, oz0;
+        kS->PegUnder(sx0, sy0, sz0);
+        kO->PegUnder(ox0, oy0, oz0);
+        const Fixed sx1 = S.x, sy1 = S.y, sz1 = S.z, ox1 = O.x, oy1 = O.y, oz1 = O.z;
+        const Fixed rx0 = sx0 - ox0, ry0 = sy0 - oy0, rz0 = sz0 - oz0;                                // the sphere from the other, at the peg
+        const Fixed mx = (sx1 - sx0) - (ox1 - ox0), my = (sy1 - sy0) - (oy1 - oy0), mz = (sz1 - sz0) - (oz1 - oz0);   // and how the step moved it, so seen
+        const Fixed moved = Fixed::Length(mx, my, mz);
+        Fixed cut = one;   // the share of the step gone when they meet: all of it, unless found sooner
+        if (moved.IsPositive())
+        {
+            Fixed px = zero, py = one, pz = zero;   // a half-space's face
+            if (cO->shape == CausalSolid::HalfSpace) O.RotateVector(px, py, pz);
+            auto gap = [&](Fixed t) {
+                Fixed lx = rx0 + mx * t, ly = ry0 + my * t, lz = rz0 + mz * t;
+                if (cO->shape == CausalSolid::Sphere) return Fixed::Length(lx, ly, lz) - S.radius - O.radius;
+                if (cO->shape == CausalSolid::Box)
+                {
+                    O.UnrotateVector(lx, ly, lz);
+                    return Planes::BoxDistance(cO->hx, cO->hy, cO->hz, lx, ly, lz) - S.radius;
+                }
+                return lx * px + ly * py + lz * pz - S.radius;
+            };
+            // The last moment before `closed` at which they are still apart.
+            auto first = [&](Fixed closed) {
+                Fixed open = zero;
+                for (int i = 0; i < 24; ++i)
+                {
+                    const Fixed mid = (open + closed) * Fixed::Half();
+                    if (gap(mid).IsPositive()) open = mid; else closed = mid;
+                }
+                return open;
+            };
+            const Fixed g0 = gap(zero), g1 = gap(one);
+            if (g0 > slack)
+            {
+                if (!g1.IsPositive()) cut = first(one);
+                else if (!(g0 + g1 > moved))
+                {
+                    // Apart at both ends, and near enough to have met between
+                    // (a gap closes no faster than the two move): toward where
+                    // it is least, until it has closed or cannot.
+                    Fixed a = zero, b = one;
+                    for (int i = 0; i < 32 && cut == one; ++i)
+                    {
+                        const Fixed third = (b - a) / Fixed::FromInt(3);
+                        const Fixed m1 = a + third, m2 = b - third;
+                        const Fixed h1 = gap(m1), h2 = gap(m2);
+                        if (!h1.IsPositive())      cut = first(m1);
+                        else if (!h2.IsPositive()) cut = first(m2);
+                        else if (h1 < h2) b = m2; else a = m1;
+                    }
+                }
+            }
+            else if (g1 < g0 - slack) cut = zero;
+        }
+        auto put = [&](Fixed t) {
+            S.PlaceAt(sx0 + (sx1 - sx0) * t, sy0 + (sy1 - sy0) * t, sz0 + (sz1 - sz0) * t);
+            O.PlaceAt(ox0 + (ox1 - ox0) * t, oy0 + (oy1 - oy0) * t, oz0 + (oz1 - oz0) * t);
+        };
+        if (cut < one) put(cut);
         SolidContact c;
         if (cO->shape == CausalSolid::Sphere)
             c = Planes::SphereSphere(S.x, S.y, S.z, S.radius, O.x, O.y, O.z, O.radius, slack);
@@ -800,13 +974,15 @@ private:
             O.RotateVector(ux, uy, uz);
             c = Planes::SphereHalfSpace(Plane::FromPointNormal(O.x, O.y, O.z, ux, uy, uz), S.x, S.y, S.z, S.radius, slack);
         }
-        if (!c.touching) return;
-
         const Fixed mS = kS->MassUnder(), mO = kO->MassUnder();
         const Fixed iS = cS->anchored || !mS.IsPositive() ? Fixed::Zero() : Fixed::One() / mS;
         const Fixed iO = cO->anchored || !mO.IsPositive() ? Fixed::Zero() : Fixed::One() / mO;
         const Fixed isum = iS + iO;
-        if (!isum.IsPositive()) return;
+        if (!c.touching || !isum.IsPositive())
+        {
+            if (cut < one) put(one);   // nothing to settle: where the step left them
+            return;
+        }
 
         // Apart.
         if (c.depth.IsPositive())
@@ -888,6 +1064,17 @@ private:
         if (gn.raw < 0 && after < landing && !cS->anchored) kS->SupportUnder(true, c.nx, c.ny, c.nz);
         if (gn.IsPositive() && after < landing && !cO->anchored && cO->shape == CausalSolid::Sphere)
             kO->SupportUnder(true, -c.nx, -c.ny, -c.nz);
+        // What is left of the step, from where it was cut: each pegged there
+        // (a later pair of this pass reads the smear from it), then moved by
+        // the motion the contact left it.
+        if (cut < one)
+        {
+            const Fixed rest = (one - cut) * dt;
+            kS->RepegUnder(S.x, S.y, S.z);
+            kO->RepegUnder(O.x, O.y, O.z);
+            if (iS.IsPositive()) { S.Velocity(mS, vSx, vSy, vSz); S.AdvanceBy(vSx, vSy, vSz, rest); }
+            if (iO.IsPositive()) { O.Velocity(mO, vOx, vOy, vOz); O.AdvanceBy(vOx, vOy, vOz, rest); }
+        }
     }
 
     /*
@@ -963,7 +1150,10 @@ private:
         ::std::vector<::std::pair<uint32_t, uint32_t>> out;
         Tree tree{ 3, cloud, nanoflann::KDTreeSingleIndexAdaptorParams(16, nanoflann::KDTreeSingleIndexAdaptorFlags::SkipInitialBuildIndex) };
 
-        const ::std::vector<::std::pair<uint32_t, uint32_t>>& pairs(const ::std::vector<Causal_*>& kids)
+        // `sweeps`: how far the step moved each member (contactsLocked), when
+        // any solid moved -- its reach is as much longer, twice over, as the
+        // swept gate allows it.
+        const ::std::vector<::std::pair<uint32_t, uint32_t>>& pairs(const ::std::vector<Causal_*>& kids, const ::std::vector<Fixed>* sweeps = nullptr)
         {
             const size_t n = kids.size();
             cloud.xyz.resize(n * 3);
@@ -972,7 +1162,7 @@ private:
             {
                 const OrderVector& a = kids[i]->Order4();
                 cloud.xyz[i * 3] = a.x.ToDouble(); cloud.xyz[i * 3 + 1] = a.y.ToDouble(); cloud.xyz[i * 3 + 2] = a.z.ToDouble();
-                reach[i] = a.radius.ToDouble();
+                reach[i] = a.radius.ToDouble() + (sweeps ? 2.0 * (*sweeps)[i].ToDouble() : 0.0);
             }
             tree.buildIndex();
             out.clear();
@@ -1055,6 +1245,11 @@ private:
     Fixed       m_step_dt;      // the span of this space's last step (Relational Apply)
     Fixed       m_gx, m_gy, m_gz;   // the stated field (SetGravity), when m_gravity_set
     bool        m_gravity_set = false;
+    Fixed       m_light;            // the stated speed of light (SetLightSpeed), when m_light_set
+    bool        m_light_set = false;
+    // Where this body was when the interaction in hand began (PegUnder):
+    // transient, set again by every interaction before it is read.
+    Fixed       m_peg_x, m_peg_y, m_peg_z;
     CausalSolid m_solid;        // the step's copy of "solid" (shape Off: not solid)
     bool        m_anchored = false;   // "anchored"
     CausalSolid::Shape m_shape = CausalSolid::Off;
@@ -1065,6 +1260,7 @@ private:
     Fixed       m_snx, m_sny, m_snz;
     ::std::atomic<bool> m_moving{ false };   // Moving(): written under the lock, read by observers
     ::std::vector<CausalSolid> m_solids;                      // contactsLocked's per-pass copy
+    ::std::vector<Fixed>       m_sweeps;                      // and how far each solid's step moved it
     ::std::vector<::std::pair<uint32_t, uint32_t>> m_solid_pairs;
     uint64_t    m_ticks = 0;
     ::std::recursive_mutex m_tree_mtx;   // the tree's, when this is its top (TreeMutex)

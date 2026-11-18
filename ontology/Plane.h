@@ -222,6 +222,18 @@ namespace Planes
         return c;
     }
 
+    // How far a point is from a box of half extents h about the origin:
+    // outside, to the nearest point of it; inside, minus how far in from the
+    // nearest face. Along a straight path this never dips twice (the box is
+    // convex), which is what lets a first touch be searched for.
+    inline Fixed BoxDistance(Fixed hx, Fixed hy, Fixed hz, Fixed cx, Fixed cy, Fixed cz)
+    {
+        const Fixed ox = cx.Abs() - hx, oy = cy.Abs() - hy, oz = cz.Abs() - hz;   // out past each pair of faces
+        if (ox.raw <= 0 && oy.raw <= 0 && oz.raw <= 0) return Fixed::Max(ox, Fixed::Max(oy, oz));
+        const Fixed z = Fixed::Zero();
+        return Fixed::Length(Fixed::Max(ox, z), Fixed::Max(oy, z), Fixed::Max(oz, z));
+    }
+
     // Two spheres: the normal from b's centre to a's.
     inline SolidContact SphereSphere(Fixed ax, Fixed ay, Fixed az, Fixed ar,
                                      Fixed bx, Fixed by, Fixed bz, Fixed br, Fixed slack)

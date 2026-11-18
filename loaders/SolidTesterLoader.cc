@@ -33,10 +33,20 @@
 //   9. A HOLE. A ball rolled over a gap in an anchored green drops through
 //      into the cup below -- a container with its own space and its own
 //      floor -- is taken into it by fit, and rests on the cup's floor.
+//  10. THE SMEAR (§14). A contact is found on the segment a step moves a
+//      body along, not where the step leaves it: a ball whose step would
+//      carry it through a thin wall, or the ground, meets it; it turns at
+//      the face, or the edge, it met, at the angle it met it, and what is
+//      left of the step is on the way out. Two free balls that cross inside
+//      a step meet. The same rows pair by pair and through the kd-tree.
+//  11. THE SPEED OF LIGHT. A space states the fastest anything in it moves:
+//      a body pushed past it moves at it and keeps the rest as heat; a room
+//      inside inherits it or states its own; 65536 where none is stated.
 //
 //   ./Run_SolidTesterLoader
 //
 #include "../ETCS.h"
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <vector>
@@ -412,6 +422,170 @@ int main()
         check(b->getParent() == cup && b->Speed() == 0.0 && std::fabs(wy - (-1.7 + 0.2)) < 0.01,
               "and rests on the cup's own floor, in the cup");
         check(ledgerHolds(w, F(2)), "the ledger, across the move");
+    }
+
+    // -- 10. the smear ----------------------------------------------------------
+    {
+        std::cout << "\n-- 10. the smear --\n";
+        const Fixed big = F(0.1);                       // a long frame: the ball moves 1.2 a step
+        auto thin = [&](Body* in, double x, double y, double z, double w, double h, double d) {
+            Body* f = in->addTag<Body>();
+            f->Box(w, h, d);
+            f->Place(x, y, z);
+            f->SetSolid(F(1.0), F(0.0));
+            f->SetAnchored(true);
+            return f;
+        };
+        auto golf = [&](Body* in, double x, double y, double z) { Body* b = ball(in, x, y, z, 1.0, 0.0); b->Ball(0.15); return b; };
+        auto vel = [](Body* b, double v[3]) { Fixed x, y, z; b->Order4().Velocity(b->mass, x, y, z); v[0] = x.ToDouble(); v[1] = y.ToDouble(); v[2] = z.ToDouble(); };
+        double v[3];
+        {
+            // Straight at a wall 0.3 thick, twelve units a second: the second
+            // step would end 0.4 past it. It meets the near face 0.5 into
+            // that step and the other 0.7 of it comes back.
+            Body* w = arena.allocate<Body>();
+            thin(w, 0, 0, 0, 0.3, 4, 4);
+            Body* b = golf(w, -2, 0, 0);
+            b->Impulse(F(1), F(0), F(0), F(72));
+            w->Run(2, big);
+            vel(b, v);
+            std::printf("        (at the wall: x %.4f, vx %.3f)\n", b->X(), v[0]);
+            check(std::fabs(b->X() + 1.0) < 0.002 && std::fabs(v[0] + 12.0) < 0.01,
+                  "a ball whose step would carry it through a thin wall meets the wall, and what is left of the step comes back");
+            check(ledgerHolds(w, F(72)), "...the energy exact");
+        }
+        {
+            // Down at a green half a unit thick, the field on: it stays above
+            // it, bounces lower, and comes to rest on it.
+            Body* w = world(arena);
+            Body* green = thin(w, 0, -0.25, 0, 8, 0.5, 8);
+            green->SetSolid(F(0.3), F(0.1));
+            Body* b = golf(w, 0, 0.6, 0);
+            b->SetSolid(F(0.45), F(0.1));
+            b->Impulse(F(0), F(-1), F(0), F(72));
+            double lowest = b->Y();
+            for (int i = 0; i < 80; ++i) { w->Run(1, big); lowest = std::min(lowest, b->Y()); }
+            std::printf("        (at the green: lowest y %.4f, at rest at y %.4f, speed %.4f)\n", lowest, b->Y(), b->Speed());
+            check(lowest > 0.148, "a ball driven down at the ground faster than the ground is thick does not pass through it");
+            check(std::fabs(b->Y() - 0.15) < 0.002 && b->Speed() == 0.0, "...and comes to rest on it");
+        }
+        {
+            // At 45 degrees: the step would end inside the wall. It turns at
+            // the face -- the angle out is the angle in -- and ends where the
+            // mirror of the step's end is, not pushed out to the face.
+            Body* w = arena.allocate<Body>();
+            thin(w, 0, 0, 0, 0.3, 4, 8);
+            Body* b = golf(w, -1.0, 0, 0);
+            const double c = std::sqrt(0.5);
+            b->Impulse(F(c), F(0), F(c), F(72));
+            w->Run(1, big);
+            vel(b, v);
+            std::printf("        (off the wall at 45: at %.4f %.4f, velocity %.3f %.3f)\n", b->X(), b->Z(), v[0], v[2]);
+            check(std::fabs(v[0] + 12 * c) < 0.01 && std::fabs(v[2] - 12 * c) < 0.01, "a ball that meets a wall at an angle leaves it at that angle");
+            check(std::fabs(b->X() - (-0.3 - (1.2 * c - 0.7))) < 0.002 && std::fabs(b->Z() - 1.2 * c) < 0.002,
+                  "...from where it met it: the rest of the step is on the way out");
+        }
+        {
+            // At a box's upright edge, along the diagonal: the step ends
+            // inside the box. The edge sends it straight back.
+            Body* w = arena.allocate<Body>();
+            thin(w, 0, 0, 0, 2, 2, 2);
+            Body* b = golf(w, -3, 0, -3);
+            const double c = std::sqrt(0.5);
+            b->Impulse(F(c), F(0), F(c), F(72));
+            w->Run(3, big);
+            vel(b, v);
+            const double met = -1.0 - 0.15 * c, back = 3.6 - (3.0 + met) / c;   // where its middle is at the edge; how far it has come back
+            std::printf("        (off the edge: at %.4f %.4f, velocity %.3f %.3f)\n", b->X(), b->Z(), v[0], v[2]);
+            check(std::fabs(v[0] + 12 * c) < 0.02 && std::fabs(v[2] + 12 * c) < 0.02 && std::fabs(b->X() - (met - back * c)) < 0.005
+                  && std::fabs(b->Z() - (met - back * c)) < 0.005,
+                  "a ball that meets a box's edge inside a step turns on the edge, not on the face its step ended nearest");
+        }
+        {
+            // Two free balls, one fast enough to end a step on the other's
+            // middle and the next beyond it.
+            Body* w = arena.allocate<Body>();
+            Body* a = ball(w, -3, 0, 0, 1.0, 0.0);
+            Body* c = ball(w,  3, 0, 0, 1.0, 0.0);
+            a->Impulse(F(1), F(0), F(0), F(450));   // 30 a second: 3 a step
+            w->Run(2, big);
+            std::printf("        (two balls: the first at x %.4f, speed %.3f; the second at x %.4f, vx %.3f)\n", a->X(), a->Speed(), c->X(), c->Vx());
+            check(std::fabs(a->X() - 2.0) < 0.002 && a->Speed() < 0.01 && std::fabs(c->X() - 4.0) < 0.002 && std::fabs(c->Vx() - 30.0) < 0.01,
+                  "two free balls that cross inside a step meet where they touch, and the struck one has the rest of the step");
+            check(ledgerHolds(w, F(450)), "...the energy exact");
+        }
+        {
+            // The same rows, pair by pair and through the kd-tree, with balls
+            // fast enough to cross each other and the floor inside a step.
+            const size_t kFrom = CausalBase<Body>::BroadphaseFrom();
+            auto crowd = [&](size_t from) {
+                CausalBase<Body>::BroadphaseFrom() = from;
+                Body* w = world(arena);
+                floorBox(w, 0, 40, 0.5, 0.4);
+                thin(w, 9, 2, 0, 0.3, 4, 30);
+                for (int i = 0; i < 40; ++i)
+                {
+                    Body* b = ball(w, (i % 8) * 1.3 - 5, 1 + (i / 8) * 1.2, ((i * 7) % 5) - 2.0, 0.5, 0.4);
+                    b->Ball(0.2);
+                    b->Impulse(F((i % 3) - 0.5), F(-0.3), F(((i * 5) % 3) - 1.0), F(40 + 20 * (i % 4)));
+                }
+                double lowest = 9;
+                for (int t = 0; t < 120; ++t)
+                {
+                    w->Run(1, F(0.05));
+                    for (Causal_* c : *w->causalChildren()) if (c->Solid().shape == CausalSolid::Sphere) lowest = std::min(lowest, c->Order4().y.ToDouble());
+                }
+                return std::make_pair(w->CausalHash(), lowest);
+            };
+            const auto pairwise = crowd(100000), tree = crowd(16), again = crowd(16);
+            CausalBase<Body>::BroadphaseFrom() = kFrom;
+            std::printf("        (a fast crowd: the lowest any ball got, y %.4f)\n", tree.second);
+            check(pairwise.first == tree.first && tree.first == again.first, "a fast crowd: the same rows pair by pair, through the kd-tree, and twice");
+            check(tree.second > 0.19, "...and none of it through the floor");
+        }
+    }
+
+    // -- 11. the speed of light --------------------------------------------------
+    {
+        std::cout << "\n-- 11. the speed of light --\n";
+        auto vx = [](Body* b) { return b->Vx(); };
+        // A space that states 16: under it nothing changes; over it the body
+        // is slowed to it, and what it lost of its motion is still its energy.
+        Body* w = arena.allocate<Body>();
+        w->SetLightSpeed(F(16));
+        Body* slow = ball(w, 0, 0, 0, 1.0, 0.0);
+        Body* fast = ball(w, 0, 0, 10, 1.0, 0.0);
+        slow->Impulse(F(1), F(0), F(0), F(72));    // 12 a second
+        fast->Impulse(F(1), F(0), F(0), F(800));   // 40 a second, asked for
+        w->Run(1, F(0.1));
+        std::printf("        (in a space of 16: 12 asked, %.3f; 40 asked, %.3f, moved %.3f in a tenth, energy %.1f)\n",
+                    vx(slow), vx(fast), fast->X(), fast->Order4().energy.ToDouble());
+        check(std::fabs(vx(slow) - 12.0) < 1e-6 && std::fabs(slow->X() - 1.2) < 1e-6, "a space states its speed of light: a body under it is left as it was");
+        check(std::fabs(vx(fast) - 16.0) < 1e-4 && std::fabs(fast->X() - 1.6) < 1e-4, "...one pushed past it moves at it, no further in a step than light goes");
+        check(fast->Order4().energy == F(800) && ledgerHolds(w, F(872)), "...and what it lost of its motion it keeps as heat: the ledger holds");
+        // Inherited down the tree, a pocket's own whatever its container's, and taken back.
+        Body* room = w->addTag<Body>();
+        room->SetSpace(F(50));
+        Body* in = ball(room, 0, 0, 0, 1.0, 0.0);
+        in->Impulse(F(0), F(0), F(1), F(800));
+        w->Run(1, F(0.1));
+        const double inherited = in->Speed();
+        room->SetLightSpeed(F(32));
+        in->Impulse(F(0), F(0), F(1), F(800));
+        w->Run(1, F(0.1));
+        const double pocket = in->Speed();
+        room->InheritLightSpeed();
+        w->Run(1, F(0.1));
+        std::printf("        (in a room in it: %.3f; the room stating 32: %.3f; taken back: %.3f)\n", inherited, pocket, in->Speed());
+        check(std::fabs(inherited - 16.0) < 1e-4, "a room that states none passes on the one it is in");
+        check(std::fabs(pocket - 32.0) < 1e-4 && std::fabs(in->Speed() - 16.0) < 1e-4, "a room stating its own has its own, and taken back it inherits again");
+        // Where nothing states one: 65536 a second.
+        Body* open = arena.allocate<Body>();
+        Body* far = ball(open, 0, 0, 0, 1.0, 0.0);
+        far->Impulse(F(1), F(0), F(0), F(500000));   // 1000 a second
+        open->Run(1, F(0.016));
+        check(open->LightUnder() == Fixed::FromInt(65536) && std::fabs(vx(far) - 1000.0) < 1e-3,
+              "where no space states one it is 65536 a second: a thousand a second is not near it");
     }
 
     std::printf("\n%s (%d failure%s)\n", g_fail ? "FAILED" : "PASSED", g_fail, g_fail == 1 ? "" : "s");

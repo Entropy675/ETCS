@@ -104,6 +104,11 @@
  */
 struct CausalStream;   // a tree's own order, below the family
 
+// The speed of light where no space states one: 2^16 units a second, far
+// enough off that a scene only meets it by approaching it on purpose. A power
+// of two: a multiple of it is a shift.
+inline Fixed DefaultLightSpeed() { return Fixed::FromInt(int64_t(1) << 16); }
+
 struct CausalSolid
 {
     enum Shape : uint8_t { Off = 0, Sphere = 1, Box = 2, HalfSpace = 3 };
@@ -184,6 +189,10 @@ public:
     // (null: no field anywhere above). The work it does is counted there.
     virtual Causal_* FieldUnder(Fixed& gx, Fixed& gy, Fixed& gz) = 0;
     virtual void CountFieldWorkUnder(Fixed joules) = 0;
+    // The speed of light in this space: the fastest anything inside it moves
+    // (CausalBase::SetLightSpeed) -- stated here, else the container's, else
+    // DefaultLightSpeed at the open boundary.
+    virtual Fixed LightUnder() = 0;
     // What this body is when it touches another solid (CausalSolid).
     virtual CausalSolid Solid() = 0;
     // The closeness check: this environment's members whose reach comes
@@ -221,6 +230,13 @@ public:
     virtual OrderVector& RowsUnder() = 0;
     virtual Fixed MassUnder() = 0;
     virtual void SupportUnder(bool resting, Fixed nx, Fixed ny, Fixed nz) = 0;
+    // THE PEG: where this body was when the interaction in hand began, in its
+    // container's frame. From it to where the step put the body is its smear
+    // (etcs_causal_constraints.md §14), which is what a solid contact is
+    // found on; a contact that cuts the smear pegs the body again where it
+    // was cut, so what is left of the smear starts there.
+    virtual void PegUnder(Fixed& x, Fixed& y, Fixed& z) = 0;
+    virtual void RepegUnder(Fixed x, Fixed y, Fixed z) = 0;
     // The field as a relation (Causal is Relational: every space is a law for
     // what is in it). FieldOnUnder is the space's half: resolve the field
     // (FieldUnder), hand it to the member, count the work where it is stated.
