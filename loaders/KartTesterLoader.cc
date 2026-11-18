@@ -8,6 +8,10 @@
 // that guest (what a link's name does), the host judges both, and both guests
 // follow the host's record. What is held to account:
 //
+//   0. THE MAPS. Each hand-made one is sound (KartArena::Faults): what is on
+//      it can be reached and does what it shows. A map with a fault is told
+//      so. (A map from a seed is held to the same over many seeds by
+//      KartMapsTesterLoader.)
 //   1. THE LOBBY. Three drivers, three karts, each at the spawn furthest from
 //      the others, facing the middle, whole and unarmed -- and parked: W moves
 //      nobody, and a guest sets nothing.
@@ -155,6 +159,11 @@ int main(int, char**)
     ETCS::Entity* g2 = battle[2];
     check(verb(host, "KartBattle.Maps") == "bowl\npillars\ncrossroads\nhills\nskatepark\nrandom\n",
           "the arena has its six maps, in order");
+    {
+        const std::string faults = verb(host, "KartBattle.Faults");
+        if (faults != "none") std::printf("%s\n", faults.c_str());
+        check(faults == "none", "...each of the hand-made ones sound: what is on it can be reached and used");
+    }
     // A seventh, of this test's own, the same on every runtime: three lanes
     // to the middle. The host's has a spring and then a deck in the air;
     // g1's a pit with a ramp out of its far side; g2's a deck to drive under.
@@ -170,6 +179,11 @@ int main(int, char**)
         verb(b, "KartBattle.AddSpawn", "0, 24");
         verb(b, "KartBattle.AddSpawn", "24, 0");
         verb(b, "KartBattle.AddPickup", "0, -8.5");
+    }
+    {
+        const std::string faults = verb(host, "KartBattle.Faults");
+        std::printf("        (%s)\n", faults.c_str());
+        check(faults == "course: pit 0 15: a spawn at its edge", "...and a map with a spawn put at a pit's edge is told so");
     }
 
     // The record and a proposals ledger per guest, wired as the page wires
