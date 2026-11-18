@@ -39,12 +39,12 @@
  * this loader's own chain -- its key, proven at the handshake; the key it was
  * built by (ETCS_BUILDER_KEY); a certificate of its registration; the root it
  * was built with. A module signed by another loader's key with nothing above
- * it meets nothing, and is the case refused by default. What meets only below
- * the root -- this loader's own, its builder's -- runs LOCAL: no transport
- * bridges it (MirrorBuffer::localFrame). What reaches the root is the global
- * surface. With ACE's root built in, a loader is in the GUILD; with none, it is
- * EXPERIMENTAL, everything it runs is local, and nothing places its epoch among
- * anyone else's.
+ * it meets nothing, and is the case refused by default. In the GUILD -- ACE's
+ * root built in -- what meets only below the root (this loader's own, its
+ * builder's) runs LOCAL: no transport bridges it (MirrorBuffer::localFrame).
+ * What reaches the root is the global surface. With no root a loader is
+ * EXPERIMENTAL: there is no global surface to keep anything off, so nothing it
+ * runs is held local, and nothing places its epoch among anyone else's.
  *
  * AS TLS IS HERE (NetworkProvider): the identity is the config -- built once
  * per session, read-only after, what every stage was set up against. Proving
@@ -422,7 +422,7 @@ struct SignatureStage : Stage
             return refuse(io, "signed by another loader's key, and nothing above it");
         }
         if (top_role != sig::Role::Root && !sig::may_issue(at, top_role)) return refuse(io, "chain is broken");
-        f.local = (zero(id->root) || top != id->root) ? 1 : 0;
+        f.local = (!zero(id->root) && top != id->root) ? 1 : 0;
         if (L.has_pass)
         {
             sig::PassOff p;

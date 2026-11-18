@@ -18,8 +18,9 @@
 //      passed itself off is a beginning, which only an experimental epoch takes.
 //      A module meets this loader's chain or runs nowhere: signed by another
 //      loader's key with nothing above it, it is refused. What meets below
-//      the root -- this loader's own, its builder's -- runs local, in the
-//      guild too; a loader built by a key takes that key's with no keystore.
+//      the root -- this loader's own, its builder's -- runs local in the
+//      guild, and nothing is held local with no root; a loader built by a key
+//      takes that key's with no keystore.
 //   4. ACE'S HALF: joined only under a root built in, only for this key; three
 //      keys under one active key each do their own work and no other's; a
 //      session that does not attest signs its local half alone, and leaves
@@ -382,10 +383,10 @@ int main(int, char**)
               "and another loader's, with nothing above it, runs in neither epoch");
         mine.root = sig::Key{};
         tr::Identity built; built.builder = pub2;
-        check(ok_as("Probe", o1, E, built, nullptr, &local) && local,
-              "a loader built by that key takes it, with no key or keystore of its own, as local");
+        check(ok_as("Probe", o1, E, built, nullptr, &local) && !local,
+              "a loader built by that key takes it, with no key or keystore of its own; with no root, nothing is held local");
         built.root = rooted.root;
-        check(ok_as("Probe", o1, E, built, nullptr, &local) && local, "in the guild too");
+        check(ok_as("Probe", o1, E, built, nullptr, &local) && local, "in the guild, as local");
 
         // The lineage: this loader passes off the next, and says so.
         std::string line;

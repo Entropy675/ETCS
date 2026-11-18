@@ -837,11 +837,13 @@ A loader trusts what was compiled into it: the root, and the key of the loader t
 handshake. Those keys, and the certificates of its registration, are **its chain**, and a module
 runs only if its own chain meets it, at any length. A module signed by another loader's key with
 nothing above it meets nothing, and is the case refused by default. What meets below the root —
-this loader's own build, its builder's — runs **local**: no transport bridges its entities
-(`MirrorBuffer::localFrame`). What reaches the root is the **global surface**: the marketplace's
-modules, and a registered loader's, on any loader that holds the same root. With ACE's root built
-in a loader is in the **guild**; with none it is **experimental**, everything it runs is local, and
-nothing places its epoch among anyone else's — which is what the expanding multiplayer needs. A
+this loader's own build, its builder's — runs **local** in the guild: no transport bridges its
+entities (`MirrorBuffer::localFrame`). What reaches the root is the **global surface**: the
+marketplace's modules, and a registered loader's, on any loader that holds the same root. With
+ACE's root built in a loader is in the **guild**; with none it is **experimental**: there is no
+global surface to keep anything off, so nothing it runs is held local and its links work as they
+always have — but nothing places its epoch among anyone else's, which is what the expanding
+multiplayer needs. A
 builder's key compiled in is also what lets a loader run with no keystore at all: `ace bundle` puts
 `bin/etcs` and a few modules on a machine with nothing else, and they load.
 
