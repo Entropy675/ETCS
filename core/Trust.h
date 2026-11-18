@@ -39,6 +39,7 @@
  */
 
 #include "Signature.h"
+#include "AceRoot.h"
 #include "Provenance.h"
 #include "Keystore.h"
 #include "InterfaceWire.h"
@@ -82,13 +83,6 @@ namespace trust
 {
 namespace mc = ::etcs_monocypher;
 
-// Set by the root ceremony. Zero is no root: nothing chains to it.
-inline const sig::Key& ace_root()
-{
-    static const sig::Key k{};
-    return k;
-}
-
 inline bool zero(const sig::Key& k)
 {
     for (uint8_t c : k) if (c) return false;
@@ -119,6 +113,26 @@ inline bool unhex(const std::string& s, uint8_t* out, size_t n)
         out[i] = uint8_t(hi << 4 | lo);
     }
     return true;
+}
+
+/*
+ * THE ROOT, built in: the super-root's public key, pinned in ACE-Build-Tools
+ * and generated into core/AceRoot.h -- a core header, so the root is in the
+ * epoch. It is what a downloaded loader holds before it holds anything else:
+ * every chain it takes ends here, its own binary's first.
+ *
+ * Zero is no root, and a loader then works under its store's (configuring).
+ * What follows takes the root as `built_in`, this by default, so either state
+ * can be held to account from a loader built in the other.
+ */
+inline const sig::Key& ace_root()
+{
+    static const sig::Key k = [] {
+        sig::Key r{};
+        if (!unhex(ETCS_ACE_ROOT_KEY, r.data(), r.size())) r = sig::Key{};
+        return r;
+    }();
+    return k;
 }
 
 inline bool read_file(const std::string& path, std::vector<uint8_t>& out)
@@ -501,7 +515,8 @@ inline bool verify(const std::string& name, const uint8_t* b, size_t n, const si
  * root, made here, so the whole path runs before ACE registers anyone: root
  * and intermediate are generated, certify, and are wiped; only their
  * certificates stay. Once ace_root() is set, a chain not ending there is no
- * registration and the loader asks ACE instead (not built).
+ * registration: one is injected (install_registration), and a loader with
+ * none signs nothing but still takes what the marketplace signed.
  */
 inline bool random_bytes(uint8_t* out, size_t n)
 {
@@ -568,9 +583,9 @@ inline bool load_public(const std::string& dir, sig::Key& pub)
     return read_hex_file(dir + "/loader.sign.pub", pub.data(), pub.size());
 }
 
-inline bool load_root(const std::string& dir, sig::Key& root)
+inline bool load_root(const std::string& dir, sig::Key& root, const sig::Key& built_in = ace_root())
 {
-    if (!zero(ace_root())) { root = ace_root(); return true; }
+    if (!zero(built_in)) { root = built_in; return true; }
     return read_hex_file(dir + "/root.pub", root.data(), root.size());
 }
 
@@ -641,12 +656,11 @@ inline bool temporary_registration(const std::string& dir, const sig::Key& pub,
 }
 
 /*
- * This loader's key and registration, made on first use. `secret` is wiped by
- * the caller. A pub file that disagrees with the keystore's key is a refusal,
- * not something to overwrite.
+ * This loader's key, made on first use. `secret` is wiped by the caller. A pub
+ * file that disagrees with the keystore's key is a refusal, not something to
+ * overwrite. The key comes before any registration: it is what gets registered.
  */
-inline bool identity(const std::string& dir, uint8_t secret[64], sig::Key& pub,
-                     std::vector<sig::Certificate>& reg, std::string& why)
+inline bool loader_key(const std::string& dir, uint8_t secret[64], sig::Key& pub, std::string& why)
 {
     if (!make_dirs(dir)) { why = "cannot create " + dir; return false; }
     uint8_t seed[32];
@@ -659,14 +673,27 @@ inline bool identity(const std::string& dir, uint8_t secret[64], sig::Key& pub,
     }
     else if (!write_public(dir + "/loader.sign.pub", hex(pub.data(), 32) + "\n"))
     { mc::crypto_wipe(secret, 64); why = "cannot write " + dir + "/loader.sign.pub"; return false; }
+    return true;
+}
 
+// The key and its registration: what a signer needs. Only a temporary root
+// registers on first use; under ACE's the registration is injected.
+inline bool identity(const std::string& dir, uint8_t secret[64], sig::Key& pub,
+                     std::vector<sig::Certificate>& reg, std::string& why, const sig::Key& built_in = ace_root())
+{
+    if (!loader_key(dir, secret, pub, why)) return false;
     std::vector<uint8_t> raw;
     sig::Key root{};
     if (read_file(dir + "/loader.chain", raw) && sig::decode_chain(raw.data(), raw.size(), reg)
-        && load_root(dir, root) && registration_valid(reg, pub, root))
+        && load_root(dir, root, built_in) && registration_valid(reg, pub, root))
         return true;
-    if (!zero(ace_root()))
-    { mc::crypto_wipe(secret, 64); why = "this loader is not registered with ACE"; return false; }
+    reg.clear();
+    if (!zero(built_in))
+    {
+        mc::crypto_wipe(secret, 64);
+        why = "this loader's key is not registered under ACE's root (etcs --loader-key, then etcs --registration)";
+        return false;
+    }
     if (!temporary_registration(dir, pub, reg, why)) { mc::crypto_wipe(secret, 64); return false; }
     return true;
 }
@@ -696,18 +723,18 @@ inline bool read_certificates(const std::string& path, std::vector<sig::Certific
     return true;
 }
 
-inline bool install_registration(const std::string& dir, const std::vector<sig::Certificate>& reg, std::string& why)
+inline bool install_registration(const std::string& dir, const std::vector<sig::Certificate>& reg, std::string& why,
+                                 const sig::Key& built_in = ace_root())
 {
     uint8_t secret[64];
     sig::Key pub{};
-    std::vector<sig::Certificate> had;
-    if (!identity(dir, secret, pub, had, why)) return false;              // the key must be this loader's to register
+    if (!loader_key(dir, secret, pub, why)) return false;                 // the key must be this loader's to register
     mc::crypto_wipe(secret, 64);
     if (reg.empty() || reg.back().role != sig::Role::Root) { why = "the chain does not end at a root certificate"; return false; }
     const sig::Key root = reg.back().subject;
     if (!registration_valid(reg, pub, root)) { why = "not a registration of this loader's key"; return false; }
-    if (!zero(ace_root()) && root != ace_root()) { why = "the chain's root is not ACE's"; return false; }
-    if (zero(ace_root()) && !write_public(dir + "/root.pub", hex(root.data(), 32) + "\n"))
+    if (!zero(built_in) && root != built_in) { why = "the chain's root is not ACE's"; return false; }
+    if (zero(built_in) && !write_public(dir + "/root.pub", hex(root.data(), 32) + "\n"))
     { why = "cannot write " + dir + "/root.pub"; return false; }
     if (!write_public(dir + "/loader.chain", sig::encode_chain(reg))) { why = "cannot write " + dir + "/loader.chain"; return false; }
     return true;
@@ -838,10 +865,11 @@ inline bool own_binary(std::string& name, std::vector<uint8_t>& bytes)
  * `prove` false reads the claim only -- enough to recognise a chain as
  * already there, which is all a build with nothing to sign needs.
  */
-inline std::shared_ptr<const Identity> establish(const std::string& dir, bool prove = true)
+inline std::shared_ptr<const Identity> establish(const std::string& dir, bool prove = true,
+                                                 const sig::Key& built_in = ace_root())
 {
     auto id = std::make_shared<Identity>();
-    id->root = ace_root();
+    id->root = built_in;
     id->temporary = zero(id->root);
 #if defined(ETCS_TEMP_ROOT_KEY)
     if (id->temporary) unhex(ETCS_TRUST_STR(ETCS_TEMP_ROOT_KEY), id->root.data(), id->root.size());
@@ -854,31 +882,39 @@ inline std::shared_ptr<const Identity> establish(const std::string& dir, bool pr
     if (!id->proven) id->unproven = "this page was built without a loader key";
     id->unattested = "a browser loader is what its page serves; it does not attest itself";
 #else
-    if (id->temporary) load_root(dir, id->root);
-    if (!load_public(dir, id->pub)) { id->unproven = "this store has no loader key yet"; return id; }
-    std::vector<uint8_t> raw;
-    if (!read_file(dir + "/loader.chain", raw) || !sig::decode_chain(raw.data(), raw.size(), id->reg)
-        || !registration_valid(id->reg, id->pub, id->root))
-        id->reg.clear();
-    if (!id->reg.empty()) id->role = id->reg[0].role;
-    if (!prove) return id;
-    std::string text, why;
-    uint8_t seed[32], secret[64];
-    sig::Key held{};
-    const keystore::Status st = keystore::load(dir, "loader-key", text, why);
-    if (st == keystore::Status::Ok && unhex(text, seed, 32))
+    if (id->temporary) load_root(dir, id->root, built_in);
+    if (!load_public(dir, id->pub)) id->unproven = "this store has no loader key yet";
+    else
     {
-        mc::crypto_ed25519_key_pair(secret, held.data(), seed);
-        mc::crypto_wipe(secret, 64);
-        id->proven = held == id->pub;
-        if (!id->proven) id->unproven = "the keystore's key is not loader.sign.pub's";
+        std::vector<uint8_t> raw;
+        if (!read_file(dir + "/loader.chain", raw) || !sig::decode_chain(raw.data(), raw.size(), id->reg)
+            || !registration_valid(id->reg, id->pub, id->root))
+            id->reg.clear();
+        if (!id->reg.empty()) id->role = id->reg[0].role;
     }
-    else id->unproven = st == keystore::Status::Absent ? "the keystore holds no key for this store"
-                      : st == keystore::Status::Ok     ? "the keystore's loader-key is not a key" : why;
-    if (!text.empty()) mc::crypto_wipe(&text[0], text.size());
+    if (!prove) return id;
+    if (id->unproven.empty())
+    {
+        std::string text, why;
+        uint8_t seed[32], secret[64];
+        sig::Key held{};
+        const keystore::Status st = keystore::load(dir, "loader-key", text, why);
+        if (st == keystore::Status::Ok && unhex(text, seed, 32))
+        {
+            mc::crypto_ed25519_key_pair(secret, held.data(), seed);
+            mc::crypto_wipe(secret, 64);
+            id->proven = held == id->pub;
+            if (!id->proven) id->unproven = "the keystore's key is not loader.sign.pub's";
+        }
+        else id->unproven = st == keystore::Status::Absent ? "the keystore holds no key for this store"
+                          : st == keystore::Status::Ok     ? "the keystore's loader-key is not a key" : why;
+        if (!text.empty()) mc::crypto_wipe(&text[0], text.size());
+    }
 
     // The loader attests itself: its own bytes through its own two stages,
     // as the identity just established. Nothing else will check this binary.
+    // Under ACE's root this asks nothing of the store -- a loader just
+    // downloaded attests by the root it was built with.
     std::vector<LineageEdge> edges;
     std::vector<uint8_t> me;
     std::string w;
@@ -919,7 +955,7 @@ Entity* gate_entity();
  */
 inline int sign_module(const std::string& dir, const std::string& name, const std::string& file,
                        const sig::Epoch& epoch, const std::string& out, std::string& why,
-                       LineageEdge* edge = nullptr)
+                       LineageEdge* edge = nullptr, const sig::Key& built_in = ace_root())
 {
     std::vector<uint8_t> b;
     std::string chain;
@@ -931,14 +967,14 @@ inline int sign_module(const std::string& dir, const std::string& name, const st
         Gate seen;
         LoadFrame probe = f;
         std::string ignored;
-        seen.use(establish(dir, false));
+        seen.use(establish(dir, false, built_in));
         if (seen.wrap(probe, ignored) && probe.already) return 3;
     }
     uint8_t secret[64];
     sig::Key pub{};
     std::vector<sig::Certificate> reg;
-    if (!identity(dir, secret, pub, reg, why)) return 2;          // makes the key and a registration on first use
-    const std::shared_ptr<const Identity> id = establish(dir);
+    if (!identity(dir, secret, pub, reg, why, built_in)) return 2;      // makes the key on first use
+    const std::shared_ptr<const Identity> id = establish(dir, true, built_in);
     Gate g;
     g.use(id);
     g.signature.signer = [&secret](const uint8_t* m, size_t n, uint8_t* sig64) { mc::crypto_ed25519_sign(sig64, secret, m, n); };
@@ -972,10 +1008,11 @@ inline int sign_module(const std::string& dir, const std::string& name, const st
  * and a loader signing its own bytes is an edge only where there is none yet.
  */
 inline int succeed(const std::string& dir, const std::string& name, const std::string& file,
-                   const sig::Epoch& epoch, const std::string& out, std::string& why, std::string* line_out = nullptr)
+                   const sig::Epoch& epoch, const std::string& out, std::string& why, std::string* line_out = nullptr,
+                   const sig::Key& built_in = ace_root())
 {
     LineageEdge e;
-    const int rc = sign_module(dir, name, file, epoch, out, why, &e);
+    const int rc = sign_module(dir, name, file, epoch, out, why, &e, built_in);
     if (rc != 0) return rc;
     std::vector<LineageEdge> had;
     std::string w;
@@ -1094,8 +1131,8 @@ inline bool open_verified(const std::string& name, const std::string& file, Open
  *   etcs --succeed <name> <file> <epoch hex> <out>  the same, for the next loader binary: adds the lineage edge
  *   etcs --registration <cert>...                   install a registration issued elsewhere, leaf first
  *   etcs --attest                                   what this loader says of itself; 0 only if it attests
- *   etcs --loader-key                               public key; made, and registered, on first use
- *   etcs --root                                     the root this loader's registration ends at
+ *   etcs --loader-key                               public key, made on first use (and registered, under a temporary root)
+ *   etcs --root                                     the root: ACE's if built in, else this store's
  *   etcs --epoch                                    this loader's epoch
  *
  * -1 when argv names none of these.
@@ -1114,11 +1151,17 @@ inline int cli(int argc, char** argv)
     if ((verb == "--loader-key" || verb == "--root") && argc == 2)
     {
         uint8_t secret[64];
-        sig::Key pub{}, root{};
+        sig::Key pub{}, root = ace_root();
         std::vector<sig::Certificate> reg;
-        if (!identity(dir, secret, pub, reg, why))
-        { std::fprintf(stderr, "etcs: %s\n", why.c_str()); return 2; }
-        mc::crypto_wipe(secret, 64);
+        // Under ACE's root neither answer waits on a registration: the root is
+        // built in, and the key is asked for in order to be registered.
+        const bool built_in = !zero(root);
+        if (!(built_in && verb == "--root"))
+        {
+            if (!(built_in ? loader_key(dir, secret, pub, why) : identity(dir, secret, pub, reg, why)))
+            { std::fprintf(stderr, "etcs: %s\n", why.c_str()); return 2; }
+            mc::crypto_wipe(secret, 64);
+        }
         if (verb == "--root" && !load_root(dir, root)) { std::fprintf(stderr, "etcs: no root\n"); return 2; }
         const sig::Key& k = verb == "--root" ? root : pub;
         std::printf("%s\n", hex(k.data(), 32).c_str());
@@ -1150,9 +1193,11 @@ inline int cli(int argc, char** argv)
     {
         const std::shared_ptr<const Identity> id = establish(dir);
         std::printf("binary    %s %s\n", id->self_name.c_str(), hex(id->self.data(), 32).c_str());
-        std::printf("key       %s (%s%s)\n", hex(id->pub.data(), 32).c_str(), sig::role_name(id->role),
-                    id->proven ? ", proven" : ", not proven");
-        std::printf("root      %s (%s)\n", hex(id->root.data(), 32).c_str(), id->temporary ? "temporary" : "ACE");
+        if (zero(id->pub)) std::printf("key       none in this store\n");
+        else std::printf("key       %s (%s%s)\n", hex(id->pub.data(), 32).c_str(), sig::role_name(id->role),
+                         id->reg.empty() ? ", not registered" : id->proven ? ", proven" : ", not proven");
+        std::printf("root      %s (%s)\n", hex(id->root.data(), 32).c_str(),
+                    id->temporary ? "this store's, configuring" : "ACE, built in");
         std::printf("attested  %s%s%s\n", id->attested ? "yes" : "no", id->attested ? "" : ": ",
                     id->attested ? "" : id->unattested.c_str());
         if (!id->proven) std::printf("unproven  %s\n", id->unproven.c_str());
