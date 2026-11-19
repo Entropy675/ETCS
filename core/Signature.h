@@ -14,7 +14,7 @@
  *
  *   cert   "ETCSCRT1" | role u8 | subject[32] | issuer[32] | n u16le | epoch[32] x n | signature[64]
  *   chain  "ETCSCHN1" | n u8 | cert x n, leaf first
- *   pass   "ETCSGEN1" | parent[32] | child[32] | from[32] | to[32] | root[32] | attested u8 | key[32] | signature[64]
+ *   pass   "ETCSGEN1" | parent[32] | child[32] | from[32] | to[32] | head[32] | attested u8 | key[32] | signature[64]
  *
  * The signature is Ed25519 (RFC 8032) by the issuer over everything before it,
  * magic included -- the magic is the domain separation. A root's own
@@ -33,9 +33,11 @@ using Epoch = std::array<uint8_t, 32>;
 /*
  * A CHAIN IS TWO HALVES joined at a loader's key. ACE's half is a tree: the
  * root certifies the active key, and the active key the keys that share it as
- * parent -- one per loader that acts for ACE (the build server's, the release
- * machine's, the site's registrar). The local half is a loader's own key and
- * what it signs. A registrar's certificate for a loader's key is the join.
+ * parent -- one per loader that acts for ACE (the minting server's, the site's
+ * registrar). The local half is a loader's own key and what it signs. A
+ * registrar's certificate for a loader's key is the join. Release stays in the
+ * table and is held by no one: the minting server's marketplace key signs
+ * loader binaries as well as modules.
  *
  * Who may certify whom is the table below, and nothing else: a key holds one
  * role, and two roles are two keys under one parent.
@@ -43,7 +45,7 @@ using Epoch = std::array<uint8_t, 32>;
  * ROOTS ATTEST EACH OTHER THE SAME WAY: a root certifying another root's key
  * continues the chain past it, as a registration continues a loader's key into
  * ACE's half. What carries the continuation is taken by a loader built with
- * either root -- it meets one or the other.
+ * an identity folded from either root along it (core/Trust.h).
  */
 enum class Role : uint8_t
 {
@@ -177,7 +179,7 @@ inline bool decode_chain(const void* p, size_t len, std::vector<Certificate>& ch
 
 /*
  * A GENERATION PASSED OFF: the loader binary `parent`, running in `from` under
- * `root`, hands its place to the binary `child`, signed for `to`, with `key` --
+ * the identity `head` (core/Trust.h), hands its place to the binary `child`, signed for `to`, with `key` --
  * the key that signs the child's leaf. `attested` is whether the parent
  * attested itself when it did. It rides in the child's signature section after
  * the chain, so the child carries the one fragment its parent could sign for;
@@ -191,7 +193,7 @@ struct PassOff
 {
     Key     parent{}, child{};
     Epoch   from{}, to{};
-    Key     root{};
+    Key     head{};
     bool    attested = false;
     Key     key{};
     uint8_t signature[kSigBytes] = {};
@@ -200,7 +202,7 @@ struct PassOff
 inline std::string signed_part(const PassOff& p)
 {
     std::string out(kPassMagic, sizeof kPassMagic);
-    for (const auto* k : { &p.parent, &p.child, &p.from, &p.to, &p.root })
+    for (const auto* k : { &p.parent, &p.child, &p.from, &p.to, &p.head })
         out.append(reinterpret_cast<const char*>(k->data()), k->size());
     out += static_cast<char>(p.attested ? 1 : 0);
     out.append(reinterpret_cast<const char*>(p.key.data()), p.key.size());
@@ -219,7 +221,7 @@ inline bool decode(const void* q, size_t len, PassOff& p)
     const uint8_t* b = static_cast<const uint8_t*>(q);
     if (!b || len != kPassBytes || std::memcmp(b, kPassMagic, sizeof kPassMagic) != 0 || b[8 + 32 * 5] > 1) return false;
     size_t at = sizeof kPassMagic;
-    for (auto* k : { &p.parent, &p.child, &p.from, &p.to, &p.root }) { std::memcpy(k->data(), b + at, 32); at += 32; }
+    for (auto* k : { &p.parent, &p.child, &p.from, &p.to, &p.head }) { std::memcpy(k->data(), b + at, 32); at += 32; }
     p.attested = b[at++] == 1;
     std::memcpy(p.key.data(), b + at, 32); at += 32;
     std::memcpy(p.signature, b + at, kSigBytes);
@@ -245,15 +247,17 @@ inline std::string registration_statement(const Key& loader, const Key& registra
 /*
  * THE SITE'S LIST OF WHAT IT SERVES (core/Trust.h publish, survey):
  *
- *   etcs-dist 1 epoch=<hex>
+ *   etcs-dist 2 epoch=<hex> kernel=<ETCS_Kernel_v...>
  *   <name> <file> <digest hex> <epoch hex>[,<epoch hex>...]
  *   ...
  *   etcs-dist-sig <signer's chain, hex> <signature hex>
  *
  * The signature is the marketplace's, over "ETCSDST1" and every byte before
- * the last line.
+ * the last line. `kernel` is the ABI's version the list was published under
+ * (BASE_SOURCE_STRING, core/ETCS_API.h): the order lists come in. A loader
+ * takes no list older than the newest it has taken, or than itself.
  */
-constexpr char kDistMagic[] = "etcs-dist 1 ";
+constexpr char kDistMagic[] = "etcs-dist 2 ";
 constexpr char kDistSig[]   = "etcs-dist-sig ";
 
 /*

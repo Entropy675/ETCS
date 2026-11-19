@@ -478,7 +478,7 @@ int main(int, char**)
             std::vector<sig::Certificate> reg;
             chained = chained && tr::read_certificates(pub_dir + "/" + roles[i], reg)
                       && tr::read_certificates(pub_dir + "/active.cert", reg) && tr::read_certificates(pub_dir + "/root.cert", reg)
-                      && reg.size() == 3 && tr::registration_valid(reg, role_keys[i], reg[2].subject);
+                      && reg.size() == 3 && tr::registration_valid(reg, role_keys[i]);
             if (chained) root_pub = reg[2].subject;
         }
         check(chained, "the public directory holds the three-step chain: each role's key <- active <- root");
@@ -540,7 +540,7 @@ int main(int, char**)
         std::vector<sig::Certificate> reg;
         check(certified && tr::read_certificates(pub2 + "/registrar.cert", reg)
               && tr::read_certificates(pub_dir + "/active.cert", reg) && tr::read_certificates(pub_dir + "/root.cert", reg)
-              && tr::registration_valid(reg, later, root_pub),
+              && tr::registration_valid(reg, later) && reg.back().subject == root_pub,
               "certify.etcs: three custodians rebuild the active key, which certifies one more key under the same root");
         auto gone3 = [&](const char* name, const char* tag) {
             if (c3.names.count(name)) verb(ETCS::etcs_resolve_rid_anywhere(&ETCS::getLoader(), c3.names[name].rid), std::string(tag) + ".Delete");
@@ -736,8 +736,8 @@ int main(int, char**)
               "it leaves marketplace, release and registrar certificates under one active key, and the root's");
         for (int i = 0; read && shaped && i < 3; ++i)
         {
-            valid = valid && tr::registration_valid(reg[i], keys[i], reg[i][2].subject);
-            crossed = crossed || tr::registration_valid(reg[i], keys[(i + 1) % 3], reg[i][2].subject);
+            valid = valid && tr::registration_valid(reg[i], keys[i]);
+            crossed = crossed || tr::registration_valid(reg[i], keys[(i + 1) % 3]);
         }
         check(read && shaped && valid && !crossed,
               "each is a registration of its own loader's key and of no other, as the loader will check it");
@@ -792,7 +792,7 @@ int main(int, char**)
         check(tr::parse_certificates(answer, chain) && chain.size() == 4 && chain[0].role == sig::Role::Loader
               && chain[0].subject == loader && chain[1].role == sig::Role::Registrar,
               "a loader's signed ask gets a Loader certificate and the chain above it");
-        check(!chain.empty() && tr::registration_valid(chain, loader, root),
+        check(!chain.empty() && tr::registration_valid(chain, loader) && chain.back().subject == root,
               "which the loader takes as its registration under that root");
         check(pki && route(pki, path) == answer, "the same ask gets the same answer");
         std::string bad = path;

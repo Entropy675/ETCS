@@ -19,7 +19,13 @@ bin/
 # from pinned sources; byte-identical on every machine, hashed into the epoch.
 core/AirtyMacros_Generated.h
 libs/monocypher.h
+# Retired generated headers ace removes; ignored until it has.
 core/AceIdentity.h
+core/AceRoot.h
+# The version script with the kernel's version on its node (ace_manifest.py).
+.ace_exports_kernel.map
 # What the site serves at /dist (ace publish) and the certificates above its registrar.
 dist/
 pki/
+# What ace mint signed, for ace publish.
+minted/

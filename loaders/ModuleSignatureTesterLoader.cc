@@ -15,25 +15,27 @@
 //      second sign is a no-op, a new epoch is carried; a second store is a
 //      second loader. A loader binary it signs is passed off: the pass-off
 //      names parent and child, and the child attests on that loader; one that
-//      passed itself off is a beginning, which only an experimental epoch takes.
-//      A module meets this loader's chain or runs nowhere: signed by another
-//      loader's key with nothing above it, it is refused. What meets below
-//      the root -- this loader's own, its builder's -- runs local in the
-//      guild, and nothing is held local with no root; a loader built by a key
-//      takes that key's with no keystore.
-//   4. ACE'S HALF: joined only under a root built in, only for this key; three
-//      keys under one active key each do their own work and no other's; a
-//      session that does not attest signs its local half alone, and leaves
-//      what carries ACE's half as it is; a release key signs a loader binary
-//      regardless, which is where a guild's lineage begins, and the build
-//      after it is passed off by it; a loader passed off by itself, by one that
-//      did not attest, or under another root, does not attest; a registrar
-//      certifies a developer's key, whose builds then carry both halves, reach
-//      the root, and run on any loader of the guild; a download with an empty
-//      store takes the marketplace's modules and attests a release. A store
+//      passed itself off is a beginning, taken with no identity built in or
+//      under its own key's, not under a minted one. A module meets this
+//      loader's chain or runs nowhere: signed by another loader's key with
+//      nothing above it, it is refused. What meets only this loader's own keys
+//      runs local under an identity, and nothing is held local with none; a
+//      loader built by a key, or whose identity is that key's, takes it with no
+//      keystore.
+//   4. THE IDENTITY: a store's is the fold along its registration to its key;
+//      three keys under one active key each do their own work and no other's;
+//      a session that does not attest signs its local half alone, and leaves
+//      what carries its half as it is; the marketplace mints a loader binary
+//      regardless, which is where a lineage under its identity begins, and a
+//      builder's next build is passed off by the minted loader; a loader passed
+//      off by itself, by one that did not attest, or under another identity,
+//      does not attest; a release key mints nothing; a registrar certifies a
+//      developer's key, whose builds run global on its own identity and on
+//      the root's, local on the marketplace's; a download with an empty store
+//      takes the marketplace's modules and attests what it minted. A store
 //      joins under another root through that root's attestation of its own,
-//      and what it signs is global under both. And the table itself, on
-//      certificates alone, roots attesting roots among it.
+//      and what it signs is global on the identities folded from either. And
+//      the table itself, on certificates alone, roots attesting roots among it.
 //   5. SEALED: what is checked is a memfd nothing can write; the file on disk
 //      changing afterwards changes nothing loaded.
 //   6. THE LOADER REFUSES: a signed module under another name, and the same
@@ -43,14 +45,14 @@
 //      handed every load first; refusing, the module does not attach; passing,
 //      the loader's own stages still decide.
 //   8. THE SITE: only the marketplace publishes, and its list names only what
-//      a download would take; a list changed, or under another root, is not
+//      a download would take; a list changed, or of another identity, is not
 //      believed; what is behind is fetched, what is the developer's is not;
 //      only the listed bytes are put in place. And a module's ask of this
 //      loader (TrustEvent) is answered on its ordering thread.
 //   9. WITNESSES: two builds that agree are witnessed by the loader among
 //      them, and only then; statements agree into a consensus only from
 //      distinct witnesses, unaltered, in one epoch, at the quorum, each root
-//      its own group; a directory is checked against it.
+//      directory its own group; a directory is checked against it.
 //
 //   ./Run_ModuleSignatureTesterLoader
 
@@ -165,7 +167,7 @@ static std::vector<uint8_t> pe_signed(std::vector<uint8_t> p, const std::string&
 }
 
 // What `who` signs with `secret`: the gate, wrapped, for a session that is
-// not this binary's -- attested under a root this binary was not built with.
+// not this binary's -- attested under an identity this binary was not built with.
 // "already" when the bytes carry it; empty when refused.
 static std::string sign_as(const tr::Identity& who, const uint8_t* secret, const std::string& name,
                            const std::vector<uint8_t>& b, const sig::Epoch& e, bool kernel, std::string* why = nullptr)
@@ -194,6 +196,14 @@ static bool pass_of(const std::vector<uint8_t>& b, sig::PassOff& p)
 {
     sig::Layout L; std::string w;
     return sig::layout(b.data(), b.size(), L, w) && L.has_pass && sig::decode(b.data() + L.pass.at, L.pass.len, p);
+}
+
+// The identity folded along these keys, from the top.
+static sig::Key head_of(std::initializer_list<std::pair<sig::Role, sig::Key>> steps)
+{
+    sig::Key h = tr::fold_start();
+    for (const auto& st : steps) h = tr::fold(h, st.first, st.second);
+    return h;
 }
 
 struct Keys { uint8_t secret[64]; sig::Key pub; };
@@ -288,19 +298,20 @@ int main(int, char**)
               "the same bytes under another name are refused");
         check(!ok_as("ChessProvider", chess, other, A, &why) && why == "not witnessed under this epoch",
               "another epoch is refused");
-        tr::Identity other_root = A; other_root.root[0] ^= 0x01; other_root.reg.clear();   // as establish leaves it
+        tr::Identity other_head = A; other_head.head[0] ^= 0x01; other_head.reg.clear();   // as establish leaves it
         {
             bool local = false;
-            check(ok_as("ChessProvider", chess, E, other_root, nullptr, &local) && local,
-                  "this loader's own build runs under another root too, and runs local: it meets at this loader's key");
+            check(ok_as("ChessProvider", chess, E, other_head, nullptr, &local) && local,
+                  "this loader's own build runs under another identity too, and runs local: it meets at this loader's key");
         }
         tr::Identity not_me = A; not_me.pub[0] ^= 0x01; not_me.builder = sig::Key{};
         tr::Identity unproven = A; unproven.proven = false; unproven.unproven = "no keystore"; unproven.builder = sig::Key{};
         if (A.role == sig::Role::Marketplace && !A.reg.empty())
             check(ok_as("ChessProvider", chess, E, not_me) && ok_as("ChessProvider", chess, E, unproven),
-                  "the marketplace signed it: any loader under the root takes it, with or without a key");
+                  "the marketplace signed it: any loader of its identity takes it, with or without a key");
         else
         {
+            not_me.head = unproven.head = sig::Key{};
             check(!ok_as("ChessProvider", chess, E, not_me, &why) && why == "signed by another loader's key, and nothing above it",
                   "a loader that is not this one refuses it: another loader's key, nothing above it");
             check(!ok_as("ChessProvider", chess, E, unproven, &why)
@@ -309,6 +320,10 @@ int main(int, char**)
             tr::Identity built = unproven; built.builder = A.pub;
             check(A.builder == A.pub && ok_as("ChessProvider", chess, E, built),
                   "unless the key is the one this loader was built by: compiled in, it needs no proof");
+            tr::Identity of_it; of_it.head = head_of({ { sig::Role::Loader, A.pub } });
+            bool local = true;
+            check(A.reg.empty() && ok_as("ChessProvider", chess, E, of_it, nullptr, &local) && !local,
+                  "or whose identity is that key's alone: there it is global, with no key at all");
         }
     }
 
@@ -320,7 +335,7 @@ int main(int, char**)
     namespace ks = ETCS::keystore;
     std::string held, kwhy;
     {
-        const sig::Key cfg{};                       // no root built in, whatever this binary has
+        const sig::Key cfg{};                       // no identity built in, whatever this binary has
         auto sign_cfg = [&](const std::string& st, const char* name, const std::string& file, const sig::Epoch& e,
                             const std::string& out) { return tr::sign_module(st, name, file, e, out, why, nullptr, cfg); };
         const ks::Status k0 = ks::load(store, "loader-key", held, kwhy);
@@ -377,18 +392,21 @@ int main(int, char**)
         check(pub2 != pub && ok_as("Probe", o1, E, theirs), "its module runs on it");
         check(!ok_as("Probe", o1, E, mine, &why) && why == "signed by another loader's key, and nothing above it",
               "and not on a loader that is not it");
-        tr::Identity rooted = theirs; rooted.root = fresh_key().pub;
+        tr::Identity headed = theirs; headed.head = fresh_key().pub;
         bool local = false;
-        check(ok_as("Probe", o1, E, rooted, nullptr, &local) && local,
-              "with a root built in, its own local half still runs on it, marked local");
-        check(!ok_as("Probe", o1, E, mine, &why) && why == "signed by another loader's key, and nothing above it" && (mine.root = rooted.root, !ok_as("Probe", o1, E, mine)),
-              "and another loader's, with nothing above it, runs in neither epoch");
-        mine.root = sig::Key{};
+        check(ok_as("Probe", o1, E, headed, nullptr, &local) && local,
+              "with an identity built in that is not its key's, its own local half still runs on it, marked local");
+        check(!ok_as("Probe", o1, E, mine, &why) && why == "signed by another loader's key, and nothing above it" && (mine.head = headed.head, !ok_as("Probe", o1, E, mine)),
+              "and another loader's, with nothing above it, runs in neither");
+        mine.head = sig::Key{};
         tr::Identity built; built.builder = pub2;
         check(ok_as("Probe", o1, E, built, nullptr, &local) && !local,
-              "a loader built by that key takes it, with no key or keystore of its own; with no root, nothing is held local");
-        built.root = rooted.root;
-        check(ok_as("Probe", o1, E, built, nullptr, &local) && local, "in the guild, as local");
+              "a loader built by that key takes it, with no key or keystore of its own; with no identity, nothing is held local");
+        built.head = headed.head;
+        check(ok_as("Probe", o1, E, built, nullptr, &local) && local, "under another identity, as local");
+        tr::Identity its; its.head = head_of({ { sig::Role::Loader, pub2 } });
+        check(ok_as("Probe", o1, E, its, nullptr, &local) && !local,
+              "and a loader whose identity is that key's alone takes it as global, with no key at all");
 
         // The lineage: this loader passes off the next, and says so.
         std::string line;
@@ -398,8 +416,8 @@ int main(int, char**)
               "signing the next loader binary records an edge");
         sig::Key child{};
         tr::digest("etcs", tw.data(), tw.size(), PL, child);
-        check(line.rfind("etcs-lineage 2 etcs root=none ", 0) == 0
-              && tr::lineage_read(store2, edges, why) && edges.size() == 1 && edges[0].child == child && tr::zero(edges[0].root)
+        check(line.rfind("etcs-lineage 3 etcs head=none ", 0) == 0
+              && tr::lineage_read(store2, edges, why) && edges.size() == 1 && edges[0].child == child && tr::zero(edges[0].head)
               && edges[0].key == pub2 && edges[0].to == E && edges[0].from == E && !edges[0].genesis
               && edges[0].parent == A.self && !edges[0].host.empty(),
               "the edge names parent, child, both epochs, the signer and the host, and verifies");
@@ -408,13 +426,13 @@ int main(int, char**)
               "the same child in the same epoch is not recorded twice");
         const auto n1 = wasm_signed(tiny_wasm(), slurp(dir + "/n1"));
         sig::PassOff po;
-        check(pass_of(n1, po) && po.parent == A.self && po.child == child && po.key == pub2 && tr::zero(po.root)
+        check(pass_of(n1, po) && po.parent == A.self && po.child == child && po.key == pub2 && tr::zero(po.head)
               && po.to == E && po.attested == tr::establish(store2, true, cfg)->attested,
-              "the child carries its pass-off: this binary -> it, under no root, by that key, attested as this session is");
+              "the child carries its pass-off: this binary -> it, under no identity, by that key, attested as this session is");
         uint8_t sk2[64]; sig::Key k2{};
         tr::loader_key(store2, sk2, k2, why);
         tr::Identity as2 = *tr::establish(store2, true, cfg);
-        as2.attested = true;                        // as a signed build of no root would be
+        as2.attested = true;                        // as a signed build of no identity would be
         const std::string a1b = sign_as(as2, sk2, "etcs", tiny_wasm(), E, true);
         const auto a1 = wasm_signed(tiny_wasm(), a1b);
         std::string kw;
@@ -434,15 +452,20 @@ int main(int, char**)
             const auto s1 = wasm_signed(tiny_wasm(), sign_as(self2, sk2, "etcs", tiny_wasm(), E, true));
             check(pass_of(s1, po) && po.parent == po.child && tr::verify("etcs", s1.data(), s1.size(), E, theirs, kw, true),
                   "a loader binary that passed itself off is a beginning, and an experimental epoch takes it");
-            self2.root = fresh_key().pub;
-            tr::Identity guild = theirs; guild.root = self2.root;
+            self2.head = head_of({ { sig::Role::Loader, pub2 } });
+            tr::Identity own = theirs; own.head = self2.head;
+            const auto s3 = wasm_signed(tiny_wasm(), sign_as(self2, sk2, "etcs", tiny_wasm(), E, true));
+            check(tr::verify("etcs", s3.data(), s3.size(), E, own, kw, true),
+                  "and so does a loader whose identity is its own key's: nothing above it to begin from");
+            self2.head = fresh_key().pub;
+            tr::Identity minted = theirs; minted.head = self2.head;
             const auto s2 = wasm_signed(tiny_wasm(), sign_as(self2, sk2, "etcs", tiny_wasm(), E, true));
-            check(!tr::verify("etcs", s2.data(), s2.size(), E, guild, kw, true)
-                  && kw == "it passed itself off: in the guild a lineage begins at a release",
-                  "the guild does not: there a lineage begins at a release");
-            check(!tr::verify("etcs", n1.data(), n1.size(), E, guild, kw, true)
-                  && kw == "passed off under another root: a loader enters the guild from a release",
-                  "and a binary passed off in an experimental epoch does not attest in the guild");
+            check(!tr::verify("etcs", s2.data(), s2.size(), E, minted, kw, true)
+                  && kw == "it passed itself off: under a minted identity a lineage begins at a mint",
+                  "a minted identity does not: there a lineage begins at a mint");
+            check(!tr::verify("etcs", n1.data(), n1.size(), E, minted, kw, true)
+                  && kw == "passed off under another identity: a loader enters an identity from a mint",
+                  "and a binary passed off under no identity does not attest under one");
             mc::crypto_wipe(sk2, 64);
         }
         {
@@ -493,10 +516,10 @@ int main(int, char**)
               "erase is the only way a key goes");
     }
 
-    // -- 4. ACE's half: the join, one role per key, and the table ------------------------
-    std::cout << "-- 4. ACE's half --\n";
+    // -- 4. the identity: the join, one role per key, minting, and the table ------------
+    std::cout << "-- 4. identity --\n";
     {
-        const Keys sroot = fresh_key(), active = fresh_key(), stray = fresh_key();
+        const Keys sroot = fresh_key(), active = fresh_key();
         const sig::Key R = sroot.pub;
         const std::string mstore = dir + "/marketplace", rstore = dir + "/release",
                           gstore = dir + "/registrar", dstore = dir + "/developer";
@@ -509,37 +532,38 @@ int main(int, char**)
         const sig::Key mk = key_of(mstore), rk = key_of(rstore), gk = key_of(gstore), dk = key_of(dstore);
         const auto ic = issue(sroot, sig::Role::Intermediate, active.pub, {});
         const auto rc = issue(sroot, sig::Role::Root, R, {});
-        auto join = [&](const std::string& st, const std::vector<sig::Certificate>& reg, const sig::Key& root) {
-            return tr::install_registration(st, reg, why, root);
+        auto join = [&](const std::string& st, const std::vector<sig::Certificate>& reg) {
+            return tr::install_registration(st, reg, why);
         };
+        auto identity_of = [&](const std::string& st) { sig::Key h{}; tr::store_identity(st, h, why); return h; };
 
-        check(!join(mstore, { issue(active, sig::Role::Marketplace, mk, {}), ic, rc }, sig::Key{})
-              && why.rfind("no root is built into this loader", 0) == 0,
-              "with no root built in, there is no half to join");
-        check(!join(mstore, { issue(active, sig::Role::Marketplace, rk, {}), ic, rc }, R)
+        check(identity_of(dstore) == head_of({ { sig::Role::Loader, dk } }),
+              "an unregistered store's identity is its key's alone");
+        check(!join(mstore, { issue(active, sig::Role::Marketplace, rk, {}), ic, rc })
               && why == "not a registration of this loader's key", "a registration for another loader's key is not installed");
-        check(!join(mstore, { issue(active, sig::Role::Marketplace, mk, {}), ic }, R)
+        check(!join(mstore, { issue(active, sig::Role::Marketplace, mk, {}), ic })
               && why == "the chain does not end at a root certificate", "nor one that does not end at a root");
-        check(!join(mstore, { issue(stray, sig::Role::Marketplace, mk, {}), issue(stray, sig::Role::Root, stray.pub, {}) }, R)
-              && why == "the chain's root is not ACE's", "nor one under any other root");
-        check(!join(dstore, { issue(active, sig::Role::Loader, dk, {}), ic, rc }, R)
+        check(!join(dstore, { issue(active, sig::Role::Loader, dk, {}), ic, rc })
               && why == "not a registration of this loader's key", "the active key certifies no loader: a registrar does");
 
-        check(join(mstore, { issue(active, sig::Role::Marketplace, mk, {}), ic, rc }, R)
-              && join(rstore, { issue(active, sig::Role::Release, rk, {}), ic, rc }, R)
-              && join(gstore, { issue(active, sig::Role::Registrar, gk, {}), ic, rc }, R),
-              "three loaders' keys sharing one active key are joined, one role each");
-        const auto M = tr::establish(mstore, true, R), Rl = tr::establish(rstore, true, R), G = tr::establish(gstore, true, R);
+        check(join(mstore, { issue(active, sig::Role::Marketplace, mk, {}), ic, rc })
+              && join(rstore, { issue(active, sig::Role::Release, rk, {}), ic, rc })
+              && join(gstore, { issue(active, sig::Role::Registrar, gk, {}), ic, rc }),
+              "three loaders' keys sharing one active key are joined, one role each, under any root");
+        const sig::Key MI = head_of({ { sig::Role::Root, R }, { sig::Role::Intermediate, active.pub }, { sig::Role::Marketplace, mk } });
+        check(identity_of(mstore) == MI, "the marketplace's identity is the fold root -> active -> its key: what the minting server builds with");
+        check(identity_of(rstore) != MI && identity_of(gstore) != MI, "each key's is its own");
+        const auto M = tr::establish(mstore, true, MI), Rl = tr::establish(rstore, true, MI), G = tr::establish(gstore, true, MI);
         check(M->role == sig::Role::Marketplace && Rl->role == sig::Role::Release && G->role == sig::Role::Registrar
-              && M->proven && Rl->proven && G->proven && M->root == R,
-              "each session is its role's, under the built-in root");
-        check(!M->attested && !Rl->attested && !G->attested, "none attests: this binary is no signed build of this root");
+              && M->proven && Rl->proven && G->proven && M->head == MI,
+              "each session is its role's, under the identity built in");
+        check(!M->attested && !Rl->attested && !G->attested, "none attests: this binary is no build of this identity");
         // The same sessions, as they are once a signed build runs them.
         struct Session { tr::Identity id; uint8_t secret[64]; };
-        auto attested = [&](const std::string& st) {
+        auto attested = [&](const std::string& st, const sig::Key& head) {
             Session ss; sig::Key k{};
             tr::loader_key(st, ss.secret, k, why);
-            ss.id = *tr::establish(st, true, R);
+            ss.id = *tr::establish(st, true, head);
             ss.id.attested = true; ss.id.unattested.clear();
             return ss;
         };
@@ -547,66 +571,82 @@ int main(int, char**)
         write_bytes(dir + "/Mod.wasm", tiny_wasm());
         {
             std::vector<sig::Certificate> u;
-            const std::string ub = (tr::sign_module(dstore, "Probe", dir + "/Mod.wasm", E, dir + "/u1", why, nullptr, R) == 0)
+            const std::string ub = (tr::sign_module(dstore, "Probe", dir + "/Mod.wasm", E, dir + "/u1", why, nullptr, MI) == 0)
                                  ? slurp(dir + "/u1") : std::string();
             check(sig::decode_chain(ub.data(), ub.size(), u) && u.size() == 1,
-                  "in the guild an unregistered loader signs its local half: what runs local");
+                  "under a minted identity an unregistered loader signs its local half: what runs local");
         }
         {
             std::vector<sig::Certificate> u;
-            const std::string ub = (tr::sign_module(mstore, "Probe", dir + "/Mod.wasm", E, dir + "/u2", why, nullptr, R) == 0)
+            const std::string ub = (tr::sign_module(mstore, "Probe", dir + "/Mod.wasm", E, dir + "/u2", why, nullptr, MI) == 0)
                                  ? slurp(dir + "/u2") : std::string();
             check(sig::decode_chain(ub.data(), ub.size(), u) && u.size() == 1 && why.rfind("its local half alone", 0) == 0,
-                  "a marketplace whose loader does not attest signs its local half alone, and says so");
+                  "a marketplace whose loader does not attest signs a module with its local half alone, and says so");
         }
-        Session Mt = attested(mstore);
+        Session Mt = attested(mstore, MI);
         const std::string m1b = sign_as(Mt.id, Mt.secret, "Probe", tiny_wasm(), E, false);
         const auto m1 = wasm_signed(tiny_wasm(), m1b);
         std::vector<sig::Certificate> mc1;
         check(sig::decode_chain(m1b.data(), m1b.size(), mc1) && mc1.size() == 4 && mc1[1].role == sig::Role::Marketplace,
-              "a marketplace whose loader attests signs a module with ACE's half");
-        check(tr::sign_module(rstore, "Probe", dir + "/Mod.wasm", E, dir + "/x1", why, nullptr, R) == 2
-              && why == "a release key signs loaders, not modules", "a release key signs no module");
-        check(tr::sign_module(gstore, "Probe", dir + "/Mod.wasm", E, dir + "/x2", why, nullptr, R) == 2
+              "a marketplace whose loader attests signs a module with its half");
+        check(tr::sign_module(rstore, "Probe", dir + "/Mod.wasm", E, dir + "/x1", why, nullptr, MI) == 2
+              && why == "a release key signs loaders, not modules", "a release key, which no one is given now, signs no module");
+        check(tr::sign_module(gstore, "Probe", dir + "/Mod.wasm", E, dir + "/x2", why, nullptr, MI) == 2
               && why == "a registrar certifies loaders; it signs no binary", "a registrar signs no binary");
 
+        // Minting: the marketplace signs a loader binary with its half, attested or not.
         write_bytes(dir + "/etcs", tiny_wasm());
-        check(!Rl->attested && (why.clear(), tr::succeed(rstore, "etcs", dir + "/etcs", E, dir + "/rel", why, nullptr, R)) == 0 && why.empty(),
-              "a release key signs a loader binary with its half, attested or not: a release is where a lineage begins");
-        const auto rel = wasm_signed(tiny_wasm(), slurp(dir + "/rel"));
-        const auto bare = tr::establish(dir + "/none", true, R);
+        check(!M->attested && (why.clear(), tr::succeed(mstore, "etcs", dir + "/etcs", E, dir + "/mint", why, nullptr, MI)) == 0 && why.empty(),
+              "the marketplace mints a loader binary with its half, attested or not: a mint is where a lineage begins");
+        const auto minted = wasm_signed(tiny_wasm(), slurp(dir + "/mint"));
+        const auto bare = tr::establish(dir + "/none", true, MI);
         auto as_kernel = [&](const std::vector<uint8_t>& b, const tr::Identity& who) {
             return tr::verify("etcs", b.data(), b.size(), E, who, why, true);
         };
         check(tr::zero(bare->pub) && !bare->proven && ok_as("Probe", m1, E, *bare),
-              "a download with an empty store takes the marketplace's module: the root it was built with is enough");
-        check(as_kernel(rel, *bare), "and attests a loader binary a release key signed");
-        check(!ok_as("etcs", rel, E, *bare, &why) && why == "a release key signs loaders, not modules",
-              "the same signature does not load as a module");
+              "a download with an empty store takes the marketplace's module: the identity it was built with is enough");
+        check(as_kernel(minted, *bare), "and attests a loader binary the marketplace minted");
+        tr::Identity other_mint = *bare; other_mint.head = head_of({ { sig::Role::Root, R }, { sig::Role::Intermediate, active.pub },
+                                                                    { sig::Role::Marketplace, fresh_key().pub } });
+        check(!as_kernel(minted, other_mint) && why == "does not come to this loader's identity",
+              "a loader of another marketplace's identity does not");
+        Session Rt = attested(rstore, MI);
+        const auto rel = wasm_signed(tiny_wasm(), sign_as(Rt.id, Rt.secret, "etcs", tiny_wasm(), E, true));
+        check(!as_kernel(rel, *bare) && why == "does not come to this loader's identity",
+              "a release key mints nothing: its chain does not come to the marketplace's identity");
+        tr::Identity rooted; rooted.head = head_of({ { sig::Role::Root, R } });
+        check(!as_kernel(rel, rooted) && why == "a loader binary is taken from this loader's identity, or from its own key",
+              "nor under the root's own identity, which it does come to: only a marketplace mints");
         auto next = tiny_wasm(); next.back() = 'x';
         write_bytes(dir + "/next", next);
-        check(tr::succeed(mstore, "etcs", dir + "/next", E, dir + "/mk1", why, nullptr, R) == 0,
-              "the build server's loader passes off its successor with its own key");
-        const auto mk1 = wasm_signed(next, slurp(dir + "/mk1"));
-        check(!as_kernel(mk1, *M) && why == "passed off by a loader that did not attest",
-              "which, passed off by a session that does not attest, does not attest either");
-        Session Mr = attested(mstore);
-        Mr.id.self = digest_of("etcs", rel);
-        const auto mrel = wasm_signed(next, sign_as(Mr.id, Mr.secret, "etcs", next, E, true));
-        sig::PassOff po;
-        check(pass_of(mrel, po) && po.parent == Mr.id.self && po.attested && po.root == R && as_kernel(mrel, *M),
-              "the build after a release, passed off by the release, attests on the build server");
-        check(!as_kernel(mrel, *bare) && why == "a loader binary is taken from a release key, or from this loader's own",
-              "and nowhere else");
-        Session Ms = attested(mstore);
-        Ms.id.self = digest_of("etcs", next);
-        const auto mself = wasm_signed(next, sign_as(Ms.id, Ms.secret, "etcs", next, E, true));
-        check(!as_kernel(mself, *M) && why == "it passed itself off: in the guild a lineage begins at a release",
-              "a build server that passes itself off begins nothing in the guild");
-        check(sign_as(Ms.id, Ms.secret, "etcs", mrel, E, true) == "already",
-              "and, signing the build the release passed off, leaves that pass-off as it is");
+        check(tr::succeed(mstore, "etcs", dir + "/next", E, dir + "/mk1", why, nullptr, MI) == 0
+              && as_kernel(wasm_signed(next, slurp(dir + "/mk1")), *bare),
+              "the minting server's own successor is minted the same way");
 
-        check(tr::issue(gstore, sig::Role::Loader, dk, dir + "/dev.chain", why, R) == 2
+        // A builder under the minted identity: its own key, unregistered.
+        const auto B = tr::establish(dstore, true, MI);
+        check(tr::succeed(dstore, "etcs", dir + "/next", E, dir + "/b1", why, nullptr, MI) == 0,
+              "a builder under the minted identity passes off its successor with its own key");
+        const auto b1 = wasm_signed(next, slurp(dir + "/b1"));
+        check(!as_kernel(b1, *B) && why == "passed off by a loader that did not attest",
+              "which, passed off by a session that does not attest, does not attest either");
+        Session Bm = attested(dstore, MI);
+        Bm.id.self = digest_of("etcs", minted);
+        const auto bmint = wasm_signed(next, sign_as(Bm.id, Bm.secret, "etcs", next, E, true));
+        sig::PassOff po;
+        check(pass_of(bmint, po) && po.parent == Bm.id.self && po.attested && po.head == MI && as_kernel(bmint, *B),
+              "the build after a mint, passed off by the minted loader, attests on that builder");
+        check(!as_kernel(bmint, *bare) && why == "signed by another loader's key, and nothing above it",
+              "and nowhere else");
+        Session Bs = attested(dstore, MI);
+        Bs.id.self = digest_of("etcs", next);
+        const auto bself = wasm_signed(next, sign_as(Bs.id, Bs.secret, "etcs", next, E, true));
+        check(!as_kernel(bself, *B) && why == "it passed itself off: under a minted identity a lineage begins at a mint",
+              "a builder that passes itself off begins nothing under a minted identity");
+        check(sign_as(Bs.id, Bs.secret, "etcs", bmint, E, true) == "already",
+              "and, signing the build the mint passed off, leaves that pass-off as it is");
+
+        check(tr::issue(gstore, sig::Role::Loader, dk, dir + "/dev.chain", why, MI) == 2
               && why.rfind("only a signed build certifies", 0) == 0,
               "a registrar whose loader does not attest certifies no one");
         {
@@ -618,51 +658,62 @@ int main(int, char**)
             std::ofstream(dir + "/dev.chain", std::ios::binary) << bytes;
             mc::crypto_wipe(gkeys.secret, 64);
         }
-        check(tr::issue(gstore, sig::Role::Marketplace, dk, dir + "/no.chain", why, R) == 2
+        check(tr::issue(gstore, sig::Role::Marketplace, dk, dir + "/no.chain", why, MI) == 2
               && why == "a registrar does not certify a marketplace", "and nothing but a loader");
-        check(tr::issue(mstore, sig::Role::Loader, dk, dir + "/no.chain", why, R) == 2
+        check(tr::issue(mstore, sig::Role::Loader, dk, dir + "/no.chain", why, MI) == 2
               && why == "a marketplace does not certify a loader", "a marketplace certifies no one");
         std::vector<sig::Certificate> dreg;
         check(tr::read_certificates(dir + "/dev.chain", dreg) && dreg.size() == 4 && dreg[0].role == sig::Role::Loader
-              && dreg[1].role == sig::Role::Registrar && join(dstore, dreg, R),
+              && dreg[1].role == sig::Role::Registrar && join(dstore, dreg),
               "the developer installs it: its key <- registrar <- active <- root");
-        const auto D = tr::establish(dstore, true, R);
-        check(D->role == sig::Role::Loader && D->proven && D->reg.size() == 4, "its loader is joined to ACE's half");
+        const sig::Key DI = head_of({ { sig::Role::Root, R }, { sig::Role::Intermediate, active.pub },
+                                      { sig::Role::Registrar, gk }, { sig::Role::Loader, dk } });
+        check(identity_of(dstore) == DI, "and its identity is the fold along it, down to its key");
+        const auto D = tr::establish(dstore, true, DI);
+        check(D->role == sig::Role::Loader && D->proven && D->reg.size() == 4, "its loader is joined to the half above it");
         write_bytes(dir + "/Dev.wasm", tiny_wasm());
-        Session Dt = attested(dstore);
+        Session Dt = attested(dstore, DI);
         const std::string d1b = sign_as(Dt.id, Dt.secret, "Probe", tiny_wasm(), E, false);
         check(!d1b.empty(), "its loader, attesting, signs its own build");
         const auto d1 = wasm_signed(tiny_wasm(), d1b);
         write_bytes(dir + "/Dev.wasm", d1);
-        check(tr::sign_module(dstore, "Probe", dir + "/Dev.wasm", E, dir + "/d2", why, nullptr, R) == 3,
-              "and a session of it that does not attest leaves what carries ACE's half as it is");
+        check(tr::sign_module(dstore, "Probe", dir + "/Dev.wasm", E, dir + "/d2", why, nullptr, DI) == 3,
+              "and a session of it that does not attest leaves what carries its half as it is");
         std::vector<sig::Certificate> dc;
         check(sig::decode_chain(d1b.data(), d1b.size(), dc) && dc.size() == 5 && dc[1].role == sig::Role::Loader
               && dc[2].role == sig::Role::Registrar && dc[4].role == sig::Role::Root,
               "which carries both halves: module <- its key <- registrar <- active <- root");
         bool local = true;
-        check(ok_as("Probe", d1, E, *D, nullptr, &local) && !local, "it runs there, on the global surface");
+        check(ok_as("Probe", d1, E, *D, nullptr, &local) && !local, "it runs on its own identity's loaders, on the global surface");
         local = true;
-        check(ok_as("Probe", d1, E, *M, nullptr, &local) && !local && ok_as("Probe", d1, E, *bare),
-              "and on any loader of the guild: its chain reaches the root");
+        check(ok_as("Probe", d1, E, rooted, nullptr, &local) && !local, "and on the root's: its chain comes to that head");
+        check(!ok_as("Probe", d1, E, *bare, &why) && why == "does not come to this loader's identity",
+              "but not on a download of the marketplace's: that requires the marketplace at its head");
+        local = false;
+        check(ok_as("Probe", d1, E, *M, nullptr, &local) && local,
+              "and on the minting server itself it meets that server's own half below the head: local");
 
-        // Under a built-in root, ACE's half goes on only from a signed build.
+        // Under an identity, the half goes on only from a signed build.
         auto signs = [&](const tr::Identity& who) {
             std::vector<sig::Certificate> c;
             const std::string chain = sign_as(who, Dt.secret, "Probe", tiny_wasm(), other, false);
             return sig::decode_chain(chain.data(), chain.size(), c) ? c.size() : size_t(0);
         };
         tr::Identity canon = Dt.id; canon.attested = false; canon.unattested = "no signed build passed this loader off";
-        check(signs(canon) == 1, "under a built-in root, a loader that does not attest signs its local half alone");
+        check(signs(canon) == 1, "under an identity, a loader that does not attest signs its local half alone");
         canon.attested = true;
         check(signs(canon) == 5, "and one that attests, both halves");
 
-        const auto fresh = tr::establish(dir + "/none", true, tr::zero(A.root) ? R : A.root);
+        const auto fresh = tr::establish(dir + "/none", true, tr::zero(A.head) ? MI : A.head);
         tr::Identity unbuilt = *fresh; unbuilt.builder = sig::Key{};
         std::vector<uint8_t> me;
         std::string my_name, w;
-        check(tr::own_binary(my_name, me) && !tr::verify(my_name, me.data(), me.size(), E, unbuilt, w, true),
-              "this binary, which no release key signed, attests on an empty store only by the builder compiled into it");
+        if (A.role == sig::Role::Marketplace && !A.reg.empty() && !tr::zero(A.head))
+            check(tr::own_binary(my_name, me) && tr::verify(my_name, me.data(), me.size(), E, unbuilt, w, true),
+                  "this binary, which the marketplace that built it minted, attests on an empty store of its identity");
+        else
+            check(tr::own_binary(my_name, me) && !tr::verify(my_name, me.data(), me.size(), E, unbuilt, w, true),
+                  "this binary, which no marketplace minted, attests on an empty store only by the builder compiled into it");
 
         {
             // A store joined under another root, through that root's attestation of this one.
@@ -671,26 +722,33 @@ int main(int, char**)
             const sig::Key ck = key_of(cstore);
             const auto cross = issue(root2, sig::Role::Root, R, {});
             const auto r2c   = issue(root2, sig::Role::Root, root2.pub, {});
-            check(!join(cstore, { issue(active, sig::Role::Marketplace, ck, {}), ic, rc }, root2.pub)
-                  && why == "the chain's root is not ACE's", "a registration under one root is not one under another");
-            check(join(cstore, { issue(active, sig::Role::Marketplace, ck, {}), ic, cross, r2c }, root2.pub),
-                  "but continued by the other root's attestation, it is joined there");
+            check(join(cstore, { issue(active, sig::Role::Marketplace, ck, {}), ic, cross, r2c }),
+                  "a store joins a half continued by another root's attestation");
+            const sig::Key CI = head_of({ { sig::Role::Root, root2.pub }, { sig::Role::Root, R },
+                                          { sig::Role::Intermediate, active.pub }, { sig::Role::Marketplace, ck } });
+            check(identity_of(cstore) == CI, "its identity folds from the attesting root down");
             uint8_t sk[64]; sig::Key k{};
             tr::loader_key(cstore, sk, k, why);
-            tr::Identity C = *tr::establish(cstore, true, root2.pub);
+            tr::Identity C = *tr::establish(cstore, true, CI);
             C.attested = true;
             check(C.reg.size() == 4 && C.role == sig::Role::Marketplace, "its session reads the continued half");
             const auto cm = wasm_signed(tiny_wasm(), sign_as(C, sk, "Probe", tiny_wasm(), E, false));
             mc::crypto_wipe(sk, 64);
-            tr::Identity on2; on2.root = root2.pub;
-            tr::Identity on1; on1.root = R;
+            tr::Identity on2; on2.head = CI;
+            tr::Identity on1; on1.head = head_of({ { sig::Role::Root, R }, { sig::Role::Intermediate, active.pub },
+                                                   { sig::Role::Marketplace, ck } });
+            tr::Identity onr2; onr2.head = head_of({ { sig::Role::Root, root2.pub } });
             bool lc = true;
-            check(ok_as("Probe", cm, E, on2, nullptr, &lc) && !lc, "what it signs is global on the other root's loaders");
+            check(ok_as("Probe", cm, E, on2, nullptr, &lc) && !lc, "what it signs is global on its identity's loaders");
             lc = true;
-            check(ok_as("Probe", cm, E, on1, nullptr, &lc) && !lc, "and on its own root's: the chain meets it on the way");
+            check(ok_as("Probe", cm, E, on1, nullptr, &lc) && !lc,
+                  "and on the identity folded from its own root: the fold from either root comes to it");
+            lc = true;
+            check(ok_as("Probe", cm, E, onr2, nullptr, &lc) && !lc, "and on the other root's own");
+            check(!ok_as("Probe", m1, E, onr2), "which takes nothing the continuation does not carry");
             ks::erase(cstore, "loader-key", kwhy);
         }
-        for (uint8_t* sk : { Mt.secret, Mr.secret, Ms.secret, Dt.secret }) mc::crypto_wipe(sk, 64);
+        for (uint8_t* sk : { Mt.secret, Rt.secret, Bm.secret, Bs.secret, Dt.secret }) mc::crypto_wipe(sk, 64);
         for (const std::string& st : { mstore, rstore, gstore, dstore }) ks::erase(st, "loader-key", kwhy);
         check(ks::load(dstore, "loader-key", held, kwhy) == ks::Status::Absent, "(their keys are erased)");
     }
@@ -709,18 +767,22 @@ int main(int, char**)
         const auto mcert  = issue(inter, sig::Role::Marketplace, market.pub, { E });
         const auto icert  = issue(root, sig::Role::Intermediate, inter.pub, {});
         const auto rcert  = issue(root, sig::Role::Root, root.pub, {});
-        tr::Identity ace; ace.root = root.pub; ace.proven = true;
+        tr::Identity ace; ace.head = head_of({ { sig::Role::Root, root.pub } }); ace.proven = true;
+        tr::Identity site; site.head = head_of({ { sig::Role::Root, root.pub }, { sig::Role::Intermediate, inter.pub },
+                                                 { sig::Role::Marketplace, market.pub } });
         auto as = [&](std::vector<sig::Certificate> chain) { return wasm_signed(w, sig::encode_chain(chain)); };
 
-        check(ok_as("Probe", as({ leaf, mcert, icert, rcert }), E, ace), "module <- marketplace <- intermediate <- root");
-        check(ok_as("Probe", as({ leaf, mcert, icert }), E, ace), "the root's own certificate may be left off");
-        check(!ok_as("Probe", as({ leaf, issue(root, sig::Role::Marketplace, market.pub, {}) }), E, ace, &why)
-              && why == "chain is broken"
-              && !ok_as("Probe", as({ leaf, issue(root, sig::Role::Marketplace, market.pub, {}), rcert }), E, ace),
+        check(ok_as("Probe", as({ leaf, mcert, icert, rcert }), E, ace), "module <- marketplace <- intermediate <- root, on the root's identity");
+        check(ok_as("Probe", as({ leaf, mcert, icert, rcert }), E, site), "and on the marketplace's");
+        check(ok_as("Probe", as({ leaf, mcert, icert }), E, ace) && ok_as("Probe", as({ leaf, mcert, icert }), E, site),
+              "the root's own certificate may be left off");
+        check(!ok_as("Probe", as({ leaf, issue(root, sig::Role::Marketplace, market.pub, {}) }), E, ace)
+              && !ok_as("Probe", as({ leaf, issue(root, sig::Role::Marketplace, market.pub, {}), rcert }), E, ace, &why)
+              && why == "chain is broken",
               "but the root certifies only the active key, with its certificate or without");
         check(!ok_as("Probe", as({ leaf, mcert, icert, rcert }), E, tr::Identity{}, &why)
-              && why == "signed under a root, and none is built into this loader",
-              "a loader with no root built in takes nothing from ACE's half");
+              && why == "signed under a root, and no identity is built into this loader",
+              "a loader with no identity built in takes nothing from a half");
         check(!ok_as("Probe", as({ leaf, mcert, icert, rcert }), other, ace), "not in another epoch");
 
         const auto lcert = issue(inter, sig::Role::Loader, market.pub, {});
@@ -729,9 +791,11 @@ int main(int, char**)
         const auto gcert = issue(inter, sig::Role::Registrar, reg.pub, {});
         const auto lreg  = issue(reg, sig::Role::Loader, market.pub, {});
         check(ok_as("Probe", as({ leaf, lreg, gcert, icert, rcert }), E, ace),
-              "a loader the registrar certified signs for any loader under the root");
-        check(!ok_as("Probe", as({ leaf, lreg, gcert }), E, ace, &why) && why == "does not chain to this loader's root",
-              "but a chain that stops short of anything this loader holds meets nothing");
+              "a loader the registrar certified signs for any loader of the root's identity");
+        check(!ok_as("Probe", as({ leaf, lreg, gcert, icert, rcert }), E, site, &why) && why == "does not come to this loader's identity",
+              "and for none of the marketplace's: its chain does not come to that head");
+        check(!ok_as("Probe", as({ leaf, lreg, gcert }), E, ace, &why) && why == "does not come to this loader's identity",
+              "a chain that stops short of anything this loader holds meets nothing");
         tr::Identity both = ace; both.pub = market.pub; both.proven = true;
         bool local = true;
         check(ok_as("Probe", as({ leaf }), E, both, nullptr, &local) && local,
@@ -746,12 +810,12 @@ int main(int, char**)
         const auto rb = as({ rleaf, relcert, icert, rcert });
         std::string kw;
         check(!ok_as("Probe", rb, E, ace, &why) && why == "a release key signs loaders, not modules"
-              && tr::verify("Probe", rb.data(), rb.size(), E, ace, kw, true),
-              "a release key's signature is a loader binary's, never a module's");
+              && !tr::verify("Probe", rb.data(), rb.size(), E, ace, kw, true)
+              && kw == "a loader binary is taken from this loader's identity, or from its own key",
+              "a release key's signature is no module's, and mints no loader binary");
         const auto mb = as({ leaf, mcert, icert, rcert });
-        check(!tr::verify("Probe", mb.data(), mb.size(), E, ace, kw, true)
-              && kw == "a loader binary is taken from a release key, or from this loader's own",
-              "and the marketplace's is a module's, never a loader binary's");
+        check(tr::verify("Probe", mb.data(), mb.size(), E, site, kw, true) && tr::verify("Probe", mb.data(), mb.size(), E, ace, kw, true),
+              "the marketplace's is a module's and a loader binary's alike: a mint");
 
         const auto mold = issue(inter, sig::Role::Marketplace, market.pub, { other });
         check(!ok_as("Probe", as({ leaf, mold, icert, rcert }), E, ace, &why) && why == "witness not valid in this epoch",
@@ -759,25 +823,29 @@ int main(int, char**)
         const auto ibad = issue(stranger, sig::Role::Intermediate, inter.pub, {});
         check(!ok_as("Probe", as({ leaf, mcert, ibad }), E, ace), "an intermediate the root did not certify is refused");
         check(!ok_as("Probe", as({ leaf, mcert, rcert, icert }), E, ace), "a root that is not last is refused");
-        check(!ok_as("Probe", as({ issue(root, sig::Role::Module, d, { E }) }), E, ace, &why) && why == "chain is broken",
+        check(!ok_as("Probe", as({ issue(root, sig::Role::Module, d, { E }) }), E, ace),
               "a module the root's key signed directly is refused: the root certifies only the active key");
         // Roots attest each other: a second root certifies the first, and a chain
-        // carrying that continuation meets a loader built with either root.
+        // carrying that continuation comes to an identity folded from either.
         const Keys root2 = fresh_key();
         const auto cross  = issue(root2, sig::Role::Root, root.pub, {});
         const auto r2cert = issue(root2, sig::Role::Root, root2.pub, {});
-        tr::Identity ace2; ace2.root = root2.pub; ace2.proven = true;
+        tr::Identity ace2; ace2.head = head_of({ { sig::Role::Root, root2.pub } }); ace2.proven = true;
         const auto carried = as({ leaf, mcert, icert, cross, r2cert });
         local = true;
         check(ok_as("Probe", carried, E, ace2, nullptr, &local) && !local,
-              "a chain continued by another root's attestation reaches that root: global on its loaders");
+              "a chain continued by another root's attestation comes to that root's identity: global on its loaders");
         local = true;
-        check(ok_as("Probe", carried, E, ace, nullptr, &local) && !local,
-              "and meets its own root on the way, at a shorter tail: global there too");
+        check(ok_as("Probe", carried, E, ace, nullptr, &local) && !local && ok_as("Probe", carried, E, site),
+              "and still to its own root's, and its marketplace's, folded from below the continuation");
+        tr::Identity site2; site2.head = head_of({ { sig::Role::Root, root2.pub }, { sig::Role::Root, root.pub },
+                                                   { sig::Role::Intermediate, inter.pub }, { sig::Role::Marketplace, market.pub } });
+        check(ok_as("Probe", carried, E, site2) && !ok_as("Probe", mb, E, site2),
+              "the marketplace's identity folded through the continuation takes it, and not the chain without it");
         check(ok_as("Probe", as({ leaf, mcert, icert, cross }), E, ace2), "the attesting root's own certificate may be left off");
-        check(!ok_as("Probe", as({ leaf, mcert, icert, rcert }), E, ace2, &why) && why == "does not chain to this loader's root",
+        check(!ok_as("Probe", as({ leaf, mcert, icert, rcert }), E, ace2, &why) && why == "does not come to this loader's identity",
               "without the continuation the other root's loaders take nothing");
-        tr::Identity third; third.root = fresh_key().pub;
+        tr::Identity third; third.head = head_of({ { sig::Role::Root, fresh_key().pub } });
         check(!ok_as("Probe", carried, E, third), "nor does a loader of a root that attested neither");
         check(!ok_as("Probe", as({ leaf, mcert, icert, rcert, cross, r2cert }), E, ace2, &why)
               && why == "a root's own certificate is not the last", "a root's own certificate is still the last");
@@ -869,23 +937,27 @@ int main(int, char**)
         const sig::Key mk = key_of(ms), rk = key_of(rs), dk = key_of(ds);
         const auto ic = issue(sroot, sig::Role::Intermediate, active.pub, {});
         const auto rc = issue(sroot, sig::Role::Root, R, {});
-        tr::install_registration(ms, { issue(active, sig::Role::Marketplace, mk, {}), ic, rc }, why, R);
-        tr::install_registration(rs, { issue(active, sig::Role::Release, rk, {}), ic, rc }, why, R);
+        tr::install_registration(ms, { issue(active, sig::Role::Marketplace, mk, {}), ic, rc }, why);
+        tr::install_registration(rs, { issue(active, sig::Role::Release, rk, {}), ic, rc }, why);
+        sig::Key MI{};
+        check(tr::store_identity(ms, MI, why) && MI == head_of({ { sig::Role::Root, R }, { sig::Role::Intermediate, active.pub },
+                                                                  { sig::Role::Marketplace, mk } }),
+              "the minting server's identity: what its downloads are built with");
 
-        // Two builds of one module, a release, and a developer's own build.
+        // Two builds of one module, a minted loader, and a developer's own build.
         auto variant = [](uint8_t v) { auto w = tiny_wasm(); w.back() = v; return w; };
         auto signed_by = [&](const std::string& st, const char* name, const std::vector<uint8_t>& w, bool kernel,
-                             const sig::Key& root) {
+                             const sig::Key& head) {
             write_bytes(dir + "/unsigned", w);
             const std::string out = dir + "/chain";
             std::remove(out.c_str());
-            if (kernel) tr::succeed(st, name, dir + "/unsigned", E, out, why, nullptr, root);
-            else if (tr::zero(root)) tr::sign_module(st, name, dir + "/unsigned", E, out, why, nullptr, root);
-            else                                    // as a signed build of this root would
+            if (kernel) tr::succeed(st, name, dir + "/unsigned", E, out, why, nullptr, head);
+            else if (tr::zero(head)) tr::sign_module(st, name, dir + "/unsigned", E, out, why, nullptr, head);
+            else                                    // as a signed build of this identity would
             {
                 uint8_t sk[64]; sig::Key k{};
                 tr::loader_key(st, sk, k, why);
-                tr::Identity who = *tr::establish(st, true, root);
+                tr::Identity who = *tr::establish(st, true, head);
                 who.attested = true;
                 const std::string chain = sign_as(who, sk, name, w, E, false);
                 mc::crypto_wipe(sk, 64);
@@ -893,32 +965,94 @@ int main(int, char**)
             }
             return wasm_signed(w, slurp(out));
         };
-        const auto probe_new = signed_by(ms, "Probe", variant('1'), false, R);
-        const auto probe_old = signed_by(ms, "Probe", variant('2'), false, R);
-        const auto release   = signed_by(rs, "etcs", variant('3'), true, R);
+        const auto probe_new = signed_by(ms, "Probe", variant('1'), false, MI);
+        const auto probe_old = signed_by(ms, "Probe", variant('2'), false, MI);
+        const auto minted    = signed_by(ms, "etcs", variant('3'), true, MI);
         const auto mine      = signed_by(ds, "Mine", variant('4'), false, sig::Key{});   // a developer's, experimental
         write_bytes(dist + "/Probe.wasm", probe_new);
-        write_bytes(dist + "/etcs", release);
+        write_bytes(dist + "/etcs", minted);
         write_bytes(dist + "/Mine.wasm", mine);
 
         std::string list, w2;
         std::vector<std::string> left;
-        check(!tr::publish(rs, dist, E, list, why, nullptr, R) && why == "only the marketplace publishes, and this loader is not registered as it",
+        check(!tr::publish(rs, dist, E, list, why, nullptr, MI) && why == "only the marketplace publishes, and this loader is not registered as it",
               "only the marketplace publishes");
-        check(tr::publish(ms, dist, E, list, why, &left, R) && left.size() == 1 && left[0].rfind("Mine.wasm", 0) == 0,
+        check(tr::publish(ms, dist, E, list, why, &left, MI) && left.size() == 1 && left[0].rfind("Mine.wasm", 0) == 0,
               "the marketplace publishes what a download would take, and leaves off a developer's own build");
         tr::Dist d;
-        check(tr::dist_read(list, d, why, R) && d.epoch == E && d.entries.size() == 2
+        check(tr::dist_read(list, d, why, MI) && d.epoch == E && d.entries.size() == 2
               && d.entries[0].name == "Probe" && d.entries[1].name == "etcs" && d.entries[1].file == "etcs",
-              "the list reads back: its epoch, a module and a release");
+              "the list reads back: its epoch, a module and a minted loader");
         std::string forged = list;
         forged[forged.find("Probe.wasm ") + 11] ^= 0x01;
-        check(!tr::dist_read(forged, d, w2, R) && w2 == "the list's signature does not verify", "a list changed after signing is refused");
-        check(!tr::dist_read(list, d, w2, fresh_key().pub) && w2 == "the list is not signed by a marketplace under this loader's root",
-              "a list under another root is refused");
-        check(!tr::dist_read(list, d, w2, sig::Key{}), "with no root built in, no list is believed");
+        check(!tr::dist_read(forged, d, w2, MI) && w2 == "the list's signature does not verify", "a list changed after signing is refused");
+        check(!tr::dist_read(list, d, w2, fresh_key().pub) && w2 == "the list is not signed by the marketplace of this loader's identity",
+              "a list of another identity is refused");
+        check(!tr::dist_read(list, d, w2, head_of({ { sig::Role::Root, R } })),
+              "even the root's: a list is believed of the marketplace whose identity this loader is");
+        check(!tr::dist_read(list, d, w2, sig::Key{}), "with no identity built in, no list is believed");
 
-        tr::Identity download; download.root = R;
+        // The marketplace key retired: an identity with another key at the third link.
+        {
+            const std::string ms2 = dir + "/s-market2";
+            const sig::Key mk2 = key_of(ms2);
+            tr::install_registration(ms2, { issue(active, sig::Role::Marketplace, mk2, {}), ic, rc }, why);
+            sig::Key MI2{};
+            tr::store_identity(ms2, MI2, why);
+            tr::Identity healed; healed.head = MI2;
+            check(MI2 != MI && !tr::dist_read(list, d, w2, MI2)
+                  && w2 == "the list is not signed by the marketplace of this loader's identity",
+                  "a loader built with the next marketplace key at the third link refuses the retired key's list");
+            check(!ok_as("Probe", probe_new, E, healed, &w2) && w2 == "does not come to this loader's identity"
+                  && !tr::verify("etcs", minted.data(), minted.size(), E, healed, w2, true),
+                  "and its modules, and the loader it minted: the identity pins the key, not only the root");
+            ks::erase(ms2, "loader-key", kwhy);
+        }
+
+        // The order lists come in: the ABI's version, never older than what was taken.
+        check(tr::dist_read(list, d, why, MI) && d.kernel == tr::kernel_version() && !d.kernel.empty(),
+              "the list names the ABI's version it was published under");
+        auto relist = [&](const std::string& kernel) {         // the same list, as the marketplace would sign it under `kernel`
+            const size_t eol = list.find('\n'), sig_at = list.rfind("\n" + std::string(sig::kDistSig));
+            const std::string header = list.substr(0, eol), keep = header.substr(0, header.find(" kernel="));
+            const std::string body = (kernel.empty() ? keep : keep + " kernel=" + kernel) + list.substr(eol, sig_at + 1 - eol);
+            uint8_t sk[64]; sig::Key k{};
+            std::vector<sig::Certificate> reg;
+            tr::identity(ms, sk, k, reg, why);
+            uint8_t sg[sig::kSigBytes];
+            const std::string m = "ETCSDST1" + body;
+            mc::crypto_ed25519_sign(sg, sk, reinterpret_cast<const uint8_t*>(m.data()), m.size());
+            mc::crypto_wipe(sk, 64);
+            const std::string chain = sig::encode_chain(reg);
+            return body + sig::kDistSig + tr::hex(reinterpret_cast<const uint8_t*>(chain.data()), chain.size())
+                 + " " + tr::hex(sg, sizeof sg) + "\n";
+        };
+        std::vector<uint32_t> up = tr::kernel_version(), down = tr::kernel_version();
+        up.push_back(1);
+        down.back() == 0 ? (void)down.pop_back() : (void)--down.back();
+        const std::string newer = relist(tr::kernel_text(up)), older = relist(tr::kernel_text(down));
+        check(tr::dist_read(newer, d, w2, MI) && d.kernel == up, "a list of a newer ABI is taken");
+        check(!tr::dist_read(older, d, w2, MI) && w2.find("a rollback") != std::string::npos,
+              "a list older than the loader itself is refused: a rollback");
+        check(!tr::dist_read(relist(""), d, w2, MI) && w2 == "the list names no kernel version",
+              "and a list that names no version is no list");
+        {
+            const std::string seen = dir + "/s-seen", shere = dir + "/seen-here/";
+            ::mkdir(seen.c_str(), 0700);
+            ::mkdir(shere.c_str(), 0700);
+            tr::Identity dl; dl.head = MI;
+            std::string rep2, put2;
+            check(tr::survey(list, rep2, w2, dl, E, shere, shere + "etcs", seen) && ::access((seen + "/kernel.seen").c_str(), F_OK) != 0,
+                  "a list of the loader's own version is taken, and moves nothing");
+            check(tr::survey(newer, rep2, w2, dl, E, shere, shere + "etcs", seen) && slurp(seen + "/kernel.seen") == tr::kernel_text(up) + "\n",
+                  "a newer one is taken, and the store keeps its version");
+            const std::string nb(probe_new.begin(), probe_new.end());
+            check(!tr::survey(list, rep2, w2, dl, E, shere, shere + "etcs", seen) && w2.find("a rollback") != std::string::npos
+                  && !tr::replace(list, "Probe", nb, put2, w2, dl, shere, shere + "etcs", seen),
+                  "after which the list from before is refused, surveyed or fetched from: it cannot be replayed");
+        }
+
+        tr::Identity download; download.head = MI;
         tr::Identity developer = download; developer.pub = dk; developer.proven = true;
         const std::string self = here + "etcs";
         std::string report;
@@ -926,11 +1060,11 @@ int main(int, char**)
               && report.find("Probe not here\n") != std::string::npos && report.find("fetch") == std::string::npos,
               "what is not here is not fetched");
         write_bytes(here + "Probe.wasm", probe_old);
-        write_bytes(self, release);
+        write_bytes(self, minted);
         check(tr::survey(list, report, why, download, E, here, self)
               && report.find("Probe differs\nfetch Probe Probe.wasm\n") != std::string::npos
               && report.find("etcs current\n") != std::string::npos,
-              "an older build of a module is fetched; the release that is here is current");
+              "an older build of a module is fetched; the minted loader that is here is current");
         check(tr::survey(list, report, why, download, other, here, self)
               && report.find("this loader is in " + tr::hex(other.data(), 32)) != std::string::npos
               && report.find("Probe behind\n") != std::string::npos,
@@ -951,13 +1085,13 @@ int main(int, char**)
               && bytes_of(here + "Probe.wasm") == probe_new, "the listed bytes are put where the loader reads them");
         check(tr::survey(list, report, why, download, E, here, self) && report.find("Probe current\n") != std::string::npos,
               "and are then current");
-        const std::string rel_bytes(release.begin(), release.end());
+        const std::string rel_bytes(minted.begin(), minted.end());
         std::remove(self.c_str());
-        check(tr::replace(list, "etcs", rel_bytes, put, why, download, here, self) && bytes_of(self) == release,
-              "the release is put in place of the loader's own binary");
-        tr::Identity wrong_root = download; wrong_root.root = fresh_key().pub;
-        check(!tr::replace(list, "Probe", new_bytes, put, why, wrong_root, here, self),
-              "a loader under another root takes nothing from this list");
+        check(tr::replace(list, "etcs", rel_bytes, put, why, download, here, self) && bytes_of(self) == minted,
+              "the minted loader is put in place of the loader's own binary");
+        tr::Identity wrong = download; wrong.head = fresh_key().pub;
+        check(!tr::replace(list, "Probe", new_bytes, put, why, wrong, here, self),
+              "a loader of another identity takes nothing from this list");
 
         // The same questions, asked of this loader through its ordering thread.
         sig::Key reg{}; reg[0] = 7;
@@ -973,8 +1107,8 @@ int main(int, char**)
               "a module's ask (TrustEvent) is signed by this loader's key, in the registration's form, on the ordering thread");
         ETCS::TrustEvent sv(ETCS::TrustEvent::Op::Survey);
         sv.a = list;
-        check(!sv() && (sv.out.rfind("no root is built into", 0) == 0 || sv.out == "the list is not signed by a marketplace under this loader's root"),
-              "and a list under a root this loader was not built with is refused there too");
+        check(!sv() && (sv.out.rfind("no identity is built into", 0) == 0 || sv.out == "the list is not signed by the marketplace of this loader's identity"),
+              "and a list of an identity this loader was not built with is refused there too");
         ETCS::TrustEvent bogus(ETCS::TrustEvent::Op::Install);
         bogus.a = "not a chain";
         check(!bogus() && bogus.out == "not a chain of certificates", "an install of something that is not a chain is refused");
