@@ -36,6 +36,9 @@
 // synonym. They live on as TAG names a provider may export, which is where a
 // difference in expected locale belongs.
 #include "ontology/DatabaseBase.h"
+// Private: a medium readable only inside this loader -- what a Database (or
+// anything holding a secret) claims when that is true of it. See ontology/Private.h.
+#include "ontology/PrivateBase.h"
 
 // Lower suspicion graphical/window ontology types (mostly RenderProvider/WindowProvider):
 #include "ontology/ResizableBase.h"

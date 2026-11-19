@@ -17,6 +17,9 @@
 #include "../core_defs.h"
 #include "EventNode.h"
 #include "SignalContext.h"
+#ifdef ETCS_LOADER
+#include "Trust.h"
+#endif
 /*
  * SECURITY CONSIDERED: compiler flags stub out these functions on the module
  * side to prevent the static-init lambda trick from side-loading DLLs before
@@ -809,7 +812,10 @@ size_t ETCS::MirrorBuffer::chainOf(ETCS::Entity* owner, WireScope scope, IWireWr
 }
 inline bool ETCS::MirrorBuffer::localFrame(ETCS::Entity* e)
 {
-    return e && (e->hasTag(ETCS::Buffer("Database")) || e->hasTag(ETCS::Buffer("Local")));
+    if (!e) return false;
+    const ETCS::Module& m = e->module_.parent ? *e->module_.parent : e->module_;
+    return m.local_only || e->hasTag(ETCS::Buffer("Database")) || e->hasTag(ETCS::Buffer("Local"))
+           || e->hasTag(ETCS::Buffer("Private"));
 }
 ::std::string ETCS::MirrorBuffer::manifestOf(ETCS::Entity* owner, WireScope scope)
 {
@@ -1603,6 +1609,17 @@ ETCS::DispatchResult ETCS::EventNode::LoaderStream::on_event(
             if (evt.pairmask_out) *evt.pairmask_out = m;
             return {ETCS::DispatchKind::Inline, &evt};
         }
+        case DLInEvent::Kind::Trust:
+        {
+            /*
+ * The loader's key and store are touched here and in no module's code.
+ * Writes no module memory; all() because a Replace writes a file the next
+ * load reads. No sendAckIfNeeded, as PairMask.
+ */
+            if (ETCS::TrustEvent* t = evt.trust)
+                t->ok = ETCS::trust::answer(static_cast<uint8_t>(t->op), t->name, t->a, t->b, t->out);
+            return {ETCS::DispatchKind::Inline, &evt};
+        }
         case DLInEvent::Kind::RequestUnload:
         {
             ETCS::Module* target = evt.request_unload_target;
@@ -1930,17 +1947,38 @@ bool ETCS::EventNode::LoaderStream::attachModule(
         library_handle_t handle = nullptr;
         try
         {
+            /*
+             * Signature first: nothing of a module runs before its bytes are
+             * known, and dlopen runs its static initializers. A refusal is an
+             * ordinary failed attach -- these bytes are not loaded, nothing
+             * already running is in doubt (core/Trust.h).
+             */
+            ETCS::trust::Opened sealed;
+            ::std::string why;
+            bool local = false;
+            if (!ETCS::trust::open_verified(module_name, global_mod->getFilename(), sealed, why,
+                                            ETCS::trust::gate(), ETCS::trust::loader_epoch(), &local))
+            {
+                const ::std::string msg = "refused module '" + module_name + "': " + why;
+                ::std::cerr << "etcs: " << msg << ::std::endl;
+                ETCS_WEB_CONSOLE_ERROR(msg.c_str());
+                throw ::std::runtime_error(msg);
+            }
 #ifdef _WIN32
-            handle = LoadLibraryA(global_mod->getFilename().c_str());
+            handle = LoadLibraryA(sealed.path.c_str());
             if (!handle)
                 throw ::std::runtime_error("Failed to load DLL (error "
                     + ::std::to_string(GetLastError()) + ") for " + module_name);
 #else
-            handle = dlopen(global_mod->getFilename().c_str(), RTLD_LAZY | RTLD_LOCAL);
+            handle = dlopen(sealed.path.c_str(), RTLD_LAZY | RTLD_LOCAL);
             if (!handle)
                 throw ::std::runtime_error(::std::string("Failed to load SO: ") + dlerror());
 #endif
+            sealed.kept();
             global_mod->adoptLibrary(handle);
+            global_mod->local_only = local;
+            if (local)
+                ETCS_LOG("DynamicLoader:Module", module_name << " is this loader's own: local, it crosses no link.");
             if (!global_mod->registerLoader(*owner)) return false;
             auto arena_it = module_arena_registry.find(module_name);
             if (arena_it != module_arena_registry.end())
@@ -3467,6 +3505,26 @@ inline bool ETCS::TagModifyEvent::operator()()
  * A refused enqueue -- the loader shutting down -- leaves result EMPTY rather
  * than all(), the one place empty is right: there is no ordering left to join.
  */
+inline bool ETCS::TrustEvent::operator()()
+{
+    ETCS_ASSERT_NOT_ORDERING_THREAD("TrustEvent");
+    ETCS_ASSERT_NO_LIFETIME_HOLD("TrustEvent");
+    DLInEvent evt{};
+    evt.kind  = DLInEvent::Kind::Trust;
+    evt.trust = this;
+#if !defined(ETCS_LOADER)
+    evt.reply_to = &ETCS::EventNode::getInstance();
+    evt.origin_extra_mask = ETCS::ActivePairModuleMask();
+#endif
+    if (!getLoader().stream.enqueue(DLInEventPtr{&evt})) { out = "the loader is shutting down"; return false; }
+#if defined(__EMSCRIPTEN__)
+    etcs_emscripten_spin([&]{ return done.load(::std::memory_order_acquire); });
+#else
+    while (!done.load(::std::memory_order_acquire));
+#endif
+    return ok;
+}
+
 inline void ETCS::PairMaskEvent::operator()()
 {
     ETCS_ASSERT_NOT_ORDERING_THREAD("PairMaskEvent");

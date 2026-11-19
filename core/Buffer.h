@@ -37,6 +37,12 @@ inline ::std::string getCurrentModulePath() {
      * then prefixed every log line in the page.
      */
     return "WASM";
+#elif defined(ETCS_MODULE_NAME) && !defined(ETCS_LOADER)
+    /*
+     * A module is loaded from a sealed copy (/proc/self/fd/N, core/Trust.h), so
+     * the dynamic linker's path for it names a descriptor, not the module.
+     */
+    return ETCS_MODULE_NAME DL_EXTENSION;
 #elif defined(_WIN32)
     char path[MAX_PATH];
     HMODULE hm = NULL;

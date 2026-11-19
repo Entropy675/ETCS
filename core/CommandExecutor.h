@@ -4692,6 +4692,9 @@ inline void offer_resume(ETCS::SignalContext& sig, const ReplLineSource* in)
  * still-in-flight RequestUnload recheck, and its dlclose, against that module's
  * own running workers.
  */
+#if defined(ETCS_LOADER) && !defined(__EMSCRIPTEN__)
+namespace ETCS { namespace trust { inline void resync_exec(); } }
+#endif
 inline int drive_main_loop_then_exit(ETCS::SignalContext& ctx, int code,
                                      const ::std::string& control_socket = "")
 {
@@ -4833,6 +4836,10 @@ inline int drive_main_loop_then_exit(ETCS::SignalContext& ctx, int code,
     ETCS::runtime_close();
     ETCS::shutdown_detached_executors();
     ETCS::PendingUnloadRegistry::getInstance().join_all();
+#if defined(ETCS_LOADER) && !defined(__EMSCRIPTEN__)
+    // A re-sync ended this session: the successor starts in its place (Trust.h).
+    ETCS::trust::resync_exec();
+#endif
     return code;
 }
 
