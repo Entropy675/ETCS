@@ -434,6 +434,19 @@ const char* etcs_web_shell_menu()
     return held.c_str();
 }
 
+/*
+ * The runtime's latest notice (CommandExecutor.h, repl_notice_publish), for a
+ * page to show above its loading mark while that is up: a re-sync. Polled on
+ * the drain's clock; a serial inside says whether it is new.
+ */
+extern "C" EMSCRIPTEN_KEEPALIVE
+const char* etcs_web_notice()
+{
+    static std::string held;
+    held = repl_notice_json();
+    return held.c_str();
+}
+
 extern "C" EMSCRIPTEN_KEEPALIVE
 const char* etcs_web_shell_drain()
 {
@@ -482,6 +495,7 @@ int main(int argc, char* argv[])
     if (const int rc = ETCS::trust::cli(argc, argv); rc >= 0) return rc;
 #endif
     shell_startup();
+    ETCS::trust::untrusted_banner();                // an untrusted build says so first (core/Trust.h)
 #if defined(__EMSCRIPTEN__)
     /*
      * STATIC HERE, because main() does not outlive the session in a browser.
@@ -530,8 +544,20 @@ int main(int argc, char* argv[])
     // (offer_resume, CommandExecutor.h); a script, or a build with no prompt,
     // starts fresh unless told --resume, which replays the last scene BEFORE
     // the script runs, so the script can use what it brings back.
-    while (argc >= 2 && (std::string_view(argv[1]) == "--resume" || std::string_view(argv[1]) == "--fresh"))
+    while (argc >= 2 && (std::string_view(argv[1]) == "--resume" || std::string_view(argv[1]) == "--fresh"
+                         || std::string_view(argv[1]) == "--resynced"))
     {
+        if (std::string_view(argv[1]) == "--resynced")
+        {
+            // A re-sync's restart (core/Trust.h): asks resume or menu; with no
+            // prompt, runs as launched with the place kept.
+            resync_note() = argc >= 3 ? argv[2] : "a newer kernel";
+            resume_choice().store(0);
+            const int used = argc >= 3 ? 2 : 1;
+            argv += used;
+            argc -= used;
+            continue;
+        }
         resume_choice().store(std::string_view(argv[1]) == "--resume" ? 1 : -1);
         argv++;
         argc--;
@@ -546,6 +572,10 @@ int main(int argc, char* argv[])
 #if !defined(ETCS_REPL_SHELL)
         if (resume_choice().load() == 0) resume_choice().store(-1);
 #endif
+        // Nothing will ask: a re-sync is said now -- in colour, and as a notice
+        // over the page's loading mark -- and the place is left in the store.
+        if (resume_choice().load() < 0 && announce_resync() && !resume_summary().empty())
+            repl_err() << COLOR_DIR << "Your place stays in the store; etcs --resume replays it." << COLOR_RESET << "\n";
 #if !defined(__EMSCRIPTEN__)
         // In a browser this waits for the worker that runs the script or the
         // REPL: a replay must not hold the page's thread.

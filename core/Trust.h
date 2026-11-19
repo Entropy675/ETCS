@@ -257,10 +257,63 @@ inline long head_meets(const std::vector<Step>& p, const sig::Key& head)
  * depends on it: every builder's loaders share one. Zero is none: nothing is
  * global, and nothing is held local either.
  */
+/*
+ * AN UNTRUSTED BUILD (-DETCS_UNTRUSTED; ace untrusted on): for rapid
+ * recompiles, a loader that checks nothing. Every module loads with no
+ * signature check, so nothing has to be signed between a build and a run, and
+ * no keystore is asked. It has no identity, attests nothing, and signs,
+ * countersigns, issues, witnesses and publishes nothing -- so nothing it built
+ * reaches anyone else, and a trusted loader refuses what it left unsigned. It
+ * is no header, so switching costs no epoch: the modules are the same ones.
+ * And it says so all the time it runs: at start, on every load, and at every
+ * prompt (trust_warn, CommandExecutor.h; the prompt's prefix there).
+ */
+#if defined(ETCS_UNTRUSTED)
+inline constexpr bool untrusted_build = true;
+#else
+inline constexpr bool untrusted_build = false;
+#endif
+
+// A warning on the channel this session has: the terminal, in colour
+// (defined in core/CommandExecutor.h, where the console is).
+inline void trust_warn(const std::string& text);
+
+/*
+ * AN UNTRUSTED BUILD IS NEVER A SIGNED LOADER. It carries a marker, and no
+ * loader signs, passes off, mints or takes as a loader binary bytes that hold
+ * it -- else a minting server building with `ace untrusted on` would mint a
+ * loader that checks nothing. The needle is assembled at run time, so a
+ * trusted binary never holds the marker whole.
+ */
+#if defined(ETCS_UNTRUSTED)
+[[gnu::used]] inline const char untrusted_marker_text[] = "ETCS::UNTRUSTED::BUILD::v1";
+#endif
+
+inline bool carries_untrusted_marker(const uint8_t* b, size_t n)
+{
+    static const unsigned char enc[] = { 0x1f, 0x0e, 0x19, 0x09, 0x60, 0x60, 0x0f, 0x14, 0x0e, 0x08, 0x0f, 0x09, 0x0e,
+                                         0x1f, 0x1e, 0x60, 0x60, 0x18, 0x0f, 0x13, 0x16, 0x1e, 0x60, 0x60, 0x2c, 0x6b };
+    std::string needle(sizeof enc, '\0');
+    for (size_t i = 0; i < sizeof enc; ++i) needle[i] = char(enc[i] ^ 0x5a);
+    return std::search(b, b + n, needle.begin(), needle.end()) != b + n;
+}
+
+inline void untrusted_banner()
+{
+    if (!untrusted_build) return;
+#if defined(ETCS_UNTRUSTED)
+    (void)*static_cast<const volatile char*>(untrusted_marker_text);
+#endif
+    trust_warn("UNTRUSTED BUILD (ETCS_UNTRUSTED): every module loads with NO signature check, this loader has no "
+               "identity, and it signs nothing. For rapid development only -- never run what you did not build. "
+               "`ace untrusted off` and rebuild for a trusted loader.");
+}
+
 inline const sig::Key& ace_identity()
 {
     static const sig::Key k = [] {
         sig::Key r{};
+        if (untrusted_build) return r;
 #if defined(ETCS_IDENTITY)
         if (!unhex(ETCS_TRUST_STR(ETCS_IDENTITY), r.data(), r.size())) r = sig::Key{};
 #endif
@@ -281,6 +334,7 @@ inline const sig::Key& ace_identity_parent()
 {
     static const sig::Key k = [] {
         sig::Key r{};
+        if (untrusted_build) return r;
 #if defined(ETCS_IDENTITY_PARENT)
         if (!unhex(ETCS_TRUST_STR(ETCS_IDENTITY_PARENT), r.data(), r.size())) r = sig::Key{};
 #endif
@@ -522,6 +576,13 @@ struct SignatureStage : Stage
         sig::Layout L;
         std::string w;
         if (!take(io, f) || !id) return refuse(io, "not a load this gate was set up for");
+        if (untrusted_build)
+        {
+            trust_warn(std::string("UNTRUSTED: '") + f.name + "' loaded with no signature check");
+            return give(io, f);
+        }
+        if (f.kernel && carries_untrusted_marker(f.bytes, size_t(f.len)))
+            return refuse(io, "an untrusted build (ETCS_UNTRUSTED): no loader takes it as a loader binary");
         if (!sig::layout(f.bytes, f.len, L, w)) return refuse(io, w);
         if (!L.has_chain) return refuse(io, "unsigned");
         std::vector<sig::Certificate> chain;
@@ -647,6 +708,7 @@ struct SignatureStage : Stage
         sig::Certificate c;
         c.role = sig::Role::Module;
         if (!take(io, f) || !id || !f.chain) return refuse(io, "not a load this gate was set up for");
+        if (untrusted_build) return refuse(io, "an untrusted build (ETCS_UNTRUSTED) signs nothing");
         if (!sig::layout(f.bytes, f.len, L, w)) return refuse(io, w);
         if (!digest(f.name, f.bytes, f.len, L, c.subject)) return refuse(io, "bad module name");
         if (zero(id->pub)) return refuse(io, "this loader has no key");
@@ -716,6 +778,7 @@ struct OwnStage : Stage
     {
         LoadFrame f;
         if (!take(io, f) || !id) return refuse(io, "not a load this gate was set up for");
+        if (untrusted_build) return give(io, f);
         const bool ours = (!zero(id->pub) && f.signer == id->pub) || (!zero(id->builder) && f.signer == id->builder);
         // A loader binary the identity's marketplace key signed is minted, and
         // taken as it is; any other is this loader's own, and passed off.
@@ -1213,6 +1276,16 @@ inline std::shared_ptr<const Identity> establish(const std::string& dir, bool pr
         if (!text.empty()) mc::crypto_wipe(&text[0], text.size());
     }
 
+    if (untrusted_build)
+    {
+        id->unattested = "an untrusted build (ETCS_UNTRUSTED): it checks nothing, so it attests nothing";
+        std::vector<uint8_t> me;
+        sig::Layout L;
+        std::string w;
+        if (own_binary(id->self_name, me) && sig::layout(me.data(), me.size(), L, w))
+            digest(id->self_name, me.data(), me.size(), L, id->self);
+        return id;
+    }
     // The loader attests itself: its own bytes through its own two stages,
     // as the identity just established. Nothing else will check this binary.
     // Minted, it asks nothing of the store -- a loader just downloaded
@@ -1242,8 +1315,9 @@ inline Gate& gate()
     static std::once_flag once;
     std::call_once(once, [] {
         std::shared_ptr<const Identity> id = establish(etcs_store_dir());
+        untrusted_banner();
 #if !defined(__EMSCRIPTEN__)
-        if (!id->attested)
+        if (!id->attested && !untrusted_build)
         {
             std::fprintf(stderr, "etcs: warning: %s is not a signed build -- %s\n", id->self_name.c_str(), id->unattested.c_str());
             if (!zero(id->head))
@@ -1280,6 +1354,8 @@ inline int sign_module(const std::string& dir, const std::string& name, const st
     LoadFrame f;
     if (!read_file(file, b)) { why = "cannot read " + file; return 2; }
     if (!load_frame(name, b.data(), b.size(), epoch, f, kernel)) { why = "bad module name"; return 2; }
+    if (kernel && carries_untrusted_marker(b.data(), b.size()))
+    { why = "an untrusted build (ETCS_UNTRUSTED) is never signed: it would attest where it checks nothing"; return 2; }
     f.chain = &chain;
     if (!kernel)                                    // a loader binary's pass-off is judged by the signer's whole identity
     {
@@ -1843,20 +1919,40 @@ inline bool replace(const std::string& text, const std::string& name, const std:
     return true;
 }
 
+// The kernel a placed re-sync goes to, from `resync`; empty when none.
+inline std::string resync_target(const std::string& store)
+{
+    std::ifstream f(store + "/resync");
+    std::string line;
+    if (store.empty() || !std::getline(f, line)) return {};
+    std::istringstream in(line);
+    for (std::string kv; in >> kv; ) if (kv.rfind("to=", 0) == 0) return kv.substr(3);
+    return {};
+}
+
 /*
- * The restart a re-sync ends in: the session closes as it would on a
- * terminate -- the last save of the scene included (runtime_close) -- and the
- * loader then becomes its successor, with --resume (resync_exec, called from
- * drive_main_loop_then_exit). A browser's is its page's reload.
+ * The restart a re-sync ends in. First the notice, on whatever channel this
+ * session has (resync_notice, core/CommandExecutor.h: the terminal, in colour);
+ * then the session closes as it would on a terminate -- the last save of the
+ * scene included (runtime_close) -- and the loader becomes its successor
+ * (resync_exec, called from drive_main_loop_then_exit) started --resynced: an
+ * interactive one asks whether to resume the session or go to the menu, and
+ * the place stays in the store either way. A loader with no prompt starts as
+ * it was launched, the place kept. A browser's re-sync is its page's reload.
  */
+inline void resync_notice(const std::string& text);
+
 inline std::atomic<bool>& resync_flag() { static std::atomic<bool> f{ false }; return f; }
 inline std::vector<std::string>& launch_args() { static std::vector<std::string> a; return a; }
+inline std::string& resync_kernel() { static std::string k; return k; }
 
 inline bool resync_pending() { return resync_flag().load(); }
 
-inline void request_resync(const std::string& why)
+inline void request_resync(const std::string& to_kernel)
 {
-    std::fprintf(stderr, "etcs: re-syncing -- %s\n", why.c_str());
+    resync_kernel() = to_kernel.empty() ? std::string("a newer kernel") : to_kernel;
+    resync_notice("re-syncing to " + resync_kernel() + ": this loader's identity moved. Saving your place, then "
+                  "restarting on its successor.");
     resync_flag().store(true);
     g_sig_term.store(1, std::memory_order_release);
 }
@@ -1866,10 +1962,16 @@ inline void resync_exec()
 #if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
     if (!resync_pending()) return;
     const std::string self = own_path();
-    std::vector<std::string> args{ self, "--resume" };
+    std::vector<std::string> args{ self, "--resynced", resync_kernel() };
+#if !defined(ETCS_REPL_SHELL)
+    // No prompt and no menu: it runs again as it was launched.
     const std::vector<std::string>& was = launch_args();
     for (size_t i = 1; i < was.size(); ++i)
+    {
+        if (was[i] == "--resynced") { ++i; continue; }
         if (was[i] != "--resume" && was[i] != "--fresh") args.push_back(was[i]);
+    }
+#endif
     std::vector<char*> argv;
     for (std::string& a : args) argv.push_back(&a[0]);
     argv.push_back(nullptr);
@@ -1938,8 +2040,8 @@ inline bool answer(uint8_t op, const std::string& name, const std::string& a, co
             if (rs == Resync::Stuck) { why = "a re-sync was placed and this is still the loader before it: reinstall from the site"; break; }
             if (rs != Resync::Placed) { why = "no successor is placed to re-sync to"; break; }
             ok = true;
-            out = "this loader's identity moved; restarting on its successor where this session left off";
-            request_resync(out);
+            out = "this loader's identity moved; restarting on its successor";
+            request_resync(resync_target(dir));
             break;
         }
         default: why = "no such question";
@@ -2385,6 +2487,13 @@ inline int cli(int argc, char** argv)
     launch_args().assign(argv, argv + argc);        // what a re-sync starts the successor with
     if (argc < 2) return -1;
     const std::string verb = argv[1];
+    if (untrusted_build)
+        for (const char* v : { "--sign", "--succeed", "--issue", "--countersign", "--manifest", "--witness" })
+            if (verb == v)
+            {
+                std::fprintf(stderr, "etcs: an untrusted build (ETCS_UNTRUSTED) signs, witnesses and publishes nothing\n");
+                return 4;
+            }
     const std::string dir = etcs_store_dir();
     std::string why;
     if (verb == "--epoch" && argc == 2)
@@ -2547,6 +2656,7 @@ inline int cli(int argc, char** argv)
         else std::printf("key       %s (%s, %s)\n", hex(id->pub.data(), 32).c_str(),
                          id->reg.empty() ? "local half only" : sig::role_name(id->role),
                          id->proven ? "proven" : "not proven");
+        if (untrusted_build) std::printf("UNTRUSTED build (ETCS_UNTRUSTED): modules load unchecked; it signs nothing\n");
         if (zero(id->head)) std::printf("identity  none built in: an experimental epoch\n");
         else std::printf("identity  %s (built in)%s\n", hex(id->head.data(), 32).c_str(),
                          own_head(id->head, id->builder) ? ": its builder's key alone" : "");

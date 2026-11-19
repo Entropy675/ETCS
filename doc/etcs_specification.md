@@ -939,8 +939,20 @@ certified, at a newer kernel, is the identity the loader moves to, and it gives 
 thing: its successor, minted by that marketplace and countersigned by a release key under the same
 active key — two keys, neither of them the retired one. The loader puts it in place, retires its old
 identity in its store, so nothing the old marketplace signs is taken again whatever kernel it
-claims, and restarts on the successor where the session left off: the scene replays as each
-persistable type defines, and the resume compares state hashes only within one kernel. A successor
+claims, says so on the channel the session has (the terminal, in colour), saves the scene and
+restarts on the successor. The successor asks whether to resume the session — replaying it to its
+last saved point, as each persistable type defines, with state hashes compared only within one
+kernel — or exit to the menu, which leaves the place in the store for a later start. A loader with no
+prompt runs again as it was launched, its place kept. A page with buttons takes the default answer by
+itself after five seconds, a ring beside it ticking from green through yellow to red; a terminal
+waits. A page still showing its loading mark shows the re-sync above it.
+
+**An untrusted build** (`-DETCS_UNTRUSTED`, `ace untrusted on`) is for rapid recompiles: every
+module loads with no signature check, so nothing is signed between a build and a run and no keystore
+is asked. It has no identity, attests nothing, and signs, countersigns, issues, witnesses and
+publishes nothing, so nothing it built reaches anyone else, and a trusted loader refuses what it
+left unsigned. It is no header, so switching costs no epoch. It says so all the time it runs: a red
+banner at start, a red line on every module load, and `[UNTRUSTED]` on every prompt. A successor
 that never took is not fetched again; the loader says to reinstall from the site.
 
 A loader is the one binary nothing else checks, so it attests itself: at the handshake it puts its
