@@ -1012,13 +1012,14 @@ int main(int, char**)
         // The order lists come in: the ABI's version, never older than what was taken.
         check(tr::dist_read(list, d, why, MI) && d.kernel == tr::kernel_version() && !d.kernel.empty(),
               "the list names the ABI's version it was published under");
-        auto relist = [&](const std::string& kernel) {         // the same list, as the marketplace would sign it under `kernel`
-            const size_t eol = list.find('\n'), sig_at = list.rfind("\n" + std::string(sig::kDistSig));
-            const std::string header = list.substr(0, eol), keep = header.substr(0, header.find(" kernel="));
-            const std::string body = (kernel.empty() ? keep : keep + " kernel=" + kernel) + list.substr(eol, sig_at + 1 - eol);
+        // A list as `store`'s marketplace would sign it under `kernel`.
+        auto relist_of = [&](const std::string& base, const std::string& store, const std::string& kernel) {
+            const size_t eol = base.find('\n'), sig_at = base.rfind("\n" + std::string(sig::kDistSig));
+            const std::string header = base.substr(0, eol), keep = header.substr(0, header.find(" kernel="));
+            const std::string body = (kernel.empty() ? keep : keep + " kernel=" + kernel) + base.substr(eol, sig_at + 1 - eol);
             uint8_t sk[64]; sig::Key k{};
             std::vector<sig::Certificate> reg;
-            tr::identity(ms, sk, k, reg, why);
+            tr::identity(store, sk, k, reg, why);
             uint8_t sg[sig::kSigBytes];
             const std::string m = "ETCSDST1" + body;
             mc::crypto_ed25519_sign(sg, sk, reinterpret_cast<const uint8_t*>(m.data()), m.size());
@@ -1027,6 +1028,7 @@ int main(int, char**)
             return body + sig::kDistSig + tr::hex(reinterpret_cast<const uint8_t*>(chain.data()), chain.size())
                  + " " + tr::hex(sg, sizeof sg) + "\n";
         };
+        auto relist = [&](const std::string& kernel) { return relist_of(list, ms, kernel); };
         std::vector<uint32_t> up = tr::kernel_version(), down = tr::kernel_version();
         up.push_back(1);
         down.back() == 0 ? (void)down.pop_back() : (void)--down.back();
@@ -1050,6 +1052,111 @@ int main(int, char**)
             check(!tr::survey(list, rep2, w2, dl, E, shere, shere + "etcs", seen) && w2.find("a rollback") != std::string::npos
                   && !tr::replace(list, "Probe", nb, put2, w2, dl, shere, shere + "etcs", seen),
                   "after which the list from before is refused, surveyed or fetched from: it cannot be replayed");
+        }
+
+        // RE-SYNC: the marketplace key retired. A sibling marketplace under the
+        // same active key mints the successor, a release key under that same
+        // active key countersigns it, and a loader of the old identity takes
+        // it -- told its identity's parent, since a fold is followed only down.
+        {
+            sig::Key head{}, P{};
+            check(tr::store_identity(ms, head, why, &P) && head == MI
+                  && P == head_of({ { sig::Role::Root, R }, { sig::Role::Intermediate, active.pub } }),
+                  "the minting server's parent: the fold root -> active, one step short of its key");
+            sig::Key dh{}, dp{};
+            check(tr::store_identity(ds, dh, why, &dp) && tr::zero(dp), "an unregistered store's identity has no parent");
+
+            const std::string ms2 = dir + "/r-market2", ms3 = dir + "/r-market3", rs2 = dir + "/r-release2",
+                              st = dir + "/r-store", rhere = dir + "/r-here/";
+            ::mkdir(st.c_str(), 0700);
+            ::mkdir(rhere.c_str(), 0700);
+            const Keys active2 = fresh_key();
+            const auto ic2 = issue(sroot, sig::Role::Intermediate, active2.pub, {});
+            tr::install_registration(ms2, { issue(active, sig::Role::Marketplace, key_of(ms2), {}), ic, rc }, why);
+            tr::install_registration(ms3, { issue(active2, sig::Role::Marketplace, key_of(ms3), {}), ic2, rc }, why);
+            tr::install_registration(rs2, { issue(active2, sig::Role::Release, key_of(rs2), {}), ic2, rc }, why);
+            sig::Key MI2{}, MI3{};
+            tr::store_identity(ms2, MI2, why);
+            tr::store_identity(ms3, MI3, why);
+
+            // A successor minted by `market`, countersigned by `release` (or not).
+            auto mint_as = [&](const std::string& market, const sig::Key& mhead, const std::vector<uint8_t>& w,
+                               const std::string& release) {
+                uint8_t sk[64]; sig::Key k{};
+                tr::loader_key(market, sk, k, why);
+                tr::Identity who = *tr::establish(market, true, mhead);
+                who.attested = true;
+                const auto minted_bytes = wasm_signed(w, sign_as(who, sk, "etcs", w, E, true));
+                mc::crypto_wipe(sk, 64);
+                if (release.empty()) return minted_bytes;
+                write_bytes(dir + "/r-unsigned", minted_bytes);
+                if (tr::countersign(release, "etcs", dir + "/r-unsigned", E, dir + "/r-section", why) != 0) return std::vector<uint8_t>();
+                return wasm_signed(w, slurp(dir + "/r-section"));
+            };
+            const auto succ = variant('6');
+            const auto bare_succ = mint_as(ms2, MI2, succ, ""), counted = mint_as(ms2, MI2, succ, rs);
+            tr::Identity old; old.head = MI; old.head_parent = P;
+            old.self = digest_of("etcs", variant('7'));
+            std::string kw;
+            auto as_old = [&](const std::vector<uint8_t>& b, const tr::Identity& who) {
+                return tr::verify("etcs", b.data(), b.size(), E, who, kw, true);
+            };
+            check(!counted.empty() && !as_old(bare_succ, old)
+                  && kw == "a successor under another marketplace of this identity's parent needs a release key's countersignature",
+                  "a successor minted by a sibling marketplace, without a release key's countersignature, is refused");
+            check(as_old(counted, old), "countersigned by a release key under the same active key, it bridges: two keys, neither the retired one");
+            tr::Identity orphan = old; orphan.head_parent = sig::Key{};
+            check(!as_old(counted, orphan) && kw == "does not come to this loader's identity",
+                  "a loader that was not told its identity's parent cannot recognise it");
+            check(!ok_as("etcs", counted, E, old, &kw), "and the same bytes as a module are not taken: the bridge is a loader binary's");
+            check(!as_old(mint_as(ms2, MI2, succ, rs2), old)
+                  && kw == "the countersignature is not a release key's under the same active key",
+                  "a release key under another active key countersigns nothing here");
+            check(!as_old(mint_as(ms3, MI3, succ, rs), old) && kw == "does not come to this loader's identity",
+                  "a marketplace another active key certified is no sibling");
+            auto torn = counted; torn[torn.size() - 1] ^= 0x01;
+            check(!as_old(torn, old), "an altered countersignature is refused");
+
+            // The sibling's list, at a newer kernel.
+            const std::string dist2 = dir + "/r-dist";
+            ::mkdir(dist2.c_str(), 0700);
+            write_bytes(dist2 + "/etcs", counted);
+            write_bytes(dist2 + "/Probe.wasm", signed_by(ms2, "Probe", variant('8'), false, MI2));
+            std::string list2;
+            check(tr::publish(ms2, dist2, E, list2, why, nullptr, MI2), "the sibling publishes its list, the countersigned successor in it");
+            const std::string list2up = relist_of(list2, ms2, tr::kernel_text(up));
+            check(tr::dist_read(list2up, d, w2, MI, tr::kernel_version(), P) && d.sibling && d.head == MI2,
+                  "a loader of the old identity, told its parent, reads the sibling's list as the identity it moves to");
+            check(!tr::dist_read(list2, d, w2, MI, tr::kernel_version(), P) && w2.find("only at a kernel newer") != std::string::npos,
+                  "only at a kernel newer than its own");
+            check(!tr::dist_read(list2up, d, w2, MI), "and not without its parent");
+
+            const std::string self = rhere + "etcs";
+            write_bytes(self, variant('7'));
+            std::string rep3, put3;
+            check(tr::survey(list2up, rep3, w2, old, E, rhere, self, st) && rep3.find("resync etcs etcs\n") != std::string::npos,
+                  "surveyed, the sibling's list names one thing to do: re-sync to the successor");
+            const std::string pb(probe_new.begin(), probe_new.end()), cb(counted.begin(), counted.end());
+            check(!tr::replace(list2up, "Probe", pb, put3, w2, old, rhere, self, st)
+                  && w2 == "from a list of the identity this loader moves to, it takes only its successor",
+                  "and nothing else of it");
+            check(tr::replace(list2up, "etcs", cb, put3, w2, old, rhere, self, st) && bytes_of(self) == counted
+                  && tr::head_retired(st, MI) && slurp(st + "/kernel.seen") == tr::kernel_text(up) + "\n",
+                  "the successor is put in place; the old identity is retired in the store, and the newer kernel kept");
+            check(tr::resync_state(st, old, self) == tr::Resync::Placed, "the re-sync waits for the restart");
+            check(!tr::survey(relist(tr::kernel_text(up)), rep3, w2, old, E, rhere, self, st)
+                  && w2.rfind("this loader's identity was retired", 0) == 0,
+                  "the retired marketplace's own list is no longer taken, whatever kernel it claims");
+            check(tr::survey(list2up, rep3, w2, old, E, rhere, self, st) && rep3.find("re-sync placed: restart\n") != std::string::npos
+                  && rep3.find("resync etcs") == std::string::npos,
+                  "seen again before the restart, it asks for the restart, not another fetch");
+            write_bytes(self, variant('7'));
+            check(tr::survey(list2up, rep3, w2, old, E, rhere, self, st) && rep3.find("reinstall from the site") != std::string::npos
+                  && rep3.find("resync etcs") == std::string::npos,
+                  "a successor that never took is not fetched again: no loop, a reinstall");
+            tr::Identity next = old; next.self = digest_of("etcs", counted);
+            check(tr::resync_state(st, next, self) == tr::Resync::Done, "the successor, running, sees the re-sync done");
+            for (const std::string& k : { ms2, ms3, rs2 }) ks::erase(k, "loader-key", kwhy);
         }
 
         tr::Identity download; download.head = MI;

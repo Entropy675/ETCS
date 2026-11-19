@@ -435,9 +435,11 @@ struct PairMaskEvent : Event
 //   Survey   a = the site's list               out = the report, "fetch <name> <file>" lines
 //   Replace  a = the site's list, b = bytes    out = the path written
 //            name = which entry b is
+//   Resync   (nothing)                         out = what happens: the session ends,
+//            and the successor a Replace placed starts in its place, resuming
 struct TrustEvent : Event
 {
-    enum class Op : uint8_t { Request, Install, Survey, Replace };
+    enum class Op : uint8_t { Request, Install, Survey, Replace, Resync };
     Op                  op;
     ::std::string       name, a, b, out;
     bool                ok = false;

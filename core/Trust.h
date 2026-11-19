@@ -74,6 +74,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <atomic>
 #include <filesystem>
@@ -226,6 +227,14 @@ inline sig::Key identity_of(const std::vector<Step>& p)
     return h;
 }
 
+// The identity one step short of the path's own key: what certified it. Zero
+// for a key with nothing above it.
+inline sig::Key parent_of(const std::vector<Step>& p)
+{
+    if (p.size() < 2) return sig::Key{};
+    return identity_of(std::vector<Step>(p.begin(), p.end() - 1));
+}
+
 // The step at which the fold from one of the path's roots -- or its top --
 // comes to `head`; -1 if it never does. A root attesting another above it
 // starts a fold of its own, so it moves no one's head.
@@ -254,6 +263,26 @@ inline const sig::Key& ace_identity()
         sig::Key r{};
 #if defined(ETCS_IDENTITY)
         if (!unhex(ETCS_TRUST_STR(ETCS_IDENTITY), r.data(), r.size())) r = sig::Key{};
+#endif
+        return r;
+    }();
+    return k;
+}
+
+/*
+ * THE IDENTITY'S PARENT, built in beside it (ace: -DETCS_IDENTITY_PARENT):
+ * the fold one step short of the builder's key -- root -> active, for the
+ * minting server. A checksum is followed only DOWN a chain: from known keys
+ * to a head, never from a head back up to the keys that made it. So a loader
+ * that is to recognise a sibling of its head -- another marketplace the same
+ * active key certified -- is told the parent; it cannot find it.
+ */
+inline const sig::Key& ace_identity_parent()
+{
+    static const sig::Key k = [] {
+        sig::Key r{};
+#if defined(ETCS_IDENTITY_PARENT)
+        if (!unhex(ETCS_TRUST_STR(ETCS_IDENTITY_PARENT), r.data(), r.size())) r = sig::Key{};
 #endif
         return r;
     }();
@@ -376,8 +405,8 @@ inline bool has_epoch(const sig::Certificate& c, const sig::Epoch& e)
 }
 
 /*
- * What this loader is for a session. `head`: the identity built in, or zero.
- * `builder`: the key of the loader that built this one, built in. `reg`: the
+ * What this loader is for a session. `head`: the identity built in, or zero;
+ * `head_parent` the fold one step short of it, built in beside it. `builder`: the key of the loader that built this one, built in. `reg`: the
  * chain above `pub`, once registered; empty is the local half alone.
  * `proven`: the keystore's key is `pub`'s, checked when the session began
  * (establish).
@@ -385,6 +414,7 @@ inline bool has_epoch(const sig::Certificate& c, const sig::Epoch& e)
 struct Identity
 {
     sig::Key    head{};
+    sig::Key    head_parent{};              // the fold one step short of head; zero: none
     sig::Key    builder{};
     sig::Key    pub{};
     bool        proven = false;
@@ -405,8 +435,9 @@ struct Identity
  * frame REFERS to the bytes (the 256-byte rule, one size up). Going in:
  * name, bytes, epoch, and whether the bytes are a loader's own (`kernel`).
  * The Signature stage adds who signed -- role 0 when the chain is the local
- * half alone -- whether its head is this loader's identity (`head`) or it met
- * this loader's own keys only (`local`), and how the bytes were passed off
+ * half alone -- whether its head is this loader's identity (`head`), it is a
+ * loader binary that bridges to a sibling of it (`bridge`), or it met this
+ * loader's own keys only (`local`), and how the bytes were passed off
  * (`passed`, a loader binary's); on the way out (signing) it fills `chain`, or
  * says the bytes already carry it, and `local` says the registration's half
  * was withheld.
@@ -428,6 +459,7 @@ struct LoadFrame
     uint8_t        local;
     uint8_t        passed;
     uint8_t        head;
+    uint8_t        bridge;
 };
 
 inline bool load_frame(const std::string& name, const uint8_t* b, size_t n, const sig::Epoch& epoch, LoadFrame& f,
@@ -534,6 +566,25 @@ struct SignatureStage : Stage
         const std::vector<Step> path = path_of(chain);
         const long h = head_meets(path, id->head);
         if (h >= 0) { meet = long(path[size_t(h)].signs); at = path[size_t(h)].role; }
+        // THE BRIDGE: a loader binary minted by another marketplace the same
+        // parent certified -- the identity this one moves to when its own
+        // marketplace key is retired -- and countersigned by a release key
+        // under that same active key. Two keys, neither of them the retired one.
+        if (h < 0 && f.kernel && chain.size() > 1 && !zero(id->head_parent)
+            && path.back().role == sig::Role::Marketplace
+            && head_meets(path, id->head_parent) == long(path.size()) - 2)
+        {
+            sig::Countersign cs;
+            if (!L.has_count) return refuse(io, "a successor under another marketplace of this identity's parent "
+                                                "needs a release key's countersignature");
+            if (!sig::decode(f.bytes + L.count.at, L.count.len, cs) || cs.child != d || cs.to != f.epoch)
+                return refuse(io, "countersigned as other bytes, or for another epoch");
+            if (cs.cert.role != sig::Role::Release || cs.cert.issuer != chain[1].issuer || !check(cs.cert)
+                || !check(cs))
+                return refuse(io, "the countersignature is not a release key's under the same active key");
+            meet = 0; at = sig::Role::Marketplace;
+            f.bridge = 1;
+        }
         if (meet < 0)
         {
             if (chain.size() > 1) return refuse(io, zero(id->head) ? "signed under a root, and no identity is built into this loader"
@@ -543,7 +594,7 @@ struct SignatureStage : Stage
         }
         if (!sig::may_issue(at, chain[size_t(meet)].role)) return refuse(io, "chain is broken");
         f.head  = h >= 0 ? 1 : 0;
-        f.local = (h < 0 && !zero(id->head)) ? 1 : 0;
+        f.local = (h < 0 && !f.bridge && !zero(id->head)) ? 1 : 0;
         if (L.has_pass)
         {
             sig::PassOff p;
@@ -562,6 +613,12 @@ struct SignatureStage : Stage
         return mc::crypto_ed25519_check(p.signature, p.key.data(), reinterpret_cast<const uint8_t*>(m.data()), m.size()) == 0;
     }
     static bool check(const sig::Certificate& c) { return trust::check(c); }
+    static bool check(const sig::Countersign& c)
+    {
+        const std::string m = sig::signed_part(c);
+        return mc::crypto_ed25519_check(c.signature, c.cert.subject.data(),
+                                        reinterpret_cast<const uint8_t*>(m.data()), m.size()) == 0;
+    }
 
     // A lineage may begin by itself only where the identity is no one else's:
     // none, or this loader's own key or its builder's, unregistered.
@@ -663,7 +720,7 @@ struct OwnStage : Stage
         // A loader binary the identity's marketplace key signed is minted, and
         // taken as it is; any other is this loader's own, and passed off.
         const bool minted = f.head && f.signer_role == uint8_t(sig::Role::Marketplace);
-        if (f.kernel && !minted)
+        if (f.kernel && !minted && !f.bridge)
         {
             if (!ours) return refuse(io, "a loader binary is taken from this loader's identity, or from its own key");
             const bool may_begin = zero(id->head) || own_head(id->head, id->pub) || own_head(id->head, id->builder);
@@ -919,15 +976,18 @@ inline bool identity(const std::string& dir, uint8_t secret[64], sig::Key& pub,
 }
 
 // What a store's builder is authorized to build with: the fold along its
-// registration to its key, or its key alone. False if the store has no key.
-inline bool store_identity(const std::string& dir, sig::Key& head, std::string& why)
+// registration to its key, or its key alone -- and, in `parent`, the fold one
+// step short of its key (zero unregistered). False if the store has no key.
+inline bool store_identity(const std::string& dir, sig::Key& head, std::string& why, sig::Key* parent = nullptr)
 {
     uint8_t secret[64];
     sig::Key pub{};
     std::vector<sig::Certificate> reg;
     if (!identity(dir, secret, pub, reg, why)) return false;
     mc::crypto_wipe(secret, 64);
-    head = identity_of(path_of(reg, pub));
+    const std::vector<Step> p = path_of(reg, pub);
+    head = identity_of(p);
+    if (parent) *parent = reg.empty() ? sig::Key{} : parent_of(p);
     return true;
 }
 /*
@@ -1116,6 +1176,7 @@ inline std::shared_ptr<const Identity> establish(const std::string& dir, bool pr
 {
     auto id = std::make_shared<Identity>();
     id->head = built_in;
+    if (built_in == ace_identity()) id->head_parent = ace_identity_parent();
 #if defined(ETCS_BUILDER_KEY)
     unhex(ETCS_TRUST_STR(ETCS_BUILDER_KEY), id->builder.data(), id->builder.size());
 #endif
@@ -1248,7 +1309,7 @@ inline int sign_module(const std::string& dir, const std::string& name, const st
             && own_binary(me_name, me) && sig::layout(me.data(), me.size(), M, w) && M.has_chain)
         {
             mc::crypto_wipe(secret, 64);
-            const size_t len = M.chain.len + (M.has_pass ? M.pass.len : 0);
+            const size_t len = M.chain.len + (M.has_pass ? M.pass.len : 0) + (M.has_count ? M.count.len : 0);
             std::ofstream o(out, std::ios::binary | std::ios::trunc);
             if (!o.write(reinterpret_cast<const char*>(me.data() + M.chain.at), std::streamsize(len)) || !o.flush())
             { why = "cannot write " + out; return 2; }
@@ -1313,6 +1374,43 @@ inline int succeed(const std::string& dir, const std::string& name, const std::s
 }
 
 /*
+ * A RELEASE KEY'S COUNTERSIGNATURE (core/Signature.h) on a loader binary that
+ * carries its chain and pass-off already -- what the minting server minted.
+ * Written to `out` as the whole section: chain, pass-off, countersignature.
+ * Only a store registered as Release, in a session that proved its key.
+ */
+inline int countersign(const std::string& dir, const std::string& name, const std::string& file,
+                       const sig::Epoch& epoch, const std::string& out, std::string& why)
+{
+    std::vector<uint8_t> b;
+    sig::Layout L;
+    std::string w;
+    if (!read_file(file, b)) { why = "cannot read " + file; return 2; }
+    if (!sig::layout(b.data(), b.size(), L, w) || !L.has_chain || !L.has_pass)
+    { why = "not a minted loader binary: it carries no chain and pass-off to countersign"; return 2; }
+    uint8_t secret[64];
+    sig::Key pub{};
+    std::vector<sig::Certificate> reg;
+    if (!identity(dir, secret, pub, reg, why)) return 2;
+    const std::shared_ptr<const Identity> id = establish(dir, true);
+    auto refused = [&](const std::string& r) { mc::crypto_wipe(secret, 64); why = r; return 2; };
+    if (reg.empty() || reg[0].role != sig::Role::Release) return refused("only a release key countersigns, and this loader is not registered as one");
+    if (!id->proven) return refused("this loader has not proven its key: " + id->unproven);
+    sig::Countersign cs;
+    cs.to = epoch; cs.cert = reg[0];
+    if (!digest(name, b.data(), b.size(), L, cs.child)) return refused("bad name");
+    const std::string m = sig::signed_part(cs);
+    mc::crypto_ed25519_sign(cs.signature, secret, reinterpret_cast<const uint8_t*>(m.data()), m.size());
+    mc::crypto_wipe(secret, 64);
+    std::string section(reinterpret_cast<const char*>(b.data() + L.chain.at), L.chain.len);
+    section.append(reinterpret_cast<const char*>(b.data() + L.pass.at), L.pass.len);
+    section += sig::encode(cs);
+    std::ofstream o(out, std::ios::binary | std::ios::trunc);
+    if (!o.write(section.data(), std::streamsize(section.size())) || !o.flush()) { why = "cannot write " + out; return 2; }
+    return 0;
+}
+
+/*
  * A REGISTRAR'S WORK: certify another loader's key as `role`, under this
  * loader's own place in its tree, and write the chain that results -- the
  * half the other loader installs with --registration. That the key is the
@@ -1362,6 +1460,8 @@ struct Dist
 {
     sig::Epoch             epoch{};
     std::vector<uint32_t>  kernel;          // the ABI's version it was published under
+    bool                   sibling = false; // a marketplace of this loader's parent, not its own
+    sig::Key               head{};          // the identity whose marketplace signed it
     std::vector<DistEntry> entries;
 };
 
@@ -1450,10 +1550,14 @@ inline std::string dist_name(const std::string& file)
 }
 
 // The list, read, and only if the marketplace whose identity is `head` signed
-// it, under no older kernel than `floor`.
+// it, under no older kernel than `floor` -- or, given the identity's `parent`,
+// a sibling marketplace that parent certified, at a kernel newer than this
+// loader's: the identity it moves to (`d.sibling`).
 inline bool dist_read(const std::string& text, Dist& d, std::string& why, const sig::Key& head,
-                      const std::vector<uint32_t>& floor = kernel_version())
+                      const std::vector<uint32_t>& floor = kernel_version(), const sig::Key& parent = sig::Key{})
 {
+    d.sibling = false;
+    d.head = head;
     if (zero(head)) { why = "no identity is built into this loader, so no marketplace to believe"; return false; }
     const std::string tag = sig::kDistSig;
     const size_t last = text.rfind("\n" + tag);
@@ -1468,8 +1572,15 @@ inline bool dist_read(const std::string& text, Dist& d, std::string& why, const 
     if (chain_hex.size() % 2 || raw.empty() || !unhex(chain_hex, reinterpret_cast<uint8_t*>(&raw[0]), raw.size())
         || !sig::decode_chain(raw.data(), raw.size(), reg) || reg.empty() || !unhex(sig_hex, s, sizeof s))
     { why = "the list's signature is unreadable"; return false; }
-    if (reg[0].role != sig::Role::Marketplace || !registration_valid(reg, reg[0].subject, head))
-    { why = "the list is not signed by the marketplace of this loader's identity"; return false; }
+    if (reg[0].role != sig::Role::Marketplace) { why = "the list is not signed by the marketplace of this loader's identity"; return false; }
+    if (!registration_valid(reg, reg[0].subject, head))
+    {
+        const std::vector<Step> p = path_of(reg, reg[0].subject);
+        if (zero(parent) || !registration_valid(reg, reg[0].subject) || head_meets(p, parent) != long(p.size()) - 2)
+        { why = "the list is not signed by the marketplace of this loader's identity"; return false; }
+        d.sibling = true;
+        d.head = fold(parent, sig::Role::Marketplace, reg[0].subject);
+    }
     const std::string m = "ETCSDST1" + body;
     if (mc::crypto_ed25519_check(s, reg[0].subject.data(), reinterpret_cast<const uint8_t*>(m.data()), m.size()) != 0)
     { why = "the list's signature does not verify"; return false; }
@@ -1485,6 +1596,8 @@ inline bool dist_read(const std::string& text, Dist& d, std::string& why, const 
     { why = "the list names no kernel version"; return false; }
     if (d.kernel < floor)
     { why = "the list is of " + kernel_text(d.kernel) + ", older than " + kernel_text(floor) + " here: a rollback"; return false; }
+    if (d.sibling && !(kernel_version() < d.kernel))
+    { why = "a list of another marketplace under this identity's parent is taken only at a kernel newer than this loader's"; return false; }
     d.entries.clear();
     while (std::getline(in, line))
     {
@@ -1543,7 +1656,7 @@ inline bool publish(const std::string& store, const std::string& dir, const sig:
                      + " kernel=" + kernel_text(kernel_version()) + "\n";
     for (const std::string& f : files)
     {
-        if (!plain_file(f) || f == "manifest") continue;
+        if (!plain_file(f) || f == "manifest" || f == "release.chain") continue;   // the release certs ride beside
         const std::string name = dist_name(f);
         std::vector<uint8_t> b;
         sig::Layout L;
@@ -1568,18 +1681,92 @@ inline bool publish(const std::string& store, const std::string& dir, const sig:
 }
 
 /*
+ * RE-SYNC: the marketplace key retired. The site's list is then a sibling's
+ * -- another marketplace the same active key certified, at a newer kernel --
+ * and what it gives this loader is only its successor, bridged (Unwrap). Put
+ * in place, this loader's identity is retired in its store (nothing its old
+ * marketplace signs is taken again), and the session restarts on the
+ * successor where it left off (request_resync; the scene replays as each
+ * persistable defines). `resync` in the store says which binary re-synced,
+ * from what file, to what:
+ *
+ *   from=<the running binary's digest> was=<its file's BLAKE2b> to=<kernel> head=<identity>
+ *
+ * so a successor that never took is told from one that is waiting for the
+ * restart, and nothing loops.
+ */
+inline bool head_retired(const std::string& store, const sig::Key& head)
+{
+    std::ifstream f(store + "/retired");
+    std::string line;
+    const std::string h = hex(head.data(), 32);
+    while (!store.empty() && std::getline(f, line)) if (line == h) return true;
+    return false;
+}
+
+inline void retire_head(const std::string& store, const sig::Key& head)
+{
+    if (store.empty() || zero(head) || head_retired(store, head)) return;
+    std::ofstream f(store + "/retired", std::ios::app);
+    f << hex(head.data(), 32) << "\n";
+}
+
+inline sig::Key file_hash(const std::string& path)
+{
+    std::vector<uint8_t> b;
+    sig::Key h{};
+    if (read_file(path, b)) mc::crypto_blake2b(h.data(), 32, b.data(), b.size());
+    return h;
+}
+
+enum class Resync { None, Placed, Stuck, Done };
+
+inline Resync resync_state(const std::string& store, const Identity& id, const std::string& self_path)
+{
+    std::ifstream f(store + "/resync");
+    std::string line, from, was;
+    if (store.empty() || !std::getline(f, line)) return Resync::None;
+    std::istringstream in(line);
+    for (std::string kv; in >> kv; )
+    {
+        if (kv.rfind("from=", 0) == 0) from = kv.substr(5);
+        if (kv.rfind("was=", 0) == 0)  was = kv.substr(4);
+    }
+    if (from != hex(id.self.data(), 32)) return Resync::Done;
+    const sig::Key now = file_hash(self_path);
+    return hex(now.data(), 32) == was ? Resync::Stuck : Resync::Placed;
+}
+
+/*
  * WHAT THE SITE HAS MOVED PAST, here: each entry against the binary this
  * loader would read under that name (its own, for "etcs"). Current is the same
  * bytes, signed for the site's epoch. A binary this loader's own key signed is
  * the developer's and is never fetched over. Anything else not current is
- * fetched -- all of it, when the site is in another epoch.
+ * fetched -- all of it, when the site is in another epoch. A sibling's list
+ * names one thing to do: "resync etcs <file>".
  */
 inline bool survey(const std::string& text, std::string& report, std::string& why, const Identity& id,
                    const sig::Epoch& local, const std::string& bin_dir, const std::string& self_path,
                    const std::string& store = std::string())
 {
     Dist d;
-    if (!dist_read(text, d, why, id.head, kernel_floor(store))) return false;
+    if (!dist_read(text, d, why, id.head, kernel_floor(store), id.head_parent)) return false;
+    const Resync rs = resync_state(store, id, self_path);
+    if (rs == Resync::Done) std::remove((store + "/resync").c_str());
+    if (d.sibling)
+    {
+        report = "identity moved: " + hex(id.head.data(), 32) + " -> " + hex(d.head.data(), 32)
+               + " at " + kernel_text(d.kernel) + "\n";
+        if (rs == Resync::Placed) { report += "re-sync placed: restart\n"; return true; }
+        if (rs == Resync::Stuck)
+        { report += "a re-sync was placed and this is still the loader before it: reinstall from the site\n"; return true; }
+        const DistEntry* e = nullptr;
+        for (const DistEntry& x : d.entries) if (x.name == "etcs") e = &x;
+        report += e ? "resync etcs " + e->file + "\n" : "the list names no loader to re-sync to\n";
+        return true;
+    }
+    if (head_retired(store, id.head))
+    { why = "this loader's identity was retired by a re-sync: the loader it re-synced to is the one to run"; return false; }
     kernel_taken(store, d.kernel);
     const bool moved = d.epoch != local;
     report = "site epoch " + hex(d.epoch.data(), 32) + (moved ? ", and this loader is in " + hex(local.data(), 32)
@@ -1607,15 +1794,19 @@ inline bool survey(const std::string& text, std::string& report, std::string& wh
  * Takes `bytes` as the list's entry `name` only if they are that entry's and
  * pass this loader's own stages in the site's epoch, then puts them where this
  * loader reads them: beside, then over. The process keeps what it mapped; the
- * next load, or start, reads these.
+ * next load, or start, reads these. From a sibling's list only "etcs", bridged,
+ * and placing it is the re-sync: this identity retired, `resync` written.
  */
 inline bool replace(const std::string& text, const std::string& name, const std::string& bytes, std::string& out,
                     std::string& why, const Identity& id, const std::string& bin_dir, const std::string& self_path,
                     const std::string& store = std::string())
 {
     Dist d;
-    if (!dist_read(text, d, why, id.head, kernel_floor(store))) return false;
-    kernel_taken(store, d.kernel);
+    if (!dist_read(text, d, why, id.head, kernel_floor(store), id.head_parent)) return false;
+    if (d.sibling && name != "etcs") { why = "from a list of the identity this loader moves to, it takes only its successor"; return false; }
+    if (!d.sibling && head_retired(store, id.head))
+    { why = "this loader's identity was retired by a re-sync: the loader it re-synced to is the one to run"; return false; }
+    if (!d.sibling) kernel_taken(store, d.kernel);
     const DistEntry* e = nullptr;
     for (const DistEntry& x : d.entries) if (x.name == name) e = &x;
     if (!e) { why = "the list has no '" + name + "'"; return false; }
@@ -1630,6 +1821,7 @@ inline bool replace(const std::string& text, const std::string& name, const std:
 
     namespace fs = std::filesystem;
     const std::string path = kernel ? self_path : bin_dir + e->file, beside = path + ".fetched";
+    const sig::Key was = file_hash(path);
     {
         std::ofstream o(beside, std::ios::binary | std::ios::trunc);
         if (!o.write(bytes.data(), std::streamsize(bytes.size())) || !o.flush()) { why = "cannot write " + beside; return false; }
@@ -1640,7 +1832,51 @@ inline bool replace(const std::string& text, const std::string& name, const std:
     fs::rename(beside, path, ec);
     if (ec) { fs::remove(beside, ec); why = "cannot put it at " + path; return false; }
     out = path;
+    if (d.sibling && !store.empty())
+    {
+        std::ofstream r(store + "/resync", std::ios::trunc);
+        r << "from=" << hex(id.self.data(), 32) << " was=" << hex(was.data(), 32) << " to=" << kernel_text(d.kernel)
+          << " head=" << hex(d.head.data(), 32) << "\n";
+        retire_head(store, id.head);
+        kernel_taken(store, d.kernel);
+    }
     return true;
+}
+
+/*
+ * The restart a re-sync ends in: the session closes as it would on a
+ * terminate -- the last save of the scene included (runtime_close) -- and the
+ * loader then becomes its successor, with --resume (resync_exec, called from
+ * drive_main_loop_then_exit). A browser's is its page's reload.
+ */
+inline std::atomic<bool>& resync_flag() { static std::atomic<bool> f{ false }; return f; }
+inline std::vector<std::string>& launch_args() { static std::vector<std::string> a; return a; }
+
+inline bool resync_pending() { return resync_flag().load(); }
+
+inline void request_resync(const std::string& why)
+{
+    std::fprintf(stderr, "etcs: re-syncing -- %s\n", why.c_str());
+    resync_flag().store(true);
+    g_sig_term.store(1, std::memory_order_release);
+}
+
+inline void resync_exec()
+{
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
+    if (!resync_pending()) return;
+    const std::string self = own_path();
+    std::vector<std::string> args{ self, "--resume" };
+    const std::vector<std::string>& was = launch_args();
+    for (size_t i = 1; i < was.size(); ++i)
+        if (was[i] != "--resume" && was[i] != "--fresh") args.push_back(was[i]);
+    std::vector<char*> argv;
+    for (std::string& a : args) argv.push_back(&a[0]);
+    argv.push_back(nullptr);
+    std::fflush(nullptr);
+    ::execv(self.c_str(), argv.data());
+    std::fprintf(stderr, "etcs: the successor did not start (%s); start it again to finish the re-sync\n", std::strerror(errno));
+#endif
 }
 
 // What a loader signs to ask a registrar for the half above its key (sig::registration_statement).
@@ -1660,7 +1896,8 @@ inline bool registration_request(const std::string& dir, const sig::Key& registr
  * WHAT A MODULE MAY ASK (TrustEvent, core/EventNode.h), on the loader's
  * ordering thread, of this loader as it runs: its store, its session's
  * identity, its own directory and binary, its epoch. `op` in TrustEvent::Op's
- * order. A registration installed now is the next session's.
+ * order. A registration installed now is the next session's; a re-sync
+ * (op 4) ends this session and starts the successor in its place.
  */
 inline bool answer(uint8_t op, const std::string& name, const std::string& a, const std::string& b, std::string& out)
 {
@@ -1695,6 +1932,16 @@ inline bool answer(uint8_t op, const std::string& name, const std::string& a, co
         }
         case 2: ok = survey(a, out, why, id, loader_epoch(), bin, self, dir); break;
         case 3: ok = replace(a, name, b, out, why, id, bin, self, dir); break;
+        case 4:
+        {
+            const Resync rs = resync_state(dir, id, self);
+            if (rs == Resync::Stuck) { why = "a re-sync was placed and this is still the loader before it: reinstall from the site"; break; }
+            if (rs != Resync::Placed) { why = "no successor is placed to re-sync to"; break; }
+            ok = true;
+            out = "this loader's identity moved; restarting on its successor where this session left off";
+            request_resync(out);
+            break;
+        }
         default: why = "no such question";
     }
     if (!ok) out = why;
@@ -2122,6 +2369,9 @@ inline bool consensus(const std::vector<std::string>& texts, const std::vector<s
  *   etcs --attest                                   what this loader says of itself; 0 only if it attests
  *   etcs --loader-key                               public key, made on first use
  *   etcs --identity                                 what this store builds with: the fold to its key (-DETCS_IDENTITY)
+ *   etcs --identity-parent                          the fold one step short of it (-DETCS_IDENTITY_PARENT); 2 if none
+ *   etcs --countersign <name> <file> <epoch hex> <out>
+ *                                                   a release key countersigns a minted loader binary
  *   etcs --epoch                                    this loader's epoch
  *   etcs --digest <file> [name]                     the digest a loader checks of it
  *   etcs --witness <a> <b> <out> [key=value]...     two builds came to the same; run as <a>/etcs
@@ -2132,6 +2382,7 @@ inline bool consensus(const std::vector<std::string>& texts, const std::vector<s
  */
 inline int cli(int argc, char** argv)
 {
+    launch_args().assign(argv, argv + argc);        // what a re-sync starts the successor with
     if (argc < 2) return -1;
     const std::string verb = argv[1];
     const std::string dir = etcs_store_dir();
@@ -2186,6 +2437,23 @@ inline int cli(int argc, char** argv)
         const bool ok = consensus(texts, names, quorum, check, report);
         std::printf("%s%s\n", report.c_str(), ok ? "consensus" : "no consensus");
         return ok ? 0 : 1;
+    }
+    if (verb == "--identity-parent" && argc == 2)
+    {
+        sig::Key head{}, parent{};
+        if (!store_identity(dir, head, why, &parent)) { std::fprintf(stderr, "etcs: %s\n", why.c_str()); return 2; }
+        if (zero(parent)) { std::fprintf(stderr, "etcs: this store is not registered: its identity has no parent\n"); return 2; }
+        std::printf("%s\n", hex(parent.data(), 32).c_str());
+        return 0;
+    }
+    if (verb == "--countersign")
+    {
+        sig::Epoch e{};
+        if (argc != 6 || !unhex(argv[4], e.data(), e.size()))
+        { std::fprintf(stderr, "usage: etcs --countersign <name> <file> <epoch hex> <out>\n"); return 2; }
+        if (countersign(dir, argv[2], argv[3], e, argv[5], why) != 0) { std::fprintf(stderr, "etcs: %s: %s\n", argv[3], why.c_str()); return 2; }
+        std::printf("countersigned %s\n", argv[3]);
+        return 0;
     }
     if (verb == "--identity" && argc == 2)
     {
@@ -2282,6 +2550,8 @@ inline int cli(int argc, char** argv)
         if (zero(id->head)) std::printf("identity  none built in: an experimental epoch\n");
         else std::printf("identity  %s (built in)%s\n", hex(id->head.data(), 32).c_str(),
                          own_head(id->head, id->builder) ? ": its builder's key alone" : "");
+        if (!zero(id->head_parent)) std::printf("parent    %s (built in): a successor under a sibling marketplace bridges\n",
+                                                hex(id->head_parent.data(), 32).c_str());
         if (!zero(id->builder)) std::printf("builder   %s (built in)\n", hex(id->builder.data(), 32).c_str());
         std::printf("passed    %s\n", zero(id->parent) ? "by no one" : id->parent == id->self ? "by itself"
                                        : ("by " + hex(id->parent.data(), 32)).c_str());

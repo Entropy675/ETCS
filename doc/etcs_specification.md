@@ -904,6 +904,19 @@ key at the third link, so the loaders built with it take nothing the retired key
 node is named for it (`Foo_Make@@ETCS_ABI_KERNEL_V_1.0`), so each symbol says at its source which
 kernel it was built for.
 
+**Re-sync** is what a retired marketplace key leaves behind. The loaders built with the old identity
+believe only that identity's lists, so they are also told its parent — the fold one step short of
+the marketplace key, root → active (`-DETCS_IDENTITY_PARENT`). A checksum is followed only down a
+chain, from keys to a head, never back up, which is where it can be checked at all; so the parent
+is given to the loader rather than found. A list from another marketplace that the same parent
+certified, at a newer kernel, is the identity the loader moves to, and it gives the loader one
+thing: its successor, minted by that marketplace and countersigned by a release key under the same
+active key — two keys, neither of them the retired one. The loader puts it in place, retires its old
+identity in its store, so nothing the old marketplace signs is taken again whatever kernel it
+claims, and restarts on the successor where the session left off: the scene replays as each
+persistable type defines, and the resume compares state hashes only within one kernel. A successor
+that never took is not fetched again; the loader says to reinstall from the site.
+
 A loader is the one binary nothing else checks, so it attests itself: at the handshake it puts its
 own bytes through its own two stages. That is what makes a **lineage**. The loader going out
 **passes off** the one that replaces it: after the chain in the child's signature section it signs

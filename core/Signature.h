@@ -15,6 +15,7 @@
  *   cert   "ETCSCRT1" | role u8 | subject[32] | issuer[32] | n u16le | epoch[32] x n | signature[64]
  *   chain  "ETCSCHN1" | n u8 | cert x n, leaf first
  *   pass   "ETCSGEN1" | parent[32] | child[32] | from[32] | to[32] | head[32] | attested u8 | key[32] | signature[64]
+ *   count  "ETCSCSG1" | child[32] | to[32] | cert | signature[64]
  *
  * The signature is Ed25519 (RFC 8032) by the issuer over everything before it,
  * magic included -- the magic is the domain separation. A root's own
@@ -229,6 +230,55 @@ inline bool decode(const void* q, size_t len, PassOff& p)
 }
 
 /*
+ * A RELEASE KEY'S COUNTERSIGNATURE on a loader binary: the key `cert`
+ * certifies as Release signs that `child` is a release for `to`. It rides
+ * after the pass-off, and carries its certificate, so a loader that holds
+ * only an identity can see which active key the release key is under. It is
+ * the second key a loader needs to take a successor minted by another
+ * marketplace of its identity's parent (core/Trust.h, the bridge).
+ */
+constexpr char kCountMagic[8] = { 'E', 'T', 'C', 'S', 'C', 'S', 'G', '1' };
+
+struct Countersign
+{
+    Key         child{};
+    Epoch       to{};
+    Certificate cert;
+    uint8_t     signature[kSigBytes] = {};
+};
+
+inline std::string signed_part(const Countersign& c)
+{
+    std::string out(kCountMagic, sizeof kCountMagic);
+    out.append(reinterpret_cast<const char*>(c.child.data()), 32);
+    out.append(reinterpret_cast<const char*>(c.to.data()), 32);
+    out += encode(c.cert);
+    return out;
+}
+
+inline std::string encode(const Countersign& c)
+{
+    std::string out = signed_part(c);
+    out.append(reinterpret_cast<const char*>(c.signature), kSigBytes);
+    return out;
+}
+
+// Exactly one countersignature: trailing bytes are a refusal.
+inline bool decode(const void* q, size_t len, Countersign& c)
+{
+    const uint8_t* b = static_cast<const uint8_t*>(q);
+    if (!b || len < sizeof kCountMagic + 64 || std::memcmp(b, kCountMagic, sizeof kCountMagic) != 0) return false;
+    size_t at = sizeof kCountMagic, used = 0;
+    std::memcpy(c.child.data(), b + at, 32); at += 32;
+    std::memcpy(c.to.data(), b + at, 32);    at += 32;
+    if (!decode(b + at, len - at, c.cert, &used)) return false;
+    at += used;
+    if (len - at != kSigBytes) return false;
+    std::memcpy(c.signature, b + at, kSigBytes);
+    return true;
+}
+
+/*
  * WHAT A LOADER SIGNS TO ASK FOR ACE'S HALF, and what a registrar checks:
  *
  *   "ETCSREG1" | the loader's key | the registrar's key
@@ -299,6 +349,8 @@ struct Layout
     Span              chain;
     bool              has_pass = false;
     Span              pass;
+    bool              has_count = false;
+    Span              count;
 };
 
 namespace detail
@@ -431,16 +483,22 @@ inline bool chain_length(const uint8_t* b, size_t len, size_t& out)
     return true;
 }
 
-// A section that is a chain then exactly one pass-off is split in two;
-// anything else is left whole, for the chain's own decoding to refuse.
+// A section that is a chain, one pass-off, and at most one countersignature
+// is split so; anything else is left whole, for the chain's own decoding to
+// refuse.
 inline void split_pass(const uint8_t* b, Layout& L)
 {
     size_t c = 0;
-    if (!L.has_chain || !chain_length(b + L.chain.at, L.chain.len, c) || L.chain.len - c != kPassBytes
+    if (!L.has_chain || !chain_length(b + L.chain.at, L.chain.len, c) || L.chain.len - c < kPassBytes
         || std::memcmp(b + L.chain.at + c, kPassMagic, sizeof kPassMagic) != 0) return;
-    L.has_pass = true;
-    L.pass  = { L.chain.at + c, kPassBytes };
-    L.chain = { L.chain.at, c };
+    const size_t rest = L.chain.len - c - kPassBytes, at = L.chain.at + c + kPassBytes;
+    Countersign cs;
+    if (rest && !decode(b + at, rest, cs)) return;
+    L.has_pass  = true;
+    L.pass      = { L.chain.at + c, kPassBytes };
+    L.has_count = rest != 0;
+    L.count     = { at, rest };
+    L.chain     = { L.chain.at, c };
 }
 } // namespace detail
 
