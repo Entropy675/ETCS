@@ -2,11 +2,11 @@
 //
 // ONE BATTLE, THREE RUNTIMES' WORTH OF IT, IN ONE PROCESS. Three worlds built
 // by the same arena script (KartProvider/scripts/kart_arena.etcs), three
-// battles on them: the host's judges, two guests follow its record. What a
-// link carries between runtimes is carried here by local Ledgers and the same
-// stream scripts the page runs: each guest's proposals ledger is authored as
-// that guest (what a link's name does), the host judges both, and both guests
-// follow the host's record. What is held to account:
+// battles on them: the host's is the authority, two guests mirror its trace.
+// What a link carries between runtimes is carried here by the same stream
+// scripts the page runs, between the battles directly: each guest's seat
+// into the host's battle (the stream names the seat), and the host's trace
+// out to each guest. What is held to account:
 //
 //   0. THE MAPS. Each hand-made one is sound (KartArena::Faults): what is on
 //      it can be reached and does what it shows. A map with a fault is told
@@ -113,13 +113,13 @@ static Tyres tyres(ETCS::Entity* b, const std::string& who)
     for (Tyre& t : r.t) in >> t.heat >> t.rope >> t.shown >> t.darkest;
     return r;
 }
-// KartBattle.Status: "<tick> <seq> <mode> <me> <slot> <phase> <secs left> <map> <round secs> <layout>".
-struct Status { uint64_t tick = 0, seq = 0; std::string mode, me; int slot = -1; std::string phase; int left = 0; std::string map; int secs = 0; uint64_t layout = 0; };
+// KartBattle.Status: "<tick> <lines> <mode> <me> <slot> <phase> <secs left> <map> <round secs> <layout>".
+struct Status { uint64_t tick = 0, lines = 0; std::string mode, me; int slot = -1; std::string phase; int left = 0; std::string map; int secs = 0; uint64_t layout = 0; };
 static Status status(ETCS::Entity* b)
 {
     Status s;
     std::istringstream in(verb(b, "KartBattle.Status"));
-    in >> s.tick >> s.seq >> s.mode >> s.me >> s.slot >> s.phase >> s.left >> s.map >> s.secs >> s.layout;
+    in >> s.tick >> s.lines >> s.mode >> s.me >> s.slot >> s.phase >> s.left >> s.map >> s.secs >> s.layout;
     return s;
 }
 // KartBattle.Scores, one driver's row: "<slot> <driver> <elims> <deaths> <hp> <weapon> <ammo> <alive|out>".
@@ -217,27 +217,17 @@ int main(int, char**)
         check(faults == "course: pit 0 15: a spawn at its edge", "...and a map with a spawn put at a pit's edge is told so");
     }
 
-    // The record and a proposals ledger per guest, wired as the page wires
-    // them -- with the page's own stream scripts.
-    ETCS::Entity* rec = ETCS::spawn_entity("NetworkProvider", "Ledger", env, loader);
-    ETCS::Entity* p1  = ETCS::spawn_entity("NetworkProvider", "Ledger", env, loader);
-    ETCS::Entity* p2  = ETCS::spawn_entity("NetworkProvider", "Ledger", env, loader);
-    verb(rec, "Ledger.Author", "host");
-    verb(p1, "Ledger.Author", "g1");
-    verb(p2, "Ledger.Author", "g2");
-    verb(host, "KartBattle.Host", std::to_string(rec->getRID()) + " " + std::to_string(p1->getRID()) + " 0 host 0 t1");
-    verb(g1, "KartBattle.Join", "0 g1 host");
+    // A seat and a mirror per guest, wired as the page wires them -- with the
+    // page's own stream scripts.
+    verb(host, "KartBattle.Host", "host 0 t1");
+    verb(g1, "KartBattle.Join", "g1 host");
     {
         ETCS::ExecutionContext wire(&root, &ctx);
-        auto bind = [&](const char* n, ETCS::Entity* e, const char* mod, const char* tag)
-        { wire.names[n] = ETCS::NameBinding{ e->getRID(), mod, tag }; };
-        bind("rec", rec, "NetworkProvider", "Ledger"); bind("p1", p1, "NetworkProvider", "Ledger"); bind("p2", p2, "NetworkProvider", "Ledger");
-        bind("host", host, "KartProvider", "KartBattle"); bind("g1", g1, "KartProvider", "KartBattle"); bind("g2", g2, "KartProvider", "KartBattle");
+        auto bind = [&](const char* n, ETCS::Entity* e) { wire.names[n] = ETCS::NameBinding{ e->getRID(), "KartProvider", "KartBattle" }; };
+        bind("host", host); bind("g1", g1);
         std::istringstream lines(
-            "detach KartProvider/scripts/kart_judge.etcs src=p1 dst=host\n"
-            "detach KartProvider/scripts/kart_judge.etcs src=p2 dst=host\n"
-            "detach KartProvider/scripts/kart_follow.etcs src=rec dst=g1\n"
-            "detach KartProvider/scripts/kart_emit.etcs src=g1 dst=p1\n");
+            "detach NetworkProvider/scripts/session_follow.etcs src=host dst=g1\n"
+            "detach NetworkProvider/scripts/session_emit.etcs src=g1 dst=host\n");
         const std::string origin = std::string(ETCS_ACE_ROOT) + "/modules/kart_wiring.etcs";
         check(ETCS::run_script(lines, origin, wire), "the streams are wired with the page's scripts");
     }
@@ -252,30 +242,29 @@ int main(int, char**)
     auto key = [&](ETCS::Entity* b, int k, bool down) {
         verb(b, "KartBattle.Key", std::to_string(k) + " " + (down ? "1" : "0"));
     };
-    // A guest's key reaches the host by the proposals stream: wait for it to
-    // be judged (the host's record seq moves) before the clock runs on.
+    // A guest's key reaches the host on its seat: wait for it to be taken
+    // (the host's trace grows) before the clock runs on.
     auto proposed = [&](ETCS::Entity* b, int k, bool down) {
-        const uint64_t before = status(host).seq;
+        const uint64_t before = status(host).lines;
         key(b, k, down);
-        for (int i = 0; i < 400 && status(host).seq == before; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        for (int i = 0; i < 400 && status(host).lines == before; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(2));
     };
     auto fire = [&](ETCS::Entity* b) { key(b, ' ', true); run(1); key(b, ' ', false); run(1); };
 
     // -- 1. the lobby ---------------------------------------------------------
     std::cout << "\n-- 1. the lobby --\n";
-    // g1 joins over its link before g2 does, so who sits where is the record's
-    // order: the host first, then g1 furthest from it, then g2 furthest from both.
+    // g1 sits before g2 does, so who sits where is the trace's order: the host first, then g1 furthest from it, then g2 furthest from both.
     for (int i = 0; i < 200 && where(host, "g1").slot < 0; ++i) run(2);
-    verb(g2, "KartBattle.Join", "0 g2 host");
+    verb(g2, "KartBattle.Join", "g2 host");
     {
         ETCS::ExecutionContext wire(&root, &ctx);
-        wire.names["g2"] = ETCS::NameBinding{ g2->getRID(), "KartProvider", "KartBattle" };
-        wire.names["p2"] = ETCS::NameBinding{ p2->getRID(), "NetworkProvider", "Ledger" };
-        wire.names["rec"] = ETCS::NameBinding{ rec->getRID(), "NetworkProvider", "Ledger" };
-        // After the Join, as kart_join.etcs has it: a Join starts the battle
-        // afresh, so a record followed before it would be lines lost.
-        std::istringstream lines("detach KartProvider/scripts/kart_follow.etcs src=rec dst=g2\n"
-                                 "detach KartProvider/scripts/kart_emit.etcs src=g2 dst=p2\n");
+        wire.names["g2"]   = ETCS::NameBinding{ g2->getRID(), "KartProvider", "KartBattle" };
+        wire.names["host"] = ETCS::NameBinding{ host->getRID(), "KartProvider", "KartBattle" };
+        // After the Join, as session_join.etcs has it: a Join starts the battle
+        // afresh, so a trace followed before it would be lines lost. Late, it
+        // mirrors the host's from its first line.
+        std::istringstream lines("detach NetworkProvider/scripts/session_follow.etcs src=host dst=g2\n"
+                                 "detach NetworkProvider/scripts/session_emit.etcs src=g2 dst=host\n");
         ETCS::run_script(lines, std::string(ETCS_ACE_ROOT) + "/modules/kart_wiring.etcs", wire);
     }
     for (int i = 0; i < 200 && where(host, "g2").slot < 0; ++i) run(2);
@@ -287,6 +276,8 @@ int main(int, char**)
     check(near(a0.z, 61.5f, 0.01f) && near(a0.hz, -1, 1e-3f), "g1 at the spawn furthest from the host, facing it across the middle");
     check(near(b0.x, 61.5f, 0.01f) && near(b0.z, 0, 0.01f) && near(b0.hx, -1, 1e-3f), "g2 at the spawn furthest from both");
     check(h0.hp == 100 && a0.weapon == "-" && status(g2).phase == "lobby", "whole and unarmed, in the lobby");
+    check(verb(host, "KartBattle.Here") == "g1\ng2\n" && verb(g2, "KartBattle.Here") == "host\n",
+          "the host has both seats here, a guest the host whose trace it follows");
     key(host, 'W', true);
     run(50);
     key(host, 'W', false);
@@ -346,9 +337,9 @@ int main(int, char**)
         proposed(g2, 'A', true);
         run(10);
         const float swapped = left();
-        const uint64_t before = status(host).seq;
+        const uint64_t before = status(host).lines;
         verb(g2, "KartBattle.SetInvert", "0");
-        for (int i = 0; i < 400 && status(host).seq == before; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        for (int i = 0; i < 400 && status(host).lines == before; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(2));
         run(30);
         const float unswapped = left();
         proposed(g2, 'A', false);
@@ -551,7 +542,7 @@ int main(int, char**)
     check(gain > 1.2f && padX > -66.5f && padX < -60.0f && fastest > 14.0f,
           "a pad pushes a kart that drives over it the way it points: more than any pedal");
     std::printf("        (g2 drove over a box and got a %s)\n", got.c_str());
-    check(got != "-" && where(g2, "g2").weapon == got, "a power-up hands over a weapon off the record's dice, the same everywhere");
+    check(got != "-" && where(g2, "g2").weapon == got, "a power-up hands over a weapon off the trace's dice, the same everywhere");
 
     // The rest of the arms, each fired once (and the battle, below, still one).
     verb(host, "KartBattle.Give", "host minigun");
@@ -656,7 +647,7 @@ int main(int, char**)
     const std::string l1 = verb(host, "KartBattle.Layout");
     std::printf("        (%s)\n", l1.c_str());
     check(l1 == verb(g1, "KartBattle.Layout") && l1 == verb(g2, "KartBattle.Layout") && status(g1).layout != 0,
-          "...the same layout on every runtime, its seed in the record");
+          "...the same layout on every runtime, its seed in the trace");
     check(verb(host, "KartBattle.Reroll") == "ok", "a new seed");
     run(2);
     const std::string l2 = verb(host, "KartBattle.Layout");
@@ -735,7 +726,7 @@ int main(int, char**)
             const View v6 = eye(g2);
             std::printf("        (E held half a second: %.0f degrees; then Q as long: %.0f)\n", v5.yaw, v6.yaw);
             check(near(v5.yaw, 57.3f, 0.5f) && near(v6.yaw, 0, 0.5f) && status(host).phase == "playing",
-                  "E looks right and Q left while held -- this runtime's alone, no line of the record");
+                  "E looks right and Q left while held -- this runtime's alone, no line of the trace");
             verb(g2, "KartBattle.Look", "0 0");
         }
         // g2 down its lane, under the deck over it -- its eye under it too --
@@ -900,15 +891,19 @@ int main(int, char**)
     check(hh == h1s && hh == h2s, "each guest at the host's tick is the host's battle, to the bit");
     const std::string sh = verb(host, "KartBattle.Snapshot");
     check(sh == verb(g1, "KartBattle.Snapshot") && sh == verb(g2, "KartBattle.Snapshot") && sh.compare(0, 2, "0 ") != 0,
-          "...and advertises the same snapshot");
+          "...and checked itself where the host's trace said its hash");
+    check(verb(g1, "KartBattle.Note").find("differs") == std::string::npos && verb(g2, "KartBattle.Note").find("differs") == std::string::npos,
+          "...and never found itself out of step");
 
     // The streams wound up as a closing script winds up what it detached:
     // each told to stop, then joined.
     auto& detached = ETCS::DetachedRegistry::getInstance();
     for (auto& [id, script] : detached.list()) detached.interrupt(id);
     for (int i = 0; i < 2500 && !detached.all_finished(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(2));
-    check(detached.all_finished(), "the six streams end when told to");
+    check(detached.all_finished(), "the four streams end when told to");
     detached.join_all();
+    check(where(host, "g1").slot < 0 && where(host, "g2").slot < 0 && verb(host, "KartBattle.Here").empty(),
+          "each seat's stream ending is its leave: both karts back in the pit, nobody here");
     for (ETCS::Entity* b : battle) verb(b, "KartBattle.Delete");
     ETCS::PendingUnloadRegistry::getInstance().join_all();
     std::printf("\n%s (%d failure%s)\n", g_fail ? "FAILED" : "PASSED", g_fail, g_fail == 1 ? "" : "s");
