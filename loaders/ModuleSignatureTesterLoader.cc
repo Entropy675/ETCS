@@ -30,8 +30,10 @@
 //      did not attest, or under another root, does not attest; a registrar
 //      certifies a developer's key, whose builds then carry both halves, reach
 //      the root, and run on any loader of the guild; a download with an empty
-//      store takes the marketplace's modules and attests a release. And the
-//      table itself, on certificates alone.
+//      store takes the marketplace's modules and attests a release. A store
+//      joins under another root through that root's attestation of its own,
+//      and what it signs is global under both. And the table itself, on
+//      certificates alone, roots attesting roots among it.
 //   5. SEALED: what is checked is a memfd nothing can write; the file on disk
 //      changing afterwards changes nothing loaded.
 //   6. THE LOADER REFUSES: a signed module under another name, and the same
@@ -287,15 +289,11 @@ int main(int, char**)
         check(!ok_as("ChessProvider", chess, other, A, &why) && why == "not witnessed under this epoch",
               "another epoch is refused");
         tr::Identity other_root = A; other_root.root[0] ^= 0x01; other_root.reg.clear();   // as establish leaves it
-        if (A.reg.empty())
         {
             bool local = false;
             check(ok_as("ChessProvider", chess, E, other_root, nullptr, &local) && local,
-                  "this loader's own build runs in a guild too, and runs local");
+                  "this loader's own build runs under another root too, and runs local: it meets at this loader's key");
         }
-        else
-            check(!ok_as("ChessProvider", chess, E, other_root, &why) && why == "does not chain to this loader's root",
-                  "a loader with another root refuses it");
         tr::Identity not_me = A; not_me.pub[0] ^= 0x01; not_me.builder = sig::Key{};
         tr::Identity unproven = A; unproven.proven = false; unproven.unproven = "no keystore"; unproven.builder = sig::Key{};
         if (A.role == sig::Role::Marketplace && !A.reg.empty())
@@ -666,6 +664,32 @@ int main(int, char**)
         check(tr::own_binary(my_name, me) && !tr::verify(my_name, me.data(), me.size(), E, unbuilt, w, true),
               "this binary, which no release key signed, attests on an empty store only by the builder compiled into it");
 
+        {
+            // A store joined under another root, through that root's attestation of this one.
+            const Keys root2 = fresh_key();
+            const std::string cstore = dir + "/continued";
+            const sig::Key ck = key_of(cstore);
+            const auto cross = issue(root2, sig::Role::Root, R, {});
+            const auto r2c   = issue(root2, sig::Role::Root, root2.pub, {});
+            check(!join(cstore, { issue(active, sig::Role::Marketplace, ck, {}), ic, rc }, root2.pub)
+                  && why == "the chain's root is not ACE's", "a registration under one root is not one under another");
+            check(join(cstore, { issue(active, sig::Role::Marketplace, ck, {}), ic, cross, r2c }, root2.pub),
+                  "but continued by the other root's attestation, it is joined there");
+            uint8_t sk[64]; sig::Key k{};
+            tr::loader_key(cstore, sk, k, why);
+            tr::Identity C = *tr::establish(cstore, true, root2.pub);
+            C.attested = true;
+            check(C.reg.size() == 4 && C.role == sig::Role::Marketplace, "its session reads the continued half");
+            const auto cm = wasm_signed(tiny_wasm(), sign_as(C, sk, "Probe", tiny_wasm(), E, false));
+            mc::crypto_wipe(sk, 64);
+            tr::Identity on2; on2.root = root2.pub;
+            tr::Identity on1; on1.root = R;
+            bool lc = true;
+            check(ok_as("Probe", cm, E, on2, nullptr, &lc) && !lc, "what it signs is global on the other root's loaders");
+            lc = true;
+            check(ok_as("Probe", cm, E, on1, nullptr, &lc) && !lc, "and on its own root's: the chain meets it on the way");
+            ks::erase(cstore, "loader-key", kwhy);
+        }
         for (uint8_t* sk : { Mt.secret, Mr.secret, Ms.secret, Dt.secret }) mc::crypto_wipe(sk, 64);
         for (const std::string& st : { mstore, rstore, gstore, dstore }) ks::erase(st, "loader-key", kwhy);
         check(ks::load(dstore, "loader-key", held, kwhy) == ks::Status::Absent, "(their keys are erased)");
@@ -737,6 +761,29 @@ int main(int, char**)
         check(!ok_as("Probe", as({ leaf, mcert, rcert, icert }), E, ace), "a root that is not last is refused");
         check(!ok_as("Probe", as({ issue(root, sig::Role::Module, d, { E }) }), E, ace, &why) && why == "chain is broken",
               "a module the root's key signed directly is refused: the root certifies only the active key");
+        // Roots attest each other: a second root certifies the first, and a chain
+        // carrying that continuation meets a loader built with either root.
+        const Keys root2 = fresh_key();
+        const auto cross  = issue(root2, sig::Role::Root, root.pub, {});
+        const auto r2cert = issue(root2, sig::Role::Root, root2.pub, {});
+        tr::Identity ace2; ace2.root = root2.pub; ace2.proven = true;
+        const auto carried = as({ leaf, mcert, icert, cross, r2cert });
+        local = true;
+        check(ok_as("Probe", carried, E, ace2, nullptr, &local) && !local,
+              "a chain continued by another root's attestation reaches that root: global on its loaders");
+        local = true;
+        check(ok_as("Probe", carried, E, ace, nullptr, &local) && !local,
+              "and meets its own root on the way, at a shorter tail: global there too");
+        check(ok_as("Probe", as({ leaf, mcert, icert, cross }), E, ace2), "the attesting root's own certificate may be left off");
+        check(!ok_as("Probe", as({ leaf, mcert, icert, rcert }), E, ace2, &why) && why == "does not chain to this loader's root",
+              "without the continuation the other root's loaders take nothing");
+        tr::Identity third; third.root = fresh_key().pub;
+        check(!ok_as("Probe", carried, E, third), "nor does a loader of a root that attested neither");
+        check(!ok_as("Probe", as({ leaf, mcert, icert, rcert, cross, r2cert }), E, ace2, &why)
+              && why == "a root's own certificate is not the last", "a root's own certificate is still the last");
+        check(!ok_as("Probe", as({ leaf, mcert, icert, issue(inter, sig::Role::Root, root.pub, {}) }), E, ace2),
+              "a root certificate signed by a key that is no root of this loader's attests nothing here");
+
         tr::Identity reg_loader = ace; reg_loader.reg = { lreg, gcert, icert, rcert }; reg_loader.pub = market.pub;
         check(ok_as("Probe", as({ issue(reg, sig::Role::Loader, stranger.pub, {}), }), E, reg_loader, &why) == false,
               "a certificate is no module");

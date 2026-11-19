@@ -33,7 +33,8 @@
  * A CHAIN IS TWO HALVES (core/Signature.h). The local half -- this loader's key
  * and what it signs -- is taken by nothing but that loader. ACE's half is
  * joined on by a registration, and is what lets anyone else take what the key
- * signs.
+ * signs. A root attesting another root continues a chain the same way: adding
+ * to the chain is trusting it as a remote.
  *
  * A MODULE'S CHAIN MUST MEET THIS LOADER'S, at any length: it ends at a key on
  * this loader's own chain -- its key, proven at the handshake; the key it was
@@ -395,8 +396,12 @@ struct SignatureStage : Stage
         if (!check(leaf)) return refuse(io, "bad signature");
         f.signer = leaf.issuer;
         f.signer_role = 0;
-        sig::Key  top = leaf.issuer;
-        sig::Role top_role = sig::Role::Module;
+        // Where the chain meets this loader's: the highest key along it that
+        // is on this loader's own chain, at whatever tail length. Every link
+        // is checked, above the meeting too.
+        long meet = -1;
+        sig::Role at{}, r{};
+        if (meets(*id, leaf.issuer, r)) { meet = 0; at = r; }
         if (chain.size() > 1)
         {
             if (!sig::may_issue(chain[1].role, sig::Role::Module))
@@ -404,26 +409,24 @@ struct SignatureStage : Stage
             for (size_t i = 1; i < chain.size(); ++i)
             {
                 const sig::Certificate& c = chain[i];
-                if (c.subject != top || !sig::may_issue(c.role, chain[i - 1].role)) return refuse(io, "chain is broken");
+                if (c.subject != chain[i - 1].issuer || !sig::may_issue(c.role, chain[i - 1].role)) return refuse(io, "chain is broken");
                 if (!c.epochs.empty() && !has_epoch(c, f.epoch)) return refuse(io, "witness not valid in this epoch");
                 if (!check(c)) return refuse(io, "bad signature in chain");
-                if (c.role == sig::Role::Root && (c.issuer != c.subject || i + 1 != chain.size()))
-                    return refuse(io, "root is not last or not self-issued");
-                top = c.issuer;
+                if (c.role == sig::Role::Root && c.issuer == c.subject && i + 1 != chain.size())
+                    return refuse(io, "a root's own certificate is not the last");
+                if (meets(*id, c.issuer, r)) { meet = long(i); at = r; }
             }
-            top_role = chain.back().role;
             f.signer_role = uint8_t(chain[1].role);
         }
-        sig::Role at{};
-        if (!meets(*id, top, at))
+        if (meet < 0)
         {
             if (chain.size() > 1) return refuse(io, zero(id->root) ? "signed under a root, and none is built into this loader"
                                                                    : "does not chain to this loader's root");
-            if (top == id->pub) return refuse(io, "signed by a loader, and this one has not proven a key: " + id->unproven);
+            if (leaf.issuer == id->pub) return refuse(io, "signed by a loader, and this one has not proven a key: " + id->unproven);
             return refuse(io, "signed by another loader's key, and nothing above it");
         }
-        if (top_role != sig::Role::Root && !sig::may_issue(at, top_role)) return refuse(io, "chain is broken");
-        f.local = (!zero(id->root) && top != id->root) ? 1 : 0;
+        if (!sig::may_issue(at, chain[size_t(meet)].role)) return refuse(io, "chain is broken");
+        f.local = (!zero(id->root) && chain[size_t(meet)].issuer != id->root) ? 1 : 0;
         if (L.has_pass)
         {
             sig::PassOff p;
@@ -731,21 +734,26 @@ inline bool loader_seed(const std::string& dir, uint8_t seed[32], std::string& w
 
 // `reg` is ACE's half above `pub`: a certificate for it in a role a loader can
 // hold, each link certified as the table says (core/Signature.h), up to `root`.
+// `root` must have signed a link of it: the chain reaches this loader's root at
+// any tail length, and what continues past it (another root that attests this
+// one) is checked as any link is.
 inline bool registration_valid(const std::vector<sig::Certificate>& reg, const sig::Key& pub, const sig::Key& root)
 {
     if (reg.empty() || reg[0].subject != pub || zero(root)) return false;
     const sig::Role r = reg[0].role;
     if (r != sig::Role::Loader && r != sig::Role::Marketplace && r != sig::Role::Release && r != sig::Role::Registrar)
         return false;
+    bool reaches = false;
     for (size_t i = 0; i < reg.size(); ++i)
     {
         const sig::Certificate& c = reg[i];
         if (i > 0 && (c.subject != reg[i - 1].issuer || !sig::may_issue(c.role, reg[i - 1].role))) return false;
         if (!check(c)) return false;
-        if (c.role == sig::Role::Root && (c.issuer != c.subject || i + 1 != reg.size())) return false;
+        if (c.role == sig::Role::Root && c.issuer == c.subject && i + 1 != reg.size()) return false;
+        reaches = reaches || c.issuer == root;
     }
     if (reg.back().role != sig::Role::Root && !sig::may_issue(sig::Role::Root, reg.back().role)) return false;
-    return reg.back().issuer == root;
+    return reaches;
 }
 
 /*
@@ -817,7 +825,8 @@ inline bool install_registration(const std::string& dir, const std::vector<sig::
     if (!loader_key(dir, secret, pub, why)) return false;                 // the key must be this loader's to register
     mc::crypto_wipe(secret, 64);
     if (reg.empty() || reg.back().role != sig::Role::Root) { why = "the chain does not end at a root certificate"; return false; }
-    if (reg.back().subject != built_in) { why = "the chain's root is not ACE's"; return false; }
+    if (std::none_of(reg.begin(), reg.end(), [&](const sig::Certificate& c) { return c.issuer == built_in; }))
+    { why = "the chain's root is not ACE's"; return false; }
     if (!registration_valid(reg, pub, built_in)) { why = "not a registration of this loader's key"; return false; }
     if (!write_public(dir + "/loader.chain", sig::encode_chain(reg))) { why = "cannot write " + dir + "/loader.chain"; return false; }
     return true;

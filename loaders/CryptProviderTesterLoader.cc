@@ -26,7 +26,8 @@
 //      active key, and every custodian and the public directory the three-step
 //      chain; any three custodians rebuild the root, whose public key is the
 //      root certificate's subject; certify.etcs rebuilds the active key from
-//      three and certifies one more key under the same root.
+//      three and certifies one more key under the same root; attest_root.etcs
+//      rebuilds the root from three and certifies another root's key.
 //   7. A KEY KEPT. A Keypair goes whole only into a Database that claims
 //      Private -- DatabaseProvider's Keystore, the OS keystore -- and comes
 //      back as the same key; a LocalDatabase is refused; nothing is replaced;
@@ -389,14 +390,16 @@ int main(int, char**)
               "spawn CryptProvider::Certificate rc\n"
               "spawn CryptProvider::Certificate ic\n"
               "spawn CryptProvider::Certificate fake\n"
-              "spawn CryptProvider::Certificate bad_root\n"
+              "spawn CryptProvider::Certificate attests\n"
               "spawn CryptProvider::Certificate self_im\n"), "keys and certificates spawn");
     auto rid = [&](const char* n) { return std::to_string(entity(n)->getRID()); };
     check(yes(verb(entity("rc"), "Certificate.Issue", rid("r") + " root " + rid("r")))
           && yes(verb(entity("rc"), "Certificate.Verify")), "a root is its own issuer, and verifies");
-    check(!yes(verb(entity("bad_root"), "Certificate.Issue", rid("r") + " root " + rid("im")))
-          && !yes(verb(entity("self_im"), "Certificate.Issue", rid("im") + " intermediate " + rid("im"))),
-          "a root of another key, or a non-root of its own, is refused");
+    check(yes(verb(entity("attests"), "Certificate.Issue", rid("r") + " root " + rid("im")))
+          && yes(verb(entity("attests"), "Certificate.Verify", rid("rc"))),
+          "a root naming another key as a root is its attestation, and verifies under the root's own certificate");
+    check(!yes(verb(entity("self_im"), "Certificate.Issue", rid("im") + " intermediate " + rid("im"))),
+          "a non-root of its own is refused");
     verb(entity("ic"), "Certificate.AddEpoch", std::string(64, 'a'));
     check(yes(verb(entity("ic"), "Certificate.Issue", rid("r") + " intermediate " + rid("im")))
           && yes(verb(entity("ic"), "Certificate.Verify", rid("rc"))), "an intermediate by the root verifies against the root's certificate");
@@ -546,6 +549,36 @@ int main(int, char**)
         for (const char* n : { "to_a", "to_b", "to_c", "to_out" }) gone3(n, "FileRelation");
         for (const char* n : { "active_cert", "cert" }) gone3(n, "Certificate");
         gone3("embassy", "Embassy");
+
+        // Another root, attested by this one: rebuilt from three custodians, it
+        // certifies the other's key as a root -- the continuation the other's
+        // chains carry so a loader built with this root takes them.
+        std::string attest = slurp(std::string(ETCS_ACE_ROOT) + "/modules/CryptProvider/scripts/attest_root.etcs");
+        const std::string pub3 = fresh_dir();
+        sig::Key other_root{};
+        tr::random_bytes(seed, 32);
+        mc::crypto_ed25519_key_pair(secret, other_root.data(), seed);
+        mc::crypto_wipe(secret, 64);
+        put(attest, "/media/custodian-a", dirs[0]);
+        put(attest, "/media/custodian-b", dirs[2]);
+        put(attest, "/media/custodian-c", dirs[4]);
+        put(attest, "PUBLIC_DIR", pub3);
+        put(attest, "OTHER_ROOT_KEY", hex(other_root.data(), 32));
+        ETCS::ExecutionContext c4(&root, &ctx);
+        std::istringstream ain(attest);
+        const bool attested = ETCS::run_script(ain, std::string(ETCS_ACE_ROOT) + "/modules/CryptProvider/scripts/attest_root.etcs", c4);
+        std::vector<sig::Certificate> cross;
+        check(attested && tr::read_certificates(pub3 + "/attested.cert", cross) && cross.size() == 1
+              && cross[0].role == sig::Role::Root && cross[0].subject == other_root && cross[0].issuer == root_pub
+              && tr::check(cross[0]),
+              "attest_root.etcs: three custodians rebuild the root, which certifies another root's key as a root");
+        auto gone4 = [&](const char* name, const char* tag) {
+            if (c4.names.count(name)) verb(ETCS::etcs_resolve_rid_anywhere(&ETCS::getLoader(), c4.names[name].rid), std::string(tag) + ".Delete");
+        };
+        for (const char* n : { "a", "b", "c", "out" }) gone4(n, "Custody");
+        for (const char* n : { "to_a", "to_b", "to_c", "to_out" }) gone4(n, "FileRelation");
+        for (const char* n : { "root_cert", "attested" }) gone4(n, "Certificate");
+        gone4("embassy", "Embassy");
     }
 
     // -- 7. a key kept ------------------------------------------------------------------

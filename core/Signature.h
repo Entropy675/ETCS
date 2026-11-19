@@ -17,8 +17,9 @@
  *   pass   "ETCSGEN1" | parent[32] | child[32] | from[32] | to[32] | root[32] | attested u8 | key[32] | signature[64]
  *
  * The signature is Ed25519 (RFC 8032) by the issuer over everything before it,
- * magic included -- the magic is the domain separation. A root is its own
- * issuer. No epochs means not bounded by epoch: an authority or a loader's
+ * magic included -- the magic is the domain separation. A root's own
+ * certificate is self-issued, and last; a root certificate issued by another
+ * root is that root attesting it. No epochs means not bounded by epoch: an authority or a loader's
  * registration, never a module. A Module certificate's subject is the digest
  * of the bytes it vouches for, not a key.
  */
@@ -38,6 +39,11 @@ using Epoch = std::array<uint8_t, 32>;
  *
  * Who may certify whom is the table below, and nothing else: a key holds one
  * role, and two roles are two keys under one parent.
+ *
+ * ROOTS ATTEST EACH OTHER THE SAME WAY: a root certifying another root's key
+ * continues the chain past it, as a registration continues a loader's key into
+ * ACE's half. What carries the continuation is taken by a loader built with
+ * either root -- it meets one or the other.
  */
 enum class Role : uint8_t
 {

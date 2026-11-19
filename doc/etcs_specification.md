@@ -824,6 +824,14 @@ join: pulled from anticurrententropy.com and installed (`etcs --registration`), 
 above a developer's key, so what that loader signs says whose it is. It still runs only there.
 Who may certify whom is a table (`sig::may_issue`), and a key never holds two roles.
 
+**Roots attest each other** the way a registration joins a loader's key to ACE's half: a root
+certifying another root's key continues that root's chains past it, and adding to the chain is
+trusting it as a remote. A chain meets a loader's own at the highest key along it that is on the
+loader's chain, at any tail length, so one chain carrying the continuation runs on a loader built
+with either root. A root's own certificate is self-issued and last; `attest_root.etcs` rebuilds a
+root from three custodians and certifies the other root's key, and the other root's role keys
+register with that certificate and its root's above their own.
+
 The root itself is built in. Its public key is pinned in ACE-Build-Tools (`manifests/root.pub`,
 written by `ace pin` from the ceremony's `root.cert`) and generated into `core/AceIdentity.h` — ACE's
 identity at its shortest, and a core header, so the root is in the epoch, and a loader built for another root is in another epoch. This is the bootstrap: a loader checking itself proves
@@ -906,7 +914,7 @@ local frame); nothing yet resolves one epoch against another. An account behind 
 that proves itself, and binds it to no one. Also unbuilt: the marketplace's attestation of
 the whole lineage, beside the download; a successor from a later epoch checked by the lineage (it is
 checked by the release key's signature, in the epoch the site's list names); signing and attesting
-the web loader, whose trust is its page's connection; roots attesting each other; the
+the web loader, whose trust is its page's connection; the
 entitlement stage; and the stage that takes another loader's modules (the untrusted scanning
 mode).
 
