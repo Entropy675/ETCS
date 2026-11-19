@@ -483,6 +483,32 @@ action is streamed in (`x.Produce -> book.Take()`), and the host keeps the recor
 **checkpoint** on (`book.Checkpoint(<seq>)`): a line that states everything makes those before it
 history nobody replays, and a reader from before it restarts there.
 
+A state can also be its own lines. A **Trace** is a state that keeps the lines it applied, in
+order, from as made -- so a copy that follows them from the first is the same state, and one
+that is not says so where the trace says its hash (`hash <at> <hash>`, a line like any other).
+One copy is the **authority**: it applies a line as it takes it, from its own hand or from a
+**seat** -- a stream into it from another runtime, named by its first message, whose every
+later message is that seat's line. The stream is who said it and the order the authority reads
+its seats in is the order, so judging is the MirrorBuffer's: the room publishes the game's
+`Trace` and `Take` and nothing else, and the game refuses what a seat may not say. The others
+**mirror** it (`host.Trace(0) -> game.Follow()`), their own lines leaving on their seat
+(`game.Emit() -> host.Take()`) and coming back as the trace's. A **Lockstep** trace's time is
+lines too: `tick <n>` steps it, and the authority's frame edge decides how many are due, so a
+world that moves between inputs is still only its trace. Beside them, **Present** is who is
+here: whose stream is open -- a seat arrives when it sits and departs when its stream ends,
+however it ends -- and the site's hall, where the owner is listed for as long as its link lasts.
+A game between runtimes claims `Lockstep` and `Present` (the kart's battle, golf's match);
+NetworkProvider's `session_host.etcs` and `session_join.etcs` wire any of them:
+
+```etcs
+requires game [Trace]
+room.Publish(game @game Trace Take)            # the host: the game is the session
+game.Host({{name}} @hall {{id}})
+# a guest, through a surface of the host's game (`far`, the same type):
+detach NetworkProvider/scripts/session_follow.etcs src=far dst=game   # far.Trace(0) -> game.Follow()
+detach NetworkProvider/scripts/session_emit.etcs src=game dst=far     # game.Emit() -> far.Take()
+```
+
 ---
 
 ## The frame edge
