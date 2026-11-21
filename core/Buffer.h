@@ -62,10 +62,65 @@ inline ::std::string getCurrentModulePath() {
     return "unknown_current_module_path";
 }
 
-inline ::std::ofstream& getModuleLog()
+#ifdef _WIN32
+/*
+ * WINDOWS KEEPS A THREAD'S LOG DIFFERENTLY, for two reasons.
+ *
+ * The CRT's append is a seek and then a write, so two threads' lines can land
+ * on the same offset and one is lost. A handle opened for FILE_APPEND_DATA
+ * alone has the kernel append each write whole: one line, one WriteFile.
+ *
+ * A thread_local std::ofstream corrupts the heap when its thread ends under
+ * MinGW's winpthreads (a fifteen-line program does it). So the stream is a
+ * plain thread_local pointer, and a fiber-local slot's callback deletes it as
+ * the thread ends.
+ */
+class AppendLineBuf : public ::std::streambuf
 {
+    HANDLE      h_;
+    ::std::string pending_;
+protected:
+    int_type overflow(int_type c) override
+    {
+        if (!traits_type::eq_int_type(c, traits_type::eof())) pending_.push_back(traits_type::to_char_type(c));
+        return traits_type::not_eof(c);
+    }
+    ::std::streamsize xsputn(const char* s, ::std::streamsize n) override { pending_.append(s, size_t(n)); return n; }
+    int sync() override
+    {
+        DWORD put = 0;
+        const bool ok = pending_.empty() || WriteFile(h_, pending_.data(), DWORD(pending_.size()), &put, nullptr);
+        pending_.clear();
+        return ok ? 0 : -1;
+    }
+public:
+    explicit AppendLineBuf(HANDLE h) : h_(h) {}
+    ~AppendLineBuf() override { sync(); CloseHandle(h_); }
+};
+
+struct AppendLog : ::std::ostream
+{
+    AppendLineBuf buf;
+    explicit AppendLog(HANDLE h) : ::std::ostream(nullptr), buf(h) { rdbuf(&buf); }
+};
+
+inline void WINAPI dropModuleLog(void* log) { delete static_cast<AppendLog*>(log); }
+#endif
+
+#ifdef _WIN32
+inline ::std::ostream& getModuleLog()
+#else
+inline ::std::ofstream& getModuleLog()
+#endif
+{
+#ifdef _WIN32
+    static const DWORD slot = FlsAlloc(dropModuleLog);
+    static thread_local AppendLog* s_log = nullptr;
+    if (!s_log)
+#else
     static thread_local ::std::ofstream s_log;
     if (!s_log.is_open())
+#endif
     {
         ::std::string fullPath = getCurrentModulePath();
         size_t slash = fullPath.find_last_of("/\\");
@@ -81,6 +136,19 @@ inline ::std::ofstream& getModuleLog()
 #endif
 
         ::std::string logPath = "logs/" + name + ".log";
+#ifdef _WIN32
+        HANDLE h = CreateFileA(logPath.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                               nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE)
+        {
+            ::std::cerr << "ETCS_LOG: failed to open log file: " << logPath << "\n";
+            return ::std::cerr;
+        }
+        s_log = new AppendLog(h);
+        if (slot != FLS_OUT_OF_INDEXES) FlsSetValue(slot, s_log);
+    }
+    return *s_log;
+#else
         s_log.open(logPath, ::std::ios::app);
         
         // verify it actually opened
@@ -88,6 +156,7 @@ inline ::std::ofstream& getModuleLog()
             ::std::cerr << "ETCS_LOG: failed to open log file: " << logPath << "\n";
     }
     return s_log;
+#endif
 }
 
 namespace ETCS
