@@ -35,9 +35,24 @@ extern "C" inline void global_signal_handler(int sig)
     switch(sig) {
         case SIGINT:  g_sig_int .store(1, ::std::memory_order_release); break;
         case SIGTERM: g_sig_term.store(1, ::std::memory_order_release); break;
+#ifndef _WIN32
         case SIGUSR1: g_sig_usr1.store(1, ::std::memory_order_release); break;
+#endif
     }
 }
+
+#ifdef _WIN32
+// Windows has no sigaction and no SIGUSR1. What a console sends is a control
+// event, delivered on a thread of its own: Ctrl-C interrupts, and the
+// console closing (or Ctrl-Break, logoff, shutdown) terminates. Handled, so
+// the default -- ExitProcess -- does not run under the scopes.
+inline BOOL WINAPI global_console_handler(DWORD event)
+{
+    if (event == CTRL_C_EVENT) g_sig_int.store(1, ::std::memory_order_release);
+    else                       g_sig_term.store(1, ::std::memory_order_release);
+    return TRUE;
+}
+#endif
 
 // Loader scope ONLY, once, in _core_init. Modules get authority via
 // AdoptRootSignalContext instead -- see below.
@@ -60,6 +75,16 @@ extern "C" inline void global_signal_handler(int sig)
 // fixed by polling (lsh::get_char, modules/ShellProvider/Linux/LinuxTerminal.h)
 // and does not
 // need global syscall restart.
+#ifdef _WIN32
+#define WIRE_ROOT_SIGNAL_CONTEXT()                              \
+    do {                                                        \
+        ETCS::SignalContext& root = ETCS::RootSignalContext();  \
+        root.interrupt = &g_sig_int;                            \
+        root.terminate = &g_sig_term;                           \
+        root.user1     = &g_sig_usr1;                           \
+        SetConsoleCtrlHandler(global_console_handler, TRUE);    \
+    } while (0)
+#else
 #define WIRE_ROOT_SIGNAL_CONTEXT()                              \
     do {                                                        \
         ETCS::SignalContext& root = ETCS::RootSignalContext();  \
@@ -75,6 +100,7 @@ extern "C" inline void global_signal_handler(int sig)
         sigaction(SIGTERM, &sa, nullptr);                       \
         sigaction(SIGUSR1, &sa, nullptr);                       \
     } while (0)
+#endif
 
 
 namespace ETCS 

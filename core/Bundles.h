@@ -1040,7 +1040,7 @@ public:
 #ifdef ETCS_LOADER
         if (!library_handle) return nullptr;
 #ifdef _WIN32
-        return GetProcAddress(library_handle, tag.c_str());
+        return reinterpret_cast<void*>(GetProcAddress(library_handle, tag.c_str()));
 #else
         return dlsym(library_handle, tag.c_str());
 #endif

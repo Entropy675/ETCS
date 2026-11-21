@@ -10,7 +10,9 @@
     #include <windows.h>
     #include <winternl.h>
     #include <dbghelp.h>
-    #pragma comment(lib, "dbghelp.lib")
+    #ifdef _MSC_VER
+    #pragma comment(lib, "dbghelp.lib")   // MinGW links it by name (ace_manifest _CORE_LIBS)
+    #endif
     using NativeHandle = HANDLE;
     #define INVALID_NATIVE_HANDLE INVALID_HANDLE_VALUE
 #else
@@ -130,8 +132,8 @@ void ApplyIATHook() {
                 if (*fnPtr == procCreateFileW && !OriginalCreateFileW) {
                     DWORD oldProtect;
                     VirtualProtect(fnPtr, sizeof(PROC), PAGE_EXECUTE_READWRITE, &oldProtect);
-                    OriginalCreateFileW = (CreateFileW_t)*fnPtr;
-                    *fnPtr = (PROC)HookedCreateFileW;
+                    OriginalCreateFileW = (CreateFileW_t)(void (*)())*fnPtr;
+                    *fnPtr = (PROC)(void (*)())HookedCreateFileW;
                     VirtualProtect(fnPtr, sizeof(PROC), oldProtect, &oldProtect);
                 }
                 
@@ -139,8 +141,8 @@ void ApplyIATHook() {
                 if (*fnPtr == procCreateFileA && !OriginalCreateFileA) {
                     DWORD oldProtect;
                     VirtualProtect(fnPtr, sizeof(PROC), PAGE_EXECUTE_READWRITE, &oldProtect);
-                    OriginalCreateFileA = (CreateFileA_t)*fnPtr;
-                    *fnPtr = (PROC)HookedCreateFileA;
+                    OriginalCreateFileA = (CreateFileA_t)(void (*)())*fnPtr;
+                    *fnPtr = (PROC)(void (*)())HookedCreateFileA;
                     VirtualProtect(fnPtr, sizeof(PROC), oldProtect, &oldProtect);
                 }
                 
@@ -148,8 +150,8 @@ void ApplyIATHook() {
                 if (*fnPtr == procCloseHandle && !OriginalCloseHandle) {
                     DWORD oldProtect;
                     VirtualProtect(fnPtr, sizeof(PROC), PAGE_EXECUTE_READWRITE, &oldProtect);
-                    OriginalCloseHandle = (CloseHandle_t)*fnPtr;
-                    *fnPtr = (PROC)HookedCloseHandle;
+                    OriginalCloseHandle = (CloseHandle_t)(void (*)())*fnPtr;
+                    *fnPtr = (PROC)(void (*)())HookedCloseHandle;
                     VirtualProtect(fnPtr, sizeof(PROC), oldProtect, &oldProtect);
                 }
                 
