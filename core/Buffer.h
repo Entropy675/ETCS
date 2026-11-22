@@ -8,6 +8,7 @@
 #include <functional>
 #include <cstring>
 #include <fstream>
+#include <mutex>
 #include <sys/stat.h>
 #include <sstream>
 #include <iomanip>
@@ -67,8 +68,8 @@ inline ::std::string getCurrentModulePath() {
  * WINDOWS KEEPS A THREAD'S LOG DIFFERENTLY, for two reasons.
  *
  * The CRT's append is a seek and then a write, so two threads' lines can land
- * on the same offset and one is lost. A handle opened for FILE_APPEND_DATA
- * alone has the kernel append each write whole: one line, one WriteFile.
+ * on the same offset and one is lost. Here a line is one WriteFile on a
+ * FILE_APPEND_DATA handle, taken in turn (sync).
  *
  * A thread_local std::ofstream corrupts the heap when its thread ends under
  * MinGW's winpthreads (a fifteen-line program does it). So the stream is a
@@ -88,6 +89,10 @@ protected:
     ::std::streamsize xsputn(const char* s, ::std::streamsize n) override { pending_.append(s, size_t(n)); return n; }
     int sync() override
     {
+        // The kernel's append is whole only on a local disk, and Wine's not
+        // even there: an image's threads take turns (one image, one file).
+        static ::std::mutex& turn = *new ::std::mutex;
+        ::std::lock_guard<::std::mutex> g(turn);
         DWORD put = 0;
         const bool ok = pending_.empty() || WriteFile(h_, pending_.data(), DWORD(pending_.size()), &put, nullptr);
         pending_.clear();
