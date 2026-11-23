@@ -1,8 +1,8 @@
 #ifndef BASE_PRESENT_H__
 #define BASE_PRESENT_H__
 #include "Present.h"
+#include <map>
 #include <mutex>
-#include <set>
 
 /*
  * THE ROLL LIVES HERE: who is here, and the hall this entity is listed in
@@ -51,21 +51,24 @@ ETCS_SUPERTYPE_BASE(Present)
     uint64_t Arrive(const std::string& who) override
     {
         std::lock_guard<std::mutex> g(m_present_mu);
-        if (who.empty() || !m_p_here.insert(who).second) return 0;
-        ArrivedConcrete(who);
+        if (who.empty()) return 0;
+        if (m_p_here[who]++ == 0) ArrivedConcrete(who);
         return m_pgen;
     }
     void Depart(uint64_t gen, const std::string& who) override
     {
         std::lock_guard<std::mutex> g(m_present_mu);
-        if (gen != m_pgen || !m_p_here.erase(who)) return;
+        auto it = m_p_here.find(who);
+        if (gen != m_pgen || it == m_p_here.end()) return;
+        if (--it->second > 0) return;
+        m_p_here.erase(it);
         DepartedConcrete(who);
     }
     std::string Here() override
     {
         std::lock_guard<std::mutex> g(m_present_mu);
         std::string out;
-        for (const auto& w : m_p_here) out += w + "\n";
+        for (const auto& w : m_p_here) out += w.first + "\n";
         return out;
     }
     void Announce() override
@@ -97,7 +100,7 @@ private:
     uint64_t              m_pgen = 1;     // 0 is Arrive's "not an arrival"
     ETCS::RID             m_p_hall = 0;
     std::string           m_p_name, m_p_id, m_p_said;
-    std::set<std::string> m_p_here;
+    std::map<std::string, int> m_p_here;   // who, and how many of its streams are open
 };
 
 #endif // BASE_PRESENT_H__

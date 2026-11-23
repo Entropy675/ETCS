@@ -504,9 +504,12 @@ A state can also be its own lines. A **Trace** is a state that keeps the lines i
 order, from as made -- so a copy that follows them from the first is the same state, and one
 that is not says so where the trace says its hash (`hash <at> <hash>`, a line like any other).
 One copy is the **authority**: it applies a line as it takes it, from its own hand or from a
-**seat** -- a stream into it from another runtime, named by its first message, whose every
-later message is that seat's line. The stream is who said it and the order the authority reads
-its seats in is the order, so judging is the MirrorBuffer's: the room publishes the game's
+**seat** -- a stream into it from another runtime, whose every message after the first is that
+seat's line. A seat is an identity: over a link, the key its link proved, so its lines are
+authored as that key's fingerprint whatever it calls itself, and the same key on a new stream
+takes its seat back; its first message gives only a label for people and a nonce its own mirror
+knows it by (`seat <nonce> <label>`, the family's line). The stream is who said it and the order
+the authority reads its seats in is the order, so judging is the MirrorBuffer's: the room publishes the game's
 `Trace` and `Take` and nothing else, and the game refuses what a seat may not say. The others
 **mirror** it (`host.Trace(0) -> game.Follow()`), their own lines leaving on their seat
 (`game.Emit() -> host.Take()`) and coming back as the trace's. A **Lockstep** trace's time is

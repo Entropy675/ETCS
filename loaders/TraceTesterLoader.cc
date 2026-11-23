@@ -13,24 +13,30 @@
 //   2. THE AUTHORITY keeps every line it takes; ticks go in in batches and
 //      always before any other line, so that line lands at the tick it was
 //      applied at, and every snapshot is a `hash` line of the trace.
-//   3. A SEAT. A stream named by its first message sits (opening with the
-//      leaf's line, as that seat); a second stream under a name already
-//      sitting, or the authority's own, does not. A seat's lines are taken as
-//      it; the leaf refuses what is not that seat's to say, and the family's
-//      own words (`tick`, `hash`) are nobody's to say -- refused lines are not
-//      kept. A mirror's seat says its name first, and its own lines are sent,
-//      not applied.
+//   3. A SEAT. A stream of this runtime's, named by its first message, sits
+//      (opening with the leaf's line, as that seat); the authority's own name
+//      or none does not. A seat's lines are taken as it; the leaf refuses what
+//      is not that seat's to say, and the family's own words (`tick`, `hash`,
+//      `seat`) are nobody's to say -- refused lines are not kept. A mirror's
+//      seat says its label and a nonce first, and its own lines are sent, not
+//      applied.
 //   4. A MIRROR fed the authority's trace from its first line is the
 //      authority: the same tick, the same state, the same snapshot -- having
 //      checked itself at every `hash` line. A mirror is itself followable.
 //   5. DRIFT. A mirror whose state is not the authority's where a `hash` line
 //      says it is told, once.
 //   6. PRESENT. A seat arrives when it sits and departs when its stream ends;
-//      the stream ending is also its leaving line. A second arrival under one
-//      name is not one; a departure from a session gone is nobody's.
+//      the stream ending is also its leaving line. Here while any stream of
+//      it is open; a departure from a session gone is nobody's.
 //   7. STALE. A stream of the last session is refused once the copy is in
 //      another; a trace ending under a copy that no longer mirrors it says
 //      nothing.
+//   8. A SEAT OVER A LINK IS ITS KEY'S. A seat stream carrying a proven peer
+//      (SignalContext::peer, as a link stamps it) is authored as the key's
+//      fingerprint whatever it called itself; the label is what people see,
+//      and the mirror whose nonce it is learns that seat is its own. The same
+//      key on a second stream takes the seat back without a second opening:
+//      the first stream's lines and its end are then nobody's.
 //
 //   ./Run_TraceTesterLoader
 //
@@ -40,6 +46,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -93,7 +100,9 @@ public:
     void ArrivedConcrete(const std::string& who) override  { arrived.push_back(who); }
     void DepartedConcrete(const std::string& who) override { departed.push_back(who); }
 
-    // The test's hands: a line of this copy's own, and its state, under the lock.
+    // The test's hands: a line of this copy's own, its state and who it is, under the lock.
+    std::string Me()                     { std::lock_guard<std::mutex> g(m_mu); return m_me; }
+    std::string Label(const std::string& who) { std::lock_guard<std::mutex> g(m_mu); return labelLocked(who); }
     void Say(const std::string& line) { std::lock_guard<std::mutex> g(m_mu); proposeLocked(line); }
     void Frame(double ms)              { std::lock_guard<std::mutex> g(m_mu); clockLocked(ms); }
     std::string State()                { std::lock_guard<std::mutex> g(m_mu); return std::to_string(m_tick) + " " + HashConcrete(); }
@@ -103,6 +112,18 @@ public:
     std::vector<std::string> seats, arrived, departed;
     std::vector<uint64_t> differed;
     bool ended = false;
+};
+
+// A seat's stream, by hand: its messages in order, then its end.
+struct Fed
+{
+    std::deque<std::string> q;
+    bool readMessage(std::string& m, size_t = 0)
+    {
+        if (q.empty()) return false;
+        m = q.front(); q.pop_front();
+        return true;
+    }
 };
 
 // Everything `c` has kept from `from` on, as its Trace stream hands it.
@@ -144,7 +165,7 @@ int main()
     check(host->seats.size() == 1 && host->State() == "10 10:1:1", "practice: its own opening taken, ten ticks stepped");
     check(lines(host).empty(), "...and nothing kept: nobody could follow it");
     check(host->Follow(host->Generation(), "0 someone rate 5") && host->rate == 1, "...and no trace followed");
-    check(!host->Sit(host->Generation() + 1, "x"), "...and a seat of another session refused");
+    check(!host->Sit(host->Generation() + 1, "x", "x", "-"), "...and a seat of another session refused");
 
     // 2. The authority.
     std::printf("\n-- 2. the authority --\n");
@@ -163,19 +184,23 @@ int main()
     std::printf("\n-- 3. a seat --\n");
     guest->Join("g", "h");
     std::string out; bool stale = false;
-    check(guest->NextEmit(guest->Generation(), out, stale) && out == "g", "a mirror's seat says its name first");
+    check(guest->NextEmit(guest->Generation(), out, stale) && out.compare(0, 2, "g ") == 0 && out.size() == 18,
+          "a mirror's seat says its label and a nonce first");
+    const std::string nonce = out.substr(2);
     guest->Say("rate 3");
     check(guest->NextEmit(guest->Generation(), out, stale) && out == "rate 3" && guest->rate == 1,
           "...then its own lines, sent and not applied here");
     const uint64_t hg = host->Generation();
-    check(host->Sit(hg, "g") && host->seats.size() == 2, "the seat sits, opening with `join` as itself");
-    check(!host->Sit(hg, "g") && !host->Sit(hg, "h") && !host->Sit(hg, ""), "...a second stream under its name, the host's or none does not");
+    const uint64_t tg = host->Sit(hg, "g", "g", nonce);
+    check(tg && host->seats.size() == 2, "the seat sits, opening with `join` as itself");
+    check(!host->Sit(hg, "h", "h", "-") && !host->Sit(hg, "", "", "-"), "...the host's name or none does not");
     const size_t before = lines(host).size();
-    host->Take(hg, "g", out);
-    host->Take(hg, "g", "bump 5");      // the owner's alone
-    host->Take(hg, "g", "tick 999");    // the family's
-    host->Take(hg, "g", "hash 1 x");    // the family's
-    host->Take(hg, "ghost", "rate 9");  // no such seat
+    host->Take(hg, "g", tg, out);
+    host->Take(hg, "g", tg, "bump 5");      // the owner's alone
+    host->Take(hg, "g", tg, "tick 999");    // the family's
+    host->Take(hg, "g", tg, "hash 1 x");    // the family's
+    host->Take(hg, "g", tg, "seat 1 x");    // the family's
+    host->Take(hg, "ghost", tg, "rate 9");  // no such seat
     const std::vector<std::string> after = lines(host, before);
     check(host->rate == 3 && host->value == 106 && host->State().compare(0, 2, "6 ") == 0 && joined(after) == "g rate 3|",
           "its own rate taken as it; the owner's bump, the family's words and an unseated name refused, and not kept");
@@ -207,11 +232,14 @@ int main()
     // 6. Present: the host's seat stream for g, by hand (etcs_trace_take).
     std::printf("\n-- 6. present --\n");
     const uint64_t pg = host->Arrive("g");
-    check(pg != 0 && host->Arrive("g") == 0 && host->Here() == "g\n" && host->arrived == std::vector<std::string>{ "g" },
-          "a seat arrives as it sits; a second stream under its name is not a second arrival");
+    const uint64_t pg_again = host->Arrive("g");
+    check(pg != 0 && pg_again == pg && host->Here() == "g\n" && host->arrived == std::vector<std::string>{ "g" },
+          "a seat arrives as it sits; a second stream of it at once is not a second arrival");
     host->Depart(pg, "g");
-    host->Rise(hg, "g");
-    check(host->departed == std::vector<std::string>{ "g" } && host->Here().empty(), "...and departs as its stream ends");
+    check(host->departed.empty() && host->Here() == "g\n", "...nor is that stream's end a departure while the other is open");
+    host->Depart(pg, "g");
+    host->Rise(hg, "g", tg);
+    check(host->departed == std::vector<std::string>{ "g" } && host->Here().empty(), "...and it departs as its last stream ends");
     check(host->seats.size() == 1 && joined(lines(host)).find("g leave|") != std::string::npos,
           "...whose end is its leaving line, as itself");
     const uint64_t pg2 = host->Arrive("g");
@@ -225,13 +253,53 @@ int main()
     const uint64_t old_gen = guest->Generation();
     guest->Leave();
     check(!guest->Follow(old_gen, "999 h tick 999") && !guest->NextEmit(old_gen, out, stale) && stale
-          && !host->Take(hg, "g", "rate 1") && !host->Sit(hg, "g2"),
+          && !host->Take(hg, "g", tg, "rate 1") && !host->Sit(hg, "g2", "g2", "-"),
           "a stream of the last session is refused, and told it is stale");
     guest->Ended(guest->Generation());
     check(!guest->ended, "...and a trace ending under a copy that no longer mirrors it says nothing");
     guest->Join("g", "h");
     guest->Ended(guest->Generation());
     check(guest->ended, "a trace ending under a mirror is said");
+
+    // 8. A seat over a link.
+    std::printf("\n-- 8. a seat over a link --\n");
+    Counter* far  = arena.allocate<Counter>();
+    Counter* mine = arena.allocate<Counter>();
+    far->Host("h");
+    mine->Join("pat", "h");
+    Fed seat;
+    while (mine->NextEmit(mine->Generation(), out, stale)) seat.q.push_back(out);
+    mine->Say("rate 7");
+    while (mine->NextEmit(mine->Generation(), out, stale)) seat.q.push_back(out);
+    ETCS::SignalContext over;                    // as an edge stamps it (Edge.h)
+    for (int i = 0; i < 32; ++i) over.peer.key[i] = uint8_t(0xa0 + i);
+    char fp[17];
+    over.peer.fingerprint(fp);
+    etcs_trace_take(*far, seat, over);           // runs the stream to its end
+    const std::string kept8 = joined(lines(far));
+    std::printf("        (trace: %s)\n", kept8.c_str());
+    const std::string k = fp;
+    check(kept8.find(k + " join|" + k + " rate 7|" + k + " leave|") != std::string::npos && far->rate == 7
+          && kept8.find(" pat join") == std::string::npos,
+          "its lines are authored as its key's fingerprint, not as the name it gave");
+    check(far->Label(k) == "pat", "...and that name is its label, for people");
+    for (const auto& l : lines(far)) mine->Follow(mine->Generation(), l);
+    check(mine->Me() == k && mine->Label(k) == "pat" && mine->State() == far->State(),
+          "the mirror whose nonce it was knows the seat as its own, and is the authority");
+    const uint64_t fg = far->Generation();
+    const uint64_t ta = far->Sit(fg, k, "pat", "-"), tb = far->Sit(fg, k, "pat", "-");
+    far->Take(fg, k, ta, "rate 1");
+    far->Take(fg, k, tb, "rate 2");
+    far->Rise(fg, k, ta);
+    const std::string mid = joined(lines(far));
+    far->Rise(fg, k, tb);
+    const std::string end = joined(lines(far));
+    auto count = [](const std::string& h, const std::string& n) { size_t c = 0; for (size_t at = h.find(n); at != std::string::npos; at = h.find(n, at + 1)) ++c; return c; };
+    check(ta && tb && ta != tb && far->rate == 2 && count(mid, k + " join|") == 2 && count(mid, k + " leave|") == 1,
+          "the same key on a second stream takes its seat back: one opening, the first stream's lines unheard");
+    check(count(end, k + " leave|") == 2, "...the first stream's end is nobody's, the second's is the seat's");
+    ETCS::MemoryArena::getInstance().deleteEntity(far, true);
+    ETCS::MemoryArena::getInstance().deleteEntity(mine, true);
 
     for (Counter* c : { host, guest, third }) ETCS::MemoryArena::getInstance().deleteEntity(c, true);
     ETCS::PendingUnloadRegistry::getInstance().join_all();
