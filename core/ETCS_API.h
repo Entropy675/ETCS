@@ -611,15 +611,11 @@ public: \
     ETCS::ExecutionContext env(&root, &ctx);
 
 // --- Arity-scaling expansion machinery (FE_*/FE_FIXED_*/FE_C_*,
-// GET_MACRO*, FOR_EACH*, ETCS_DISPATCH_SELECT*) lives in a generated
-// file, not here. Regenerate via generate_arity_macros.py whenever the
-// arity ceiling (currently 64) needs to change — never hand-edit the
-// generated file directly, and never hand-edit a replacement for it
-// here; that's exactly the drift the generator exists to prevent.
+// GET_MACRO*, FOR_EACH*, ETCS_COUNT_ARGS, ETCS_DISPATCH_SELECT*) lives in
+// a generated file, not here: ACE's dev_tools/generate_airty_macros.py,
+// MAX_ARITY (128), written by `ace deps generate`. Never hand-edit it, nor
+// a replacement for any of it here; that's the drift the generator prevents.
 #include "AirtyMacros_Generated.h"
-// see root/dev_tools/generate_airty_macros.py to generate
-#define ETCS_COUNT_ARGS(...) \
-    GET_MACRO(__VA_ARGS__,64,63,62,61,60,59,58,57,56,55,54,53,52,51,50,49,48,47,46,45,44,43,42,41,40,39,38,37,36,35,34,33,32,31,30,29,28,27,26,25,24,23,22,21,20,19,18,17,16,15,14,13,12,11,10,9,8,7,6,5,4,3,2,1)
 #define ETCS_DISPATCH_CONCAT2_(a,b)   a##b
 #define ETCS_DISPATCH_CONCAT2(a,b)    ETCS_DISPATCH_CONCAT2_(a,b)
 #define ETCS_DISPATCH_CONCAT3_(a,b,c) a##b##c
