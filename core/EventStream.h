@@ -239,6 +239,9 @@ protected:
     // its own hides this; refining it is an explicit claim that two things may
     // run at once.
     TagMask mask_for(State&, const InEvent&) { return TagMask::all(); }
+    // The ring is caught up: the end of a burst, where a consumer settles what
+    // it deferred while draining it. Every loop ends a drain here.
+    void on_drained(State&) {}
     // launch_slot — run one admitted event's handler. Reached from
     // ordering_loop when it arrived unblocked, or from service() when its last
     // blocker committed. Identical either way; admission is the only difference.
@@ -313,6 +316,7 @@ protected:
             const LBuffer* buf = input_ring_->acquireRead(in_seq_);
             if (!buf)
             {
+                static_cast<Derived*>(this)->on_drained(state_);
                 LMAXSequentialSharedPage::progressiveYield(retry);
                 continue;
             }
@@ -338,6 +342,7 @@ protected:
             service();
             ++in_seq_;
         }
+        static_cast<Derived*>(this)->on_drained(state_);
         ETCS_LOG("EventStream", "Ordering thread exiting. in_seq="
             << in_seq_ << " cmp_seq=" << cmp_seq_ << " blocked_admissions="
             << blocked_admissions_.load(::std::memory_order_relaxed));
@@ -693,6 +698,7 @@ protected:
             service();
             drain_completions();
         }
+        static_cast<Derived*>(this)->on_drained(state_);
         return true;
     }
 

@@ -24,6 +24,7 @@
 #include "EventNode.h"
 #include <iostream>
 #include <vector>
+#include <memory>   // restoreValues posts its events
 #include <mutex>   // resolvePairModuleMask's cache
 #include <thread>  // the loader stream pair waits out its producer body
 #include <chrono>
@@ -524,6 +525,7 @@ private:
         const RID*   rids()   const { return reinterpret_cast<const RID*>(groups() + ngroups); }
     };
     mutable ::std::atomic<const SurfaceView*> surface_view_{ nullptr };
+    ::std::atomic<uint64_t>                   surface_version_{ 0 };   // views published (surfaceVersion)
     ::std::atomic<const ChildView*>           child_view_{ nullptr };
     mutable ::std::atomic<const OrderedView*> ordered_view_{ nullptr };
     // The keys that moved since the last rebuild, which it acts on: which
@@ -554,6 +556,7 @@ private:
     }
     void publishSurface(const SurfaceView* v)
     {
+        surface_version_.fetch_add(1, ::std::memory_order_release);
         ETCS::Reclaimer::getInstance().retire(const_cast<SurfaceView*>(surface_view_.exchange(v, ::std::memory_order_acq_rel)));
     }
     // The whole surface, from the maps: for a tag going on or off (rare), and
@@ -840,7 +843,20 @@ private:
         indexAll(v);
         publishChildrenLocked(v);
     }
-    const SurfaceView* surfaceView() const { return surface_view_.load(::std::memory_order_acquire); }
+    /*
+     * A SURFACE IS BORN WHOLE. Nothing publishes while the entity is being
+     * made (addTypeTag), so the first view is built from the maps by whoever
+     * first needs one: the loader's bundle attach, the first write, or a read
+     * of a view never built. Null is "never built", not "behind".
+     */
+    const SurfaceView* surfaceView() const
+    {
+        if (const SurfaceView* v = surface_view_.load(::std::memory_order_acquire)) return v;
+        Entity* self = const_cast<Entity*>(this);
+        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
+        if (!surface_view_.load(::std::memory_order_relaxed)) self->publishSurfaceLocked();
+        return surface_view_.load(::std::memory_order_acquire);
+    }
     const ChildView*   childView()   const { return child_view_.load(::std::memory_order_acquire); }
     /*
  * ---------------------------------------------------------------------
@@ -1550,23 +1566,64 @@ private:
     }
 public:
 
-    // A record's value, back: a stored value is set, a bound one is handed
-    // to its binding. No funnel and no record -- this is a value the capture
-    // kept as WHAT, coming back as what. False when the key has no place
-    // here, or the binding refused it.
+    // A record's value, back: a stored value through the funnel, a bound one
+    // handed to its binding. No record -- this is a value the capture kept as
+    // WHAT, coming back as what. False when the key has no place here, or the
+    // binding refused it.
     bool restoreValue(const ETCS::Buffer& key, const ::std::string& v)
     {
-        ValueBinding b;
-        bool bound = false;
+        return restoreValues({ { key.toString(), v } }) == 1;
+    }
+    // Several at once, as one burst: a stored value through the funnel
+    // (restoreImpl), all posted before any is waited on; a bound one to its
+    // binding. How many landed.
+    size_t restoreValues(const ::std::vector<::std::pair<::std::string, ::std::string>>& kv)
+    {
+        size_t landed = 0;
+        ::std::vector<::std::pair<::std::unique_ptr<ETCS::TagModifyEvent>, size_t>> posted;
+        for (size_t i = 0; i < kv.size(); ++i)
+        {
+            const ETCS::Buffer key(kv[i].first.c_str());
+            ValueBinding b;
+            bool bound = false;
+            {
+                ::std::lock_guard<::std::mutex> lock(m_tagMutex);
+                auto it = bindings_.find(key);
+                if (it != bindings_.end()) { b = it->second; bound = true; }
+                else if (flags_.find(key) == flags_.end()) continue;
+            }
+            if (bound) { if (b.read && b.read(b.self, kv[i].second)) ++landed; continue; }
+            auto ev = ::std::make_unique<ETCS::TagModifyEvent>(this, key, false, &Entity::restoreImpl);
+            ev->value = &kv[i].second;
+            if (ev->post()) posted.emplace_back(::std::move(ev), i);
+        }
+        for (auto& [ev, i] : posted)
+        {
+            if (!ev->wait()) continue;
+            onValue(ETCS::Buffer(kv[i].first.c_str()), &kv[i].second);   // stored: the family's copy follows
+            ++landed;
+        }
+        return landed;
+    }
+    /*
+     * What a stream owes this entity once its burst is drained
+     * (tagModifyImpl): the view, from the maps -- `only` the key that moved,
+     * null for several -- and then the one mark.
+     */
+    void publishOwed(const ETCS::Buffer* only)
+    {
         {
             ::std::lock_guard<::std::mutex> lock(m_tagMutex);
-            auto it = bindings_.find(key);
-            if (it != bindings_.end()) { b = it->second; bound = true; }
-            else if (flags_.find(key) == flags_.end()) return false;
-            else { setValueLocked(key, v); surfaceSetLocked(key, &v); }
+            if (!only) publishSurfaceLocked();
+            else if (flags_.find(*only) == flags_.end()) surfaceRemoveLocked(*only);
+            else
+            {
+                auto v = values_.find(*only);
+                if (v == values_.end()) surfaceSetLocked(*only, nullptr);
+                else { const ::std::string val(v->second.data(), v->second.size()); surfaceSetLocked(*only, &val); }
+            }
         }
-        if (!bound) { onValue(key, &v); return true; }   // stored: the family's copy follows
-        return b.read && b.read(b.self, v);
+        markStateChange(this, getRID());
     }
 
     // This node's values as one number; getHash composes them over the subtree.
@@ -1682,7 +1739,7 @@ public:
                 ::std::string("addTypeTag: type tag must start with an uppercase letter: ")
                 + (s ? s : ""));
         ::std::lock_guard<::std::mutex> lock(m_tagMutex);
-        if (tags.emplace(type_tag, TagEntry{}).second) publishSurfaceLocked();
+        tags.emplace(type_tag, TagEntry{});   // unpublished: born whole (surfaceView)
     }
 
     /*
@@ -2536,6 +2593,10 @@ public:
     // recompute would believe a value the recompute did not see. The digest
     // lands first, so a reader that sees the epoch sees the digest.
     uint32_t hashEpoch() const { return hash_epoch_.load(::std::memory_order_acquire); }
+    // How many views this entity's surface has published: 0 until it is born
+    // (surfaceView), one more per publish. A reader can tell by it whether the
+    // surface moved since it last looked.
+    uint64_t surfaceVersion() const { return surface_version_.load(::std::memory_order_acquire); }
     void     stampHash(uint64_t h, uint32_t epoch, const unsigned char* digest = nullptr) const
     {
         if (digest) ::std::memcpy(hash_digest_, digest, 32);
@@ -3698,12 +3759,26 @@ public:
     }
 private:
 
+    /*
+     * THE MAPS ONLY. The stream that applies this owes the surface: once its
+     * burst is drained it publishes one view per entity it touched and marks
+     * it once (publishOwed), and only then wakes the writers. A write is never
+     * returned before it can be read; a burst is never published by halves.
+     */
     static bool tagModifyImpl(Entity* target, const ETCS::Buffer& key, bool is_remove, const ::std::string* value)
     {
-        const bool changed = tagModifyBody(target, key, is_remove, value);
-        if (!changed || !target) return changed;
-        markStateChange(target, target->getRID());
-        return changed;
+        return target && tagModifyBody(target, key, is_remove, value);
+    }
+    // A record's value back (restoreValue): onto a flag the replay put back,
+    // or nowhere. True when it landed. No record: what comes back is WHAT,
+    // not an action.
+    static bool restoreImpl(Entity* target, const ETCS::Buffer& key, bool, const ::std::string* value)
+    {
+        if (!target || !value) return false;
+        ::std::lock_guard<::std::mutex> lock(target->m_tagMutex);
+        if (target->flags_.find(key) == target->flags_.end()) return false;
+        target->setValueLocked(key, *value);
+        return true;
     }
 
     static bool tagModifyBody(Entity* target, const ETCS::Buffer& key, bool is_remove, const ::std::string* value)
@@ -3717,7 +3792,6 @@ private:
             {
                 value_set = target->setValueLocked(key, *value);
             }
-            if (flag_on || value_set) target->surfaceSetLocked(key, value_set ? value : nullptr);
             return flag_on || value_set;
         }
  
@@ -3817,7 +3891,6 @@ private:
             {
                 changed = (target->flags_.erase(key) > 0);
                 target->values_.erase(key);
-                if (changed) target->surfaceRemoveLocked(key);
             }
         }
  

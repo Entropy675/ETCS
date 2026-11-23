@@ -1384,6 +1384,52 @@ inline bool etcs_tagmodify_apply(const ETCS::DLInEvent& evt)
     return evt.tagmodify_impl(live, evt.conjugate_key, evt.tagmodify_is_remove, evt.tagmodify_value);
 }
 /*
+ * WHAT A STREAM OWES THE SURFACE (Entity::tagModifyImpl). A flag or value is
+ * applied to the maps and its writer parked; when the burst is drained, or
+ * before anything else runs, every entity it touched gets one view and one
+ * mark, and then the writers wake. A move is not owed: it publishes as it
+ * goes and wakes at once.
+ */
+inline void etcs_tagmodify_wake(ETCS::DLInEvent& e)
+{
+    // Answer before flag: the caller spins on the flag.
+    if (e.tagmodify_changed) e.tagmodify_changed->store(e.release_value != 0, ::std::memory_order_relaxed);
+    if (e.tagmodify_done) e.tagmodify_done->store(true, ::std::memory_order_release);
+}
+inline void etcs_tagmodify_settle(::std::vector<ETCS::DLInEvent*>& owed)
+{
+    if (owed.empty()) return;
+    // Each entity once: the one key it moved, or all of it. Resolved again,
+    // quietly: one retired since its write is owed nothing.
+    struct Touched { ETCS::Entity* e; const ETCS::Buffer* key; bool several; };
+    ::std::vector<Touched> touched;
+    for (ETCS::DLInEvent* ev : owed)
+    {
+        if (!ev->release_value) continue;
+        ETCS::Entity* live = etcs_type_published(ev->tagmodify_type)
+                           ? ETCS::etcs_resolve_by_key(ev->tagmodify_type, ev->tagmodify_rid) : ev->tagmodify_target;
+        if (!live) continue;
+        auto it = ::std::find_if(touched.begin(), touched.end(), [live](const Touched& t) { return t.e == live; });
+        if (it == touched.end()) touched.push_back({ live, &ev->conjugate_key, false });
+        else if (!(*it->key == ev->conjugate_key)) it->several = true;
+    }
+    for (const Touched& t : touched) t.e->publishOwed(t.several ? nullptr : t.key);
+    for (ETCS::DLInEvent* ev : owed) etcs_tagmodify_wake(*ev);
+    owed.clear();
+}
+inline void etcs_tagmodify_owe(::std::vector<ETCS::DLInEvent*>& owed, ETCS::DLInEvent* e)
+{
+    if (e->tagmodify_move_impl) { etcs_tagmodify_wake(*e); return; }
+    owed.push_back(e);
+    if (owed.size() >= ETCS::GAP_DEPTH) etcs_tagmodify_settle(owed);   // a burst that never drains still wakes
+}
+// Anything but a flag or value runs only once the surface is settled: what
+// is ordered after a write reads it.
+inline bool etcs_tagmodify_owed_kind(const ETCS::DLInEvent& e)
+{
+    return e.kind == ETCS::DLInEvent::Kind::TagModify && !e.tagmodify_move_impl;
+}
+/*
  * -- LoaderStream method bodies ------------------------------------------------
  * Declared in EventNode.h, defined here where Module is fully defined.
  * All EventNode state access goes through owner pointer - no getInstance().
@@ -1457,6 +1503,16 @@ ETCS::TagMask ETCS::EventNode::LoaderStream::mask_for(
     }
 }
 
+void ETCS::EventNode::LoaderStream::owe(DLInEvent* e) { etcs_tagmodify_owe(owed, e); }
+void ETCS::EventNode::LoaderStream::on_drained(DLState&)
+{
+    if (owed.empty()) return;
+    struct OrderingThreadGuard {
+        OrderingThreadGuard()  { EventNode::on_ordering_thread = true; }
+        ~OrderingThreadGuard() { EventNode::on_ordering_thread = false; }
+    } _ordering_thread_guard;
+    etcs_tagmodify_settle(owed);
+}
 ETCS::DispatchResult ETCS::EventNode::LoaderStream::on_event(
     DLState&, const DLInEventPtr& ref, uint64_t)
 {
@@ -1485,6 +1541,7 @@ ETCS::DispatchResult ETCS::EventNode::LoaderStream::on_event(
  * position is now taste, not safety.
  */
     DLInEvent& evt = *ref.ptr;
+    if (!etcs_tagmodify_owed_kind(evt)) etcs_tagmodify_settle(owed);
     switch (evt.kind)
     {
         case DLInEvent::Kind::Load:
@@ -2813,10 +2870,13 @@ bool ETCS::EventNode::LoaderStream::isTypedActionStream(
  */
 #ifndef ETCS_LOADER
  
+void ETCS::EventNode::ModuleProxy::owe(DLInEvent* e) { etcs_tagmodify_owe(owed, e); }
+void ETCS::EventNode::ModuleProxy::on_drained(DLState&) { etcs_tagmodify_settle(owed); }
 ETCS::DispatchResult ETCS::EventNode::ModuleProxy::on_event(
     DLState&, const DLInEventPtr& ref, uint64_t)
 {
     DLInEvent& evt = *ref.ptr;
+    if (!etcs_tagmodify_owed_kind(evt)) etcs_tagmodify_settle(owed);
  
     if (evt.kind == DLInEvent::Kind::TagModify)
     {
@@ -3475,11 +3535,11 @@ inline void ETCS::ChangeModuleEvent::operator()()
  * LOCALLY (see ModuleProxy::on_event's fork) - never crosses to the
  * loader itself, regardless of which scope fires it.
  */
-inline bool ETCS::TagModifyEvent::operator()()
+inline bool ETCS::TagModifyEvent::post()
 {
     ETCS_ASSERT_NOT_ORDERING_THREAD("TagModifyEvent");
     ETCS_ASSERT_NO_LIFETIME_HOLD("TagModifyEvent");
-    DLInEvent evt{};
+    DLInEvent& evt = posted;
     evt.kind                = DLInEvent::Kind::TagModify;
     evt.conjugate_key       = conjugate_key;
     evt.tagmodify_rid       = target->getRID();
@@ -3528,8 +3588,10 @@ inline bool ETCS::TagModifyEvent::operator()()
  * stream is already cleaning up, so there is no ordering left to join and
  * nothing should be acting on a claim it thinks it won.
  */
-    if (!ETCS::EventNode::getInstance().stream.enqueue(DLInEventPtr{&evt}))
-        return false;
+    return ETCS::EventNode::getInstance().stream.enqueue(DLInEventPtr{&evt});
+}
+inline bool ETCS::TagModifyEvent::wait()
+{
 #if defined(__EMSCRIPTEN__)
     // This node's loop, not the loader's: the event is on THIS stream.
     etcs_emscripten_spin(ETCS::EventNode::getInstance(),

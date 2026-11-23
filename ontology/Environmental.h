@@ -313,9 +313,7 @@ inline bool etcs_freeze(ETCS::Entity* root, FrozenTree& out,
 // does not have) is skipped, and the count says so.
 inline size_t etcs_restore_values(ETCS::Entity* e, const ETCS::EnvironmentState& st)
 {
-    size_t n = 0;
-    for (auto& [k, v] : st.kv) if (e->restoreValue(ETCS::Buffer(k.c_str()), v)) ++n;
-    return n;
+    return e->restoreValues(st.kv);   // one burst
 }
 
 #endif // SUPERTYPE_ENVIRONMENTAL_H__

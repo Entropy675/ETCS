@@ -379,8 +379,9 @@ struct TagModifyEvent : Event
     MoveImpl          move_impl = nullptr;
     ::std::atomic<bool> done{false};
     ::std::atomic<bool> changed{false};
+    DLInEvent           posted{};   // on the ring from post() until wait() returns
     // The fail-shut substitution an empty mask needs — a type with no tag
-    // block, so nothing ever assigned its TAG_MASK — is made in operator()(),
+    // block, so nothing ever assigned its TAG_MASK — is made in post(),
     // where the mask is now acquired. Kept out of TAG_MASK's own default,
     // which must stay empty-until-assigned for ETCS_TAG_DECLARE's alias guard.
     TagModifyEvent(ETCS::Entity* t, const ETCS::Buffer& key, bool remove, Impl fn,
@@ -397,7 +398,12 @@ struct TagModifyEvent : Event
  * second mechanism, and the ordering is the one every other state change in
  * the module already takes.
  */
-    bool operator()();
+    bool operator()() { return post() && wait(); }
+    // Apart, so one writer can put several on the ring and wait once: the
+    // stream drains them as one burst (Entity::restoreValues). post() false:
+    // the stream is ending, and there is nothing to wait for.
+    bool post();
+    bool wait();
 };
 // PairMaskEvent — resolve two contract tags into a MODULE-scope mask.
 //
@@ -871,6 +877,10 @@ public:
     struct LoaderStream : ETCS::EventStream<LoaderStream, DLState, DLInEventPtr>
     {
         EventNode* owner = nullptr; // wired in EventNode ctor
+        // As ModuleProxy's: the TagModify writers this stream owes a surface.
+        ::std::vector<DLInEvent*> owed;
+        void owe(DLInEvent* e);
+        void on_drained(DLState&);
         // module name -> current live anchor Module, or nullptr (vacant).
         // NON-OWNING: every REAL anchor Module lives inside its hosting
         // entity's own local_arena_ — the first entity spawned of a
@@ -1076,12 +1086,7 @@ public:
                     if (e->unload_done)  e->unload_done->store(true, ::std::memory_order_release);
                     break;
                 case DLInEvent::Kind::TagModify:
-                    // Answer before flag: the caller spins on the flag, so the
-                    // store that releases it must be the last touch here.
-                    if (e->tagmodify_changed)
-                        e->tagmodify_changed->store(e->release_value != 0,
-                                                    ::std::memory_order_relaxed);
-                    if (e->tagmodify_done) e->tagmodify_done->store(true, ::std::memory_order_release);
+                    owe(e);
                     break;
                 case DLInEvent::Kind::ChangeModule:
                     if (e->changemodule_done) e->changemodule_done->store(true, ::std::memory_order_release);
@@ -1218,14 +1223,13 @@ public:
         // slot.result is null and this no-ops.
         void on_emit(DLState&, ETCS::GapSlot& slot)
         {
-            DLInEvent* e = static_cast<DLInEvent*>(slot.result);
-            if (!e) return;
-            // Answer before flag -- see LoaderStream::on_emit's own note.
-            if (e->tagmodify_changed)
-                e->tagmodify_changed->store(e->release_value != 0, ::std::memory_order_relaxed);
-            if (e->tagmodify_done)
-                e->tagmodify_done->store(true, ::std::memory_order_release);
+            if (DLInEvent* e = static_cast<DLInEvent*>(slot.result)) owe(e);
         }
+        // The writers whose surface this stream owes until its burst is
+        // drained (etcs_tagmodify_settle, DynamicLoader.h).
+        ::std::vector<DLInEvent*> owed;
+        void owe(DLInEvent* e);
+        void on_drained(DLState&);
         // Module scope. TagModify is handled locally and its mask is genuine
         // TAG bits, stamped from the emitting type's own closure -- meaningful
         // here and nowhere else. Everything else is a hand-off whose effects
