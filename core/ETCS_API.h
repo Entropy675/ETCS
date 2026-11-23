@@ -16,7 +16,13 @@
     #endif
 #else
     // When NOT building the DLL, we are using it, so we IMPORT symbols.
-    #ifdef _WIN32
+    // A loader is the exception on Windows: it DEFINES what it marks
+    // (RegisterDynamicLoader, DynamicLoader.h), and a definition cannot be
+    // an import. Nothing is linked by import anywhere -- every symbol that
+    // crosses an image is looked up by name -- so export is what it means.
+    #if defined(_WIN32) && defined(ETCS_LOADER)
+        #define ETCS_API __declspec(dllexport)
+    #elif defined(_WIN32)
         #define ETCS_API __declspec(dllimport)
     #elif defined(__EMSCRIPTEN__)
         // Import side: still need the symbol visible for cross-module calls;
@@ -373,8 +379,16 @@ inline ::std::atomic<bool> g_etcs_runtime_threads_started{false};
 // PLATFORM-SPECIFIC HEADER INCLUDES
 // ====================================================================
 #ifdef _WIN32
+    // winsock2 before windows, here, where the core first meets either: the
+    // other order pulls in winsock 1, and the two do not coexist.
+    #include <winsock2.h>
     #include <windows.h>
     #include <direct.h> // For _getcwd
+    // Three of its macros are names here: Entity's far end of a remote, a
+    // tester's near and far bodies, and the Window family's CreateWindow.
+    #undef near
+    #undef far
+    #undef CreateWindow
     using library_handle_t = HMODULE;
     #define DL_EXTENSION ".dll"
     #define RENAME_CMD(old_name, new_name) MoveFileExA(old_name.c_str(), new_name.c_str(), MOVEFILE_REPLACE_EXISTING)

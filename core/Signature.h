@@ -279,6 +279,22 @@ inline bool decode(const void* q, size_t len, Countersign& c)
 }
 
 /*
+ * A LINK'S WORD: what a loader signs to say that one link is its own --
+ * "ETCSLNK1" | 'd' (it dialled) or 'a' (it accepted) | the transcript, a hash
+ * of both sides' names and fresh exchange keys. Nothing else is ever signed
+ * after this prefix, so a module asking the loader for it can be given no
+ * module's, list's or registration's signature by asking.
+ */
+constexpr size_t kLinkTranscript = 32;
+inline std::string link_statement(char side, const uint8_t transcript[kLinkTranscript])
+{
+    std::string m("ETCSLNK1");
+    m.push_back(side);
+    m.append(reinterpret_cast<const char*>(transcript), kLinkTranscript);
+    return m;
+}
+
+/*
  * WHAT A LOADER SIGNS TO ASK FOR ACE'S HALF, and what a registrar checks:
  *
  *   "ETCSREG1" | the loader's key | the registrar's key

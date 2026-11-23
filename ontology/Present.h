@@ -24,9 +24,10 @@
 // Directory.h), whose entries last exactly as long as the link they
 // came over -- an edge again -- kept current, and withdrawn when it goes.
 //
-//   Arrive    `who`'s stream opened: the presence's generation, or 0 if
-//             `who` is here already (a second stream is not a second
-//             arrival)
+//   Arrive    `who`'s stream opened: the presence's generation (0 for
+//             nobody). Here while any stream of it is open: a second at
+//             once -- a link come back before the old one went -- is not
+//             a second arrival, nor is the first one's end a departure
 //   Depart    that stream ended; ignored once the generation is another's
 //   Here      who is, one name a line
 //   Announce  the hall's line on the owner, said again if it changed

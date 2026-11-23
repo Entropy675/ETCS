@@ -208,8 +208,17 @@ using namespace ETCS;
  */
 struct PendingUnloadRegistry
 {
-    ::std::mutex               mutex_;
-    ::std::vector<::std::thread> threads_;
+    // A recheck's thread, and whether its body has returned. A finished one is
+    // joined at the next spawn rather than at exit: a joinable thread keeps its
+    // stack mapped until joined, and a process that spawns and deletes kept one
+    // stack per module emptied, for its whole life.
+    struct Tracked
+    {
+        ::std::thread                        thread;
+        ::std::shared_ptr<::std::atomic<bool>> done;   // null: track()ed, never reaped early
+    };
+    ::std::mutex                 mutex_;
+    ::std::vector<Tracked>       threads_;
     /*
  * Set by join_all(): the join barrier has been crossed and no further
  * recheck may be started. Without this the registry has a second hole
@@ -242,15 +251,24 @@ struct PendingUnloadRegistry
  */
     bool spawn(::std::function<void()> body)
     {
-        ::std::lock_guard<::std::mutex> lock(mutex_);
-        if (closed_) return false;
-        threads_.emplace_back(::std::move(body));
+        ::std::vector<Tracked> finished;
+        {
+            ::std::lock_guard<::std::mutex> lock(mutex_);
+            if (closed_) return false;
+            reapLocked(finished);
+            auto done = ::std::make_shared<::std::atomic<bool>>(false);
+            threads_.push_back(Tracked{ ::std::thread([body = ::std::move(body), done]() {
+                struct Mark { ::std::atomic<bool>& d; ~Mark() { d.store(true, ::std::memory_order_release); } } mark{ *done };
+                body();
+            }), done });
+        }
+        for (auto& t : finished) t.thread.join();   // outside the lock, as drain does
         return true;
     }
     void track(::std::thread t)
     {
         ::std::lock_guard<::std::mutex> lock(mutex_);
-        threads_.push_back(::std::move(t));
+        threads_.push_back(Tracked{ ::std::move(t), nullptr });
     }
     /*
  * JOINED WITH THE LOCK RELEASED. A recheck finishes only when the loader's
@@ -282,18 +300,29 @@ struct PendingUnloadRegistry
         return instance;
     }
 private:
+    void reapLocked(::std::vector<Tracked>& out)
+    {
+        for (size_t i = 0; i < threads_.size();)
+            if (threads_[i].done && threads_[i].done->load(::std::memory_order_acquire))
+            {
+                out.push_back(::std::move(threads_[i]));
+                threads_[i] = ::std::move(threads_.back());
+                threads_.pop_back();
+            }
+            else ++i;
+    }
     void drain(bool close)
     {
         for (;;)
         {
-            ::std::vector<::std::thread> round;
+            ::std::vector<Tracked> round;
             {
                 ::std::lock_guard<::std::mutex> lock(mutex_);
                 if (threads_.empty()) { if (close) closed_ = true; return; }
                 round.swap(threads_);
             }
             for (auto& t : round)
-                if (t.joinable()) t.join();
+                if (t.thread.joinable()) t.thread.join();
         }
     }
 };

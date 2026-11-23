@@ -915,6 +915,31 @@ inline bool random_bytes(uint8_t* out, size_t n)
 #endif
 }
 
+// `reg` is a half above `pub`: a certificate for it in a role a loader can
+// hold, each link certified as the table says (core/Signature.h), ending at a
+// root's certificate or a key a root may certify. With a `head`, the fold along
+// it -- from its top or from a root on it -- must come to `head` at `pub`: a
+// registration whose identity that is. A root attesting another above is
+// checked as any link is.
+inline bool registration_valid(const std::vector<sig::Certificate>& reg, const sig::Key& pub, const sig::Key& head = sig::Key{})
+{
+    if (reg.empty() || reg[0].subject != pub) return false;
+    const sig::Role r = reg[0].role;
+    if (r != sig::Role::Loader && r != sig::Role::Marketplace && r != sig::Role::Release && r != sig::Role::Registrar)
+        return false;
+    for (size_t i = 0; i < reg.size(); ++i)
+    {
+        const sig::Certificate& c = reg[i];
+        if (i > 0 && (c.subject != reg[i - 1].issuer || !sig::may_issue(c.role, reg[i - 1].role))) return false;
+        if (!check(c)) return false;
+        if (c.role == sig::Role::Root && c.issuer == c.subject && i + 1 != reg.size()) return false;
+    }
+    if (reg.back().role != sig::Role::Root && !sig::may_issue(sig::Role::Root, reg.back().role)) return false;
+    if (zero(head)) return true;
+    const std::vector<Step> p = path_of(reg, pub);
+    return head_meets(p, head) == long(p.size()) - 1;
+}
+
 #if !defined(__EMSCRIPTEN__)
 inline bool make_dirs(const std::string& dir)
 {
@@ -978,31 +1003,6 @@ inline bool loader_seed(const std::string& dir, uint8_t seed[32], std::string& w
     if (!text.empty()) mc::crypto_wipe(&text[0], text.size());
     if (st == keystore::Status::Ok && !ok) why = "the keystore's loader-key is not a key";
     return ok;
-}
-
-// `reg` is a half above `pub`: a certificate for it in a role a loader can
-// hold, each link certified as the table says (core/Signature.h), ending at a
-// root's certificate or a key a root may certify. With a `head`, the fold along
-// it -- from its top or from a root on it -- must come to `head` at `pub`: a
-// registration whose identity that is. A root attesting another above is
-// checked as any link is.
-inline bool registration_valid(const std::vector<sig::Certificate>& reg, const sig::Key& pub, const sig::Key& head = sig::Key{})
-{
-    if (reg.empty() || reg[0].subject != pub) return false;
-    const sig::Role r = reg[0].role;
-    if (r != sig::Role::Loader && r != sig::Role::Marketplace && r != sig::Role::Release && r != sig::Role::Registrar)
-        return false;
-    for (size_t i = 0; i < reg.size(); ++i)
-    {
-        const sig::Certificate& c = reg[i];
-        if (i > 0 && (c.subject != reg[i - 1].issuer || !sig::may_issue(c.role, reg[i - 1].role))) return false;
-        if (!check(c)) return false;
-        if (c.role == sig::Role::Root && c.issuer == c.subject && i + 1 != reg.size()) return false;
-    }
-    if (reg.back().role != sig::Role::Root && !sig::may_issue(sig::Role::Root, reg.back().role)) return false;
-    if (zero(head)) return true;
-    const std::vector<Step> p = path_of(reg, pub);
-    return head_meets(p, head) == long(p.size()) - 1;
 }
 
 /*
@@ -1995,15 +1995,138 @@ inline bool registration_request(const std::string& dir, const sig::Key& registr
 #endif // !__EMSCRIPTEN__
 
 /*
+ * A LINK BETWEEN TWO LOADERS, as each loader vouches for its own end of it.
+ * The link's module (NetworkProvider) makes the fresh exchange keys and the
+ * transcript; the loader signs only the transcript, and only in the one form
+ * (sig::link_statement), so what it lends a module by this is its word on a
+ * link and nothing else. The far side's word is checked here too: its
+ * signature under its key, its chain to a root if it has one, and the fold
+ * that is its identity -- by the meet rule's own measure (path_of,
+ * identity_of), so a registered peer and a module of the same registration
+ * are the same identity.
+ *
+ * A BROWSER HOLDS NO KEYSTORE, so a tab vouches with a key of its own made
+ * for the session and forgotten with it: a local identity that lasts as long
+ * as the page. Kept nowhere, it is nowhere to be stolen from; a tab that
+ * reloads is somebody new. (Rejected: keeping it in the page's storage,
+ * which the page -- not the loader -- would then own.) An untrusted build
+ * does the same, for its own reason (link_secret).
+ */
+// A key made for this session and kept only in memory: a browser's, and an
+// untrusted build's (below).
+inline bool session_link_key(uint8_t secret[64], sig::Key& pub, std::string& why)
+{
+    static std::mutex m;
+    static uint8_t held[64];
+    static sig::Key held_pub{};
+    static bool made = false;
+    std::lock_guard<std::mutex> g(m);
+    if (!made)
+    {
+        uint8_t seed[32];
+        if (!random_bytes(seed, 32)) { why = "no randomness"; return false; }
+        mc::crypto_ed25519_key_pair(held, held_pub.data(), seed);        // wipes seed
+        made = true;
+    }
+    std::memcpy(secret, held, 64);
+    pub = held_pub;
+    return true;
+}
+
+/*
+ * AN UNTRUSTED BUILD VOUCHES WITH A SESSION KEY TOO, never the store's: it
+ * runs modules nothing checked, and its loader key is the developer's word
+ * everywhere that key is known -- lending it to an unchecked runtime would be
+ * signing for what nobody verified. A session key says only "this runtime,
+ * while it runs", which is all it can honestly say; the far side sees a local
+ * identity. And it says so, every link, as it says everything else.
+ */
+inline bool link_secret(uint8_t secret[64], sig::Key& pub, std::vector<sig::Certificate>& reg, std::string& why)
+{
+    reg.clear();
+#if defined(__EMSCRIPTEN__)
+    return session_link_key(secret, pub, why);
+#else
+    if (untrusted_build)
+    {
+        trust_warn("UNTRUSTED: this link is vouched for by a key made for this session, not the loader's own; "
+                   "the far side sees a local identity");
+        return session_link_key(secret, pub, why);
+    }
+    if (!identity(etcs_store_dir(), secret, pub, reg, why)) return false;
+    const Identity& id = *gate().signature.id;
+    if (!id.proven || id.pub != pub) { mc::crypto_wipe(secret, 64); why = "this session's key is not proven: " + id.unproven; return false; }
+    return true;
+#endif
+}
+
+// Vouch: "<key> <chain|-> <signature>" for this end of the link.
+inline bool vouch(char side, const std::string& transcript_hex, std::string& out, std::string& why)
+{
+    uint8_t t[sig::kLinkTranscript], secret[64], s[sig::kSigBytes];
+    if ((side != 'd' && side != 'a') || !unhex(transcript_hex, t, sizeof t)) { why = "not a link's transcript"; return false; }
+    sig::Key pub{};
+    std::vector<sig::Certificate> reg;
+    if (!link_secret(secret, pub, reg, why)) return false;
+    const std::string m = sig::link_statement(side, t);
+    mc::crypto_ed25519_sign(s, secret, reinterpret_cast<const uint8_t*>(m.data()), m.size());
+    mc::crypto_wipe(secret, 64);
+    const std::string chain = reg.empty() ? std::string() : sig::encode_chain(reg);
+    out = hex(pub.data(), 32) + " " + (chain.empty() ? "-" : hex(reinterpret_cast<const uint8_t*>(chain.data()), chain.size()))
+        + " " + hex(s, sizeof s);
+    return true;
+}
+
+// Recognize: the far side's word on the same transcript -> "<identity> <registered> <guild>".
+inline bool recognize(char side, const std::string& word, const std::string& transcript_hex, std::string& out, std::string& why)
+{
+    uint8_t t[sig::kLinkTranscript], s[sig::kSigBytes];
+    sig::Key pub{};
+    std::istringstream in(word);
+    std::string k, c, g;
+    in >> k >> c >> g;
+    if ((side != 'd' && side != 'a') || !unhex(transcript_hex, t, sizeof t) || !unhex(k, pub.data(), pub.size())
+        || !unhex(g, s, sizeof s) || c.empty())
+    { why = "not a link's word"; return false; }
+    const std::string m = sig::link_statement(side, t);
+    if (mc::crypto_ed25519_check(s, pub.data(), reinterpret_cast<const uint8_t*>(m.data()), m.size()) != 0)
+    { why = "its signature on this link does not verify"; return false; }
+    std::vector<sig::Certificate> reg;
+    if (c != "-")
+    {
+        std::string raw(c.size() / 2, '\0');
+        if (c.size() % 2 || raw.empty() || !unhex(c, reinterpret_cast<uint8_t*>(&raw[0]), raw.size())
+            || !sig::decode_chain(raw.data(), raw.size(), reg) || !registration_valid(reg, pub))
+        { why = "its chain is not a registration of its key"; return false; }
+    }
+    const std::vector<Step> p = path_of(reg, pub);
+    const sig::Key ident = identity_of(p);
+    // In this loader's guild: under its identity's parent (the same active
+    // key), or under the identity itself.
+    const bool guild = !reg.empty() && (head_meets(p, ace_identity_parent()) >= 0 || head_meets(p, ace_identity()) >= 0);
+    out = hex(ident.data(), 32) + " " + (reg.empty() ? "0" : "1") + " " + (guild ? "1" : "0");
+    return true;
+}
+
+/*
  * WHAT A MODULE MAY ASK (TrustEvent, core/EventNode.h), on the loader's
  * ordering thread, of this loader as it runs: its store, its session's
  * identity, its own directory and binary, its epoch. `op` in TrustEvent::Op's
  * order. A registration installed now is the next session's; a re-sync
- * (op 4) ends this session and starts the successor in its place.
+ * (op 4) ends this session and starts the successor in its place. A link's
+ * word (ops 5 and 6) is asked of a browser loader too.
  */
 inline bool answer(uint8_t op, const std::string& name, const std::string& a, const std::string& b, std::string& out)
 {
     out.clear();
+    if (op == 5 || op == 6)
+    {
+        std::string why;
+        const char side = name.empty() ? '\0' : name[0];
+        const bool ok = op == 5 ? vouch(side, a, out, why) : recognize(side, a, b, out, why);
+        if (!ok) out = why;
+        return ok;
+    }
 #if defined(__EMSCRIPTEN__)
     (void)op; (void)name; (void)a; (void)b;
     out = "a browser loader keeps no store";

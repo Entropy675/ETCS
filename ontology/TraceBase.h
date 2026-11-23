@@ -6,8 +6,10 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <deque>
+#include <map>
 #include <mutex>
-#include <set>
+#include <random>
+#include <sstream>
 #include <thread>
 #include <type_traits>
 #include <vector>
@@ -35,11 +37,10 @@
  *   EndedConcrete    the authority's trace ended under a mirror
  *   DiffersConcrete  a mirror is not the authority at `at`, said once
  *
- * A SEAT IS ITS STREAM, so it is named once, by its first message, and an
- * authority refuses a second stream under a name already sitting (or its
- * own). Nothing proves the name: what it buys is that a stream speaks for
- * one seat, and a seat's lines are refused whatever they say that is not
- * that seat's to say.
+ * A SEAT IS AN IDENTITY (Trace.h): its key's fingerprint over a link, its
+ * label from this runtime. Each stream that sits holds a TOKEN; only the
+ * newest stream of a seat is heard, and only its ending is the seat's. A
+ * name that is the authority's own is never a seat.
  */
 ETCS_SUPERTYPE_BASE(Trace)
 {
@@ -72,10 +73,14 @@ ETCS_SUPERTYPE_BASE(Trace)
     // is named `name` by its stream's first message.
     bool Join(const std::string& name, const std::string& owner)
     {
-        if (name.empty() || owner.empty() || name == owner) return false;
+        if (name.empty() || owner.empty() || name == owner || name.find(' ') != std::string::npos) return false;
         std::lock_guard<std::mutex> g(m_mu);
         beginLocked(name, owner, false, true);
-        m_outbox.push_back(name);
+        std::random_device rd;
+        char n[17];
+        std::snprintf(n, sizeof n, "%08x%08x", rd(), rd());
+        m_nonce = n;
+        m_outbox.push_back(name + " " + m_nonce);
         return true;
     }
     // Out of the session; the state stays where its last line left it.
@@ -101,6 +106,7 @@ ETCS_SUPERTYPE_BASE(Trace)
             return false;
         }
         if (line.compare(0, 5, "hash ") == 0) checkLocked(line);
+        else if (line.compare(0, 5, "seat ") == 0) seatedLocked(author, line);
         else if (!applyLineLocked(author, line))
             ETCS_LOG("Trace", "line " << seq << " (" << author << " " << line << ") refused here -- this copy is not " << m_owner << "'s.");
         keepLocked(author, line);
@@ -114,26 +120,37 @@ ETCS_SUPERTYPE_BASE(Trace)
         for (uint64_t i = from; i < m_lines.size() && out.size() < kLinesAtOnce; ++i) out.push_back(m_lines[i]);
         return true;
     }
-    bool Sit(uint64_t gen, const std::string& seat) override
+    uint64_t Sit(uint64_t gen, const std::string& seat, const std::string& label, const std::string& nonce) override
     {
         std::lock_guard<std::mutex> g(m_mu);
-        if (gen != m_gen || !m_authority || seat.empty() || seat == m_me || seat.find(' ') != std::string::npos
-            || !m_seats.insert(seat).second) return false;
+        if (gen != m_gen || !m_authority || seat.empty() || seat == m_me || seat.find(' ') != std::string::npos)
+            return 0;
+        const std::string shown = label.empty() || label.find(' ') != std::string::npos ? seat : label;
+        auto it = m_seats.find(seat);
+        const bool back = it != m_seats.end();
+        const uint64_t token = ++m_tokens;
+        m_seats[seat] = token;
+        keepLocked(seat, "seat " + (nonce.empty() ? std::string("-") : nonce) + " " + shown);
+        m_labels[seat] = shown;
+        if (back) return token;              // its seat again: no second opening
         const std::string open = OpeningConcrete();
         if (!open.empty()) takeLocked(seat, open);
-        return true;
+        return token;
     }
-    bool Take(uint64_t gen, const std::string& seat, const std::string& line) override
+    bool Take(uint64_t gen, const std::string& seat, uint64_t token, const std::string& line) override
     {
         std::lock_guard<std::mutex> g(m_mu);
         if (gen != m_gen) return false;
-        if (m_seats.count(seat) && !familyLineLocked(line)) takeLocked(seat, line);
+        auto it = m_seats.find(seat);
+        if (it != m_seats.end() && it->second == token && !familyLineLocked(line)) takeLocked(seat, line);
         return true;
     }
-    void Rise(uint64_t gen, const std::string& seat) override
+    void Rise(uint64_t gen, const std::string& seat, uint64_t token) override
     {
         std::lock_guard<std::mutex> g(m_mu);
-        if (gen != m_gen || !m_seats.erase(seat)) return;
+        auto it = m_seats.find(seat);
+        if (gen != m_gen || it == m_seats.end() || it->second != token) return;
+        m_seats.erase(it);
         const std::string leaving = LeavingConcrete();
         if (!leaving.empty()) takeLocked(seat, leaving);
     }
@@ -170,13 +187,23 @@ ETCS_SUPERTYPE_BASE(Trace)
 
 protected:
     // A line the family itself writes, which no seat may (Lockstep adds `tick`).
-    virtual bool familyLineLocked(const std::string& line) const { return line.compare(0, 5, "hash ") == 0; }
+    virtual bool familyLineLocked(const std::string& line) const
+    {
+        return line.compare(0, 5, "hash ") == 0 || line.compare(0, 5, "seat ") == 0;
+    }
+    // What a seat calls itself, for people: its label, or the seat itself.
+    std::string labelLocked(const std::string& seat) const
+    {
+        auto it = m_labels.find(seat);
+        return it == m_labels.end() ? seat : it->second;
+    }
     virtual bool applyLineLocked(const std::string& author, const std::string& line) { return ApplyConcrete(author, line); }
     // Before a line is kept by the authority (Lockstep: the ticks so far go first).
     virtual void beforeKeepLocked(const std::string& line) { (void)line; }
     virtual void restartLocked()
     {
         m_lines.clear();
+        m_labels.clear();
         m_snap_at = 0; m_snap_hash = "-"; m_differed = false;
         RestartConcrete();
     }
@@ -227,12 +254,22 @@ private:
     {
         nextGenerationLocked();
         m_me.clear(); m_owner.clear(); m_authority = false; m_session = false;
-        m_seats.clear(); m_outbox.clear();
+        m_seats.clear(); m_outbox.clear(); m_nonce.clear();
         restartLocked();
         m_me = me; m_owner = owner; m_authority = authority; m_session = session;
         if (!authority) return;
         const std::string open = OpeningConcrete();
         if (!open.empty()) takeLocked(me, open);
+    }
+    // A mirror at `seat <nonce> <label>`: that seat's label, and -- its nonce
+    // being this copy's -- the seat this copy is, as the authority knows it.
+    void seatedLocked(const std::string& seat, const std::string& line)
+    {
+        std::istringstream in(line.substr(5));
+        std::string nonce, label;
+        in >> nonce >> label;
+        m_labels[seat] = label.empty() ? seat : label;
+        if (!m_nonce.empty() && nonce == m_nonce) m_me = seat;
     }
     // A mirror at the authority's `hash <at> <hash>`: the same lines, so the same hash.
     void checkLocked(const std::string& line)
@@ -249,7 +286,10 @@ private:
     }
 
     std::condition_variable  m_grew;    // a line kept, or the generation moved
-    std::set<std::string>    m_seats;
+    std::map<std::string, uint64_t>    m_seats;    // each seat's newest stream
+    std::map<std::string, std::string> m_labels;   // what each seat calls itself
+    uint64_t                 m_tokens = 0;
+    std::string              m_nonce;   // a mirror's: how it knows its own seat
     std::deque<std::string>  m_outbox;  // a mirror's: its seat's name first, then its lines
     bool                     m_differed = false;
 };
@@ -301,7 +341,7 @@ inline void etcs_trace_follow(Leaf& self, Stream& stream, ETCS::SignalContext ct
     etcs_trace_depart(self, pgen, owner);
     if (ended) self.Ended(gen);
 }
-// mine.Emit() -> theirs.Take(): a mirror's seat, its name and then its lines.
+// mine.Emit() -> theirs.Take(): a mirror's seat, "<label> <nonce>" and then its lines.
 template <class Leaf, class Stream>
 inline void etcs_trace_emit(Leaf& self, Stream& stream, ETCS::SignalContext ctx)
 {
@@ -319,18 +359,26 @@ inline void etcs_trace_emit(Leaf& self, Stream& stream, ETCS::SignalContext ctx)
         if (!stream.writeMessage(line)) break;
     }
 }
-// ... -> authority.Take(): a seat, from its name to its stream's end.
+// ... -> authority.Take(): a seat, from its first message to its stream's
+// end. The seat is the key the link proved (SignalContext::peer); a stream
+// of this runtime's own is named by its label.
 template <class Leaf, class Stream>
 inline void etcs_trace_take(Leaf& self, Stream& stream, ETCS::SignalContext ctx)
 {
     const uint64_t gen = self.Generation();
-    std::string seat, line;
-    if (!stream.readMessage(seat, 256) || !self.Sit(gen, seat)) return;
+    std::string first, line, label, nonce;
+    if (!stream.readMessage(first, 256)) return;
+    std::istringstream in(first);
+    in >> label >> nonce;
+    std::string seat = label;
+    if (ctx.peer.known()) { char fp[17]; ctx.peer.fingerprint(fp); seat = fp; }
+    const uint64_t token = self.Sit(gen, seat, label, nonce);
+    if (!token) return;
     const uint64_t pgen = etcs_trace_arrive(self, seat);
     while (!ctx.isInterrupted() && stream.readMessage(line, 1u << 16))
-        if (!self.Take(gen, seat, line)) break;
+        if (!self.Take(gen, seat, token, line)) break;
     etcs_trace_depart(self, pgen, seat);
-    self.Rise(gen, seat);
+    self.Rise(gen, seat, token);
 }
 
 #endif // BASE_TRACE_H__
