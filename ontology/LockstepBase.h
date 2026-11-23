@@ -88,7 +88,9 @@ protected:
     {
         if (line.compare(0, 5, "tick ") != 0) flushTicksLocked();
     }
-    void restartLocked() override
+    // Final: a leaf's own reset is RestartConcrete, which this reaches
+    // through TraceBase. A leaf method of this name would replace it.
+    void restartLocked() override final
     {
         m_tick = m_kept = 0;
         m_wall_ms = 0.0;
