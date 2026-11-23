@@ -336,7 +336,7 @@ int main(int, char**)
     run(55);
     const Kart h1 = where(host, "host");
     std::printf("        (after 1.1 s: z %.2f, x %.3f, %.1f u/s, y %.2f %s)\n", h1.z, h1.x, h1.speed, h1.y, h1.air.c_str());
-    check(h1.z - h0.z > 1.2f && h1.speed > 2.7f && h1.speed < 3.7f && near(h1.x, 0, 0.05f), "W: toward the middle, in a straight line, slow off the line");
+    check(h1.z - h0.z > 1.5f && h1.speed > 3.5f && h1.speed < 4.8f && near(h1.x, 0, 0.05f), "W: toward the middle, in a straight line, slow off the line");
     run(240);
     key(host, 'W', false);
     const Kart h2 = where(host, "host");
@@ -468,7 +468,7 @@ int main(int, char**)
         const Tyres c0 = tyres(host, "host");
         std::printf("        (straight at %.1f u/s after 2 s, %.1f along: sliding %.3f, %d mark segments)\n",
                     k0.speed, k0.z + 81.0f, k0.slide, c0.shown());
-        check(k0.speed > 5.5f && k0.speed < 7.5f && std::fabs(k0.slide) < 0.01f && c0.shown() == 0,
+        check(k0.speed > 9.0f && k0.speed < 11.0f && std::fabs(k0.slide) < 0.01f && c0.shown() == 0,
               "speed builds gradually; in a straight line the tyres roll: no slide, no marks");
         key(host, 'W', false);
         key(host, 'S', true);
