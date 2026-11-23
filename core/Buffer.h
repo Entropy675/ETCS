@@ -11,6 +11,7 @@
 #include <mutex>
 #include <sys/stat.h>
 #include <sstream>
+#include <type_traits>
 #include <iomanip>
 #include <cassert> 
 
@@ -395,6 +396,14 @@ using MBuffer = TBuffer<MAX_MIRROR_TRANSPORT_SIZE>;
 
 // for network usages, 8kb stack buffer.
 using NBuffer = TBuffer<ETCS_NETWORK_MAX_HEADER_SIZE>;
+
+// Every TBuffer crosses DSO and ring boundaries by memcpy, and a Bit rides one as
+// its words. A non-trivial member would stop that being a copy without a word.
+static_assert(::std::is_trivially_copyable_v<Buffer>,  "Buffer must stay trivially copyable");
+static_assert(::std::is_trivially_copyable_v<LBuffer>, "LBuffer must stay trivially copyable");
+static_assert(::std::is_trivially_copyable_v<BBuffer>, "BBuffer must stay trivially copyable");
+static_assert(::std::is_trivially_copyable_v<MBuffer>, "MBuffer must stay trivially copyable");
+static_assert(::std::is_trivially_copyable_v<NBuffer>, "NBuffer must stay trivially copyable");
 
 template<size_t N, typename T>
 inline TBuffer<N>& operator>>(TBuffer<N>& b, T& val) 

@@ -99,12 +99,7 @@ struct LMAXSequentialSharedPage
     static_assert(SLOT_SIZE % SLOT_ALIGN == 0,
                   "Slot stride does not preserve sub-object alignment");
 
-    // The ring memcpys LBuffer across the ABI boundary. If TBuffer ever gains
-    // a non-trivial member this assert fires rather than the copy silently
-    // ceasing to be a memcpy. (The broader assert covering Buffer/BBuffer/
-    // MBuffer belongs next to the alias declarations in Buffer.h.)
-    static_assert(::std::is_trivially_copyable_v<LBuffer>,
-                  "LBuffer must stay trivially copyable — it crosses DSO and ring boundaries");
+    // LBuffer stays trivially copyable: asserted beside the aliases (Buffer.h).
 
     char*                  buffer;
     long long              slot_count_;

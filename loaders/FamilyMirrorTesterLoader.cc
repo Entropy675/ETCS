@@ -27,6 +27,7 @@
 
 #include "../ETCS.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <iostream>
 #include <string>
@@ -98,6 +99,32 @@ int main(int, char**)
     check(ETCS::resolve_in_family<Deletable_>("LayoutProvider:Deletable", a->getRID()) == nullptr,
           "LayoutProvider:Deletable does NOT resolve A");
 
+    // -- 4b. "first" is a stated relation -------------------------------------
+    //
+    // Each match carries the sector that held it, and a relation over those
+    // picks one. Two sectors holding the same number can't be made to happen
+    // on purpose, so the second check states the matches by hand: whichever
+    // order they arrive in, the relation gives the same one.
+    {
+        std::vector<ETCS::RIDMatch<Deletable_>> m;
+        ETCS::collect_matches_in_family<Deletable_>("Deletable", a->getRID(), m);
+        check(m.size() == 1 && std::string(m[0].origin) == "RenderProvider",
+              "a match carries the provider whose list held it");
+        check(ETCS::resolve_in_family<Deletable_>("Deletable", a->getRID(), ETCS::ByOrigin{})
+                  == ETCS::resolve_in_family<Deletable_>("Deletable", a->getRID()),
+              "with one match, the relation's answer is the bare answer");
+
+        Deletable_* da = ETCS::resolve_in_family<Deletable_>("Deletable", a->getRID());
+        Deletable_* db = ETCS::resolve_in_family<Deletable_>("Deletable", b->getRID());
+        std::vector<ETCS::RIDMatch<Deletable_>> one{ { da, "RenderProvider" }, { db, "LayoutProvider" } };
+        std::vector<ETCS::RIDMatch<Deletable_>> two{ { db, "LayoutProvider" }, { da, "RenderProvider" } };
+        check(std::min_element(one.begin(), one.end(), ETCS::ByOrigin{})->entity == db
+              && std::min_element(two.begin(), two.end(), ETCS::ByOrigin{})->entity == db,
+              "two sectors, one number: ByOrigin picks the same one in either order");
+        check(ETCS::resolve_held<Deletable_>("Deletable", b->getRID(), ETCS::ByOrigin{}).get() == db,
+              "resolve_held takes the relation too");
+    }
+
     // -- 5. per-type rows, by bare name and by qualified name -----------------
     check(ETCS::etcs_ridmap_named(ldr, ETCS::Buffer("RenderProvider:ImageSurface")) != nullptr,
           "a per-type list is reachable by qualified name");
@@ -122,6 +149,14 @@ int main(int, char**)
           "...and B, in a different module's image");
     check(ETCS::etcs_resolve_rid_anywhere(ldr, 0) == nullptr,
           "...and answers null for RID 0 rather than the first row");
+    {
+        // A is in its type's list and every family list it claims: one entity,
+        // however many lists hold it.
+        std::vector<ETCS::Entity*> all;
+        ETCS::etcs_collect_rid_anywhere(ldr, a->getRID(), all);
+        check(all.size() == 1 && all[0] == a,
+              "collecting a RID anywhere gives each entity once, not once per list");
+    }
 
     // -- 5c. A QUALIFIED ASK WHEN NOTHING MIRRORED THE NAME -------------------
     //

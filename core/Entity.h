@@ -4243,12 +4243,15 @@ inline ETCS::RIDListHandle* etcs_ridmap_row(ETCS::EventNode* owner,
 }
 
 /*
- * AN ENTITY FROM A BARE RID, WITH NO TYPE AND NO FAMILY -- own lists first,
- * then every image that published into the mirror.
+ * AN ENTITY FROM A BARE RID, WITH NO TYPE AND NO FAMILY -- own lists and every
+ * image that published into the mirror.
  *
- * Sound because RIDs are runtime-unique, so the first hit is the only hit. USE
- * ONLY WHEN THE TYPE IS GENUINELY UNKNOWN: it touches every row, where naming
- * the type touches one.
+ * A RID is unique only within a trait set, so with no trait named the same
+ * number can be held in two sectors. The walk collects every distinct entity
+ * and answers with the one its stated relation puts first: by the sector that
+ * holds it, then the list it is in -- never the maps' iteration order. USE ONLY
+ * WHEN THE TYPE IS GENUINELY UNKNOWN: it touches every row, where naming the
+ * type touches one.
  *
  * IT EXISTS HERE SO THAT IT EXISTS ONCE. This walk was hand-written in four
  * modules (ConnectionManager, HttpServer, TarpitNode, ForumNode), each reading
@@ -4261,15 +4264,32 @@ inline ETCS::RIDListHandle* etcs_ridmap_row(ETCS::EventNode* owner,
  * was noticed in none of them. So the walk is an accessor now, and a module
  * that wants a bare RID asks rather than iterates.
  */
-inline Entity* etcs_resolve_rid_anywhere(ETCS::EventNode* owner, RID rid)
+// Every distinct entity the RID names, in any list, in the relation's order.
+inline size_t etcs_collect_rid_anywhere(ETCS::EventNode* owner, RID rid, ::std::vector<Entity*>& out)
 {
-    if (!owner || rid == 0) return nullptr;
+    if (!owner || rid == 0) return 0;
+    struct Hit { Entity* e; const char* origin; const char* list; };
+    ::std::vector<Hit> hits;
+    const char* own = owner->scope ? owner->scope : "(loader)";
     for (auto& entry : owner->ridMap)
-        if (Entity* e = entry.second.invoke_get(rid)) return e;
+        if (Entity* e = entry.second.invoke_get(rid)) hits.push_back({ e, own, entry.first.buf });
     for (auto& bucket : owner->ridMirror)
         for (auto& row : bucket.second)
-            if (Entity* e = row.handle.invoke_get(rid)) return e;
-    return nullptr;
+            if (Entity* e = row.handle.invoke_get(rid)) hits.push_back({ e, row.module.buf, bucket.first.buf });
+    ::std::sort(hits.begin(), hits.end(), [](const Hit& a, const Hit& b) {
+        const int o = ::std::strcmp(a.origin, b.origin);
+        return o != 0 ? o < 0 : ::std::strcmp(a.list, b.list) < 0;
+    });
+    size_t added = 0;
+    for (auto& h : hits)
+        if (::std::find(out.end() - added, out.end(), h.e) == out.end()) { out.push_back(h.e); ++added; }
+    return added;
+}
+
+inline Entity* etcs_resolve_rid_anywhere(ETCS::EventNode* owner, RID rid)
+{
+    ::std::vector<Entity*> all;
+    return etcs_collect_rid_anywhere(owner, rid, all) ? all.front() : nullptr;
 }
 
 inline Entity* etcs_resolve_by_key(const ETCS::Buffer& conjugate_key, RID rid)
@@ -6248,9 +6268,11 @@ inline Base* resolve_in_family(const char* family, RID rid)
                 ETCS_LOG("resolve_in_family", "RID:" << rid << " is ambiguous for family '"
                          << name << "' -- it names an entity under BOTH " << found_owner
                          << " and " << mod << ". RIDs are unique per provider-type, not per "
-                         "process. This overload can only answer with one, so it answers with "
-                         "none: use collect_in_family to get them all, or name the provider, "
-                         "e.g. resolve_in_family(\"" << mod << ":" << bare << "\", rid).");
+                         "process. This overload states no relation, so it answers with none: "
+                         "pass the relation that says which comes first, e.g. "
+                         "resolve_in_family<T>(\"" << name << "\", rid, ETCS::ByOrigin{}), "
+                         "name the provider (\"" << mod << ":" << bare << "\"), or "
+                         "collect_in_family for them all.");
                 return nullptr;
             }
         }
@@ -6275,8 +6297,31 @@ inline Base* resolve_in_family(const char* family, RID rid)
  * Appends rather than clearing, so a caller can accumulate across several
  * families into one list. Returns how many THIS call added.
  */
+/*
+ * WHAT "FIRST" MEANS. A RID is unique only within a trait set, so one family ask
+ * can name an entity in each sector that holds the number; the sector is what
+ * tells them apart, and it rides each match as its origin (the provider whose
+ * list held it). Taking one is choosing by a comparison relation the caller
+ * states -- never scan order, which is an accident of what loaded when.
+ */
 template <typename Base>
-inline size_t collect_in_family(const char* family, RID rid, ::std::vector<Base*>& out)
+struct RIDMatch
+{
+    Base*       entity;
+    const char* origin;   // the provider whose list held it; the caller's frame only
+};
+
+// The relation to state when nothing finer is meant: by sector. The same set
+// of loaded providers gives the same answer on every runtime.
+struct ByOrigin
+{
+    template <typename Base>
+    bool operator()(const RIDMatch<Base>& a, const RIDMatch<Base>& b) const
+    { return ::std::strcmp(a.origin, b.origin) < 0; }
+};
+
+template <typename Base>
+inline size_t collect_matches_in_family(const char* family, RID rid, ::std::vector<RIDMatch<Base>>& out)
 {
     if (rid == 0) return 0;
     const ::std::string name(family);
@@ -6305,7 +6350,7 @@ inline size_t collect_in_family(const char* family, RID rid, ::std::vector<Base*
         auto it = mine_node->ridMap.find(bare);
         if (it != mine_node->ridMap.end())
             if (void* p = it->second.invoke_get_iface(rid))
-            { out.push_back(static_cast<Base*>(p)); ++added; }
+            { out.push_back({ static_cast<Base*>(p), mine_node->scope ? mine_node->scope : "(loader)" }); ++added; }
     }
 
     if (!owner) return added;
@@ -6320,7 +6365,7 @@ inline size_t collect_in_family(const char* family, RID rid, ::std::vector<Base*
         auto it = owner->ridMap.find(bare);
         if (it != owner->ridMap.end())
             if (void* p = it->second.invoke_get_iface(rid))
-            { out.push_back(static_cast<Base*>(p)); ++added; }
+            { out.push_back({ static_cast<Base*>(p), owner->scope ? owner->scope : "(loader)" }); ++added; }
     }
 
     if (mirror == owner->ridMirror.end()) return added;
@@ -6328,9 +6373,38 @@ inline size_t collect_in_family(const char* family, RID rid, ::std::vector<Base*
     {
         if (qualified && row.module.toString() != wanted_module) continue;
         if (void* p = row.handle.invoke_get_iface(rid))
-        { out.push_back(static_cast<Base*>(p)); ++added; }
+        { out.push_back({ static_cast<Base*>(p), row.module.buf }); ++added; }
     }
     return added;
+}
+
+template <typename Base>
+inline size_t collect_in_family(const char* family, RID rid, ::std::vector<Base*>& out)
+{
+    ::std::vector<RIDMatch<Base>> m;
+    const size_t added = collect_matches_in_family<Base>(family, rid, m);
+    for (auto& x : m) out.push_back(x.entity);
+    return added;
+}
+
+// The one a stated relation puts first; null when the RID names nothing here.
+// `first(a, b)` is true when a stands before b (ByOrigin, or the caller's own).
+template <typename Base, typename Relation>
+inline Base* resolve_in_family(const char* family, RID rid, Relation first)
+{
+    ::std::vector<RIDMatch<Base>> m;
+    if (!collect_matches_in_family<Base>(family, rid, m)) return nullptr;
+    return ::std::min_element(m.begin(), m.end(), first)->entity;
+}
+
+template <typename Base, typename Relation>
+inline Held<Base> resolve_held(const char* family, RID rid, Relation first)
+{
+    Base* p = resolve_in_family<Base>(family, rid, first);
+    if (!p) return {};
+    LifetimeHold h(static_cast<Entity*>(p));
+    if (!h) return {};
+    return Held<Base>(p, ::std::move(h));
 }
 
 /*
