@@ -16,6 +16,8 @@
 //   3. THE PEDAL. The same driver, the same keys, from the same spawn: the
 //      moto is the quickest off the line and to the highest top, then the
 //      bike, the kart, the pickup and the truck, slowest of all.
+//   3b. THE PEDAL BY LEVEL. A touch pad's pedal (Pedal 8) is W; half of it
+//      pushes about half as hard; all of it the other way reverses.
 //   4. THE TYRES. Off the pedal at 12 u/s, a wheel held half a second: the
 //      kart and both trucks grip (nothing across is left) and both bikes
 //      slide, leaning into the turn and the other way for the other turn; the
@@ -232,6 +234,29 @@ int main(int, char**)
           "no ride outside the lobby");
     verb(host, "KartBattle.Abandon");
     run(2);
+
+    // -- 3b. the pedal by level ----------------------------------------------------
+    std::cout << "\n-- 3b. the pedal by level --\n";
+    // A touch pad's pedal: Pedal <level>, -8..8, a `drive` line like a key's.
+    // The kart from the strip's spawn a second on the whole pedal, then on half.
+    auto second = [&](const char* how) {
+        verb(host, "KartBattle.StartRound");
+        run(2);
+        if (std::string(how) == "W") key(host, 'W', true); else verb(host, "KartBattle.Pedal", how);
+        run(50);
+        const float v = where(host, "host").speed;
+        if (std::string(how) == "W") key(host, 'W', false); else verb(host, "KartBattle.Pedal", "0");
+        verb(host, "KartBattle.Abandon");
+        run(2);
+        return v;
+    };
+    verb(host, "KartBattle.Ride", "kart");
+    rides(host, "host", "kart");
+    const float whole = second("W"), eight = second("8"), half = second("4"), back = second("-8");
+    std::printf("        (after a second: W %.2f u/s, Pedal 8 %.2f, Pedal 4 %.2f, Pedal -8 %.2f)\n", whole, eight, half, back);
+    check(std::fabs(eight - whole) < 0.01f, "the whole pedal is a key's");
+    check(half > 0.3f * whole && half < 0.6f * whole, "half of it pushes about half as hard (less, low down: the pedal's curve climbs with the speed)");
+    check(back > 4.0f, "...and all of it down the other way, from a stand, reverses (the speed is its size)");
 
     // -- 4. the tyres ------------------------------------------------------------
     std::cout << "\n-- 4. the tyres --\n";

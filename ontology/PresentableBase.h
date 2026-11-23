@@ -81,6 +81,12 @@ ETCS_SUPERTYPE_BASE(Presentable), public AnimatedBase<Derived>
      * the frame rate is whatever the driver and the work permit, and Fps()
      * reports what actually happened rather than what was asked for.
      *
+     * WHAT IS OWED CARRIES, up to one interval. Reset to nothing on a present,
+     * a visit a hair short of the interval (a driver ticking AT the interval,
+     * its clock a hair off this one's) skipped a present and the next made up
+     * none of it: half the rate, on and off. Carried, a short visit is made up
+     * by the next; capped, a long stall is not paid back as a burst.
+     *
      * ZERO IS UNPACED: present on every visit and let the driver set the rate,
      * which is the only honest way to ask how fast the pipeline can go.
      */
@@ -90,7 +96,8 @@ ETCS_SUPERTYPE_BASE(Presentable), public AnimatedBase<Derived>
         {
             m_owed_ms += dt_ms;
             if (m_owed_ms < m_interval_ms) return;
-            m_owed_ms = 0.0;
+            m_owed_ms -= m_interval_ms;
+            if (m_owed_ms > m_interval_ms) m_owed_ms = m_interval_ms;
         }
         static_cast<Derived*>(this)->RecomposeBound();
         Present();
