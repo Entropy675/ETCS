@@ -135,21 +135,24 @@ int main(int argc, char** argv)
     check(differs == 0, "a seed makes the same map twice");
 
     // A bank by hand, up to the north wall: its lip half a unit short of the
-    // karts' bound leaves a trench under it, which is a fault; on the bound
-    // there is none (the bowl's banks were the first, the skatepark's too).
-    auto bank = [](float middle) {
+    // karts' bound leaves a trench under it, which is a fault; right on the
+    // bound is one too (a hairline of floor there, which a slim bike found
+    // in the bowl and the skatepark); run on into the wall, there is none.
+    auto bank = [](float middle, int up, float height) {
         KartArena::Map m;
         KartArena::Ramp r;
         r.x = Fixed::Zero(); r.z = Fixed::From(middle); r.yaw = 0;
-        r.width = Fixed::FromInt(192); r.up = Fixed::FromInt(21); r.flat = r.down = Fixed::Zero(); r.height = Fixed::FromInt(3);
+        r.width = Fixed::FromInt(194); r.up = Fixed::FromInt(up); r.flat = r.down = Fixed::Zero(); r.height = Fixed::From(height);
         m.ramps.push_back(r);
         KartArena::Prepare(m);
         return KartArena::Faults(m);
     };
-    const std::string shy = bank(84.0f), flush = bank(84.5f);
-    std::printf("        (a bank to 94.5: %s; to 95: %s)\n", shy.empty() ? "sound" : shy.c_str(), flush.empty() ? "sound" : flush.c_str());
+    const std::string shy = bank(84.0f, 21, 3.0f), flush = bank(84.5f, 21, 3.0f), into = bank(85.5f, 23, 3.2857f);
+    std::printf("        (a bank to 94.5: %s; to 95: %s; into the wall: %s)\n", shy.empty() ? "sound" : shy.c_str(),
+                flush.empty() ? "sound" : flush.c_str(), into.empty() ? "sound" : into.c_str());
     check(shy.find("a trench between its lip and the wall") != std::string::npos, "a bank whose lip is short of the karts' bound is a fault: a trench to hide in");
-    check(flush.find("trench") == std::string::npos, "...and with its lip on the bound there is none (this map of one bank is bare, and is told that instead)");
+    check(flush.find("a trench between its lip and the wall") != std::string::npos, "...and so is one with its lip right on the bound: a hairline of trench");
+    check(into.find("trench") == std::string::npos, "...and run on into the wall there is none (this map of one bank is bare, and is told that instead)");
 
     // The fire's warp is Perlin's noise in the rows' integers, redrawn by the
     // renderer in floats: the two must be one field, and smooth -- near points

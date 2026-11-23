@@ -22,6 +22,11 @@
 //      kart and the trucks never lean. A bike's two tyres take its slide's
 //      heat, the hidden pair none. At its top on a held wheel the kart slides
 //      and both trucks grip.
+//   4b. THE LEAN. A bike leans in as its wheel is held, all the way only
+//      after a fifth of a second or so, and when the wheel is let go it
+//      settles upright, a slide or not.
+//   4c. THE OIL. A slick oils whichever tyres touch it -- its own kart's too,
+//      once that kart has left it: backing on, the rear tyres, then all four.
 //   5. THE WEIGHT. A bike and a truck head on, off the pedal: the truck,
 //      about nine bikes' weight, carries on, and the bike goes back.
 //   6. THE SAME BATTLE. With guests on a moto and a truck driving and
@@ -55,8 +60,8 @@ static std::string verb(ETCS::Entity* e, const std::string& action, const std::s
 }
 
 // KartBattle.Kart: "<slot> <x> <z> <hx> <hz> <speed> <hp> <weapon> <ammo> <y> <air|ground> <wheel> <slide>
-// <spare> <spare ammo> <oil ticks> <dagger ticks> <vehicle> <lean>".
-struct Kart { int slot = -1; float x = 0, z = 0, speed = 0, y = 0, slide = 0, lean = 0; std::string vehicle; };
+// <spare> <spare ammo> <oil ticks> <dagger ticks> <vehicle> <lean> <oiled, a digit a tyre>".
+struct Kart { int slot = -1; float x = 0, z = 0, speed = 0, y = 0, slide = 0, lean = 0; int oil = 0; std::string vehicle, oiled; };
 static Kart where(ETCS::Entity* b, const std::string& who)
 {
     Kart k;
@@ -66,7 +71,7 @@ static Kart where(ETCS::Entity* b, const std::string& who)
     std::string w;
     float f;
     int n;
-    in >> k.slot >> k.x >> k.z >> f >> f >> k.speed >> n >> w >> n >> k.y >> w >> f >> k.slide >> w >> n >> n >> n >> k.vehicle >> k.lean;
+    in >> k.slot >> k.x >> k.z >> f >> f >> k.speed >> n >> w >> n >> k.y >> w >> f >> k.slide >> w >> n >> k.oil >> n >> k.vehicle >> k.lean >> k.oiled;
     return k;
 }
 // KartBattle.Tyres: per tyre (fr fl rr rl) "<heat> <rope> <shown> <darkest>".
@@ -271,6 +276,82 @@ int main(int, char**)
           "a bike's two tyres take its slide's heat; the hidden pair none");
     const Turn ktop = turn("kart", 21.9f, 1), ptop = turn("pickup", 16.9f, 1), ttop = turn("truck", 16.9f, 1);
     check(ktop.slide > 0.0f && ptop.slide == 0.0f && ttop.slide == 0.0f, "at its top on a held wheel the kart slides and both trucks grip");
+
+    // -- 4b. the lean ------------------------------------------------------------
+    std::cout << "\n-- 4b. the lean --\n";
+    // Up to 18 u/s, off the pedal; the wheel held a second and a fifth, then
+    // let go for as long: the lean every 3 ticks.
+    struct Lean { float at[20] = {}, free[20] = {}; };
+    auto lean = [&](const char* v) {
+        Lean l;
+        verb(host, "KartBattle.Ride", v);
+        rides(host, "host", v);
+        verb(host, "KartBattle.StartRound");
+        run(2);
+        key(host, 'W', true);
+        for (int i = 0; i < 600 && where(host, "host").speed < 18; ++i) run(1);
+        key(host, 'W', false);
+        key(host, 'D', true);
+        for (int i = 0; i < 60; ++i) { run(1); if (i % 3 == 2) l.at[i / 3] = where(host, "host").lean; }
+        key(host, 'D', false);
+        for (int i = 0; i < 60; ++i) { run(1); if (i % 3 == 2) l.free[i / 3] = where(host, "host").lean; }
+        verb(host, "KartBattle.Abandon");
+        run(2);
+        std::printf("        (%s held:", v);
+        for (float f : l.at) std::printf(" %.2f", f);
+        std::printf("\n         %s let go:", v);
+        for (float f : l.free) std::printf(" %.2f", f);
+        std::printf(")\n");
+        return l;
+    };
+    const Lean ml = lean("moto"), bl = lean("bike");
+    auto builds = [](const Lean& l) { const float most = l.at[19]; return most > 0.5f && l.at[0] < 0.25f * most && l.at[1] < 0.75f * most && l.at[4] > 0.95f * most; };
+    auto settles = [](const Lean& l) {
+        bool down = l.free[0] > 0.5f * l.at[19];
+        for (int i = 1; i < 5; ++i) down = down && l.free[i] < l.free[i - 1];
+        return down && std::fabs(l.free[11]) < 0.05f;
+    };
+    check(builds(ml) && builds(bl), "a held wheel leans a bike in gradually: under a quarter of the way at 0.06 s, all of it by 0.3 s");
+    check(settles(ml) && settles(bl), "let go, it settles back upright, steadily, within 0.7 s -- though it is still sliding");
+
+    // -- 4c. the oil ---------------------------------------------------------------
+    std::cout << "\n-- 4c. the oil --\n";
+    // The kart drops a slick standing (it is on it: its rear tyres), drives
+    // off it, stops, and backs over it again.
+    {
+        verb(host, "KartBattle.Ride", "kart");
+        rides(host, "host", "kart");
+        verb(host, "KartBattle.StartRound");
+        run(2);
+        key(host, 'W', true); run(40); key(host, 'W', false);
+        key(host, 'S', true);
+        for (int i = 0; i < 200 && where(host, "host").speed > 0.05f; ++i) run(1);
+        key(host, 'S', false);
+        run(5);
+        verb(host, "KartBattle.Give", "host oil");
+        key(host, ' ', true); run(1); key(host, ' ', false);
+        run(10);
+        const Kart dropped = where(host, "host");
+        key(host, 'W', true); run(60); key(host, 'W', false);
+        key(host, 'S', true);
+        for (int i = 0; i < 200 && where(host, "host").speed > 0.05f; ++i) run(1);
+        const Kart off = where(host, "host");
+        bool rear_only = false, all = false;
+        for (int i = 0; i < 400 && !all; ++i)
+        {
+            run(1);
+            const Kart k = where(host, "host");
+            rear_only = rear_only || k.oiled == "0011";
+            all = all || k.oiled == "1111";
+        }
+        key(host, 'S', false);
+        std::printf("        (just dropped: oil %d, tyres %s; driven off: %s; backed over it: rear alone %s, all %s)\n",
+                    dropped.oil, dropped.oiled.c_str(), off.oiled.c_str(), rear_only ? "yes" : "no", all ? "yes" : "no");
+        check(dropped.oil == 0 && dropped.oiled == "0000", "a kart standing on the slick it just dropped has no oil from it");
+        check(off.oiled == "0000" && rear_only && all, "backing over it after it left it, its own oil: on the rear tyres first, then all four");
+        verb(host, "KartBattle.Abandon");
+        run(2);
+    }
 
     // -- 5. the weight ------------------------------------------------------------
     std::cout << "\n-- 5. the weight --\n";
