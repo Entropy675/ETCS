@@ -466,13 +466,30 @@ The far side decides what is reachable: a `Room` publishes entities by name
 (`room.Publish(minutes @minutes Head Since Follow)`: a record published to be read) — and nothing
 else in that runtime can be bound. The way in to a record published that way is a *door*: a
 sealed `Ledger` fed into it (`door.Feed(@minutes)`), so writing takes the key and reading does
-not. One guest per name: a second link under a name already linked is refused at the hello. And
+not. One guest per name: a second link under a name already linked is refused at the hello, unless
+it is the same key coming back for it, which takes the old link's place. And
 the link is symmetric — what a guest publishes on its `Peer`, the host binds through the `Room` by
 the guest's name (`remote.Bind(mail @room alice)`), the one channel that is that guest's alone. The host of a room is its
 authority — every guest's actions arrive there and run in its order — whether it serves the room
 itself (`room.Host(@links studio)`, beside an `HttpServer`'s `LinkHub`) or, unable to accept
 connections, hosts through a server that only splices bytes (`room.HostVia(wss://site/link/studio)`).
 Guests dial the same address either way.
+
+**A link is between two proven keys, and sealed.** The hello is a handshake: each side makes a
+fresh exchange key, and each side's *loader* signs the transcript of both names and both exchange
+keys (`"ETCSLNK1"`, a form it signs nothing else in — `core/Trust.h`, `vouch`) with its own key,
+giving its chain to a root besides when it is registered; the other loader checks it
+(`recognize`). A **local identity** is a key alone — the same key as before, nothing more said;
+a **registered** one climbs a chain to a root, and is of this loader's guild when that root's
+active key is its own identity's too. A browser tab, holding no keystore, signs with a key made for
+its session, and so does an untrusted build -- never its store's key, which would be the
+developer's word lent to modules nothing checked -- saying so on every link. A room admits anyone
+by default; `room.Admit(registered)` or `room.Admit(guild)` turns the rest away at the hello. The two exchange keys give a key each way, and every message of the edge after
+the hello is sealed under them, numbered (XChaCha20-Poly1305): altered, replayed or out of order,
+it does not open and the link closes. A hub splices bytes and reads none, so the seal is end to
+end. What the far side proved goes with every verb and stream half run for it, as
+`SignalContext::peer` — its key and identity, not the name it said; `peer.Who` and
+`room.Who <guest>` read it.
 
 Two families ride on this for anything shared: a **Directory** (`NetworkProvider::Lobby`) lists who
 can be reached, each entry lasting as long as its advertiser's link, and watched as a stream

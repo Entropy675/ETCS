@@ -108,6 +108,41 @@ namespace ETCS
 
 struct ActionFrame;   // core/Provenance.h
 
+/*
+ * WHO ASKED, OVER A LINK: the far runtime as its link proved it at the hello
+ * (NetworkProvider's Edge: its loader's key signed the handshake, its chain
+ * folded to an identity -- core/Trust.h, trust::recognize). Stamped by the
+ * edge on every verb and stream half it runs for that side, and carried by
+ * value from there, so a body credits a line to the key that sent it rather
+ * than to a name it said. All zero for anything asked in this runtime.
+ *
+ * A LOCAL identity is a key alone: the same key as before, nothing more said.
+ * A REGISTERED one climbs a chain to a root; `guild` says the root's active
+ * key is this loader's own identity's too. The name is the far side's word,
+ * a label for people, never what anything is keyed by.
+ */
+struct Peer
+{
+    uint8_t key[32]      = {};
+    uint8_t identity[32] = {};
+    uint8_t registered   = 0;
+    uint8_t guild        = 0;
+    char    name[46]     = {};
+
+    bool known() const
+    {
+        for (uint8_t b : key) if (b) return true;
+        return false;
+    }
+    // The key's first eight bytes in hex: what a line is authored as.
+    void fingerprint(char out[17]) const
+    {
+        static const char* d = "0123456789abcdef";
+        for (int i = 0; i < 8; ++i) { out[2 * i] = d[key[i] >> 4]; out[2 * i + 1] = d[key[i] & 15]; }
+        out[16] = '\0';
+    }
+};
+
 // One level of signal authority plus a link to its parent.
 //
 // Previously seven local flags AND seven flattened *_parent slots. A single
@@ -161,6 +196,11 @@ struct SignalContext
  * copy of a context, which may outlive the frame it named.
  */
     const ActionFrame* frame = nullptr;
+
+    // The far runtime this call came over a link from (Peer, above); zero
+    // for anything asked here. By value: a stream's body outlives the edge
+    // thread that started it.
+    Peer peer{};
 
     /*
  * IS THIS LEVEL THE OUTER EDGE OF A CLOSURE?
