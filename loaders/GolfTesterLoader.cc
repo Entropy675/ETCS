@@ -169,11 +169,12 @@ int main(int, char**)
     check(pulling.find("pulling") != std::string::npos, "a press on your ball and a drag pull a shot back");
     {
         // "x y z length mode": from a camera looking down 55 degrees the pull
-        // still lies along the ground the ball is on.
+        // lies along the ground the ball is on, but for its own rise off it
+        // (35 degrees, as dragged) let through damped: for a pull this long, a little.
         float px = 0, py = 0, pz = 0, pl = 0;
         std::istringstream in(pulling);
         in >> px >> py >> pz >> pl;
-        check(pl > 0.2f && std::fabs(py) < 0.01f * pl && pz > 0.9f * pl, "...along the green, whatever the camera's pitch: no loft to begin with");
+        check(pl > 0.2f && py > 0.02f * pl && py < 0.15f * pl && pz > 0.9f * pl, "...along the green, its own rise let through damped: a little loft, no more");
     }
     check(down.find("down") != std::string::npos && std::fabs(ball(host, "solo").z - z0) < 0.01f,
           "letting go of the right button puts it down: the left's release shoots nothing");
@@ -202,10 +203,15 @@ int main(int, char**)
         verb(host, "GolfMatch.RightDrag", "512, 520");
         std::istringstream again(verb(host, "GolfMatch.Pull"));
         again >> px >> py >> pz >> pl;
-        check(std::fabs(py) < 0.01f * pl, "...and raised past where it was, back along the ground and no further");
+        check(py >= 0.0f && py < 0.15f * pl, "...and raised past where it was, back to the drag's own rise and no further");
         verb(host, "GolfMatch.RightRelease", "512, 520");
         verb(host, "GolfMatch.Release", "512, 520");
     }
+
+    check(verb(host, "GolfMatch.Settings") == "look 1.000 zoom 1.000" && verb(host, "GolfMatch.Setting", "zoom 2") == "ok"
+          && verb(host, "GolfMatch.Setting", "spin 2") == "refused" && verb(host, "GolfMatch.Settings") == "look 1.000 zoom 2.000",
+          "a runtime's settings: the camera's look and zoom at their pace as made, and set");
+    verb(host, "GolfMatch.Setting", "zoom 1");
 
     // -- 3. two players --------------------------------------------------------
     std::cout << "\n-- 3. two players --\n";

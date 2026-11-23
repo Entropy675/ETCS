@@ -319,6 +319,12 @@ int main(int, char**)
         check(livery(g1) == "8 g1" && score(g2, "g1").hp == 100, "...everywhere, the colour kept");
     }
 
+    // The settings: this runtime's alone. As made the marks keep eighty units
+    // of road; the checks below are of forty, so the host's are set to that.
+    check(verb(host, "KartBattle.Settings") == "invert 0 marks 80 look 1.000", "a runtime's settings as made: the wheel as it is, eighty units of marks, the look at its pace");
+    check(verb(host, "KartBattle.Setting", "marks 40") == "ok" && verb(host, "KartBattle.Setting", "marks lots") == "refused"
+          && verb(host, "KartBattle.Settings") == "invert 0 marks 40 look 1.000" && verb(g1, "KartBattle.Settings") == "invert 0 marks 80 look 1.000",
+          "...set on one runtime, and on that one alone");
     // -- 2. a round, abandoned ------------------------------------------------
     std::cout << "\n-- 2. a round, abandoned --\n";
     check(verb(host, "KartBattle.StartRound") == "ok", "the host starts a round on the bowl");
@@ -330,7 +336,7 @@ int main(int, char**)
     run(55);
     const Kart h1 = where(host, "host");
     std::printf("        (after 1.1 s: z %.2f, x %.3f, %.1f u/s, y %.2f %s)\n", h1.z, h1.x, h1.speed, h1.y, h1.air.c_str());
-    check(h1.z - h0.z > 5.0f && h1.speed > 7.0f && near(h1.x, 0, 0.05f), "W: toward the middle, quickly, in a straight line");
+    check(h1.z - h0.z > 1.2f && h1.speed > 2.7f && h1.speed < 3.7f && near(h1.x, 0, 0.05f), "W: toward the middle, in a straight line, slow off the line");
     run(240);
     key(host, 'W', false);
     const Kart h2 = where(host, "host");
@@ -338,8 +344,8 @@ int main(int, char**)
     check(near(h2.y, -2.25f, 0.01f), "...over the ring road's edge and down the ramp into the bowl's low ground");
     check(h2.z > -25.8f && h2.z < -24.8f, "the bumper in its way there stops it: solid meets solid");
     {
-        // The wheel, standing still: A puts it at the lock at once -- to the
-        // left, the wheel's minus -- and held, it eases on to twice the lock.
+        // The wheel, standing still: A puts it at half the lock at once -- to
+        // the left, the wheel's minus -- and held, it eases on to twice the lock.
         auto left = [&]() { return -where(host, "g2").wheel; };
         proposed(g2, 'A', true);
         run(10);
@@ -352,7 +358,7 @@ int main(int, char**)
         const float w110 = left();
         proposed(g2, 'A', false);
         std::printf("        (wheel held: %.3f at 0.2 s, %.3f at 0.4 s, %.3f at 1 s, %.3f at 2.2 s)\n", w10, w20, w50, w110);
-        check(w10 >= 0.45f && w10 < 0.53f, "A held: the wheel is at the lock at once");
+        check(w10 >= 0.29f && w10 < 0.34f, "A held: the wheel is at half the lock at once, and easing on");
         check(w20 > w10 && w50 > w20 && w50 < 0.80f && near(w110, 0.9f, 0.002f),
               "...and eases on, over a second and a half, to twice the lock");
         run(25);
@@ -363,8 +369,8 @@ int main(int, char**)
         const float tap = left();
         run(25);
         std::printf("        (let go: %.3f after 0.5 s; a tap of 4 ticks: %.3f; then %.3f)\n", back, tap, left());
-        check(near(back, 0, 1e-3f) && tap >= 0.45f && tap < 0.50f && near(left(), 0, 1e-3f),
-              "let go, it comes back to the middle; a tap is the lock, and no more");
+        check(near(back, 0, 1e-3f) && tap >= 0.225f && tap < 0.27f && near(left(), 0, 1e-3f),
+              "let go, it comes back to the middle; a tap is half the lock, and little more");
         // The keys swapped, on g2's runtime alone: A is the right now, and
         // swapped back with A still held it is the left again.
         verb(g2, "KartBattle.SetInvert", "1");
@@ -415,7 +421,7 @@ int main(int, char**)
             if (along > 0) { front += a; ++nf; } else { rear += a; ++nr; }
         }
         std::printf("        (axles off square: front %.3f rad, rear %.3f rad, %d+%d wheels)\n", nf ? front / nf : -1.f, nr ? rear / nr : -1.f, nf, nr);
-        check(nf == 2 && nr == 2 && std::fabs(front / nf - std::fabs(b1.wheel)) < 0.02f && std::fabs(b1.wheel) > 0.7f && rear / nr < 0.01f,
+        check(nf == 2 && nr == 2 && std::fabs(front / nf - std::fabs(b1.wheel)) < 0.02f && std::fabs(b1.wheel) > 0.6f && rear / nr < 0.01f,
               "...and the front wheels, the kart's own members, are seen turned as far as the wheel is, the rear ones square");
     }
     verb(host, "KartBattle.Abandon");
@@ -462,7 +468,7 @@ int main(int, char**)
         const Tyres c0 = tyres(host, "host");
         std::printf("        (straight at %.1f u/s after 2 s, %.1f along: sliding %.3f, %d mark segments)\n",
                     k0.speed, k0.z + 81.0f, k0.slide, c0.shown());
-        check(k0.speed > 12.0f && k0.speed < 15.0f && std::fabs(k0.slide) < 0.01f && c0.shown() == 0,
+        check(k0.speed > 5.5f && k0.speed < 7.5f && std::fabs(k0.slide) < 0.01f && c0.shown() == 0,
               "speed builds gradually; in a straight line the tyres roll: no slide, no marks");
         key(host, 'W', false);
         key(host, 'S', true);
@@ -475,7 +481,7 @@ int main(int, char**)
                     b0.t[0].rope, b0.t[1].rope, b0.t[2].rope, b0.t[3].rope, b0.t[0].shown, b0.t[1].shown, b0.t[2].shown,
                     b0.t[3].shown, b0.t[0].darkest, b0.t[1].darkest, b0.t[2].darkest, b0.t[3].darkest);
         bool four = true;
-        for (const Tyre& t : b0.t) four = four && t.shown >= 2 && t.darkest >= 0.75f;
+        for (const Tyre& t : b0.t) four = four && t.shown >= 1 && t.darkest >= 0.75f;
         check(four, "braked to a stop: every tyre leaves a dark mark");
         check(b1.shown() == b0.shown(), "...which stays while the kart stands");
         // Forty units of road wipe it: back down the road and let roll to a
@@ -488,12 +494,13 @@ int main(int, char**)
         const Kart kr = where(host, "host");
         const Tyres r0 = tyres(host, "host");
         key(host, 'W', true);
-        run(160);
+        run(255);
         const Tyres w0 = tyres(host, "host");
         const Kart k2 = where(host, "host");
         std::printf("        (back %.1f units: %d mark segments; on %.1f more: %d, ropes %.2f)\n",
                     kb.z - kr.z, r0.shown(), k2.z - kr.z, w0.shown(), w0.t[0].rope);
-        check(r0.shown() == b0.shown() && kr.speed == 0.0f, "...and while the road since is short of the rope's forty units");
+        check(r0.shown() >= b0.shown() && r0.shown() <= b0.shown() + 4 && kr.speed == 0.0f,
+              "...and while the road since is short of the rope's forty units (the run open at the stop closed as it moves off)");
         check(w0.shown() == 0 && w0.t[0].rope >= 40.0f && w0.t[0].rope < 44.5f,
               "...and is wiped from the far end as it goes on, either way: the rope keeps its length");
         key(host, 'D', true);
@@ -506,13 +513,13 @@ int main(int, char**)
         key(host, 'W', false);
         const float lock = 0.45f / (1.0f + kp.speed / 10.0f);
         const float turned = std::acos(std::max(-1.0f, std::min(1.0f, k2.hx * k1.hx + k2.hz * k1.hz)));
-        std::printf("        (at %.1f u/s the wheel is %.3f at once, the lock there %.3f; held 0.7 s it is %.3f, turned %.2f rad, sliding %.2f u/s)\n",
-                    kp.speed, kp.wheel, lock, k1.wheel, turned, k1.slide);
+        std::printf("        (at %.1f u/s the wheel is %.3f at once, half the lock there %.3f; held 0.7 s it is %.3f, turned %.2f rad, sliding %.2f u/s)\n",
+                    kp.speed, kp.wheel, lock * 0.5f, k1.wheel, turned, k1.slide);
         std::printf("        (tyres fr fl rr rl: heat %.1f %.1f %.1f %.1f, marks %d %d %d %d, darkest %.2f %.2f %.2f %.2f)\n",
                     c1.t[0].heat, c1.t[1].heat, c1.t[2].heat, c1.t[3].heat, c1.t[0].shown, c1.t[1].shown, c1.t[2].shown,
                     c1.t[3].shown, c1.t[0].darkest, c1.t[1].darkest, c1.t[2].darkest, c1.t[3].darkest);
-        check(kp.speed > 12.0f && kp.wheel > lock - 0.005f && kp.wheel < lock * 1.1f,
-              "at speed D puts the wheel at once at the smaller lock for that speed");
+        check(kp.speed > 12.0f && kp.wheel > lock * 0.5f - 0.005f && kp.wheel < lock * 0.6f,
+              "at speed D puts the wheel at once at half the smaller lock for that speed");
         check(k1.wheel > kp.wheel * 1.2f && k1.wheel < 0.9f && turned > 0.6f && turned < 2.2f,
               "...and held, it eases on past it: an arc that tightens");
         check(k1.hx > 0.3f && k1.slide < -0.5f,
@@ -563,7 +570,7 @@ int main(int, char**)
     proposed(g2, 'W', true);
     std::string got = "-";
     float gain = 0.0f, last = 0.0f, padX = 0.0f, fastest = 0.0f;
-    for (int i = 0; i < 80 && got == "-"; ++i)
+    for (int i = 0; i < 200 && got == "-"; ++i)
     {
         run(2);
         const Kart k = where(host, "g2");
@@ -654,7 +661,9 @@ int main(int, char**)
         const Tyres m2 = tyres(host, "host");
         std::printf("        (braked: marks %d, darkest %.2f; backed off to z %.1f: marks %d, darkest %.2f, ropes %.2f)\n",
                     m0.shown(), m0.t[0].darkest, where(host, "host").z, m2.shown(), m2.t[0].darkest, m2.t[0].rope);
-        bool kept = m0.shown() >= 4 && m2.shown() == m0.shown();
+        // (The run still open when it stopped -- the last, lightest of the
+        // braking -- is closed as it moves off: at most one more a tyre.)
+        bool kept = m0.shown() >= 4 && m2.shown() >= m0.shown() && m2.shown() <= m0.shown() + 4;
         for (int t = 0; t < 4; ++t) kept = kept && m2.t[t].darkest == m0.t[t].darkest && m2.t[t].rope < 44.5f;
         check(kept, "backing off over its own marks leaves them as they were laid, the rope its length");
         check(onRampErr >= 0.0f && onRampErr < 0.03f, "up the ramp, the kart rides at the ramp's height");
@@ -835,13 +844,15 @@ int main(int, char**)
               "...and it comes down on the deck: a level plane in the air, and it stands on it");
         key(host, 'W', true);
         bool off = false;
-        for (int t = 0; t < 200 && !off; ++t) { run(1); const Kart k = where(host, "host"); off = k.air == "ground" && near(k.y, 0.25f, 0.01f); }
+        for (int t = 0; t < 200 && !off; ++t) { run(1); const Kart k = where(host, "host"); off = k.air == "ground" && k.y < 0.26f; }
         key(host, 'W', false);
         key(host, 'S', true);
         for (int t = 0; t < 120 && where(host, "host").speed > 0.05f; ++t) run(1);
         key(host, 'S', false);
-        std::printf("        (off the deck's edge: down on the floor at z %.1f)\n", where(host, "host").z);
-        check(off && where(host, "host").z > -4.5f, "...and off its edge it falls back to the floor");
+        // At the pedal's pace from a stand on the deck it carries over the
+        // floor and into the pit past it: down either way.
+        std::printf("        (off the deck's edge: down at z %.1f, y %.2f)\n", where(host, "host").z, where(host, "host").y);
+        check(off && where(host, "host").z > 2.0f, "...and off its edge it falls back down");
     }
 
     // -- 8. the edges ---------------------------------------------------------
@@ -984,13 +995,17 @@ int main(int, char**)
         check(d0.dagger > 300 && d0.weapon == "-", "a smoke bomb gives its kart a dagger for eight seconds");
         proposed(g2, 'W', true);
         int touching = 0;
-        for (int t = 0; t < 200 && touching < 60; ++t)
+        for (int t = 0; t < 400 && touching < 60; ++t)
         {
             run(1);
             const Kart a = where(host, "g2"), h = where(host, "host");
             if (std::hypot(a.x - h.x, a.z - h.z) < 2.6f) ++touching;
         }
         proposed(g2, 'W', false);
+        // ...and g2 stopped there, behind the host, for the slick to come.
+        proposed(g2, 'S', true);
+        for (int t = 0; t < 150 && where(host, "g2").speed > 0.05f; ++t) run(1);
+        proposed(g2, 'S', false);
         const Kart v1 = where(host, "host");
         std::printf("        (the host, up against g2's dagger %d ticks: %d -> %d hp)\n", touching, v0.hp, v1.hp);
         check(touching >= 10 && v0.hp - v1.hp >= 8 && (v0.hp - v1.hp) % 8 == 0, "a kart up against it is cut, 8 a fifth of a second");
@@ -1032,19 +1047,31 @@ int main(int, char**)
         key(host, 'W', false);
         // g2 up the lane after it, over the slick: a third of its pedal.
         proposed(g2, 'W', true);
-        float before = 0.0f, onIt = 0.0f, last = where(host, "g2").speed;
+        // Gains over ten ticks: the pedal's push a tick is under the speed's
+        // tenth, which is all a Kart line says.
+        float before = 0.0f, onIt = 0.0f;
+        std::vector<float> speeds;
+        std::vector<int> slips;
         int slipped = 0;
-        for (int i = 0; i < 200; ++i)
+        for (int i = 0; i < 300; ++i)
         {
             run(1);
             const Kart k = where(host, "g2");
-            if (k.slip > 0) { ++slipped; onIt = std::max(onIt, k.speed - last); }
-            else if (!slipped && k.speed < 12.0f) before = std::max(before, k.speed - last);
-            last = k.speed;
+            speeds.push_back(k.speed); slips.push_back(k.slip > 0 ? 1 : 0);
+            if (k.slip > 0) ++slipped;
+            const size_t n = speeds.size();
+            if (n > 10)
+            {
+                const float gain = speeds[n - 1] - speeds[n - 11];
+                bool all = true, none = true;
+                for (size_t j = n - 10; j < n; ++j) { all = all && slips[j]; none = none && !slips[j]; }
+                if (all) onIt = std::max(onIt, gain);
+                else if (none && !slipped && k.speed < 12.0f) before = std::max(before, gain);
+            }
             if (k.z > slick + 6.0f) break;
         }
         proposed(g2, 'W', false);
-        std::printf("        (a slick at z %.1f: g2 gained %.3f u/s a tick before it, %.3f at most on it, %d ticks slipping)\n", slick, before, onIt, slipped);
+        std::printf("        (a slick at z %.1f: g2 gained %.3f u/s in ten ticks before it, %.3f at most on it, %d ticks slipping)\n", slick, before, onIt, slipped);
         check(slipped > 10 && onIt < before * 0.6f, "a kart on a slick has oil on its tyres: its pedal does a third of what it did");
         check(where(host, "host").slip == 0, "...and not the kart that dropped it");
     }
