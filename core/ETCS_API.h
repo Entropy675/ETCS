@@ -1168,22 +1168,23 @@ namespace ETCS
         }
         return longest;
     }
-    // Looks up the loader's exported manifest getter (ETCS_GetLoaderManifest,
-    // DynamicLoader.h) in the process's global symbol scope -- a plain
-    // function so ETCS_MODULE_EXPORT_MAIN's macro body doesn't need a raw
-    // #ifdef _WIN32 inside its backslash-continued expansion. Null when no
-    // loader is in this process (dlsym/GetProcAddress miss), not an error --
-    // the module's own manifest check treats that as "nothing to compare
-    // against" rather than a mismatch.
-    inline void* etcs_find_loader_manifest_getter()
+    // Looks up one of the loader's exports (DynamicLoader.h: its manifest
+    // getter, ETCS_GetLoaderManifest; its epoch, ETCS_GetLoaderEpoch) in the
+    // process's global symbol scope -- a plain function so
+    // ETCS_MODULE_EXPORT_MAIN's macro body doesn't need a raw #ifdef _WIN32
+    // inside its backslash-continued expansion. Null when no loader is in
+    // this process (dlsym/GetProcAddress miss), not an error -- the module's
+    // own manifest check treats that as "nothing to compare against" rather
+    // than a mismatch.
+    inline void* etcs_find_loader_symbol(const char* name)
     {
 #ifdef _WIN32
-        return reinterpret_cast<void*>(
-            GetProcAddress(GetModuleHandleA(nullptr), "ETCS_GetLoaderManifest"));
+        return reinterpret_cast<void*>(GetProcAddress(GetModuleHandleA(nullptr), name));
 #else
-        return dlsym(RTLD_DEFAULT, "ETCS_GetLoaderManifest");
+        return dlsym(RTLD_DEFAULT, name);
 #endif
     }
+    inline void* etcs_find_loader_manifest_getter() { return etcs_find_loader_symbol("ETCS_GetLoaderManifest"); }
 }
 /**
  * ETCS_MODULE_EXPORT_MAIN

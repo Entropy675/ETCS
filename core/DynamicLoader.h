@@ -3003,6 +3003,24 @@ void* ETCS_GetLoaderManifest()
 {
     return static_cast<void*>(&ETCS::Entity::getManifest());
 }
+
+/*
+ * ETCS_GetLoaderEpoch - this loader's epoch (trust::loader_epoch: its 32
+ * bytes), exported the same way. Every runtime that can interact with
+ * another shares it -- that is what a module's epoch check and a link's
+ * handshake hold -- so it is the seed for anything such runtimes must pick
+ * alike without saying (ontology/Epoch.h), and it moves with every update.
+ */
+extern "C"
+#ifdef _WIN32
+__declspec(dllexport)
+#else
+__attribute__((visibility("default")))
+#endif
+const unsigned char* ETCS_GetLoaderEpoch()
+{
+    return ETCS::trust::loader_epoch().data();
+}
 #endif // ETCS_LOADER
 
 /*
