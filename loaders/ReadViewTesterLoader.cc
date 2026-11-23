@@ -390,6 +390,31 @@ int main()
         del(root);
     }
 
+    // -- 5. a value's bytes ------------------------------------------------------
+    {
+        std::cout << "\n-- 5. a long value takes its bytes from the entity's arena --\n";
+        A* e = arena.allocate<A>();
+        ETCS::MemoryArena& ea = e->getArena();
+        const std::string lng(300, 'v');
+        std::string v;
+        e->addTag(ETCS::Buffer("note"), "short");
+        long long before = ea.getUsage();
+        e->addTag(ETCS::Buffer("note"), lng);
+        check(e->valueOf(ETCS::Buffer("note"), v) && v == lng, "the long value reads back");
+        check(ea.getUsage() - before >= static_cast<long long>(lng.size()), "its bytes came from the entity's arena");
+        e->removeTag(ETCS::Buffer("note"));
+        e->addTag(ETCS::Buffer("note"), "short");
+        before = ea.getUsage();
+        e->addTag(ETCS::Buffer("note"), lng);
+        check(ea.getUsage() == before, "taken off and set again, it reuses the freed bytes");
+        ETCS::ArenaString loose;
+        loose = "short";
+        bool threw = false;
+        try { loose.assign(lng.data(), lng.size()); } catch (const std::bad_alloc&) { threw = true; }
+        check(threw && loose == "short", "with no arena, a short value holds and a long one throws");
+        del(e);
+    }
+
     std::printf("\n%s (%d failure%s)\n", g_fail ? "FAILED" : "PASSED", g_fail, g_fail == 1 ? "" : "s");
     return g_fail ? 1 : 0;
 }

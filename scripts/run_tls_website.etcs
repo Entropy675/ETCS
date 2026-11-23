@@ -32,6 +32,10 @@ tree.ListPaths()
 run site_apps.etcs tree=tree
 tree.ListPaths()
 
+# ACE's half at /pki and the binaries at /dist (site_pki.etcs). The registrar
+# is this site's: it is the build server too, for now.
+run site_pki.etcs web=web tree=tree
+
 spawn NetworkProvider::TarpitNode tarpit
 tarpit.LoadDefaultTarpitPatterns()
 

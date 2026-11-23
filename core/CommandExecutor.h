@@ -2828,14 +2828,21 @@ inline ::std::string repl_json_escape(const ::std::string& s)
     return o;
 }
 
+// `auto_send`, with `auto_ms`, is the entry a page with buttons takes by
+// itself when nothing is pressed in that long (the shell page's countdown).
+// A terminal waits; it is the page's, and only where there is one to draw it.
 inline void repl_menu_publish(const ::std::string& prompt, const ::std::string& title,
-                              const ::std::vector<ReplMenuItem>& items)
+                              const ::std::vector<ReplMenuItem>& items,
+                              const ::std::string& auto_send = ::std::string(), unsigned auto_ms = 0)
 {
     ReplMenu& m = repl_menu();
     ::std::lock_guard<::std::mutex> lock(m.mu);
     ::std::string j = "{\"serial\":" + ::std::to_string(++m.serial)
                     + ",\"prompt\":\"" + repl_json_escape(prompt) + "\""
-                    + ",\"title\":\"" + repl_json_escape(title) + "\",\"items\":[";
+                    + ",\"title\":\"" + repl_json_escape(title) + "\"";
+    if (!auto_send.empty() && auto_ms)
+        j += ",\"auto\":{\"send\":\"" + repl_json_escape(auto_send) + "\",\"ms\":" + ::std::to_string(auto_ms) + "}";
+    j += ",\"items\":[";
     for (size_t i = 0; i < items.size(); ++i)
     {
         const ReplMenuItem& it = items[i];
@@ -2854,6 +2861,34 @@ inline ::std::string repl_menu_json()
     ReplMenu& m = repl_menu();
     ::std::lock_guard<::std::mutex> lock(m.mu);
     return m.json;
+}
+
+/*
+ * A NOTICE, for a page that has somewhere to show one: above the ETCS loading
+ * mark while it is up (the pages' boot throbber). The same text always goes to
+ * the terminal, in colour; this is the second channel, polled like the menu
+ * (etcs_web_notice), and a page with no mark up shows nothing more.
+ */
+struct ReplNotice
+{
+    ::std::mutex  mu;
+    uint64_t      serial = 0;
+    ::std::string json;
+};
+inline ReplNotice& repl_notice() { static ReplNotice n; return n; }
+
+inline void repl_notice_publish(const ::std::string& text)
+{
+    ReplNotice& n = repl_notice();
+    ::std::lock_guard<::std::mutex> lock(n.mu);
+    n.json = "{\"serial\":" + ::std::to_string(++n.serial) + ",\"text\":\"" + repl_json_escape(text) + "\"}";
+}
+
+inline ::std::string repl_notice_json()
+{
+    ReplNotice& n = repl_notice();
+    ::std::lock_guard<::std::mutex> lock(n.mu);
+    return n.json;
 }
 
 // Output helpers. ETCS_LOG already follows ETCS::log_sink; these are for the
@@ -3158,10 +3193,16 @@ extern "C" void etcs_web_shell_write(const char* text);
 
 inline ReplLineSource repl_shell_line_source(ETCS::Entity* shell, ETCS::SignalContext& sig)
 {
-    return [shell, &sig](const ::std::string& prompt, ::std::string& out) -> bool
+    return [shell, &sig](const ::std::string& asked, ::std::string& out) -> bool
     {
         if (!shell) return false;
         if (sig.isInterrupted() || sig.isTerminated()) return false;
+#if defined(ETCS_UNTRUSTED)
+        // An untrusted build says so at every prompt it puts up (core/Trust.h).
+        const ::std::string prompt = asked.empty() ? asked : "[UNTRUSTED] " + asked;
+#else
+        const ::std::string& prompt = asked;
+#endif
 
 #if defined(__EMSCRIPTEN__)
         /*
@@ -4621,12 +4662,47 @@ inline void runtime_close()
  */
 inline ::std::atomic<int>& resume_choice() { static ::std::atomic<int> c{ 0 }; return c; }
 
+// Set when this start is a re-sync's restart (--resynced <kernel>,
+// core/Trust.h): the kernel it re-synced to. The question is then resume or
+// menu, asked even of a start that would otherwise not ask.
+inline ::std::string& resync_note() { static ::std::string k; return k; }
+
 inline ::std::string resume_summary()
 {
     ::std::ifstream f(ETCS::etcs_store_dir() + "/scene");
     ::std::string line;
     if (f) ::std::getline(f, line);
     return line;
+}
+
+// The kernel the last scene was saved under (its second line); empty when it
+// does not say -- a scene from before it was written.
+inline ::std::string resume_kernel()
+{
+    ::std::ifstream f(ETCS::etcs_store_dir() + "/scene");
+    ::std::string line;
+    if (f && ::std::getline(f, line) && ::std::getline(f, line) && line.rfind("kernel ", 0) == 0) return line.substr(7);
+    return {};
+}
+
+/*
+ * WHETHER THIS START IS A RE-SYNC, and saying so. Either it was started as one
+ * (--resynced: the successor a re-sync placed), or the session waiting in the
+ * store was saved under another kernel -- the site served a newer loader, as a
+ * browser's page does on its reload. Said in colour on the terminal, and as a
+ * notice for a page to show above its loading mark. True if it is one.
+ */
+inline bool announce_resync()
+{
+    const ::std::string saved = resume_kernel();
+    if (resync_note().empty() && (saved.empty() || saved == BASE_SOURCE_STRING)) return false;
+    if (resync_note().empty()) resync_note() = BASE_SOURCE_STRING;
+    const ::std::string text = "re-synced to " + resync_note()
+        + (saved.empty() || saved == resync_note() ? ::std::string() : " -- your session was saved under " + saved)
+        + ".";
+    repl_err() << COLOR_WARN << "etcs: " << text << COLOR_RESET << "\n";
+    repl_notice_publish(text);
+    return true;
 }
 
 inline bool resume_last_scene(ETCS::SignalContext& sig)
@@ -4658,13 +4734,31 @@ inline void offer_resume(ETCS::SignalContext& sig, const ReplLineSource* in)
     const int choice = resume_choice().exchange(-1);
     if (choice < 0) return;
     const ::std::string summary = resume_summary();
+    if (choice == 0 && announce_resync())
+    {
+        // After a re-sync: resume the session, or the menu with the place
+        // kept. A page with buttons takes `resume` by itself after 5 s.
+        if (summary.empty() || !in) return;
+        ETCS_SHELL("Navigator", COLOR_DIR << "Your session: " << summary << COLOR_RESET);
+        const ::std::string ask = "Resume the session (replays to its last saved point) or exit to menu? [r/M] ";
+        repl_menu_publish(ask, "Your session: " + summary,
+                          { { "r", "resume", "yes", false, "" }, { "m", "exit to menu", "no", false, "" } }, "r", 5000);
+        ::std::string answer;
+        if (!(*in)(ask, answer)) return;
+        if (answer == "r" || answer == "R" || answer == "resume") { resume_last_scene(sig); return; }
+        repl_err() << COLOR_DIR << "Your place stays in the store; the next start offers it again." << COLOR_RESET << "\n";
+        return;
+    }
     if (summary.empty()) return;
     if (choice == 0)
     {
         if (!in) return;
         ETCS_SHELL("Navigator", COLOR_DIR << "Last time: " << summary << COLOR_RESET);
+        const ::std::string ask = "Continue where you left off? [y/N] ";
+        repl_menu_publish(ask, "Last time: " + summary,
+                          { { "y", "yes", "yes", false, "" }, { "n", "no", "no", false, "" } }, "y", 5000);
         ::std::string answer;
-        if (!(*in)("Continue where you left off? [y/N] ", answer)) return;
+        if (!(*in)(ask, answer)) return;
         if (answer != "y" && answer != "Y" && answer != "yes") return;
     }
     resume_last_scene(sig);
@@ -4692,6 +4786,26 @@ inline void offer_resume(ETCS::SignalContext& sig, const ReplLineSource* in)
  * still-in-flight RequestUnload recheck, and its dlclose, against that module's
  * own running workers.
  */
+#if defined(ETCS_LOADER) && !defined(__EMSCRIPTEN__)
+namespace ETCS { namespace trust { inline void resync_exec(); } }
+#endif
+#if defined(ETCS_LOADER)
+// The re-sync's notice (core/Trust.h), on the channel this session has: the
+// terminal, in colour.
+namespace ETCS { namespace trust {
+inline void resync_notice(const ::std::string& text)
+{
+    repl_err() << COLOR_WARN << "etcs: " << text << COLOR_RESET << "\n";
+    repl_notice_publish(text);
+}
+
+// The trust layer's warnings (an untrusted build's, Trust.h): red, every time.
+inline void trust_warn(const ::std::string& text)
+{
+    repl_err() << (ETCS::color_enabled() ? "\033[1;31m" : "") << "etcs: " << text << COLOR_RESET << "\n";
+}
+} }
+#endif
 inline int drive_main_loop_then_exit(ETCS::SignalContext& ctx, int code,
                                      const ::std::string& control_socket = "")
 {
@@ -4833,6 +4947,10 @@ inline int drive_main_loop_then_exit(ETCS::SignalContext& ctx, int code,
     ETCS::runtime_close();
     ETCS::shutdown_detached_executors();
     ETCS::PendingUnloadRegistry::getInstance().join_all();
+#if defined(ETCS_LOADER) && !defined(__EMSCRIPTEN__)
+    // A re-sync ended this session: the successor starts in its place (Trust.h).
+    ETCS::trust::resync_exec();
+#endif
     return code;
 }
 

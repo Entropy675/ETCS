@@ -29,7 +29,11 @@
 
 #include "../ETCS.h"
 #include "../modules/KartProvider/KartProvider/KartArena.h"
+#include "../ontology/Epoch.h"
+#include "../ontology/Noise.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -129,6 +133,61 @@ int main(int argc, char** argv)
     const double pits = static_cast<double>(seeds - none[6]) / seeds;
     check(seeds < 1000 || (pits > 0.4 && pits < 0.6), "about one in two has a pit");
     check(differs == 0, "a seed makes the same map twice");
+
+    // A bank by hand, up to the north wall: its lip half a unit short of the
+    // karts' bound leaves a trench under it, which is a fault; on the bound
+    // there is none (the bowl's banks were the first, the skatepark's too).
+    auto bank = [](float middle) {
+        KartArena::Map m;
+        KartArena::Ramp r;
+        r.x = Fixed::Zero(); r.z = Fixed::From(middle); r.yaw = 0;
+        r.width = Fixed::FromInt(192); r.up = Fixed::FromInt(21); r.flat = r.down = Fixed::Zero(); r.height = Fixed::FromInt(3);
+        m.ramps.push_back(r);
+        KartArena::Prepare(m);
+        return KartArena::Faults(m);
+    };
+    const std::string shy = bank(84.0f), flush = bank(84.5f);
+    std::printf("        (a bank to 94.5: %s; to 95: %s)\n", shy.empty() ? "sound" : shy.c_str(), flush.empty() ? "sound" : flush.c_str());
+    check(shy.find("a trench between its lip and the wall") != std::string::npos, "a bank whose lip is short of the karts' bound is a fault: a trench to hide in");
+    check(flush.find("trench") == std::string::npos, "...and with its lip on the bound there is none (this map of one bank is bare, and is told that instead)");
+
+    // The fire's warp is Perlin's noise in the rows' integers, redrawn by the
+    // renderer in floats: the two must be one field, and smooth -- near points
+    // near in value -- and not flat. And the Warp that carries it, with Perlin
+    // in its slot, must push alike in both.
+    {
+        using ETCS::Noise::Perlin;
+        float worst = 0.0f, jump = 0.0f, lo = 1.0f, hi = -1.0f, apart = 0.0f;
+        const ETCS::Noise::Warp<Perlin, Fixed> wf{ 0xC0FFEEu, KartArena::F(3, 2), KartArena::F(45, 100) };
+        const ETCS::Noise::Warp<Perlin, float> wg{ 0xC0FFEEu, 1.5f, 0.45f };
+        for (int i = 0; i < 4000; ++i)
+        {
+            const float x = -3.0f + 0.0037f * i, y = 1.3f - 0.0011f * i, z = 0.7f + 0.0023f * (i % 1700);
+            const float f = Perlin::At(Fixed::From(x), Fixed::From(y), Fixed::From(z), 0xC0FFEEu).ToFloat();
+            const float g = Perlin::At(x, y, z, 0xC0FFEEu);
+            const float h = Perlin::At(x + 0.001f, y, z, 0xC0FFEEu);
+            worst = std::max(worst, std::fabs(f - g)); jump = std::max(jump, std::fabs(h - g));
+            lo = std::min(lo, g); hi = std::max(hi, g);
+            Fixed px = Fixed::Zero(), py = Fixed::Zero(), pz = Fixed::Zero();
+            float qx = 0.0f, qy = 0.0f, qz = 0.0f;
+            wf.Push(Fixed::From(x), Fixed::From(y), Fixed::From(z), px, py, pz);
+            wg.Push(x, y, z, qx, qy, qz);
+            apart = std::max({ apart, std::fabs(px.ToFloat() - qx), std::fabs(py.ToFloat() - qy), std::fabs(pz.ToFloat() - qz) });
+        }
+        std::printf("        (the warp's noise: integers against floats at most %.6f apart; a step of 0.001 moves it at most %.5f; it ranges %.2f..%.2f;"
+                    " the warp's pushes at most %.6f apart)\n", worst, jump, lo, hi, apart);
+        check(worst < 1e-4f, "the fire's warp is one field in integers and in floats: what is drawn is what was decided");
+        check(jump < 0.01f && hi - lo > 0.8f, "...smooth, and not flat");
+        check(apart < 1e-3f, "...and the Warp with Perlin in its slot pushes alike in both");
+    }
+
+    // A seed every runtime that can interact picks alike: the loader's epoch,
+    // found the way a module finds it -- exported, not compiled in.
+    {
+        const uint64_t own = XXH3_64bits(ETCS::trust::loader_epoch().data(), 32);
+        std::printf("        (the epoch's seed: %016llx)\n", static_cast<unsigned long long>(ETCS::EpochSeed()));
+        check(ETCS::EpochSeed() == own && own != 0, "the epoch's seed is the loader's own epoch, found through its export");
+    }
 
     std::printf("\n%s (%d failure%s)\n", g_fail ? "FAILED" : "PASSED", g_fail, g_fail == 1 ? "" : "s");
     return g_fail ? 1 : 0;

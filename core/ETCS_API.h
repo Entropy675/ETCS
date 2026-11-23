@@ -16,7 +16,13 @@
     #endif
 #else
     // When NOT building the DLL, we are using it, so we IMPORT symbols.
-    #ifdef _WIN32
+    // A loader is the exception on Windows: it DEFINES what it marks
+    // (RegisterDynamicLoader, DynamicLoader.h), and a definition cannot be
+    // an import. Nothing is linked by import anywhere -- every symbol that
+    // crosses an image is looked up by name -- so export is what it means.
+    #if defined(_WIN32) && defined(ETCS_LOADER)
+        #define ETCS_API __declspec(dllexport)
+    #elif defined(_WIN32)
         #define ETCS_API __declspec(dllimport)
     #elif defined(__EMSCRIPTEN__)
         // Import side: still need the symbol visible for cross-module calls;
@@ -373,8 +379,16 @@ inline ::std::atomic<bool> g_etcs_runtime_threads_started{false};
 // PLATFORM-SPECIFIC HEADER INCLUDES
 // ====================================================================
 #ifdef _WIN32
+    // winsock2 before windows, here, where the core first meets either: the
+    // other order pulls in winsock 1, and the two do not coexist.
+    #include <winsock2.h>
     #include <windows.h>
     #include <direct.h> // For _getcwd
+    // Three of its macros are names here: Entity's far end of a remote, a
+    // tester's near and far bodies, and the Window family's CreateWindow.
+    #undef near
+    #undef far
+    #undef CreateWindow
     using library_handle_t = HMODULE;
     #define DL_EXTENSION ".dll"
     #define RENAME_CMD(old_name, new_name) MoveFileExA(old_name.c_str(), new_name.c_str(), MOVEFILE_REPLACE_EXISTING)
@@ -597,15 +611,11 @@ public: \
     ETCS::ExecutionContext env(&root, &ctx);
 
 // --- Arity-scaling expansion machinery (FE_*/FE_FIXED_*/FE_C_*,
-// GET_MACRO*, FOR_EACH*, ETCS_DISPATCH_SELECT*) lives in a generated
-// file, not here. Regenerate via generate_arity_macros.py whenever the
-// arity ceiling (currently 64) needs to change — never hand-edit the
-// generated file directly, and never hand-edit a replacement for it
-// here; that's exactly the drift the generator exists to prevent.
+// GET_MACRO*, FOR_EACH*, ETCS_COUNT_ARGS, ETCS_DISPATCH_SELECT*) lives in
+// a generated file, not here: ACE's dev_tools/generate_airty_macros.py,
+// MAX_ARITY (128), written by `ace deps generate`. Never hand-edit it, nor
+// a replacement for any of it here; that's the drift the generator prevents.
 #include "AirtyMacros_Generated.h"
-// see root/dev_tools/generate_airty_macros.py to generate
-#define ETCS_COUNT_ARGS(...) \
-    GET_MACRO(__VA_ARGS__,64,63,62,61,60,59,58,57,56,55,54,53,52,51,50,49,48,47,46,45,44,43,42,41,40,39,38,37,36,35,34,33,32,31,30,29,28,27,26,25,24,23,22,21,20,19,18,17,16,15,14,13,12,11,10,9,8,7,6,5,4,3,2,1)
 #define ETCS_DISPATCH_CONCAT2_(a,b)   a##b
 #define ETCS_DISPATCH_CONCAT2(a,b)    ETCS_DISPATCH_CONCAT2_(a,b)
 #define ETCS_DISPATCH_CONCAT3_(a,b,c) a##b##c
@@ -1158,22 +1168,23 @@ namespace ETCS
         }
         return longest;
     }
-    // Looks up the loader's exported manifest getter (ETCS_GetLoaderManifest,
-    // DynamicLoader.h) in the process's global symbol scope -- a plain
-    // function so ETCS_MODULE_EXPORT_MAIN's macro body doesn't need a raw
-    // #ifdef _WIN32 inside its backslash-continued expansion. Null when no
-    // loader is in this process (dlsym/GetProcAddress miss), not an error --
-    // the module's own manifest check treats that as "nothing to compare
-    // against" rather than a mismatch.
-    inline void* etcs_find_loader_manifest_getter()
+    // Looks up one of the loader's exports (DynamicLoader.h: its manifest
+    // getter, ETCS_GetLoaderManifest; its epoch, ETCS_GetLoaderEpoch) in the
+    // process's global symbol scope -- a plain function so
+    // ETCS_MODULE_EXPORT_MAIN's macro body doesn't need a raw #ifdef _WIN32
+    // inside its backslash-continued expansion. Null when no loader is in
+    // this process (dlsym/GetProcAddress miss), not an error -- the module's
+    // own manifest check treats that as "nothing to compare against" rather
+    // than a mismatch.
+    inline void* etcs_find_loader_symbol(const char* name)
     {
 #ifdef _WIN32
-        return reinterpret_cast<void*>(
-            GetProcAddress(GetModuleHandleA(nullptr), "ETCS_GetLoaderManifest"));
+        return reinterpret_cast<void*>(GetProcAddress(GetModuleHandleA(nullptr), name));
 #else
-        return dlsym(RTLD_DEFAULT, "ETCS_GetLoaderManifest");
+        return dlsym(RTLD_DEFAULT, name);
 #endif
     }
+    inline void* etcs_find_loader_manifest_getter() { return etcs_find_loader_symbol("ETCS_GetLoaderManifest"); }
 }
 /**
  * ETCS_MODULE_EXPORT_MAIN

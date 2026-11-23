@@ -1,9 +1,13 @@
 #ifndef MIRRORBUFFER_H__
 #define MIRRORBUFFER_H__
-#include <unistd.h>
 #include <fcntl.h>
-#include <sys/socket.h>
-#include <poll.h>
+#ifdef _WIN32
+#  include <io.h>
+#else
+#  include <unistd.h>
+#  include <sys/socket.h>
+#  include <poll.h>
+#endif
 #include <cerrno>
 #include <cstring>
 #include <stdexcept>
@@ -18,6 +22,114 @@
 #include "SignalContext.h"
 #include "InterfaceWire.h"
 #include "SharedPage.h"
+
+/*
+ * THE DESCRIPTOR CALLS THIS FILE MAKES, in one place, because they are not the
+ * same calls everywhere. On POSIX each is the call of its name. Windows has no
+ * poll over a pipe, no O_NONBLOCK on one, and read and write that do not say
+ * "would block", so there each is answered for a CRT descriptor over an
+ * anonymous pipe, from the pipe's own state: what is waiting to be read, how
+ * much room is left, whether the other end has closed.
+ *
+ * A SOCKET IS NOT A DESCRIPTOR ON WINDOWS (it is a kernel handle, and read and
+ * write do not take one), so shut answers ENOTSOCK there and the Socket
+ * strategy closes instead, as it already does for a one-way fd. A provider
+ * with real sockets on Windows hands them over as descriptors.
+ */
+namespace ETCS { namespace fdio {
+#ifndef _WIN32
+// The revents, 0 on a timeout, -1 on an error (errno).
+inline int  wait(int fd, short events, int ms)
+{
+    pollfd p{ fd, events, 0 };
+    const int r = ::poll(&p, 1, ms);
+    return r > 0 ? (p.revents ? p.revents : events) : r;
+}
+inline void blocking(int fd, bool on)
+{
+    const int flags = fcntl(fd, F_GETFL, 0);
+    if (flags != -1) fcntl(fd, F_SETFL, on ? (flags & ~O_NONBLOCK) : (flags | O_NONBLOCK));
+}
+inline ssize_t read(int fd, void* buf, size_t n)        { return ::read(fd, buf, n); }
+inline ssize_t write(int fd, const void* buf, size_t n) { return ::write(fd, buf, n); }
+inline int     close(int fd)                            { return ::close(fd); }
+inline int     shut(int fd, bool write_side)            { return ::shutdown(fd, write_side ? SHUT_WR : SHUT_RD); }
+inline int     pipe(int fds[2])                         { return ::pipe(fds); }
+#else
+// A pipe's state as the kernel keeps it (FilePipeLocalInformation): the one
+// question that answers for either end without reading or writing.
+// Asked of ntdll by name, so no image gains a library on its link line for it.
+struct PipeState { ULONG type, config, max_instances, instances, in_quota, readable, out_quota, writable, state, end; };
+inline HANDLE handle(int fd) { return reinterpret_cast<HANDLE>(_get_osfhandle(fd)); }
+inline bool   state(int fd, PipeState& s)
+{
+    using Query = LONG (__stdcall*)(HANDLE, void*, void*, ULONG, int);
+    static const Query query = reinterpret_cast<Query>(
+        reinterpret_cast<void*>(GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryInformationFile")));
+    struct { void* status; ULONG_PTR information; } io{};
+    return query && query(handle(fd), &io, &s, sizeof(s), 24 /* FilePipeLocalInformation */) >= 0;
+}
+// No readiness to block on for an anonymous pipe, so its state is asked. The
+// first millisecond yields (the other end is usually mid-write); after it, a
+// millisecond's sleep a time -- which is 15.6 on a stock Windows timer.
+inline int wait(int fd, short events, int ms)
+{
+    LARGE_INTEGER hz, t0, now;
+    QueryPerformanceFrequency(&hz);
+    QueryPerformanceCounter(&t0);
+    // The write end's quota reads 0 however full the pipe is, so a write is
+    // told "try" after one pause: the write that does not wait is the test.
+    for (bool paused = false;; paused = true)
+    {
+        PipeState s{};
+        if (!state(fd, s)) return POLLNVAL;
+        const bool closing = s.state != 3;   // 3: connected
+        if (events & POLLIN)
+        {
+            if (s.readable) return POLLIN;
+            if (closing)    return POLLHUP;
+        }
+        else
+        {
+            if (closing)    return POLLERR;
+            if (paused)     return POLLOUT;
+        }
+        QueryPerformanceCounter(&now);
+        const LONGLONG gone = now.QuadPart - t0.QuadPart;
+        if (gone * 1000 >= LONGLONG(ms) * hz.QuadPart) return 0;
+        if (gone * 1000 < hz.QuadPart) SwitchToThread();
+        else                           Sleep(1);
+    }
+}
+inline void blocking(int fd, bool on)
+{
+    DWORD mode = on ? PIPE_WAIT : PIPE_NOWAIT;
+    SetNamedPipeHandleState(handle(fd), &mode, nullptr, nullptr);
+}
+inline ssize_t read(int fd, void* buf, size_t n)
+{
+    DWORD got = 0;
+    if (ReadFile(handle(fd), buf, static_cast<DWORD>(n), &got, nullptr)) return static_cast<ssize_t>(got);
+    const DWORD e = GetLastError();
+    if (e == ERROR_BROKEN_PIPE || e == ERROR_HANDLE_EOF) return 0;
+    errno = (e == ERROR_NO_DATA) ? EAGAIN : EIO;
+    return -1;
+}
+// No more at once than the pipe is sure to take whole when it has room: a
+// write that does not wait takes all of what it is handed or none of it.
+inline ssize_t write(int fd, const void* buf, size_t n)
+{
+    DWORD put = 0;
+    const DWORD ask = static_cast<DWORD>(n < 4096 ? n : 4096);
+    if (!WriteFile(handle(fd), buf, ask, &put, nullptr)) { errno = EPIPE; return -1; }
+    if (put == 0 && ask) { errno = EAGAIN; return -1; }
+    return static_cast<ssize_t>(put);
+}
+inline int close(int fd)            { return ::_close(fd); }
+inline int shut(int, bool)          { errno = ENOTSOCK; return -1; }
+inline int pipe(int fds[2])         { return ::_pipe(fds, 65536, _O_BINARY | _O_NOINHERIT); }
+#endif
+}}
 #include "LMAXSequentialSharedPage.h"
 
 // TODO/Warn: the LMAX wrap path is the least exercised of the three and the
@@ -370,22 +482,13 @@ private:
         while (true)
         {
             if (ctx.isInterrupted() || ctx.isTerminated()) return 0;
-            pollfd p{ fd, events, 0 };
-            const int r = ::poll(&p, 1, 100);
-            if (r > 0) return p.revents ? p.revents : events;
+            const int r = fdio::wait(fd, events, 100);
+            if (r > 0) return static_cast<short>(r);
             if (r < 0 && errno != EINTR) return 0;
         }
     }
-    static void setBlocking(int fd)
-    {
-        int flags = fcntl(fd, F_GETFL, 0);
-        if (flags != -1) fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
-    }
-    static void setNonBlocking(int fd)
-    {
-        int flags = fcntl(fd, F_GETFL, 0);
-        if (flags != -1) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-    }
+    static void setBlocking(int fd)    { fdio::blocking(fd, true); }
+    static void setNonBlocking(int fd) { fdio::blocking(fd, false); }
     // This strategy's own WireScope bit — the mask a stage's Scope()
     // result gets tested against at resolution time. No Entity/ontology
     // dependency at all, so (unlike resolveWrapChain/buildWrapManifest)
@@ -485,8 +588,8 @@ public:
      * Database -- a resource of a locale, whose surface is this runtime's
      * own (ontology/Database.h) -- and anything else that says it is only
      * here with the bare `Local` tag (DatabaseProvider's Persistence: the
-     * verbs of this loader's store). A transport refuses to bind or open a
-     * pair onto one, on either side.
+     * verbs of this loader's store), and anything Private (ontology/Private.h).
+     * A transport refuses to bind or open a pair onto one, on either side.
      */
     static bool localFrame(Entity* e);   // Defined in DynamicLoader.h.
     // -----------------------------------------------------------------------
@@ -954,14 +1057,14 @@ public:
                 if (lmax_page_) { lmax_page_->tombstone(); lmax_page_ = nullptr; }
                 break;
             case ActiveStrategy::Pipe:
-                if (write_fd_ != -1) { ::close(write_fd_); write_fd_ = -1; }
+                if (write_fd_ != -1) { fdio::close(write_fd_); write_fd_ = -1; }
                 break;
             case ActiveStrategy::Socket:
                 // A one-way fd (a link channel's pipe, NetworkProvider/Edge.h)
                 // has no direction to shut down: this half is its only user,
                 // so the end of the stream is closing it.
-                if (write_fd_ != -1 && ::shutdown(write_fd_, SHUT_WR) != 0 && errno == ENOTSOCK)
-                { ::close(write_fd_); write_fd_ = -1; }
+                if (write_fd_ != -1 && fdio::shut(write_fd_, true) != 0 && errno == ENOTSOCK)
+                { fdio::close(write_fd_); write_fd_ = -1; }
                 break;
         }
     }
@@ -995,11 +1098,11 @@ public:
             case ActiveStrategy::LMAX:
                 break;
             case ActiveStrategy::Pipe:
-                if (read_fd_ != -1) { ::close(read_fd_); read_fd_ = -1; }
+                if (read_fd_ != -1) { fdio::close(read_fd_); read_fd_ = -1; }
                 break;
             case ActiveStrategy::Socket:
-                if (read_fd_ != -1 && ::shutdown(read_fd_, SHUT_RD) != 0 && errno == ENOTSOCK)
-                { ::close(read_fd_); read_fd_ = -1; }   // see closeWrite
+                if (read_fd_ != -1 && fdio::shut(read_fd_, false) != 0 && errno == ENOTSOCK)
+                { fdio::close(read_fd_); read_fd_ = -1; }   // see closeWrite
                 break;
         }
     }
@@ -1054,7 +1157,7 @@ public:
                 if (read_fd_ == -1) return false;
                 if (in_.read_offset < in_.written) return true;
                 in_.reset();
-                ssize_t bytes = ::read(read_fd_, in_.buf, MBuffer::bufsize - 1);
+                ssize_t bytes = fdio::read(read_fd_, in_.buf, MBuffer::bufsize - 1);
                 if (bytes > 0)
                 {
                     in_.written    = static_cast<size_t>(bytes);
@@ -1311,9 +1414,9 @@ public:
             case ActiveStrategy::Socket:
             {
                 if (write_fd_ == -1) return true;
-                pollfd p{ write_fd_, POLLOUT, 0 };
-                if (::poll(&p, 1, 0) < 0) return errno != EINTR && errno != EAGAIN;
-                return (p.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0;
+                const int r = fdio::wait(write_fd_, POLLOUT, 0);
+                if (r < 0) return errno != EINTR && errno != EAGAIN;
+                return (r & (POLLERR | POLLHUP | POLLNVAL)) != 0;
             }
         }
         return true;
@@ -1563,7 +1666,7 @@ private:
         long long   sent = 0;
         while (sent < total)
         {
-            ssize_t n = ::write(write_fd_, src + sent, static_cast<size_t>(total - sent));
+            ssize_t n = fdio::write(write_fd_, src + sent, static_cast<size_t>(total - sent));
             if (n > 0) { sent += n; continue; }
             if (errno == EAGAIN || errno == EWOULDBLOCK)
             {
@@ -1654,7 +1757,7 @@ private:
             size_t space = MBuffer::bufsize - 1 - in_.written;
             if (space == 0) return false; // Buffer full but still can't extract? Stream corrupt.
             // Read a chunk from the fd
-            ssize_t bytes = ::read(read_fd_, in_.buf + in_.written, space);
+            ssize_t bytes = fdio::read(read_fd_, in_.buf + in_.written, space);
             if (bytes > 0)
             {
                 in_.written += static_cast<size_t>(bytes);
@@ -1728,7 +1831,7 @@ private:
         if (out_.written == 0) return true;
         while (true)
         {
-            ssize_t n = ::write(write_fd_, out_.buf, out_.written);
+            ssize_t n = fdio::write(write_fd_, out_.buf, out_.written);
             if (n > 0) { out_.reset(); return true; }
             if (errno == EAGAIN || errno == EWOULDBLOCK)
             {
@@ -1747,7 +1850,7 @@ private:
         while (true)
         {
             in_.reset();
-            ssize_t bytes = ::read(read_fd_, in_.buf, MBuffer::bufsize - 1);
+            ssize_t bytes = fdio::read(read_fd_, in_.buf, MBuffer::bufsize - 1);
             if (bytes > 0)
             {
                 in_.written    = static_cast<size_t>(bytes);
@@ -1904,7 +2007,7 @@ inline void MirrorBuffer::makePair<StrategyPipe, SharedPage>(
 {
     assert(page && "[MirrorBuffer] Pipe makePair: null staging page");
     int fds_data[2], fds_ack[2];
-    if (pipe(fds_data) < 0 || pipe(fds_ack) < 0)
+    if (fdio::pipe(fds_data) < 0 || fdio::pipe(fds_ack) < 0)
         throw ::std::runtime_error("[MirrorBuffer] Pipe makePair: pipe() failed");
  
     producer.active_      = MirrorBuffer::ActiveStrategy::Pipe;
@@ -2055,7 +2158,7 @@ inline void MirrorBuffer::teardownPair<StrategyPipe, SharedPage>(
     if (producer.debug_ || consumer.debug_)
         ETCS_LOG("MirrorBuffer", "Pipe teardown.");
  
-    auto closefd = [](int& fd) { if (fd != -1) { ::close(fd); fd = -1; } };
+    auto closefd = [](int& fd) { if (fd != -1) { fdio::close(fd); fd = -1; } };
     closefd(producer.read_fd_);
     closefd(producer.write_fd_);
     closefd(consumer.read_fd_);
@@ -2078,7 +2181,7 @@ inline void MirrorBuffer::teardownPair<StrategySocket, SharedPage>(
     // Socket fds are owned by the entity; we close our handle here. One
     // socket usually carries both halves (a Link's fd reads and writes), and
     // closing it twice would close whatever the kernel reused the number for.
-    auto closefd = [](int& fd) { if (fd != -1) { ::close(fd); fd = -1; } };
+    auto closefd = [](int& fd) { if (fd != -1) { fdio::close(fd); fd = -1; } };
     if (producer.write_fd_ == consumer.read_fd_) consumer.read_fd_ = -1;
     closefd(producer.write_fd_);
     closefd(consumer.read_fd_);

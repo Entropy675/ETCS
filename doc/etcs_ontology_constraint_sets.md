@@ -35,7 +35,56 @@ many families a leaf type draws from.
 
 ---
 
-## 2. Families as constraint sets, and structural exclusivity
+## 2. The triple: constraints, questions, context
+
+§1 says what a constraint is when the program is compiled. When it runs
+there are three things, and each of them is one thing in the runtime:
+
+| | is | in a work function |
+|---|---|---|
+| **constraints** | the entity: the families its leaf claims, each proven by its `Base` | `self` |
+| **questions** | the data put to those constraints, and the answer they give | `data` |
+| **context** | the signals that can reach the call, scope by scope | `ctx` |
+
+Each pairing holds in both directions.
+
+- **An entity is its constraint set.** What it can be asked and what it will
+  answer are exactly what its families declare. A constraint set, in turn,
+  exists at run time only as an entity that carries it.
+- **A question is data presented to a constraint.** There is no other way to
+  ask an entity anything than to hand data to one of its work functions. The
+  answer comes back in the same buffer, so a question and its answer are one
+  value at two moments.
+- **A context is the signals that reach you.** A `SignalContext` is the flags
+  a call can be interrupted, terminated or hung up by, and the `up` chain of
+  scopes they come down through. Whatever cannot reach the call is not part
+  of its context.
+
+**The work function is where the three meet, not a fourth thing.** Its
+signature is the triple and nothing else:
+
+```cpp
+void _implWork_T_Name(T& self, ETCS::Buffer& data, ETCS::SignalContext ctx);
+```
+
+`DEFINE_WORK_FUNC_TYPED` only unpacks `data` into named fields. The record of
+a call is the same three again: `ETCS_ACTION_SCOPE` keeps the entity's RID,
+the action and its payload, under the context's frame. That is why a trace
+counts only work functions as transformations. A transformation is the triple
+evaluated once, and nothing else is one.
+
+**What this does to writing code.** A leaf picks at most one member from each
+family (§3), and each of its work functions answers a declared question under
+the context it is handed. What is left to write is the body of a function
+whose inputs, outputs and authority are already fixed. Reaching another entity
+is a call of its own, another triple with the context handed down, so the
+shape repeats rather than escapes. This is what makes code in this tree
+derivable, by a person or a generator, and checkable by reading: the review is
+whether the body keeps to its three, not whether it seems reasonable.
+
+---
+
+## 3. Families as constraint sets, and structural exclusivity
 
 An inheritance lineage in the ontology —`Entity → X → {Y, Z}`, for
 example — defines a **family**. Membership in a family is *cumulative* down
@@ -69,7 +118,7 @@ A valid leaf might compose one pick from each bracket — e.g. `Y + B + C + D`
 
 ---
 
-## 3. Orthogonal composition via fold-in at the `Base` layer
+## 4. Orthogonal composition via fold-in at the `Base` layer
 
 Distinct from sibling exclusivity within one family is **deliberate
 composition across independent families**. When a leaf's `Base<Derived>`
@@ -85,7 +134,7 @@ specific constraint set from multiple independent axes at once.
 
 ---
 
-## 4. Incidental exclusivity: constraint sets discovered, not designed
+## 5. Incidental exclusivity: constraint sets discovered, not designed
 
 Families as described above are **structural** — the exclusivity exists
 because of an explicit, authored ancestor relationship in the type hierarchy,
@@ -133,7 +182,7 @@ This is meaningfully different from a true structural family:
   `C` collides with some distant, as-yet-uncombined family is unknown until
   someone actually tries to fold both into the same leaf.
 - It is **escapable**, unlike true sibling exclusivity, via explicit
-  disambiguation (see §5) — it defaults to a compile error, not a permanent
+  disambiguation (see §6) — it defaults to a compile error, not a permanent
   prohibition.
 
 ### Naming as a constraint-authoring act
@@ -151,7 +200,7 @@ family's interface in isolation.
 
 ---
 
-## 5. Resolving a genuine collision: disambiguation, not defaults
+## 6. Resolving a genuine collision: disambiguation, not defaults
 
 When two orthogonal families collide on a name, the compiler forces a choice
 at the point of combination — it will not silently pick one family's
@@ -212,7 +261,7 @@ need drawing.
 
 The collision was a **symptom of one name covering two concepts**, so the
 fix was to name the second one: `Drawable_::Animating` became
-`Drawable_::NeedsFrame`. That is the act §4's naming subsection describes,
+`Drawable_::NeedsFrame`. That is the act §5's naming subsection describes,
 applied after the fact rather than before it — and it left something the
 merge would have hidden. With two names, the tree question can be *defined
 in terms of* the causal one: `NeedsFrame` defaults to "am I Animated, and if
@@ -235,7 +284,7 @@ the same call that projected it into a camera. That made "what a thing
 does" a property of "being looked at", and a scene nobody was projecting
 did not happen.
 
-The fix was the orthogonal fold-in §3 describes, applied to the physics:
+The fix was the orthogonal fold-in §4 describes, applied to the physics:
 `Causal_` / `CausalBase` (`ontology/Causal.h`, `CausalBase.h`) is the family
 that *has rows* — the OrderVector (`ontology/OrderVector.h`), fixed-point
 throughout (`ontology/Fixed.h`) so two runtimes reach the same state to the
@@ -279,14 +328,14 @@ like one; the escape is that any place can say otherwise
 
 ---
 
-## 6. Summary of the constraint model
+## 7. Summary of the constraint model
 
 | Relationship | Discovered when | Exclusivity source | Escape hatch |
 |---|---|---|---|
 | Lineage (`X → Y`) | Authored, up front | N/A — cumulative, not exclusive | N/A |
 | Siblings (`Y`, `Z` under `X`) | Authored, up front | Same constraint, different specialization | None — genuinely exclusive |
 | Orthogonal families (`Ephemeral_` + `ConnectionState_`) | Authored, at fold-in | N/A — independent axes | N/A — always combinable |
-| Incidental name collision (`C`, `D`) | Lazily, at first attempted combination | Coincidental name/signature overlap | Explicit merge, composition via `addTag`, or rename-and-derive (§5) |
+| Incidental name collision (`C`, `D`) | Lazily, at first attempted combination | Coincidental name/signature overlap | Explicit merge, composition via `addTag`, or rename-and-derive (§6) |
 
 The overall effect is an ontology whose full constraint surface is not
 entirely legible from any single interface file in isolation: two families

@@ -466,13 +466,30 @@ The far side decides what is reachable: a `Room` publishes entities by name
 (`room.Publish(minutes @minutes Head Since Follow)`: a record published to be read) — and nothing
 else in that runtime can be bound. The way in to a record published that way is a *door*: a
 sealed `Ledger` fed into it (`door.Feed(@minutes)`), so writing takes the key and reading does
-not. One guest per name: a second link under a name already linked is refused at the hello. And
+not. One guest per name: a second link under a name already linked is refused at the hello, unless
+it is the same key coming back for it, which takes the old link's place. And
 the link is symmetric — what a guest publishes on its `Peer`, the host binds through the `Room` by
 the guest's name (`remote.Bind(mail @room alice)`), the one channel that is that guest's alone. The host of a room is its
 authority — every guest's actions arrive there and run in its order — whether it serves the room
 itself (`room.Host(@links studio)`, beside an `HttpServer`'s `LinkHub`) or, unable to accept
 connections, hosts through a server that only splices bytes (`room.HostVia(wss://site/link/studio)`).
 Guests dial the same address either way.
+
+**A link is between two proven keys, and sealed.** The hello is a handshake: each side makes a
+fresh exchange key, and each side's *loader* signs the transcript of both names and both exchange
+keys (`"ETCSLNK1"`, a form it signs nothing else in — `core/Trust.h`, `vouch`) with its own key,
+giving its chain to a root besides when it is registered; the other loader checks it
+(`recognize`). A **local identity** is a key alone — the same key as before, nothing more said;
+a **registered** one climbs a chain to a root, and is of this loader's guild when that root's
+active key is its own identity's too. A browser tab, holding no keystore, signs with a key made for
+its session, and so does an untrusted build -- never its store's key, which would be the
+developer's word lent to modules nothing checked -- saying so on every link. A room admits anyone
+by default; `room.Admit(registered)` or `room.Admit(guild)` turns the rest away at the hello. The two exchange keys give a key each way, and every message of the edge after
+the hello is sealed under them, numbered (XChaCha20-Poly1305): altered, replayed or out of order,
+it does not open and the link closes. A hub splices bytes and reads none, so the seal is end to
+end. What the far side proved goes with every verb and stream half run for it, as
+`SignalContext::peer` — its key and identity, not the name it said; `peer.Who` and
+`room.Who <guest>` read it.
 
 Two families ride on this for anything shared: a **Directory** (`NetworkProvider::Lobby`) lists who
 can be reached, each entry lasting as long as its advertiser's link, and watched as a stream
@@ -482,6 +499,35 @@ each came over, and followed as a stream (`book.Follow(0) -> copy.Mirror()`). A 
 action is streamed in (`x.Produce -> book.Take()`), and the host keeps the record from its last
 **checkpoint** on (`book.Checkpoint(<seq>)`): a line that states everything makes those before it
 history nobody replays, and a reader from before it restarts there.
+
+A state can also be its own lines. A **Trace** is a state that keeps the lines it applied, in
+order, from as made -- so a copy that follows them from the first is the same state, and one
+that is not says so where the trace says its hash (`hash <at> <hash>`, a line like any other).
+One copy is the **authority**: it applies a line as it takes it, from its own hand or from a
+**seat** -- a stream into it from another runtime, whose every message after the first is that
+seat's line. A seat is an identity: over a link, the key its link proved, so its lines are
+authored as that key's fingerprint whatever it calls itself, and the same key on a new stream
+takes its seat back; its first message gives only a label for people and a nonce its own mirror
+knows it by (`seat <nonce> <label>`, the family's line). The stream is who said it and the order
+the authority reads its seats in is the order, so judging is the MirrorBuffer's: the room publishes the game's
+`Trace` and `Take` and nothing else, and the game refuses what a seat may not say. The others
+**mirror** it (`host.Trace(0) -> game.Follow()`), their own lines leaving on their seat
+(`game.Emit() -> host.Take()`) and coming back as the trace's. A **Lockstep** trace's time is
+lines too: `tick <n>` steps it, and the authority's frame edge decides how many are due, so a
+world that moves between inputs is still only its trace. Beside them, **Present** is who is
+here: whose stream is open -- a seat arrives when it sits and departs when its stream ends,
+however it ends -- and the site's hall, where the owner is listed for as long as its link lasts.
+A game between runtimes claims `Lockstep` and `Present` (the kart's battle, golf's match);
+NetworkProvider's `session_host.etcs` and `session_join.etcs` wire any of them:
+
+```etcs
+requires game [Trace]
+room.Publish(game @game Trace Take)            # the host: the game is the session
+game.Host({{name}} @hall {{id}})
+# a guest, through a surface of the host's game (`far`, the same type):
+detach NetworkProvider/scripts/session_follow.etcs src=far dst=game   # far.Trace(0) -> game.Follow()
+detach NetworkProvider/scripts/session_emit.etcs src=game dst=far     # game.Emit() -> far.Take()
+```
 
 ---
 
@@ -785,6 +831,182 @@ caller.
 `GenerateEnvironmentSignature` — name plus the whole manifest — still exists and still answers
 the first question. It is no longer what any `_GetHash` export returns.
 
+**Who witnessed these bytes** — the signature, a third question and checked first: `dlopen` runs a
+module's static initialisers, so nothing of it may run before it is known. Every module binary
+carries a certificate chain (`core/Signature.h`) in a place the platform's loader never maps —
+`.etcs.sig` in ELF, an `etcs.sig` custom section in wasm, a trailer after a PE image. Its leaf names
+a digest of the bytes the platform does map, under the module's name, and the epochs it is
+witnessed in: the epoch is the contract and lib keys of the manifest, hashed together, so libs
+count here and stay `[DIFF]` above — two layers of hashing.
+
+The check is a wrap chain, the one the `Wrapper` family already is (`core/Trust.h`). A load is a
+frame that refers to the module's bytes; each stage passes it or refuses it, and a refusal is a
+failed attach. The loader's own two stages are wired in core, before any module can provide a
+type. **Signature**: the chain names these bytes under this name in this epoch, and climbs through
+strictly higher roles to a root; passing, it says who signed. **Own**: a module signed by a
+loader's key is taken only by that loader, and only in a session where it has proven the key is
+its own; what comes to the loader's identity is taken by any loader built with it, and a loader
+binary only if it was minted or passed off. Any `Wrapper` child
+of the gate's entity stands outside those two, like any chain, and signing is the same chain
+wrapped: `ace` signs every module it builds by asking `bin/etcs --sign`, and holds no key. The
+bytes checked are the bytes mapped — a sealed memfd on Linux, a file held against writers on
+Windows.
+
+A loader is one installation as it runs, and its key is what makes it that one. The key is made on
+first use and kept in the OS keystore (`core/Keystore.h`) — the Secret Service, the Credential
+Manager — which is the medium `Private` names. A session begins with a handshake: the store's
+files say what the loader claims to be, the keystore says whether the claim is its own, and a
+loader that cannot prove it takes nothing a loader signed. It does not fall back. A browser holds
+no key and is told at link time which loader built it.
+
+A chain is a linked list in two halves, joined at a loader's key. The **local half** is that key
+and what it signs: it is all a loader needs to run its own builds, it needs no root, and nothing
+but that loader takes it. **ACE's half** is a tree: a super-root that exists only as shards, the
+active key it certifies, and under the active key the keys of the loaders that act for ACE — one
+role each, sharing that parent. The minting server's loader is `Marketplace` and signs what a
+download takes, modules and loader binaries alike; the site's is `Registrar` and certifies other
+loaders' keys as `Loader`. `Release` stays in the table and is held by no one. That certificate is the
+join: pulled from anticurrententropy.com and installed (`etcs --registration`), it puts ACE's half
+above a developer's key, so what that loader signs says whose it is. It still runs only there.
+Who may certify whom is a table (`sig::may_issue`), and a key never holds two roles.
+
+**Roots attest each other** the way a registration joins a loader's key to ACE's half: a root
+certifying another root's key continues that root's chains past it, and adding to the chain is
+trusting it as a remote. An identity may be folded from either root along a chain that carries
+the continuation, so one chain runs on loaders of identities from both. A root's own certificate is
+self-issued and last; `attest_root.etcs` rebuilds a
+root from three custodians and certifies the other root's key, and the other root's role keys
+register with that certificate and its root's above their own.
+
+A loader's **identity** is built in: a checksum folded along a chain from a root down to the key
+that built it, `h = BLAKE2b("ETCSIDN1")`, then `h = BLAKE2b(h | role | key)` for each key — over keys
+and their roles, so reissuing a certificate moves nothing. A builder's identity is the fold along
+its own registration to its own key (`etcs --identity`); unregistered, its key alone. It is what
+that builder is authorized to build with, and ace passes it to every loader it builds
+(`-DETCS_IDENTITY`; `ace identity` builds for another's). It is no header, so it is in no epoch:
+every identity's loaders share one, and differ only in what they require. The site's downloads are
+built for the minting server's identity, root → active → marketplace, and require that marketplace
+at the head of anything they take globally. This is the bootstrap: a loader checking itself proves
+nothing to someone who holds no identity, so the first trust comes from where the binary was
+obtained, and the identity inside it is what every later check stands on — its own bytes first,
+then every module, with an empty store and no key. Such a loader takes what the marketplace signed
+and attests what it minted.
+
+A loader trusts what was compiled into it: the identity, and the key of the loader that built it
+(`ETCS_BUILDER_KEY`, which ace compiles into every loader), besides its own key proven at the
+handshake. A module runs if the fold from one of the roots along its chain comes to the identity,
+at whatever key: that is the **global surface** — the marketplace's modules, on a download of its
+identity; a registered developer's, on loaders of his own identity or of the root's alone. Short of
+that it must meet this loader's own keys — its key, its builder's, a certificate of its
+registration — and then runs **local**: no transport bridges its entities
+(`MirrorBuffer::localFrame`). A module signed by another loader's key with nothing above it meets
+nothing, and is the case refused by default. With no identity built in a loader is
+**experimental**: there is no global surface to keep anything off, so nothing it runs is held local
+and its links work as they always have — but nothing places it among anyone else's, which is what
+the expanding multiplayer needs. A
+builder's key compiled in is also what lets a loader run with no keystore at all: `ace bundle` puts
+`bin/etcs` and a few modules on a machine with nothing else, and they load.
+
+The root is made by etcs itself, on such a machine: `root_ceremony.etcs` makes the super-root, the
+active key it certifies, and the marketplace, release and registrar certificates the active key
+issues (the release certificate is held by no one now), splits both keys 3 of 5 to five custodians, writes the certificates out, and forgets both
+keys. `certify.etcs` rebuilds the active key from any three custodians to certify another key later.
+Once the root is in a registration, what is handed on is the loader's own key, its registration,
+and its lineage.
+
+What the ceremony runs is agreed on before it runs. **Witnesses**: `ace source` packs this tree,
+Commons and ACE-Build-Tools, each with its `.git`, and the Monocypher pin into one tar a machine
+with no network builds from. On each machine, unpacked at the same path (it is compiled into the
+loader and some modules), `ace witness` builds the loader and the ceremony's modules twice from
+scratch with no builder key. The loader just built then writes a statement, `etcs --witness`, and
+only if both builds came to the same digests: the digest of each binary, the epoch, the arch, and
+the builder's account of what it built from (the commits, the path, the compiler), signed by a key
+made for it and forgotten. `etcs --consensus` agrees on statements: one epoch and one source across
+all of them; per arch, every witness the same digests, from at least a quorum of distinct
+witnesses. Where two disagree it names what their accounts differ in. With `check=<dir>` it says
+whether a directory's binaries are the consensus build, and `ace bundle --from` packs that build for
+the ceremony. **Minting** is the same agreement with the marketplace key at the end: witnesses
+build for the minting server's identity (`ace witness --identity`), and `ace mint` on the minting
+server checks the consensus of the build it is handed, refuses one built for another identity, and
+signs those exact bytes, the loader among them, for `ace publish`. Builders of lower trust run the
+build before the higher key goes on it. Binaries are compared by the digest a loader checks (`etcs --digest`), never as
+files, since every signer's section differs.
+
+The site is where the two halves meet. It serves **ACE's half on one path** (`/pki`): its registrar
+is a `CryptProvider::Registrar` route whose key is a `Keypair` kept in the site's keystore, and a
+loader that signs `"ETCSREG1" | its key | the registrar's key` gets a `Loader` certificate and the
+chain above it. It serves **the binaries on another** (`/dist`): what was minted, modules and
+loader, with a list of their digests and epochs and the epoch the site is in, signed by the marketplace. A
+loader reads that list through `CryptProvider::Upstream` and fetches whatever the site has moved
+past, unless its own key signed it, in which case it belongs to the developer. A module never
+holds the loader's key or writes its store: everything that does is the loader's own code, reached
+through a `TrustEvent` on the loader's ordering thread. A fetched binary is put in place only if it
+is the bytes the list names and passes the loader's own stages in the site's epoch, and it is the
+next session's. The list names the ABI's version it was published under (`BASE_SOURCE_STRING`, which
+moves on an ABI change and so with every change in trust a release makes), and a loader takes no
+list older than itself or than the newest it has taken, which its store keeps: a list replayed from
+before a key was retired is refused. Retiring the marketplace key is a new identity, with the next
+key at the third link, so the loaders built with it take nothing the retired key signs. The same version is on every function a module or loader exports: the version script's
+node is named for it (`Foo_Make@@ETCS_ABI_KERNEL_V_1.0`), so each symbol says at its source which
+kernel it was built for.
+
+**Re-sync** is what a retired marketplace key leaves behind. The loaders built with the old identity
+believe only that identity's lists, so they are also told its parent — the fold one step short of
+the marketplace key, root → active (`-DETCS_IDENTITY_PARENT`). A checksum is followed only down a
+chain, from keys to a head, never back up, which is where it can be checked at all; so the parent
+is given to the loader rather than found. A list from another marketplace that the same parent
+certified, at a newer kernel, is the identity the loader moves to, and it gives the loader one
+thing: its successor, minted by that marketplace and countersigned by a release key under the same
+active key — two keys, neither of them the retired one. The loader puts it in place, retires its old
+identity in its store, so nothing the old marketplace signs is taken again whatever kernel it
+claims, says so on the channel the session has (the terminal, in colour), saves the scene and
+restarts on the successor. The successor asks whether to resume the session — replaying it to its
+last saved point, as each persistable type defines, with state hashes compared only within one
+kernel — or exit to the menu, which leaves the place in the store for a later start. A loader with no
+prompt runs again as it was launched, its place kept. A page with buttons takes the default answer by
+itself after five seconds, a ring beside it ticking from green through yellow to red; a terminal
+waits. A page still showing its loading mark shows the re-sync above it.
+
+**An untrusted build** (`-DETCS_UNTRUSTED`, `ace untrusted on`) is for rapid recompiles: every
+module loads with no signature check, so nothing is signed between a build and a run and no keystore
+is asked. It has no identity, attests nothing, and signs, countersigns, issues, witnesses and
+publishes nothing, so nothing it built reaches anyone else, and a trusted loader refuses what it
+left unsigned. It is no header, so switching costs no epoch. It says so all the time it runs: a red
+banner at start, a red line on every module load, and `[UNTRUSTED]` on every prompt. A successor
+that never took is not fetched again; the loader says to reinstall from the site.
+
+A loader is the one binary nothing else checks, so it attests itself: at the handshake it puts its
+own bytes through its own two stages. That is what makes a **lineage**. The loader going out
+**passes off** the one that replaces it: after the chain in the child's signature section it signs
+`"ETCSGEN1"` | parent digest | child digest | the epoch on either side | its identity | whether it
+attested | its key. That is the one fragment a loader can sign for; the lineage behind it is the
+marketplace's to attest, at the site. A loader binary its own key (or its builder's) signed attests
+only if an attesting loader of the same identity passed it off. A loader that passed itself off is
+a lineage beginning, which a loader of no identity, or of its own key's, takes, and one of a minted
+identity does not: there a lineage begins at a mint, whose signature attests the binary by itself,
+and the build after it is passed off by the minted loader. A loader that does not attest still
+runs, with a warning, and signs — its local half alone, since local authority is any loader's and
+global authority a signed build's. What it already signed with its half is left as it is.
+`lineage.log` in the store is the signer's own trace of what it passed off: parent, child, epochs,
+identity, and its word for when and where.
+
+`DatabaseProvider::Keystore` is that same store as a `Database` claiming `Private`: where a script
+keeps a secret, and the one place a `Keypair` goes whole. Its `Wrapper` children guard it as they
+would a node on a link, so a secret kept under a `CryptProvider::Envelope` — a stage that seals
+under the key its own `Private` child holds, given by no verb — is reached only by an entity
+carrying the same one. Naming it is not enough.
+
+Unbuilt: the minting server's identity, which waits on the ceremony being run for real (a
+rehearsal's root, or a test authority's, stands in); the unlock of a downloaded loader's head gate,
+which would let it take chains that do not start at the marketplace. A link that carries a local module's entities is refused (the
+local frame); nothing yet resolves one epoch against another. An account behind a registration: the registrar certifies any key
+that proves itself, and binds it to no one. Also unbuilt: the marketplace's attestation of
+the whole lineage, beside the download; a successor from a later epoch checked by the lineage (it is
+checked by the marketplace's signature, in the epoch the site's list names); signing and attesting
+the web loader, whose trust is its page's connection; the
+entitlement stage; and the stage that takes another loader's modules (the untrusted scanning
+mode).
+
 ## Shutdown
 
 Loader unload and the root's own vacate are ordered so a module is never unloaded while a call
@@ -825,6 +1047,7 @@ and then writes nothing more, so a half torn-down runtime is never what the next
 | Passing a local down | `detach child.etcs k=name` / `run child.etcs k=name` |
 | Comments | `#` prefix |
 | Sub-script search path | `#IMPORT` / `#EXPORT` on line two |
+| Module signature | automatic at module load, before anything of the module runs |
 | ABI check | automatic at module load |
 | Whole-tree check | automatic at invocation, before any line runs |
 

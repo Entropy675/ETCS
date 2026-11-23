@@ -36,6 +36,9 @@
 // synonym. They live on as TAG names a provider may export, which is where a
 // difference in expected locale belongs.
 #include "ontology/DatabaseBase.h"
+// Private: a medium readable only inside this loader -- what a Database (or
+// anything holding a secret) claims when that is true of it. See ontology/Private.h.
+#include "ontology/PrivateBase.h"
 
 // Lower suspicion graphical/window ontology types (mostly RenderProvider/WindowProvider):
 #include "ontology/ResizableBase.h"
@@ -147,6 +150,13 @@
 // each wrote for themselves. See ontology/Directory.h, ontology/Record.h.
 #include "ontology/DirectoryBase.h"
 #include "ontology/RecordBase.h"
+// A state that is its lines, kept, which a mirror follows into the same state
+// (Trace); one whose time is lines too (Lockstep) -- one lineage, cumulative.
+// Present is beside it: who is here is whose stream is open. The session shapes
+// chess, paint and the kart battle each wrote for themselves. See
+// ontology/Trace.h, Lockstep.h, Present.h.
+#include "ontology/LockstepBase.h"
+#include "ontology/PresentBase.h"
 #include "ontology/SwitchableBase.h"
 #include "ontology/FilterBase.h"
 

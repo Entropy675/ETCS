@@ -15,6 +15,7 @@
 namespace ETCS {
 // Forward declarations
 struct Module;
+struct TrustEvent;
 class  EventNode;
 class  Entity;
 class  Root;   // defined at the bottom of Entity.h, after this header --
@@ -29,7 +30,7 @@ class  Root;   // defined at the bottom of Entity.h, after this header --
 struct DLInEvent
 {
     enum class Kind : uint8_t { Load, Resolve, Destroy, AddTag, EntityUnload, TagModify,
-                                 RequestUnload, Ack, ChangeModule, PairMask };
+                                 RequestUnload, Ack, ChangeModule, PairMask, Trust };
     Kind                        kind;
     ETCS::Buffer                conjugate_key;   // Load/Resolve: module:tag key.
                                                    // AddTag: the child's tag name (reused —
@@ -100,6 +101,8 @@ struct DLInEvent
     ETCS::Buffer       pairmask_tag_b;
     ETCS::TagMask*     pairmask_out  = nullptr;
     ::std::atomic<bool>* pairmask_done = nullptr;
+    // Trust only -- the caller's event: its inputs, and where the answer goes.
+    ETCS::TrustEvent*  trust = nullptr;
     // MODULE-SCOPE bits the ORIGIN wants added, on top of the origin module's
     // own bit. Today that is exactly one thing: the module pair of a stream
     // call whose body this event was fired from inside
@@ -376,8 +379,9 @@ struct TagModifyEvent : Event
     MoveImpl          move_impl = nullptr;
     ::std::atomic<bool> done{false};
     ::std::atomic<bool> changed{false};
+    DLInEvent           posted{};   // on the ring from post() until wait() returns
     // The fail-shut substitution an empty mask needs — a type with no tag
-    // block, so nothing ever assigned its TAG_MASK — is made in operator()(),
+    // block, so nothing ever assigned its TAG_MASK — is made in post(),
     // where the mask is now acquired. Kept out of TAG_MASK's own default,
     // which must stay empty-until-assigned for ETCS_TAG_DECLARE's alias guard.
     TagModifyEvent(ETCS::Entity* t, const ETCS::Buffer& key, bool remove, Impl fn,
@@ -394,7 +398,12 @@ struct TagModifyEvent : Event
  * second mechanism, and the ordering is the one every other state change in
  * the module already takes.
  */
-    bool operator()();
+    bool operator()() { return post() && wait(); }
+    // Apart, so one writer can put several on the ring and wait once: the
+    // stream drains them as one burst (Entity::restoreValues). post() false:
+    // the stream is ending, and there is nothing to wait for.
+    bool post();
+    bool wait();
 };
 // PairMaskEvent — resolve two contract tags into a MODULE-scope mask.
 //
@@ -420,6 +429,35 @@ struct PairMaskEvent : Event
     PairMaskEvent(const ETCS::Buffer& tag_a, const ETCS::Buffer& b)
         : Event(tag_a), tag_b(b) {}
     void operator()();
+};
+// TrustEvent -- what a module asks of the loader's trust layer (core/Trust.h,
+// trust::answer). The loader's key and store are the loader's: a module that
+// needs one of them used asks here, and the asking is ordered on the loader's
+// thread like PairMask's. Blocking; `out` and `ok` are the handler's, published
+// by on_emit.
+//
+//   Request  a = the registrar's key, hex      out = "<this loader's key> <signature>"
+//   Install  a = a chain, binary or hex        out = what it registered as
+//   Survey   a = the site's list               out = the report, "fetch <name> <file>" lines
+//   Replace  a = the site's list, b = bytes    out = the path written
+//            name = which entry b is
+//   Resync   (nothing)                         out = what happens: the session ends,
+//            and the successor a Replace placed starts in its place, resuming
+//   Vouch    a = a link's transcript, hex      out = "<key> <chain|-> <signature>": this
+//            name = 'd' (dialled) or 'a'         loader's word on that link, and only
+//                                                on one (sig::link_statement)
+//   Recognize a = "<key> <chain|-> <signature>"   out = "<identity> <registered> <guild>":
+//            b = the transcript, hex             the far side's word, checked here
+//            name = the far side's 'd' or 'a'
+struct TrustEvent : Event
+{
+    enum class Op : uint8_t { Request, Install, Survey, Replace, Resync, Vouch, Recognize };
+    Op                  op;
+    ::std::string       name, a, b, out;
+    bool                ok = false;
+    ::std::atomic<bool> done{false};
+    explicit TrustEvent(Op o) : Event(""), op(o) {}
+    bool operator()();
 };
 // EntityUnloadEvent — the sole entry point into module-scope election and
 // arena reclamation, fired from exactly two places:
@@ -839,6 +877,10 @@ public:
     struct LoaderStream : ETCS::EventStream<LoaderStream, DLState, DLInEventPtr>
     {
         EventNode* owner = nullptr; // wired in EventNode ctor
+        // As ModuleProxy's: the TagModify writers this stream owes a surface.
+        ::std::vector<DLInEvent*> owed;
+        void owe(DLInEvent* e);
+        void on_drained(DLState&);
         // module name -> current live anchor Module, or nullptr (vacant).
         // NON-OWNING: every REAL anchor Module lives inside its hosting
         // entity's own local_arena_ — the first entity spawned of a
@@ -1044,12 +1086,7 @@ public:
                     if (e->unload_done)  e->unload_done->store(true, ::std::memory_order_release);
                     break;
                 case DLInEvent::Kind::TagModify:
-                    // Answer before flag: the caller spins on the flag, so the
-                    // store that releases it must be the last touch here.
-                    if (e->tagmodify_changed)
-                        e->tagmodify_changed->store(e->release_value != 0,
-                                                    ::std::memory_order_relaxed);
-                    if (e->tagmodify_done) e->tagmodify_done->store(true, ::std::memory_order_release);
+                    owe(e);
                     break;
                 case DLInEvent::Kind::ChangeModule:
                     if (e->changemodule_done) e->changemodule_done->store(true, ::std::memory_order_release);
@@ -1063,6 +1100,9 @@ public:
                     break;
                 case DLInEvent::Kind::PairMask:
                     if (e->pairmask_done) e->pairmask_done->store(true, ::std::memory_order_release);
+                    break;
+                case DLInEvent::Kind::Trust:
+                    if (e->trust) e->trust->done.store(true, ::std::memory_order_release);
                     break;
                 case DLInEvent::Kind::Ack:
                     break;
@@ -1183,14 +1223,13 @@ public:
         // slot.result is null and this no-ops.
         void on_emit(DLState&, ETCS::GapSlot& slot)
         {
-            DLInEvent* e = static_cast<DLInEvent*>(slot.result);
-            if (!e) return;
-            // Answer before flag -- see LoaderStream::on_emit's own note.
-            if (e->tagmodify_changed)
-                e->tagmodify_changed->store(e->release_value != 0, ::std::memory_order_relaxed);
-            if (e->tagmodify_done)
-                e->tagmodify_done->store(true, ::std::memory_order_release);
+            if (DLInEvent* e = static_cast<DLInEvent*>(slot.result)) owe(e);
         }
+        // The writers whose surface this stream owes until its burst is
+        // drained (etcs_tagmodify_settle, DynamicLoader.h).
+        ::std::vector<DLInEvent*> owed;
+        void owe(DLInEvent* e);
+        void on_drained(DLState&);
         // Module scope. TagModify is handled locally and its mask is genuine
         // TAG bits, stamped from the emitting type's own closure -- meaningful
         // here and nowhere else. Everything else is a hand-off whose effects

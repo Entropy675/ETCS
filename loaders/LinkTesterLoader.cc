@@ -17,6 +17,15 @@
 //      browser tab hosts) whose control link is held for 17 s: the hub keeps
 //      the guest parked, the guest keeps waiting for its welcome, and when
 //      the host comes for it the two are linked.
+//   5. A LINK IS BETWEEN TWO PROVEN KEYS, SEALED. Each end knows the other's
+//      key as its loader checked it (here one loader, so its own key, a
+//      local identity: the fold along its key alone). A loader's word on one
+//      link is no word on another, nor on the other side's part of the same.
+//      A byte altered on the way closes the link. The same key coming back
+//      under its name takes the place of its old link. A room that admits
+//      registered identities only turns a local one away at the hello. (An
+//      untrusted build vouches with a key made for the session instead of
+//      its own: the same checks hold, on that key.)
 //
 //   ./Run_LinkTesterLoader
 //
@@ -64,6 +73,7 @@ static double since(std::chrono::steady_clock::time_point t0)
 struct Relay
 {
     std::atomic<bool> hold{ false }, stop{ false };
+    std::atomic<int>  flip{ 0 };     // alter the last byte of the server's next chunks
     int listener = -1, port = 0, to = 0;
     std::thread th;
     std::vector<std::thread> pipes;
@@ -113,6 +123,7 @@ struct Relay
             if (!hold && (p[1].revents & (POLLIN | POLLHUP)))
             {
                 const ssize_t n = ::recv(s, buf, sizeof buf, 0);
+                if (n > 0 && flip.load() > 0) { --flip; buf[n - 1] ^= 0x5a; }
                 if (n <= 0 || ::send(c, buf, static_cast<size_t>(n), MSG_NOSIGNAL) != n) break;
             }
         }
@@ -268,6 +279,87 @@ int main(int, char**)
     }
     verb(entity(elsewhere, "room2"), "Room.Delete");
     far.close();
+
+    // -- 5. proven, and sealed --------------------------------------------------
+    std::cout << "\n-- 5. proven, and sealed --\n";
+    {
+        ETCS::sig::Key key = ETCS::trust::gate().signature.id->pub;
+        if (ETCS::trust::untrusted_build)
+        {
+            uint8_t secret[64]; std::string w;
+            ETCS::trust::session_link_key(secret, key, w);
+            ETCS::trust::mc::crypto_wipe(secret, 64);
+        }
+        const ETCS::sig::Key ident = ETCS::trust::identity_of(ETCS::trust::path_of({}, key));
+        const std::string mine = ETCS::trust::hex(key.data(), 32) + " " + ETCS::trust::hex(ident.data(), 32) + " 0 0";
+        ETCS::ExecutionContext third(&root, &ctx);
+        std::istringstream in(
+            "spawn NetworkProvider::Peer peer3\n"
+            "peer3.SetName(third)\n"
+            "peer3.Connect(ws://127.0.0.1:" + std::to_string(relay.port) + "/link/t1)\n"
+            "spawn NetworkProvider::Ledger mirror3\n"
+            "mirror3.spawn(NetworkProvider::Remote rm3)\n"
+            "rm3.Bind(book @peer3)\n");
+        ETCS::run_script(in, std::string(ETCS_ACE_ROOT) + "/loaders/link_third.etcs", third);
+        ETCS::Entity* peer3 = entity(third, "peer3");
+        ETCS::Entity* mirror3 = entity(third, "mirror3");
+        ETCS::Entity* room = entity(host, "room");
+        const std::string seen_by_guest = peer3 ? verb(peer3, "Peer.Who") : std::string();
+        const std::string seen_by_host = verb(room, "Room.Who", "third");
+        std::printf("        (the guest sees %s; the host sees %s)\n", seen_by_guest.substr(0, 16).c_str(), seen_by_host.substr(0, 16).c_str());
+        check(seen_by_guest == mine && seen_by_host == mine,
+              "each end knows the other's key as its loader proved it: a local identity, its key alone");
+
+        // A word is for one link, and for one side of it.
+        uint8_t t[32], u[32];
+        for (int i = 0; i < 32; ++i) { t[i] = uint8_t(i); u[i] = uint8_t(i ^ 1); }
+        const std::string th = ETCS::trust::hex(t, 32), uh = ETCS::trust::hex(u, 32);
+        std::string word, out, why;
+        const bool vouched = ETCS::trust::vouch('d', th, word, why);
+        check(vouched && ETCS::trust::recognize('d', word, th, out, why) && out.compare(0, 64, mine.substr(65, 64)) == 0
+              && !ETCS::trust::recognize('a', word, th, out, why) && !ETCS::trust::recognize('d', word, uh, out, why),
+              "a loader's word on a link is taken for that link and that side, not for another or the other side");
+
+        // Altered on the way: the guest's answer does not open, the link closes.
+        check(mirror3 && verb(mirror3, "Ledger.Head") == head, "...and the surface over it reads the host's record");
+        relay.flip = 1;
+        const std::string altered = mirror3 ? verb(mirror3, "Ledger.Head") : std::string("x");
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        check(altered.empty() && peer3 && verb(peer3, "Peer.Who") == "-", "a byte altered on the way closes the link");
+
+        // The same key back under the same name takes its place. (A Peer holds
+        // its address until closed, so the second dials the host directly.)
+        if (peer3) verb(peer3, "Peer.Close");
+        ETCS::ExecutionContext again(&root, &ctx);
+        std::istringstream in2(
+            "spawn NetworkProvider::Peer peer4\n"
+            "peer4.SetName(fourth)\n"
+            "peer4.Connect(ws://127.0.0.1:" + std::to_string(relay.port) + "/link/t1)\n"
+            "spawn NetworkProvider::Peer peer5\n"
+            "peer5.SetName(fourth)\n"
+            "peer5.Connect(ws://127.0.0.1:18471/link/t1)\n");
+        ETCS::run_script(in2, std::string(ETCS_ACE_ROOT) + "/loaders/link_again.etcs", again);
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        ETCS::Entity* peer4 = entity(again, "peer4");
+        ETCS::Entity* peer5 = entity(again, "peer5");
+        check(peer4 && peer5 && verb(peer4, "Peer.Who") == "-" && verb(peer5, "Peer.Who") == mine
+              && verb(room, "Room.Who", "fourth") == mine,
+              "the same key coming back under its name takes the place of its old link");
+        for (ETCS::Entity* p : { peer4, peer5 }) if (p) verb(p, "Peer.Close");
+
+        // A room that admits registered identities only.
+        check(verb(room, "Room.Admit", "registered").find('1') != std::string::npos, "a room set to admit registered identities only");
+        ETCS::ExecutionContext barred(&root, &ctx);
+        std::istringstream in3(
+            "spawn NetworkProvider::Peer peer6\n"
+            "peer6.SetName(sixth)\n"
+            "peer6.Connect(ws://127.0.0.1:18471/link/t1)\n");
+        ETCS::run_script(in3, std::string(ETCS_ACE_ROOT) + "/loaders/link_barred.etcs", barred);
+        ETCS::Entity* peer6 = entity(barred, "peer6");
+        check(peer6 && verb(peer6, "Peer.Who") == "-" && verb(room, "Room.Who", "sixth") == "-",
+              "...turns a local identity away at the hello");
+        verb(room, "Room.Admit", "anyone");
+    }
 
     relay.close();
     verb(entity(host, "room"), "Room.Delete");

@@ -24,6 +24,7 @@
 #include "EventNode.h"
 #include <iostream>
 #include <vector>
+#include <memory>   // restoreValues posts its events
 #include <mutex>   // resolvePairModuleMask's cache
 #include <thread>  // the loader stream pair waits out its producer body
 #include <chrono>
@@ -366,7 +367,7 @@ public:
         uint64_t (*digest)(void*)                  = nullptr;
     };
 private:
-    ArenaMap<ETCS::Buffer, ::std::string>  values_;     // stored values, by key
+    ArenaMap<ETCS::Buffer, ArenaString>    values_;     // stored values, by key; bytes in local_arena_
     ArenaMap<ETCS::Buffer, ValueBinding>   bindings_;   // bound values, by key
     /*
  * One type-erased pointer per composed family, keyed by family name.
@@ -524,6 +525,7 @@ private:
         const RID*   rids()   const { return reinterpret_cast<const RID*>(groups() + ngroups); }
     };
     mutable ::std::atomic<const SurfaceView*> surface_view_{ nullptr };
+    ::std::atomic<uint64_t>                   surface_version_{ 0 };   // views published (surfaceVersion)
     ::std::atomic<const ChildView*>           child_view_{ nullptr };
     mutable ::std::atomic<const OrderedView*> ordered_view_{ nullptr };
     // The keys that moved since the last rebuild, which it acts on: which
@@ -554,6 +556,7 @@ private:
     }
     void publishSurface(const SurfaceView* v)
     {
+        surface_version_.fetch_add(1, ::std::memory_order_release);
         ETCS::Reclaimer::getInstance().retire(const_cast<SurfaceView*>(surface_view_.exchange(v, ::std::memory_order_acq_rel)));
     }
     // The whole surface, from the maps: for a tag going on or off (rare), and
@@ -591,7 +594,7 @@ private:
         for (size_t i = 0; i < vk.size(); ++i)
         {
             ks[i] = put(vk[i]->buf, vk[i]->written);
-            const ::std::string& val = values_.find(*vk[i])->second;
+            const ArenaString& val = values_.find(*vk[i])->second;
             vs[i] = put(val.data(), val.size());
         }
         for (size_t i = 0; i < tk.size(); ++i)
@@ -840,7 +843,20 @@ private:
         indexAll(v);
         publishChildrenLocked(v);
     }
-    const SurfaceView* surfaceView() const { return surface_view_.load(::std::memory_order_acquire); }
+    /*
+     * A SURFACE IS BORN WHOLE. Nothing publishes while the entity is being
+     * made (addTypeTag), so the first view is built from the maps by whoever
+     * first needs one: the loader's bundle attach, the first write, or a read
+     * of a view never built. Null is "never built", not "behind".
+     */
+    const SurfaceView* surfaceView() const
+    {
+        if (const SurfaceView* v = surface_view_.load(::std::memory_order_acquire)) return v;
+        Entity* self = const_cast<Entity*>(this);
+        ::std::lock_guard<::std::mutex> lock(m_tagMutex);
+        if (!surface_view_.load(::std::memory_order_relaxed)) self->publishSurfaceLocked();
+        return surface_view_.load(::std::memory_order_acquire);
+    }
     const ChildView*   childView()   const { return child_view_.load(::std::memory_order_acquire); }
     /*
  * ---------------------------------------------------------------------
@@ -1133,7 +1149,7 @@ public:
               DEFAULT_ARENA_START_PAGE, /* performance */ false))
         , tags(ArenaAllocator<::std::pair<const ETCS::Buffer, TagEntry>>(local_arena_))
         , flags_(ArenaAllocator<::std::pair<const ETCS::Buffer, bool>>(local_arena_))
-        , values_(ArenaAllocator<::std::pair<const ETCS::Buffer, ::std::string>>(local_arena_))
+        , values_(ArenaAllocator<::std::pair<const ETCS::Buffer, ArenaString>>(local_arena_))
         , bindings_(ArenaAllocator<::std::pair<const ETCS::Buffer, ValueBinding>>(local_arena_))
         , interface_pointers_(ArenaAllocator<::std::pair<const ETCS::Buffer, void*>>(local_arena_))
         , typed_children_(ArenaAllocator<::std::pair<const ETCS::Buffer, RIDListHandle>>(local_arena_))
@@ -1537,23 +1553,77 @@ public:
         ::std::sort(out.begin(), out.end());
     }
 
-    // A record's value, back: a stored value is set, a bound one is handed
-    // to its binding. No funnel and no record -- this is a value the capture
-    // kept as WHAT, coming back as what. False when the key has no place
-    // here, or the binding refused it.
+private:
+    // The one writer of values_. Never operator[]: it would build the string
+    // with no arena (ArenaString). True when the value changed.
+    bool setValueLocked(const ETCS::Buffer& key, const ::std::string& v)
+    {
+        auto [it, fresh] = values_.try_emplace(key, v.data(), v.size(), ArenaAllocator<char>(local_arena_));
+        if (fresh) return true;
+        if (::std::string_view(it->second.data(), it->second.size()) == ::std::string_view(v)) return false;
+        it->second.assign(v.data(), v.size());
+        return true;
+    }
+public:
+
+    // A record's value, back: a stored value through the funnel, a bound one
+    // handed to its binding. No record -- this is a value the capture kept as
+    // WHAT, coming back as what. False when the key has no place here, or the
+    // binding refused it.
     bool restoreValue(const ETCS::Buffer& key, const ::std::string& v)
     {
-        ValueBinding b;
-        bool bound = false;
+        return restoreValues({ { key.toString(), v } }) == 1;
+    }
+    // Several at once, as one burst: a stored value through the funnel
+    // (restoreImpl), all posted before any is waited on; a bound one to its
+    // binding. How many landed.
+    size_t restoreValues(const ::std::vector<::std::pair<::std::string, ::std::string>>& kv)
+    {
+        size_t landed = 0;
+        ::std::vector<::std::pair<::std::unique_ptr<ETCS::TagModifyEvent>, size_t>> posted;
+        for (size_t i = 0; i < kv.size(); ++i)
+        {
+            const ETCS::Buffer key(kv[i].first.c_str());
+            ValueBinding b;
+            bool bound = false;
+            {
+                ::std::lock_guard<::std::mutex> lock(m_tagMutex);
+                auto it = bindings_.find(key);
+                if (it != bindings_.end()) { b = it->second; bound = true; }
+                else if (flags_.find(key) == flags_.end()) continue;
+            }
+            if (bound) { if (b.read && b.read(b.self, kv[i].second)) ++landed; continue; }
+            auto ev = ::std::make_unique<ETCS::TagModifyEvent>(this, key, false, &Entity::restoreImpl);
+            ev->value = &kv[i].second;
+            if (ev->post()) posted.emplace_back(::std::move(ev), i);
+        }
+        for (auto& [ev, i] : posted)
+        {
+            if (!ev->wait()) continue;
+            onValue(ETCS::Buffer(kv[i].first.c_str()), &kv[i].second);   // stored: the family's copy follows
+            ++landed;
+        }
+        return landed;
+    }
+    /*
+     * What a stream owes this entity once its burst is drained
+     * (tagModifyImpl): the view, from the maps -- `only` the key that moved,
+     * null for several -- and then the one mark.
+     */
+    void publishOwed(const ETCS::Buffer* only)
+    {
         {
             ::std::lock_guard<::std::mutex> lock(m_tagMutex);
-            auto it = bindings_.find(key);
-            if (it != bindings_.end()) { b = it->second; bound = true; }
-            else if (flags_.find(key) == flags_.end()) return false;
-            else { values_[key] = v; surfaceSetLocked(key, &v); }
+            if (!only) publishSurfaceLocked();
+            else if (flags_.find(*only) == flags_.end()) surfaceRemoveLocked(*only);
+            else
+            {
+                auto v = values_.find(*only);
+                if (v == values_.end()) surfaceSetLocked(*only, nullptr);
+                else { const ::std::string val(v->second.data(), v->second.size()); surfaceSetLocked(*only, &val); }
+            }
         }
-        if (!bound) { onValue(key, &v); return true; }   // stored: the family's copy follows
-        return b.read && b.read(b.self, v);
+        markStateChange(this, getRID());
     }
 
     // This node's values as one number; getHash composes them over the subtree.
@@ -1669,7 +1739,7 @@ public:
                 ::std::string("addTypeTag: type tag must start with an uppercase letter: ")
                 + (s ? s : ""));
         ::std::lock_guard<::std::mutex> lock(m_tagMutex);
-        if (tags.emplace(type_tag, TagEntry{}).second) publishSurfaceLocked();
+        tags.emplace(type_tag, TagEntry{});   // unpublished: born whole (surfaceView)
     }
 
     /*
@@ -2523,6 +2593,10 @@ public:
     // recompute would believe a value the recompute did not see. The digest
     // lands first, so a reader that sees the epoch sees the digest.
     uint32_t hashEpoch() const { return hash_epoch_.load(::std::memory_order_acquire); }
+    // How many views this entity's surface has published: 0 until it is born
+    // (surfaceView), one more per publish. A reader can tell by it whether the
+    // surface moved since it last looked.
+    uint64_t surfaceVersion() const { return surface_version_.load(::std::memory_order_acquire); }
     void     stampHash(uint64_t h, uint32_t epoch, const unsigned char* digest = nullptr) const
     {
         if (digest) ::std::memcpy(hash_digest_, digest, 32);
@@ -3685,12 +3759,26 @@ public:
     }
 private:
 
+    /*
+     * THE MAPS ONLY. The stream that applies this owes the surface: once its
+     * burst is drained it publishes one view per entity it touched and marks
+     * it once (publishOwed), and only then wakes the writers. A write is never
+     * returned before it can be read; a burst is never published by halves.
+     */
     static bool tagModifyImpl(Entity* target, const ETCS::Buffer& key, bool is_remove, const ::std::string* value)
     {
-        const bool changed = tagModifyBody(target, key, is_remove, value);
-        if (!changed || !target) return changed;
-        markStateChange(target, target->getRID());
-        return changed;
+        return target && tagModifyBody(target, key, is_remove, value);
+    }
+    // A record's value back (restoreValue): onto a flag the replay put back,
+    // or nowhere. True when it landed. No record: what comes back is WHAT,
+    // not an action.
+    static bool restoreImpl(Entity* target, const ETCS::Buffer& key, bool, const ::std::string* value)
+    {
+        if (!target || !value) return false;
+        ::std::lock_guard<::std::mutex> lock(target->m_tagMutex);
+        if (target->flags_.find(key) == target->flags_.end()) return false;
+        target->setValueLocked(key, *value);
+        return true;
     }
 
     static bool tagModifyBody(Entity* target, const ETCS::Buffer& key, bool is_remove, const ::std::string* value)
@@ -3702,11 +3790,8 @@ private:
             bool value_set = false;
             if (value)
             {
-                auto v = target->values_.find(key);
-                if (v == target->values_.end()) { target->values_.emplace(key, *value); value_set = true; }
-                else if (v->second != *value)   { v->second = *value;                  value_set = true; }
+                value_set = target->setValueLocked(key, *value);
             }
-            if (flag_on || value_set) target->surfaceSetLocked(key, value_set ? value : nullptr);
             return flag_on || value_set;
         }
  
@@ -3806,7 +3891,6 @@ private:
             {
                 changed = (target->flags_.erase(key) > 0);
                 target->values_.erase(key);
-                if (changed) target->surfaceRemoveLocked(key);
             }
         }
  
@@ -4232,12 +4316,15 @@ inline ETCS::RIDListHandle* etcs_ridmap_row(ETCS::EventNode* owner,
 }
 
 /*
- * AN ENTITY FROM A BARE RID, WITH NO TYPE AND NO FAMILY -- own lists first,
- * then every image that published into the mirror.
+ * AN ENTITY FROM A BARE RID, WITH NO TYPE AND NO FAMILY -- own lists and every
+ * image that published into the mirror.
  *
- * Sound because RIDs are runtime-unique, so the first hit is the only hit. USE
- * ONLY WHEN THE TYPE IS GENUINELY UNKNOWN: it touches every row, where naming
- * the type touches one.
+ * A RID is unique only within a trait set, so with no trait named the same
+ * number can be held in two sectors. The walk collects every distinct entity
+ * and answers with the one its stated relation puts first: by the sector that
+ * holds it, then the list it is in -- never the maps' iteration order. USE ONLY
+ * WHEN THE TYPE IS GENUINELY UNKNOWN: it touches every row, where naming the
+ * type touches one.
  *
  * IT EXISTS HERE SO THAT IT EXISTS ONCE. This walk was hand-written in four
  * modules (ConnectionManager, HttpServer, TarpitNode, ForumNode), each reading
@@ -4250,15 +4337,32 @@ inline ETCS::RIDListHandle* etcs_ridmap_row(ETCS::EventNode* owner,
  * was noticed in none of them. So the walk is an accessor now, and a module
  * that wants a bare RID asks rather than iterates.
  */
-inline Entity* etcs_resolve_rid_anywhere(ETCS::EventNode* owner, RID rid)
+// Every distinct entity the RID names, in any list, in the relation's order.
+inline size_t etcs_collect_rid_anywhere(ETCS::EventNode* owner, RID rid, ::std::vector<Entity*>& out)
 {
-    if (!owner || rid == 0) return nullptr;
+    if (!owner || rid == 0) return 0;
+    struct Hit { Entity* e; const char* origin; const char* list; };
+    ::std::vector<Hit> hits;
+    const char* own = owner->scope ? owner->scope : "(loader)";
     for (auto& entry : owner->ridMap)
-        if (Entity* e = entry.second.invoke_get(rid)) return e;
+        if (Entity* e = entry.second.invoke_get(rid)) hits.push_back({ e, own, entry.first.buf });
     for (auto& bucket : owner->ridMirror)
         for (auto& row : bucket.second)
-            if (Entity* e = row.handle.invoke_get(rid)) return e;
-    return nullptr;
+            if (Entity* e = row.handle.invoke_get(rid)) hits.push_back({ e, row.module.buf, bucket.first.buf });
+    ::std::sort(hits.begin(), hits.end(), [](const Hit& a, const Hit& b) {
+        const int o = ::std::strcmp(a.origin, b.origin);
+        return o != 0 ? o < 0 : ::std::strcmp(a.list, b.list) < 0;
+    });
+    size_t added = 0;
+    for (auto& h : hits)
+        if (::std::find(out.end() - added, out.end(), h.e) == out.end()) { out.push_back(h.e); ++added; }
+    return added;
+}
+
+inline Entity* etcs_resolve_rid_anywhere(ETCS::EventNode* owner, RID rid)
+{
+    ::std::vector<Entity*> all;
+    return etcs_collect_rid_anywhere(owner, rid, all) ? all.front() : nullptr;
 }
 
 inline Entity* etcs_resolve_by_key(const ETCS::Buffer& conjugate_key, RID rid)
@@ -6237,9 +6341,11 @@ inline Base* resolve_in_family(const char* family, RID rid)
                 ETCS_LOG("resolve_in_family", "RID:" << rid << " is ambiguous for family '"
                          << name << "' -- it names an entity under BOTH " << found_owner
                          << " and " << mod << ". RIDs are unique per provider-type, not per "
-                         "process. This overload can only answer with one, so it answers with "
-                         "none: use collect_in_family to get them all, or name the provider, "
-                         "e.g. resolve_in_family(\"" << mod << ":" << bare << "\", rid).");
+                         "process. This overload states no relation, so it answers with none: "
+                         "pass the relation that says which comes first, e.g. "
+                         "resolve_in_family<T>(\"" << name << "\", rid, ETCS::ByOrigin{}), "
+                         "name the provider (\"" << mod << ":" << bare << "\"), or "
+                         "collect_in_family for them all.");
                 return nullptr;
             }
         }
@@ -6264,8 +6370,31 @@ inline Base* resolve_in_family(const char* family, RID rid)
  * Appends rather than clearing, so a caller can accumulate across several
  * families into one list. Returns how many THIS call added.
  */
+/*
+ * WHAT "FIRST" MEANS. A RID is unique only within a trait set, so one family ask
+ * can name an entity in each sector that holds the number; the sector is what
+ * tells them apart, and it rides each match as its origin (the provider whose
+ * list held it). Taking one is choosing by a comparison relation the caller
+ * states -- never scan order, which is an accident of what loaded when.
+ */
 template <typename Base>
-inline size_t collect_in_family(const char* family, RID rid, ::std::vector<Base*>& out)
+struct RIDMatch
+{
+    Base*       entity;
+    const char* origin;   // the provider whose list held it; the caller's frame only
+};
+
+// The relation to state when nothing finer is meant: by sector. The same set
+// of loaded providers gives the same answer on every runtime.
+struct ByOrigin
+{
+    template <typename Base>
+    bool operator()(const RIDMatch<Base>& a, const RIDMatch<Base>& b) const
+    { return ::std::strcmp(a.origin, b.origin) < 0; }
+};
+
+template <typename Base>
+inline size_t collect_matches_in_family(const char* family, RID rid, ::std::vector<RIDMatch<Base>>& out)
 {
     if (rid == 0) return 0;
     const ::std::string name(family);
@@ -6294,7 +6423,7 @@ inline size_t collect_in_family(const char* family, RID rid, ::std::vector<Base*
         auto it = mine_node->ridMap.find(bare);
         if (it != mine_node->ridMap.end())
             if (void* p = it->second.invoke_get_iface(rid))
-            { out.push_back(static_cast<Base*>(p)); ++added; }
+            { out.push_back({ static_cast<Base*>(p), mine_node->scope ? mine_node->scope : "(loader)" }); ++added; }
     }
 
     if (!owner) return added;
@@ -6309,7 +6438,7 @@ inline size_t collect_in_family(const char* family, RID rid, ::std::vector<Base*
         auto it = owner->ridMap.find(bare);
         if (it != owner->ridMap.end())
             if (void* p = it->second.invoke_get_iface(rid))
-            { out.push_back(static_cast<Base*>(p)); ++added; }
+            { out.push_back({ static_cast<Base*>(p), owner->scope ? owner->scope : "(loader)" }); ++added; }
     }
 
     if (mirror == owner->ridMirror.end()) return added;
@@ -6317,9 +6446,38 @@ inline size_t collect_in_family(const char* family, RID rid, ::std::vector<Base*
     {
         if (qualified && row.module.toString() != wanted_module) continue;
         if (void* p = row.handle.invoke_get_iface(rid))
-        { out.push_back(static_cast<Base*>(p)); ++added; }
+        { out.push_back({ static_cast<Base*>(p), row.module.buf }); ++added; }
     }
     return added;
+}
+
+template <typename Base>
+inline size_t collect_in_family(const char* family, RID rid, ::std::vector<Base*>& out)
+{
+    ::std::vector<RIDMatch<Base>> m;
+    const size_t added = collect_matches_in_family<Base>(family, rid, m);
+    for (auto& x : m) out.push_back(x.entity);
+    return added;
+}
+
+// The one a stated relation puts first; null when the RID names nothing here.
+// `first(a, b)` is true when a stands before b (ByOrigin, or the caller's own).
+template <typename Base, typename Relation>
+inline Base* resolve_in_family(const char* family, RID rid, Relation first)
+{
+    ::std::vector<RIDMatch<Base>> m;
+    if (!collect_matches_in_family<Base>(family, rid, m)) return nullptr;
+    return ::std::min_element(m.begin(), m.end(), first)->entity;
+}
+
+template <typename Base, typename Relation>
+inline Held<Base> resolve_held(const char* family, RID rid, Relation first)
+{
+    Base* p = resolve_in_family<Base>(family, rid, first);
+    if (!p) return {};
+    LifetimeHold h(static_cast<Entity*>(p));
+    if (!h) return {};
+    return Held<Base>(p, ::std::move(h));
 }
 
 /*

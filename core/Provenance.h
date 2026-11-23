@@ -145,9 +145,11 @@ struct ActionScope
 
 /*
  * Where this runtime keeps what outlives it (Persistence, DatabaseProvider):
- * ETCS_STORE if set, else $XDG_DATA_HOME/etcs, else ~/.local/share/etcs; in a
- * browser, the IndexedDB-backed /persist. One answer, so the loader and the
- * store agree on it without either asking the other.
+ * ETCS_STORE if set, else $XDG_DATA_HOME/etcs, else ~/.local/share/etcs; on
+ * Windows, which sets no HOME, %LOCALAPPDATA%\etcs; in a browser, the
+ * IndexedDB-backed /persist. One answer, so the loader and the store agree on
+ * it without either asking the other. The last resort, .etcs, is relative to
+ * the working directory, so two launches from two places are two stores.
  */
 inline std::string etcs_store_dir()
 {
@@ -155,6 +157,9 @@ inline std::string etcs_store_dir()
     return "/persist";
 #else
     if (const char* s = std::getenv("ETCS_STORE"); s && *s) return s;
+#if defined(_WIN32)
+    if (const char* l = std::getenv("LOCALAPPDATA"); l && *l) return std::string(l) + "\\etcs";
+#endif
     if (const char* x = std::getenv("XDG_DATA_HOME"); x && *x) return std::string(x) + "/etcs";
     if (const char* h = std::getenv("HOME"); h && *h) return std::string(h) + "/.local/share/etcs";
     return ".etcs";

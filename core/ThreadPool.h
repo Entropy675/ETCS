@@ -130,7 +130,11 @@ private:
         bool is_terminating = false;
         bool dump_requested = false;
         bool cancel_requested = false;
+#ifdef _WIN32
+        HANDLE native_handle = nullptr;   // a real handle, closed when the task ends
+#else
         ::std::thread::native_handle_type native_handle;
+#endif
     };
 
     void watchdog_loop()
@@ -479,7 +483,10 @@ public:
                         meta.ctx                = task.ctx;
                         meta.signal_detected_at  = ::std::chrono::steady_clock::now();
 #ifdef _WIN32
-                        meta.native_handle = GetCurrentThread();
+                        // GetCurrentThread() is a pseudo-handle: used by the
+                        // watchdog it would name the watchdog.
+                        DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(),
+                                        &meta.native_handle, THREAD_TERMINATE, FALSE, 0);
 #else
                         meta.native_handle = pthread_self();
 #endif
@@ -496,6 +503,11 @@ public:
 
                     {
                         ::std::lock_guard<::std::mutex> lock(active_tasks_mutex_);
+#ifdef _WIN32
+                        auto done = active_tasks_.find(::std::this_thread::get_id());
+                        if (done != active_tasks_.end() && done->second.native_handle)
+                            CloseHandle(done->second.native_handle);
+#endif
                         active_tasks_.erase(::std::this_thread::get_id());
                     }
                 }

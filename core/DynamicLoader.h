@@ -17,6 +17,9 @@
 #include "../core_defs.h"
 #include "EventNode.h"
 #include "SignalContext.h"
+#ifdef ETCS_LOADER
+#include "Trust.h"
+#endif
 /*
  * SECURITY CONSIDERED: compiler flags stub out these functions on the module
  * side to prevent the static-init lambda trick from side-loading DLLs before
@@ -205,8 +208,17 @@ using namespace ETCS;
  */
 struct PendingUnloadRegistry
 {
-    ::std::mutex               mutex_;
-    ::std::vector<::std::thread> threads_;
+    // A recheck's thread, and whether its body has returned. A finished one is
+    // joined at the next spawn rather than at exit: a joinable thread keeps its
+    // stack mapped until joined, and a process that spawns and deletes kept one
+    // stack per module emptied, for its whole life.
+    struct Tracked
+    {
+        ::std::thread                        thread;
+        ::std::shared_ptr<::std::atomic<bool>> done;   // null: track()ed, never reaped early
+    };
+    ::std::mutex                 mutex_;
+    ::std::vector<Tracked>       threads_;
     /*
  * Set by join_all(): the join barrier has been crossed and no further
  * recheck may be started. Without this the registry has a second hole
@@ -239,15 +251,24 @@ struct PendingUnloadRegistry
  */
     bool spawn(::std::function<void()> body)
     {
-        ::std::lock_guard<::std::mutex> lock(mutex_);
-        if (closed_) return false;
-        threads_.emplace_back(::std::move(body));
+        ::std::vector<Tracked> finished;
+        {
+            ::std::lock_guard<::std::mutex> lock(mutex_);
+            if (closed_) return false;
+            reapLocked(finished);
+            auto done = ::std::make_shared<::std::atomic<bool>>(false);
+            threads_.push_back(Tracked{ ::std::thread([body = ::std::move(body), done]() {
+                struct Mark { ::std::atomic<bool>& d; ~Mark() { d.store(true, ::std::memory_order_release); } } mark{ *done };
+                body();
+            }), done });
+        }
+        for (auto& t : finished) t.thread.join();   // outside the lock, as drain does
         return true;
     }
     void track(::std::thread t)
     {
         ::std::lock_guard<::std::mutex> lock(mutex_);
-        threads_.push_back(::std::move(t));
+        threads_.push_back(Tracked{ ::std::move(t), nullptr });
     }
     /*
  * JOINED WITH THE LOCK RELEASED. A recheck finishes only when the loader's
@@ -279,18 +300,29 @@ struct PendingUnloadRegistry
         return instance;
     }
 private:
+    void reapLocked(::std::vector<Tracked>& out)
+    {
+        for (size_t i = 0; i < threads_.size();)
+            if (threads_[i].done && threads_[i].done->load(::std::memory_order_acquire))
+            {
+                out.push_back(::std::move(threads_[i]));
+                threads_[i] = ::std::move(threads_.back());
+                threads_.pop_back();
+            }
+            else ++i;
+    }
     void drain(bool close)
     {
         for (;;)
         {
-            ::std::vector<::std::thread> round;
+            ::std::vector<Tracked> round;
             {
                 ::std::lock_guard<::std::mutex> lock(mutex_);
                 if (threads_.empty()) { if (close) closed_ = true; return; }
                 round.swap(threads_);
             }
             for (auto& t : round)
-                if (t.joinable()) t.join();
+                if (t.thread.joinable()) t.thread.join();
         }
     }
 };
@@ -809,7 +841,10 @@ size_t ETCS::MirrorBuffer::chainOf(ETCS::Entity* owner, WireScope scope, IWireWr
 }
 inline bool ETCS::MirrorBuffer::localFrame(ETCS::Entity* e)
 {
-    return e && (e->hasTag(ETCS::Buffer("Database")) || e->hasTag(ETCS::Buffer("Local")));
+    if (!e) return false;
+    const ETCS::Module& m = e->module_.parent ? *e->module_.parent : e->module_;
+    return m.local_only || e->hasTag(ETCS::Buffer("Database")) || e->hasTag(ETCS::Buffer("Local"))
+           || e->hasTag(ETCS::Buffer("Private"));
 }
 ::std::string ETCS::MirrorBuffer::manifestOf(ETCS::Entity* owner, WireScope scope)
 {
@@ -1349,6 +1384,52 @@ inline bool etcs_tagmodify_apply(const ETCS::DLInEvent& evt)
     return evt.tagmodify_impl(live, evt.conjugate_key, evt.tagmodify_is_remove, evt.tagmodify_value);
 }
 /*
+ * WHAT A STREAM OWES THE SURFACE (Entity::tagModifyImpl). A flag or value is
+ * applied to the maps and its writer parked; when the burst is drained, or
+ * before anything else runs, every entity it touched gets one view and one
+ * mark, and then the writers wake. A move is not owed: it publishes as it
+ * goes and wakes at once.
+ */
+inline void etcs_tagmodify_wake(ETCS::DLInEvent& e)
+{
+    // Answer before flag: the caller spins on the flag.
+    if (e.tagmodify_changed) e.tagmodify_changed->store(e.release_value != 0, ::std::memory_order_relaxed);
+    if (e.tagmodify_done) e.tagmodify_done->store(true, ::std::memory_order_release);
+}
+inline void etcs_tagmodify_settle(::std::vector<ETCS::DLInEvent*>& owed)
+{
+    if (owed.empty()) return;
+    // Each entity once: the one key it moved, or all of it. Resolved again,
+    // quietly: one retired since its write is owed nothing.
+    struct Touched { ETCS::Entity* e; const ETCS::Buffer* key; bool several; };
+    ::std::vector<Touched> touched;
+    for (ETCS::DLInEvent* ev : owed)
+    {
+        if (!ev->release_value) continue;
+        ETCS::Entity* live = etcs_type_published(ev->tagmodify_type)
+                           ? ETCS::etcs_resolve_by_key(ev->tagmodify_type, ev->tagmodify_rid) : ev->tagmodify_target;
+        if (!live) continue;
+        auto it = ::std::find_if(touched.begin(), touched.end(), [live](const Touched& t) { return t.e == live; });
+        if (it == touched.end()) touched.push_back({ live, &ev->conjugate_key, false });
+        else if (!(*it->key == ev->conjugate_key)) it->several = true;
+    }
+    for (const Touched& t : touched) t.e->publishOwed(t.several ? nullptr : t.key);
+    for (ETCS::DLInEvent* ev : owed) etcs_tagmodify_wake(*ev);
+    owed.clear();
+}
+inline void etcs_tagmodify_owe(::std::vector<ETCS::DLInEvent*>& owed, ETCS::DLInEvent* e)
+{
+    if (e->tagmodify_move_impl) { etcs_tagmodify_wake(*e); return; }
+    owed.push_back(e);
+    if (owed.size() >= ETCS::GAP_DEPTH) etcs_tagmodify_settle(owed);   // a burst that never drains still wakes
+}
+// Anything but a flag or value runs only once the surface is settled: what
+// is ordered after a write reads it.
+inline bool etcs_tagmodify_owed_kind(const ETCS::DLInEvent& e)
+{
+    return e.kind == ETCS::DLInEvent::Kind::TagModify && !e.tagmodify_move_impl;
+}
+/*
  * -- LoaderStream method bodies ------------------------------------------------
  * Declared in EventNode.h, defined here where Module is fully defined.
  * All EventNode state access goes through owner pointer - no getInstance().
@@ -1422,6 +1503,16 @@ ETCS::TagMask ETCS::EventNode::LoaderStream::mask_for(
     }
 }
 
+void ETCS::EventNode::LoaderStream::owe(DLInEvent* e) { etcs_tagmodify_owe(owed, e); }
+void ETCS::EventNode::LoaderStream::on_drained(DLState&)
+{
+    if (owed.empty()) return;
+    struct OrderingThreadGuard {
+        OrderingThreadGuard()  { EventNode::on_ordering_thread = true; }
+        ~OrderingThreadGuard() { EventNode::on_ordering_thread = false; }
+    } _ordering_thread_guard;
+    etcs_tagmodify_settle(owed);
+}
 ETCS::DispatchResult ETCS::EventNode::LoaderStream::on_event(
     DLState&, const DLInEventPtr& ref, uint64_t)
 {
@@ -1450,6 +1541,7 @@ ETCS::DispatchResult ETCS::EventNode::LoaderStream::on_event(
  * position is now taste, not safety.
  */
     DLInEvent& evt = *ref.ptr;
+    if (!etcs_tagmodify_owed_kind(evt)) etcs_tagmodify_settle(owed);
     switch (evt.kind)
     {
         case DLInEvent::Kind::Load:
@@ -1601,6 +1693,17 @@ ETCS::DispatchResult ETCS::EventNode::LoaderStream::on_event(
                 m = GetModuleBit(it_a->second) | GetModuleBit(it_b->second);
             }
             if (evt.pairmask_out) *evt.pairmask_out = m;
+            return {ETCS::DispatchKind::Inline, &evt};
+        }
+        case DLInEvent::Kind::Trust:
+        {
+            /*
+ * The loader's key and store are touched here and in no module's code.
+ * Writes no module memory; all() because a Replace writes a file the next
+ * load reads. No sendAckIfNeeded, as PairMask.
+ */
+            if (ETCS::TrustEvent* t = evt.trust)
+                t->ok = ETCS::trust::answer(static_cast<uint8_t>(t->op), t->name, t->a, t->b, t->out);
             return {ETCS::DispatchKind::Inline, &evt};
         }
         case DLInEvent::Kind::RequestUnload:
@@ -1930,17 +2033,38 @@ bool ETCS::EventNode::LoaderStream::attachModule(
         library_handle_t handle = nullptr;
         try
         {
+            /*
+             * Signature first: nothing of a module runs before its bytes are
+             * known, and dlopen runs its static initializers. A refusal is an
+             * ordinary failed attach -- these bytes are not loaded, nothing
+             * already running is in doubt (core/Trust.h).
+             */
+            ETCS::trust::Opened sealed;
+            ::std::string why;
+            bool local = false;
+            if (!ETCS::trust::open_verified(module_name, global_mod->getFilename(), sealed, why,
+                                            ETCS::trust::gate(), ETCS::trust::loader_epoch(), &local))
+            {
+                const ::std::string msg = "refused module '" + module_name + "': " + why;
+                ::std::cerr << "etcs: " << msg << ::std::endl;
+                ETCS_WEB_CONSOLE_ERROR(msg.c_str());
+                throw ::std::runtime_error(msg);
+            }
 #ifdef _WIN32
-            handle = LoadLibraryA(global_mod->getFilename().c_str());
+            handle = LoadLibraryA(sealed.path.c_str());
             if (!handle)
                 throw ::std::runtime_error("Failed to load DLL (error "
                     + ::std::to_string(GetLastError()) + ") for " + module_name);
 #else
-            handle = dlopen(global_mod->getFilename().c_str(), RTLD_LAZY | RTLD_LOCAL);
+            handle = dlopen(sealed.path.c_str(), RTLD_LAZY | RTLD_LOCAL);
             if (!handle)
                 throw ::std::runtime_error(::std::string("Failed to load SO: ") + dlerror());
 #endif
+            sealed.kept();
             global_mod->adoptLibrary(handle);
+            global_mod->local_only = local;
+            if (local)
+                ETCS_LOG("DynamicLoader:Module", module_name << " is this loader's own: local, it crosses no link.");
             if (!global_mod->registerLoader(*owner)) return false;
             auto arena_it = module_arena_registry.find(module_name);
             if (arena_it != module_arena_registry.end())
@@ -2746,10 +2870,13 @@ bool ETCS::EventNode::LoaderStream::isTypedActionStream(
  */
 #ifndef ETCS_LOADER
  
+void ETCS::EventNode::ModuleProxy::owe(DLInEvent* e) { etcs_tagmodify_owe(owed, e); }
+void ETCS::EventNode::ModuleProxy::on_drained(DLState&) { etcs_tagmodify_settle(owed); }
 ETCS::DispatchResult ETCS::EventNode::ModuleProxy::on_event(
     DLState&, const DLInEventPtr& ref, uint64_t)
 {
     DLInEvent& evt = *ref.ptr;
+    if (!etcs_tagmodify_owed_kind(evt)) etcs_tagmodify_settle(owed);
  
     if (evt.kind == DLInEvent::Kind::TagModify)
     {
@@ -2935,6 +3062,24 @@ __attribute__((visibility("default")))
 void* ETCS_GetLoaderManifest()
 {
     return static_cast<void*>(&ETCS::Entity::getManifest());
+}
+
+/*
+ * ETCS_GetLoaderEpoch - this loader's epoch (trust::loader_epoch: its 32
+ * bytes), exported the same way. Every runtime that can interact with
+ * another shares it -- that is what a module's epoch check and a link's
+ * handshake hold -- so it is the seed for anything such runtimes must pick
+ * alike without saying (ontology/Epoch.h), and it moves with every update.
+ */
+extern "C"
+#ifdef _WIN32
+__declspec(dllexport)
+#else
+__attribute__((visibility("default")))
+#endif
+const unsigned char* ETCS_GetLoaderEpoch()
+{
+    return ETCS::trust::loader_epoch().data();
 }
 #endif // ETCS_LOADER
 
@@ -3390,11 +3535,11 @@ inline void ETCS::ChangeModuleEvent::operator()()
  * LOCALLY (see ModuleProxy::on_event's fork) - never crosses to the
  * loader itself, regardless of which scope fires it.
  */
-inline bool ETCS::TagModifyEvent::operator()()
+inline bool ETCS::TagModifyEvent::post()
 {
     ETCS_ASSERT_NOT_ORDERING_THREAD("TagModifyEvent");
     ETCS_ASSERT_NO_LIFETIME_HOLD("TagModifyEvent");
-    DLInEvent evt{};
+    DLInEvent& evt = posted;
     evt.kind                = DLInEvent::Kind::TagModify;
     evt.conjugate_key       = conjugate_key;
     evt.tagmodify_rid       = target->getRID();
@@ -3443,8 +3588,10 @@ inline bool ETCS::TagModifyEvent::operator()()
  * stream is already cleaning up, so there is no ordering left to join and
  * nothing should be acting on a claim it thinks it won.
  */
-    if (!ETCS::EventNode::getInstance().stream.enqueue(DLInEventPtr{&evt}))
-        return false;
+    return ETCS::EventNode::getInstance().stream.enqueue(DLInEventPtr{&evt});
+}
+inline bool ETCS::TagModifyEvent::wait()
+{
 #if defined(__EMSCRIPTEN__)
     // This node's loop, not the loader's: the event is on THIS stream.
     etcs_emscripten_spin(ETCS::EventNode::getInstance(),
@@ -3467,6 +3614,26 @@ inline bool ETCS::TagModifyEvent::operator()()
  * A refused enqueue -- the loader shutting down -- leaves result EMPTY rather
  * than all(), the one place empty is right: there is no ordering left to join.
  */
+inline bool ETCS::TrustEvent::operator()()
+{
+    ETCS_ASSERT_NOT_ORDERING_THREAD("TrustEvent");
+    ETCS_ASSERT_NO_LIFETIME_HOLD("TrustEvent");
+    DLInEvent evt{};
+    evt.kind  = DLInEvent::Kind::Trust;
+    evt.trust = this;
+#if !defined(ETCS_LOADER)
+    evt.reply_to = &ETCS::EventNode::getInstance();
+    evt.origin_extra_mask = ETCS::ActivePairModuleMask();
+#endif
+    if (!getLoader().stream.enqueue(DLInEventPtr{&evt})) { out = "the loader is shutting down"; return false; }
+#if defined(__EMSCRIPTEN__)
+    etcs_emscripten_spin([&]{ return done.load(::std::memory_order_acquire); });
+#else
+    while (!done.load(::std::memory_order_acquire));
+#endif
+    return ok;
+}
+
 inline void ETCS::PairMaskEvent::operator()()
 {
     ETCS_ASSERT_NOT_ORDERING_THREAD("PairMaskEvent");
