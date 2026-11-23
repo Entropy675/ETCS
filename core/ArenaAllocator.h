@@ -1,6 +1,7 @@
 #ifndef ARENA_ALLOCATOR_H__
 #define ARENA_ALLOCATOR_H__
 #include "MemoryArena.h"
+#include <string>
 namespace ETCS
 {
 template<typename T>
@@ -77,5 +78,11 @@ struct ArenaAllocator
     template<typename U>
     bool operator!=(const ArenaAllocator<U>& other) const noexcept { return arena != other.arena; }
 };
+
+// A string whose bytes live in an arena. With no arena it holds only what fits
+// inline (15 chars on libstdc++; 22 on libc++, 10 on wasm32): anything longer
+// throws bad_alloc, so a site that forgot its arena fails on the first long
+// value instead of leaking it to the heap.
+using ArenaString = ::std::basic_string<char, ::std::char_traits<char>, ArenaAllocator<char>>;
 } // namespace ETCS
 #endif

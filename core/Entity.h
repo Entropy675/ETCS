@@ -366,7 +366,7 @@ public:
         uint64_t (*digest)(void*)                  = nullptr;
     };
 private:
-    ArenaMap<ETCS::Buffer, ::std::string>  values_;     // stored values, by key
+    ArenaMap<ETCS::Buffer, ArenaString>    values_;     // stored values, by key; bytes in local_arena_
     ArenaMap<ETCS::Buffer, ValueBinding>   bindings_;   // bound values, by key
     /*
  * One type-erased pointer per composed family, keyed by family name.
@@ -591,7 +591,7 @@ private:
         for (size_t i = 0; i < vk.size(); ++i)
         {
             ks[i] = put(vk[i]->buf, vk[i]->written);
-            const ::std::string& val = values_.find(*vk[i])->second;
+            const ArenaString& val = values_.find(*vk[i])->second;
             vs[i] = put(val.data(), val.size());
         }
         for (size_t i = 0; i < tk.size(); ++i)
@@ -1133,7 +1133,7 @@ public:
               DEFAULT_ARENA_START_PAGE, /* performance */ false))
         , tags(ArenaAllocator<::std::pair<const ETCS::Buffer, TagEntry>>(local_arena_))
         , flags_(ArenaAllocator<::std::pair<const ETCS::Buffer, bool>>(local_arena_))
-        , values_(ArenaAllocator<::std::pair<const ETCS::Buffer, ::std::string>>(local_arena_))
+        , values_(ArenaAllocator<::std::pair<const ETCS::Buffer, ArenaString>>(local_arena_))
         , bindings_(ArenaAllocator<::std::pair<const ETCS::Buffer, ValueBinding>>(local_arena_))
         , interface_pointers_(ArenaAllocator<::std::pair<const ETCS::Buffer, void*>>(local_arena_))
         , typed_children_(ArenaAllocator<::std::pair<const ETCS::Buffer, RIDListHandle>>(local_arena_))
@@ -1537,6 +1537,19 @@ public:
         ::std::sort(out.begin(), out.end());
     }
 
+private:
+    // The one writer of values_. Never operator[]: it would build the string
+    // with no arena (ArenaString). True when the value changed.
+    bool setValueLocked(const ETCS::Buffer& key, const ::std::string& v)
+    {
+        auto [it, fresh] = values_.try_emplace(key, v.data(), v.size(), ArenaAllocator<char>(local_arena_));
+        if (fresh) return true;
+        if (::std::string_view(it->second.data(), it->second.size()) == ::std::string_view(v)) return false;
+        it->second.assign(v.data(), v.size());
+        return true;
+    }
+public:
+
     // A record's value, back: a stored value is set, a bound one is handed
     // to its binding. No funnel and no record -- this is a value the capture
     // kept as WHAT, coming back as what. False when the key has no place
@@ -1550,7 +1563,7 @@ public:
             auto it = bindings_.find(key);
             if (it != bindings_.end()) { b = it->second; bound = true; }
             else if (flags_.find(key) == flags_.end()) return false;
-            else { values_[key] = v; surfaceSetLocked(key, &v); }
+            else { setValueLocked(key, v); surfaceSetLocked(key, &v); }
         }
         if (!bound) { onValue(key, &v); return true; }   // stored: the family's copy follows
         return b.read && b.read(b.self, v);
@@ -3702,9 +3715,7 @@ private:
             bool value_set = false;
             if (value)
             {
-                auto v = target->values_.find(key);
-                if (v == target->values_.end()) { target->values_.emplace(key, *value); value_set = true; }
-                else if (v->second != *value)   { v->second = *value;                  value_set = true; }
+                value_set = target->setValueLocked(key, *value);
             }
             if (flag_on || value_set) target->surfaceSetLocked(key, value_set ? value : nullptr);
             return flag_on || value_set;
