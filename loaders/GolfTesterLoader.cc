@@ -65,15 +65,15 @@ static std::string verb(ETCS::Entity* e, const std::string& action, const std::s
     e->call(a, d);
     return d.toString();
 }
-// GolfMatch.Ball: "<slot> <x> <y> <z> <speed> <strokes> <total> <state> <power> <resting|moving>".
-struct Ball { int slot = -1; float x = 0, y = 0, z = 0, speed = 0; int strokes = 0, total = 0; std::string state, power, rest; };
+// GolfMatch.Ball: "<slot> <x> <y> <z> <speed> <strokes> <total> <state> <power> <resting|moving> <spare>".
+struct Ball { int slot = -1; float x = 0, y = 0, z = 0, speed = 0; int strokes = 0, total = 0; std::string state, power, rest, spare; };
 static Ball ball(ETCS::Entity* g, const std::string& who)
 {
     Ball b;
     const std::string row = verb(g, "GolfMatch.Ball", who);
     if (row == "-") return b;
     std::istringstream in(row);
-    in >> b.slot >> b.x >> b.y >> b.z >> b.speed >> b.strokes >> b.total >> b.state >> b.power >> b.rest;
+    in >> b.slot >> b.x >> b.y >> b.z >> b.speed >> b.strokes >> b.total >> b.state >> b.power >> b.rest >> b.spare;
     return b;
 }
 // GolfMatch.Status: "<tick> <lines> <mode> <me> <slot> <phase> <secs left> <course> <hole> <holes> <hole secs> <layout>".
@@ -124,11 +124,11 @@ int main(int, char**)
 
     // -- 0. the courses --------------------------------------------------------
     std::cout << "\n-- 0. the courses --\n";
-    check(verb(host, "GolfMatch.Maps") == "classic\nboosters\nterraces\nrandom\n", "four courses, in order: classic, boosters, terraces, random");
+    check(verb(host, "GolfMatch.Maps") == "classic\nboosters\nterraces\nridge\nchannels\nrandom\n", "six courses, in order: classic, boosters, terraces, ridge, channels, random");
     {
         const std::string faults = verb(host, "GolfMatch.Faults");
         if (faults != "none") std::printf("        (%s)\n", faults.c_str());
-        check(faults == "none", "...each hand-made hole sound: its cup cut into a level green, everything on it standing on something");
+        check(faults == "none", "...each hand-made hole sound: its cup cut into a level green, everything on it standing on something, and ground from its tee to its cup (or a pad or a spring to throw a ball)");
     }
 
     // -- 1. alone --------------------------------------------------------------
@@ -148,6 +148,15 @@ int main(int, char**)
     std::cout << "\n-- 2. the hand --\n";
     for (int i = 0; i < 3; ++i) verb(host, "GolfMatch.Frame", "16");   // the eye onto the ball
     const float z0 = ball(host, "solo").z;
+    // In the lobby the menu is up, over the middle of the picture: a press
+    // there is the menu's, and pulls nothing. M folds it away.
+    verb(host, "GolfMatch.Press", "512, 384");
+    verb(host, "GolfMatch.Drag", "512, 470");
+    const std::string menus = verb(host, "GolfMatch.Pull");
+    verb(host, "GolfMatch.Release", "512, 470");
+    check(menus.find("pulling") == std::string::npos, "with the lobby's menu up, a press on it is the menu's: no ball is pulled through it");
+    verb(host, "GolfMatch.Key", "77, 1");
+    verb(host, "GolfMatch.Frame", "16");
     verb(host, "GolfMatch.Press", "512, 384");
     verb(host, "GolfMatch.Drag", "512, 470");
     const std::string pulling = verb(host, "GolfMatch.Pull");
@@ -158,6 +167,14 @@ int main(int, char**)
     verb(host, "GolfMatch.Run", "100");
     std::printf("        (pulling: %s; after the right let go: %s)\n", pulling.c_str(), down.c_str());
     check(pulling.find("pulling") != std::string::npos, "a press on your ball and a drag pull a shot back");
+    {
+        // "x y z length mode": from a camera looking down 55 degrees the pull
+        // still lies along the ground the ball is on.
+        float px = 0, py = 0, pz = 0, pl = 0;
+        std::istringstream in(pulling);
+        in >> px >> py >> pz >> pl;
+        check(pl > 0.2f && std::fabs(py) < 0.01f * pl && pz > 0.9f * pl, "...along the green, whatever the camera's pitch: no loft to begin with");
+    }
     check(down.find("down") != std::string::npos && std::fabs(ball(host, "solo").z - z0) < 0.01f,
           "letting go of the right button puts it down: the left's release shoots nothing");
     verb(host, "GolfMatch.Frame", "16");
@@ -166,6 +183,29 @@ int main(int, char**)
     verb(host, "GolfMatch.Release", "512, 470");
     verb(host, "GolfMatch.Run", "100");
     check(ball(host, "solo").z > z0 + 0.5f, "...pressed and let go again, it shoots: away from the camera, up the green");
+    {
+        // Loft is the camera brought down while the pull is held: the right
+        // button with the left, the pointer up the picture fifty pixels
+        // (0.3 of a radian).
+        verb(host, "GolfMatch.Run", "250");
+        verb(host, "GolfMatch.Frame", "16");
+        verb(host, "GolfMatch.Press", "512, 384");
+        verb(host, "GolfMatch.Drag", "512, 470");
+        verb(host, "GolfMatch.RightPress", "512, 470");
+        verb(host, "GolfMatch.RightDrag", "512, 420");
+        float px = 0, py = 0, pz = 0, pl = 0;
+        const std::string lofted = verb(host, "GolfMatch.Pull");
+        std::istringstream in(lofted);
+        in >> px >> py >> pz >> pl;
+        std::printf("        (lofted: %s)\n", lofted.c_str());
+        check(pl > 0.1f && py > 0.25f * pl && py < 0.35f * pl, "the camera lowered while a pull is held tips the shot up off the ground by as much");
+        verb(host, "GolfMatch.RightDrag", "512, 520");
+        std::istringstream again(verb(host, "GolfMatch.Pull"));
+        again >> px >> py >> pz >> pl;
+        check(std::fabs(py) < 0.01f * pl, "...and raised past where it was, back along the ground and no further");
+        verb(host, "GolfMatch.RightRelease", "512, 520");
+        verb(host, "GolfMatch.Release", "512, 520");
+    }
 
     // -- 3. two players --------------------------------------------------------
     std::cout << "\n-- 3. two players --\n";
@@ -200,9 +240,27 @@ int main(int, char**)
           "...and each has the other here: the host the guest's seat, the guest the trace it follows");
     check(verb(g1, "GolfMatch.StartRound") == "refused" && verb(g1, "GolfMatch.Configure", "boosters 60") == "refused",
           "a guest sets nothing: the course, the time and the round are the host's");
+    // A look is each player's own, and the lobby's: a colour of the palette
+    // and a name, a line of the trace -- so every runtime shows it.
+    {
+        auto livery = [&](ETCS::Entity* g) { std::string c, n; std::istringstream in(verb(g, "GolfMatch.Livery")); in >> c >> n; return c + " " + n; };
+        check(livery(host) == "0 host" && livery(g1) == "1 g1", "a player's look to begin with: its ball's own colour, its seat's label");
+        proposed("GolfMatch.Recolour", "9");
+        proposed("GolfMatch.Rename", "zed");
+        run(4);
+        check(livery(g1) == "9 zed" && verb(host, "GolfMatch.Scores").find(" zed ") != std::string::npos && verb(host, "GolfMatch.Scores").find(" g1 ") == std::string::npos,
+              "the guest takes the tenth colour and the name zed: on the host's board too");
+        check(ball(host, "zed").slot == 1 && ball(host, "g1").slot == 1, "a player is still found by its seat, and by its name too");
+        check(verb(host, "GolfMatch.Rename", "zed") == "refused" && verb(host, "GolfMatch.Rename", "g1") == "refused" && verb(host, "GolfMatch.Recolour", "10") == "refused",
+              "a name is one player's -- not another's, nor another's seat -- and a colour one of the ten");
+        proposed("GolfMatch.Rename", "");
+        run(4);
+        check(livery(g1) == "9 g1", "no name is the seat's label again, the colour kept");
+    }
     check(verb(host, "GolfMatch.Configure", "classic 30") == "ok" && verb(host, "GolfMatch.StartRound") == "ok", "the host starts a round on the classic");
     run(30);
     check(status(g1).phase == "playing" && status(g1).hole == 1, "...and the guest is on its first hole with it");
+    check(verb(g1, "GolfMatch.Recolour", "2") == "refused" && verb(g1, "GolfMatch.Rename", "late") == "refused", "a look is not changed in a round");
     proposed("GolfMatch.Shoot", "0, 0, 1.2");
     run(250);
     const Ball a1 = ball(host, "g1");
@@ -297,7 +355,10 @@ int main(int, char**)
     const Ball pulled = ball(host, "host");
     std::printf("        (black hole: x %.2f -> %.2f)\n", hb.x, pulled.x);
     check(pulled.x > hb.x + 0.5f, "a black hole pulls a ball near it toward it");
-    run(150);
+    // A power at work is at work for half a minute, or until its hole is over:
+    // a round begun again is a hole with nothing on it.
+    auto fresh = [&]() { verb(host, "GolfMatch.Abandon"); run(10); verb(host, "GolfMatch.StartRound"); run(30); };
+    fresh();
     const Ball w0 = ball(host, "g1");
     verb(host, "GolfMatch.Give", "host wind");
     verb(host, "GolfMatch.Use", "0, 0, 0, 90");
@@ -305,7 +366,11 @@ int main(int, char**)
     const Ball w1 = ball(host, "g1");
     std::printf("        (wind toward +x: g1 x %.2f -> %.2f)\n", w0.x, w1.x);
     check(w1.x > w0.x + 0.3f, "a wind blows every ball the way its user looked -- another's too");
-    run(200);
+    run(250);
+    const Ball w2 = ball(host, "g1");
+    std::printf("        (...and six seconds on: x %.2f)\n", w2.x);
+    check(w2.x > w1.x + 0.3f || w2.x > 7.0f, "...and goes on blowing: a power at work is at work for half a minute");
+    fresh();
     const Ball t0 = ball(host, "host"), o0 = ball(host, "g1");
     verb(host, "GolfMatch.Give", "host teleport");
     verb(host, "GolfMatch.Use", std::to_string(t0.x) + ", 0, " + std::to_string(t0.z + 30.0f) + ", 0");
@@ -324,6 +389,77 @@ int main(int, char**)
     }
     std::printf("        (tornado: the host's ball went %.2f from where it was)\n", moved);
     check(moved > 1.0f, "a tornado near a ball swirls it, and its lightning throws it");
+    fresh();
+
+    // Two are carried: a spot's power goes to the spare when one is in hand,
+    // in place of what the spare was, and comes to hand when that is used.
+    verb(host, "GolfMatch.Give", "host pad");
+    verb(host, "GolfMatch.Give", "host spring pickup");
+    run(2);
+    check(ball(host, "host").power == "pad" && ball(g1, "host").spare == "spring", "a power picked up with one in hand is the spare, on both runtimes");
+    verb(host, "GolfMatch.Give", "host sand pickup");
+    run(2);
+    check(ball(host, "host").power == "pad" && ball(host, "host").spare == "sand", "...and the next one takes the spare's place");
+    auto still = [&](const char* who) { for (int i = 0; i < 60 && ball(host, who).rest != "resting"; ++i) run(10); return ball(host, who); };
+    Ball c0 = still("host");
+    verb(host, "GolfMatch.Use", std::to_string(c0.x) + ", 0, " + std::to_string(c0.z + 3.0f) + ", 0");
+    run(2);
+    check(ball(host, "host").power == "sand" && ball(g1, "host").spare == "-", "the one in hand used, the spare comes to hand");
+
+    // The cannon: the user's own ball, at rest, in an arc to the point.
+    const float aim = c0.z > 24.0f ? c0.z - 8.0f : c0.z + 8.0f;
+    verb(host, "GolfMatch.Give", "host cannon");
+    verb(host, "GolfMatch.Use", "0, 0, " + std::to_string(aim) + ", 0");
+    float peak = c0.y;
+    for (int t = 0; t < 20; ++t) { run(5); peak = std::max(peak, ball(host, "host").y); }
+    const Ball c1 = still("host");
+    std::printf("        (cannon: from z %.2f at %.2f, up to y %.2f, down at %.2f,%.2f; strokes %d -> %d)\n", c0.z, aim, peak, c1.x, c1.z, c0.strokes, c1.strokes);
+    check(peak > c0.y + 1.0f && std::fabs(c1.z - aim) < 2.5f && std::fabs(c1.x) < 2.5f && c1.strokes == c0.strokes, "a cannon fires its user's ball in an arc to the point, and it comes down dead there: no stroke");
+
+    // The freeze: every other ball in the cold -- slowed, not stopped. g1's
+    // shot, the same struck twice: once free, once frozen.
+    still("g1");
+    proposed("GolfMatch.Shoot", "1.5, 0, 0");
+    run(5);
+    const float free0 = ball(host, "g1").speed;
+    run(40);
+    const float free1 = ball(host, "g1").speed;
+    still("g1");
+    verb(host, "GolfMatch.Give", "host freeze");
+    verb(host, "GolfMatch.Use", std::to_string(c1.x) + ", 0, " + std::to_string(c1.z) + ", 0");
+    proposed("GolfMatch.Shoot", "-1.5, 0, 0");
+    run(5);
+    const float cold0 = ball(host, "g1").speed;
+    run(40);
+    const float cold1 = ball(host, "g1").speed;
+    std::printf("        (g1's shot: free %.2f -> %.2f u/s in 40 ticks; frozen %.2f -> %.2f)\n", free0, free1, cold0, cold1);
+    check(free0 > 2.0f && cold0 > 1.0f && cold1 > 0.05f && cold1 / cold0 < 0.75f * free1 / free0 && ball(g1, "g1").speed == cold1,
+          "a freeze slows every other ball -- it still plays, and its shot carries less far");
+
+    // Smoke: a cloud put down, thick and then dissipating -- in the match as
+    // an effect, on both runtimes.
+    verb(host, "GolfMatch.Give", "host smoke");
+    verb(host, "GolfMatch.Use", std::to_string(c1.x) + ", 0, " + std::to_string(c1.z + 4.0f) + ", 0");
+    run(2);
+    check(verb(g1, "GolfMatch.Note") == "host put down a smoke" && ball(host, "host").power == "-", "a smoke cloud is put down where it is pointed");
+
+    // The magnet: the cup pulls its user's ball from as far as ten off.
+    fresh();
+    for (int k = 0; k < 6; ++k)
+    {
+        const Ball at = still("host");
+        if (std::fabs(at.z - 37.0f) < 0.5f && std::fabs(at.x) < 0.5f) break;
+        verb(host, "GolfMatch.Give", "host teleport");
+        verb(host, "GolfMatch.Use", "0, 0, 37, 0");
+        run(10);
+    }
+    const Ball m0 = still("host");
+    verb(host, "GolfMatch.Give", "host magnet");
+    verb(host, "GolfMatch.Use", "0, 0, 0, 0");
+    for (int t = 0; t < 60 && ball(host, "host").state != "holed"; ++t) run(10);
+    const Ball m1 = ball(host, "host");
+    std::printf("        (magnet: the cup at 0,44; the ball from %.2f,%.2f to %.2f,%.2f, %s)\n", m0.x, m0.z, m1.x, m1.z, m1.state.c_str());
+    check(m1.state == "holed", "a magnet draws its user's ball to the cup, slowly enough to drop in");
 
     // -- 8. the round ----------------------------------------------------------
     std::cout << "\n-- 8. the round --\n";

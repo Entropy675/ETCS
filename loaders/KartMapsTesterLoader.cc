@@ -130,6 +130,23 @@ int main(int argc, char** argv)
     check(seeds < 1000 || (pits > 0.4 && pits < 0.6), "about one in two has a pit");
     check(differs == 0, "a seed makes the same map twice");
 
+    // A bank by hand, up to the north wall: its lip half a unit short of the
+    // karts' bound leaves a trench under it, which is a fault; on the bound
+    // there is none (the bowl's banks were the first, the skatepark's too).
+    auto bank = [](float middle) {
+        KartArena::Map m;
+        KartArena::Ramp r;
+        r.x = Fixed::Zero(); r.z = Fixed::From(middle); r.yaw = 0;
+        r.width = Fixed::FromInt(192); r.up = Fixed::FromInt(21); r.flat = r.down = Fixed::Zero(); r.height = Fixed::FromInt(3);
+        m.ramps.push_back(r);
+        KartArena::Prepare(m);
+        return KartArena::Faults(m);
+    };
+    const std::string shy = bank(84.0f), flush = bank(84.5f);
+    std::printf("        (a bank to 94.5: %s; to 95: %s)\n", shy.empty() ? "sound" : shy.c_str(), flush.empty() ? "sound" : flush.c_str());
+    check(shy.find("a trench between its lip and the wall") != std::string::npos, "a bank whose lip is short of the karts' bound is a fault: a trench to hide in");
+    check(flush.find("trench") == std::string::npos, "...and with its lip on the bound there is none (this map of one bank is bare, and is told that instead)");
+
     std::printf("\n%s (%d failure%s)\n", g_fail ? "FAILED" : "PASSED", g_fail, g_fail == 1 ? "" : "s");
     return g_fail ? 1 : 0;
 }
