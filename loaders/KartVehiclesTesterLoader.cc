@@ -25,6 +25,9 @@
 //      by a tick at most; a guest draws it moving on every frame too.
 //   3d. THE EYE AND A BLOCK. A turned block behind the kart, taller than the
 //      eye rides: the eye comes in in front of it.
+//   3e. A GUEST'S TICKS IN BURSTS. The host's ticks reach a guest unevenly,
+//      up to five at once with gaps between: the guest still draws the kart
+//      moving on every frame, at an even pace.
 //   4. THE TYRES. Off the pedal at 12 u/s, a wheel held half a second: the
 //      kart and both trucks grip (nothing across is left) and both bikes
 //      slide, leaning into the turn and the other way for the other turn; the
@@ -49,11 +52,13 @@
 #include "../ETCS.h"
 
 #include <chrono>
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <sstream>
 #include <string>
 #include <thread>
+#include <vector>
 
 static int g_fail = 0;
 static void check(bool ok, const char* what)
@@ -377,6 +382,53 @@ int main(int, char**)
         check(boom < 7.0f && (u > 1.5f || v > 1.5f), "a block behind the kart, taller than the eye: the eye comes in in front of it (short of its 7.5), not inside it");
         verb(host, "KartBattle.Abandon");
         run(2);
+    }
+
+    // -- 3e. a guest's ticks in bursts -------------------------------------------
+    std::cout << "\n-- 3e. a guest's ticks in bursts --\n";
+    // Frames of 10 ms on g1; the host's clock moved only now and then, by the
+    // frames since (1 to 10 of them), so its ticks reach g1 in uneven bursts,
+    // up to five at once. After a second to settle, g1 draws the host's kart
+    // moving every frame, and no frame's step more than half again the usual
+    // one. (Aimed at kBatch behind the newest tick, as it was, the drawn
+    // tick caught up with the newest on these and stood still.)
+    {
+        start();
+        run(2);
+        key(host, 'W', true);
+        run(100);
+        const int gaps[] = { 1, 10, 2, 10, 1, 9, 3, 10 };
+        int gap = 0, since = 0, still = 0;
+        float gx0 = 0.0f, gz0 = 0.0f;
+        std::vector<float> steps;
+        for (int i = 0; i < 260; ++i)
+        {
+            if (++since == gaps[gap])
+            {
+                verb(host, "KartBattle.Frame", std::to_string(since * 10));
+                settle();
+                since = 0; gap = (gap + 1) % 8;
+            }
+            verb(g1, "KartBattle.Frame", "10");
+            std::istringstream in(verb(g1, "KartBattle.Drawn", "host"));
+            float gx, gy, gz;
+            if (!(in >> gx >> gy >> gz)) { ++still; continue; }
+            if (i >= 100)
+            {
+                const float step = std::hypot(gx - gx0, gz - gz0);
+                if (step < 1e-4f) ++still; else steps.push_back(step);
+            }
+            gx0 = gx; gz0 = gz;
+        }
+        key(host, 'W', false);
+        verb(host, "KartBattle.Abandon");
+        run(2);
+        std::vector<float> sorted = steps;
+        std::sort(sorted.begin(), sorted.end());
+        const float usual = sorted.empty() ? 0.0f : sorted[sorted.size() / 2], most = sorted.empty() ? 0.0f : sorted.back();
+        std::printf("        (160 frames of 10 ms on g1: still on %d, moved on %zu; a frame's step usually %.3f, at most %.3f)\n",
+                    still, steps.size(), usual, most);
+        check(still == 0 && steps.size() == 160 && most <= usual * 1.5f, "a guest whose ticks come in bursts draws the kart moving every frame, at an even pace");
     }
 
     // -- 4. the tyres ------------------------------------------------------------
