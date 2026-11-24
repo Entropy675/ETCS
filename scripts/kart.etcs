@@ -1,0 +1,20 @@
+#!/usr/bin/env etcs
+#IMPORT ACE_ROOT/modules
+
+# KART, IN A WINDOW.
+#
+#     ./bin/etcs scripts/kart.etcs
+#
+# Runs the boot the browser page runs (KartProvider/scripts/www/boot_kart.etcs)
+# on the OS runtime, then what the page does once you are named: a battle of
+# your own. There is no copy of the boot here.
+#
+# `battle` is made HERE and taken by the boot (`ensure` there), so it is this
+# script's global and answers at the prompt beside the window
+# (battle.Status(), battle.Scores()). Hosting and joining are the session
+# scripts the page fills in (NetworkProvider/scripts/session_host.etcs,
+# session_join.etcs), run from that prompt.
+
+spawn KartProvider::KartBattle battle
+run KartProvider/scripts/www/boot_kart.etcs
+battle.Practice(driver)

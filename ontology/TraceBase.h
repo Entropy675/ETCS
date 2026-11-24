@@ -12,6 +12,7 @@
 #include <sstream>
 #include <thread>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 /*
@@ -35,7 +36,12 @@
  *   LeavingConcrete  the line a seat's stream ending is taken as, as that
  *                    seat (default: none)
  *   EndedConcrete    the authority's trace ended under a mirror
- *   DiffersConcrete  a mirror is not the authority at `at`, said once
+ *   ReadyConcrete    whether lines may be applied yet (default: always);
+ *                    a mirror's lines wait until it is, and readyLocked
+ *                    applies them once it says so
+ *   ResyncedConcrete a mirror that differed at `at` is the authority again,
+ *                    its trace replayed (default: nothing)
+ *   DiffersConcrete  a mirror is not the authority at `at` even replayed, said once
  *
  * A SEAT IS AN IDENTITY (Trace.h): its key's fingerprint over a link, its
  * label from this runtime. Each stream that sits holds a TOKEN; only the
@@ -53,6 +59,8 @@ ETCS_SUPERTYPE_BASE(Trace)
     virtual std::string LeavingConcrete() { return std::string(); }
     virtual void        EndedConcrete() {}
     virtual void        DiffersConcrete(uint64_t at, const std::string& mine, const std::string& theirs) { (void)at; (void)mine; (void)theirs; }
+    virtual bool        ReadyConcrete() { return true; }
+    virtual void        ResyncedConcrete(uint64_t at) { (void)at; }
 
     // ── sessions ───────────────────────────────────────────────────────
     // Alone: the authority of a trace nobody follows, so none is kept.
@@ -89,7 +97,7 @@ ETCS_SUPERTYPE_BASE(Trace)
         std::lock_guard<std::mutex> g(m_mu);
         nextGenerationLocked();
         m_me.clear(); m_owner.clear(); m_authority = false; m_session = false;
-        m_seats.clear(); m_outbox.clear();
+        m_seats.clear(); m_outbox.clear(); m_parked.clear();
     }
 
     // ── Trace_ ─────────────────────────────────────────────────────────
@@ -99,17 +107,16 @@ ETCS_SUPERTYPE_BASE(Trace)
         if (gen != m_gen) return false;
         if (m_authority) return true;
         uint64_t seq = 0; std::string author, line;
-        if (!ParseLine(msg, seq, author, line) || seq < m_lines.size()) return true;
-        if (seq > m_lines.size())
+        const uint64_t next = m_lines.size() + m_parked.size();
+        if (!ParseLine(msg, seq, author, line) || seq < next) return true;
+        if (seq > next)
         {
-            ETCS_LOG("Trace", "line " << seq << " follows " << m_lines.size() << " -- a gap; this mirror stops here.");
+            ETCS_LOG("Trace", "line " << seq << " follows " << next << " -- a gap; this mirror stops here.");
             return false;
         }
-        if (line.compare(0, 5, "hash ") == 0) checkLocked(line);
-        else if (line.compare(0, 5, "seat ") == 0) seatedLocked(author, line);
-        else if (!applyLineLocked(author, line))
-            ETCS_LOG("Trace", "line " << seq << " (" << author << " " << line << ") refused here -- this copy is not " << m_owner << "'s.");
-        keepLocked(author, line);
+        // Not ready (a page still making what the lines are about): it waits.
+        if (!m_parked.empty() || !ReadyConcrete()) { m_parked.emplace_back(author, line); return true; }
+        followLocked(author, line, true);
         return true;
     }
     bool Lines(uint64_t gen, uint64_t from, std::vector<std::string>& out) override
@@ -208,6 +215,19 @@ protected:
         RestartConcrete();
     }
     void nextGenerationLocked() { ++m_gen; m_grew.notify_all(); }
+    // The leaf is ready: the lines that waited for it, applied in order.
+    void readyLocked()
+    {
+        while (!m_parked.empty() && ReadyConcrete())
+        {
+            std::pair<std::string, std::string> l = std::move(m_parked.front());
+            m_parked.pop_front();
+            followLocked(l.first, l.second, true);
+        }
+    }
+    // Replaying its own trace to put a mirror right (checkLocked): a leaf's
+    // RestartConcrete may keep what is this runtime's alone (keys, the eye).
+    bool replayingLocked() const { return m_replaying; }
 
     // A line applied as `author` and kept: the authority's act.
     bool takeLocked(const std::string& author, const std::string& line)
@@ -254,7 +274,7 @@ private:
     {
         nextGenerationLocked();
         m_me.clear(); m_owner.clear(); m_authority = false; m_session = false;
-        m_seats.clear(); m_outbox.clear(); m_nonce.clear();
+        m_seats.clear(); m_outbox.clear(); m_nonce.clear(); m_parked.clear();
         restartLocked();
         m_me = me; m_owner = owner; m_authority = authority; m_session = session;
         if (!authority) return;
@@ -271,7 +291,26 @@ private:
         m_labels[seat] = label.empty() ? seat : label;
         if (!m_nonce.empty() && nonce == m_nonce) m_me = seat;
     }
-    // A mirror at the authority's `hash <at> <hash>`: the same lines, so the same hash.
+    // One of the authority's lines, as a mirror: applied (or checked, or a
+    // seat learnt) and kept. `check` false is a replay: a hash is only kept.
+    void followLocked(const std::string& author, const std::string& line, bool check)
+    {
+        if (line.compare(0, 5, "hash ") == 0) { if (check) checkLocked(line); }
+        else if (line.compare(0, 5, "seat ") == 0) seatedLocked(author, line);
+        else if (!applyLineLocked(author, line))
+            ETCS_LOG("Trace", "line " << m_lines.size() << " (" << author << " " << line << ") refused here -- this copy is not " << m_owner << "'s.");
+        keepLocked(author, line);
+    }
+    /*
+     * A mirror at the authority's `hash <at> <hash>`: the same lines, so the
+     * same hash. One that differs got there some way the lines do not say
+     * (a line applied before the leaf was ready for it, a state changed by
+     * hand). It has every line, so it PUTS ITSELF RIGHT: everything as
+     * made, and its own trace again from the first line -- nothing asked of
+     * the authority. If it still differs, the lines do not decide the state
+     * (the leaf is not deterministic): that is reported, once, and it stops
+     * trying.
+     */
     void checkLocked(const std::string& line)
     {
         const size_t sp = line.find(' ', 5);
@@ -281,8 +320,28 @@ private:
         m_snap_at = at;
         m_snap_hash = HashConcrete();
         if (m_snap_hash == theirs || m_differed) return;
+        replayLocked();
+        m_snap_at = at;
+        m_snap_hash = HashConcrete();
+        if (m_snap_hash == theirs) { ResyncedConcrete(at); return; }
         m_differed = true;
         DiffersConcrete(at, m_snap_hash, theirs);
+    }
+    void replayLocked()
+    {
+        const auto t0 = std::chrono::steady_clock::now();
+        std::vector<std::string> kept;
+        kept.swap(m_lines);
+        m_replaying = true;
+        restartLocked();
+        for (const std::string& msg : kept)
+        {
+            uint64_t seq = 0; std::string author, line;
+            if (ParseLine(msg, seq, author, line)) followLocked(author, line, false);
+        }
+        m_replaying = false;
+        ETCS_LOG("Trace", "replayed " << kept.size() << " lines in "
+                 << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count() << " ms");
     }
 
     std::condition_variable  m_grew;    // a line kept, or the generation moved
@@ -292,6 +351,8 @@ private:
     std::string              m_nonce;   // a mirror's: how it knows its own seat
     std::deque<std::string>  m_outbox;  // a mirror's: its seat's name first, then its lines
     bool                     m_differed = false;
+    bool                     m_replaying = false;
+    std::deque<std::pair<std::string, std::string>> m_parked;   // a mirror's lines (author, line) waiting for ReadyConcrete
 };
 
 /*

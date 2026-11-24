@@ -10,7 +10,7 @@ Tools & Modules
 
 I do not recommend working on this substrate until the below todo's are complete, as they can change the active surface.
 
-To write an ETCS provider, you effectively have to introduce yourself to the ETCS runtime via a thin ontology compliant wrapper. Every module has the same shape (`modules/readme.txt`: which file holds what, and why ace only attests headers in those places). See ChessProvider in ETCS-Commons repo (https://github.com/Entropy675/ETCS-Commons/tree/main/ChessProvider) for a bare bones example. Once your types speak over the ETCS scripting language, you can act across the arbitrary MirrorBuffer boundary, which is the function call boundary for stream functions or streams you negotiate yourself (less recommended unless you know what you are doing - I'll make a tutorials). The stream work function contract is an explicit lifetime: the consume stream function holds open the lifetime of the connection and is blocking; the produce side is non-blocking and expected to output continuously over the MirrorBuffer they share, which wraps/unwraps via the Wrapper_ based types owned by either side. A connection drop or otherwise failure to set up a MirrorBuffer ends the connection, logging it as a failure on both sides. If one side cannot assemble the same Wrapper_ based types required to generate a valid MirrorBuffer to a target type, stream calls fail. Since all scripts are run locally remote connections have to be brokered via a name server equivalent domain (See ChessNode from ChessProvider). MirrorBuffer covers quite literally every physical boundary from LMAX within process local buffers to sockets, the local EventNode's EventStream negotiates the provenience of local memory with the most local loader separately from the identity of the code, all entities' origin is local in every way (RIDs are runtime deterministic sequences). It's maximized for decreasing arbitrary pattern replication via the ontology, the CRTP layer reduces that pattern match to static casts. An ontology compliant wrapper of existing code gains distribution over all platforms ETCS supports, including the ETCS kernel when it releases, unless platform specific types are declared in the modules type contract declaration (the auto generated header via ace tool's module setup, Contract_XXXXXProvider.h where you can typecast unify your types for every supported system).
+To write an ETCS provider, you effectively have to introduce yourself to the ETCS runtime via a thin ontology compliant wrapper. Every module has the same shape (`modules/readme.txt`: which file holds what, and why ace only attests headers in those places). See ChessProvider in ETCS-Commons repo (https://github.com/Entropy675/ETCS-Commons/tree/main/ChessProvider) for a bare bones example. Once your types speak over the ETCS scripting language, you can act across the arbitrary MirrorBuffer boundary, which is the function call boundary for stream functions or streams you negotiate yourself (less recommended unless you know what you are doing - I'll make tutorials). The stream work function contract is an explicit lifetime: the consume stream function holds open the lifetime of the connection and is blocking; the produce side is non-blocking and expected to output continuously over the MirrorBuffer they share, which wraps/unwraps via the Wrapper_ based types owned by either side. A connection drop or otherwise failure to set up a MirrorBuffer ends the connection, logging it as a failure on both sides. If one side cannot assemble the same Wrapper_ based types required to generate a valid MirrorBuffer to a target type, stream calls fail. Since all scripts are run locally remote connections have to be brokered via a name server equivalent domain (See ChessNode from ChessProvider). MirrorBuffer covers quite literally every physical boundary from LMAX within process local buffers to sockets, the local EventNode's EventStream negotiates the provenience of local memory with the most local loader separately from the identity of the code, all entities' origin is local in every way (RIDs are runtime deterministic sequences). It's maximized for decreasing arbitrary pattern replication via the ontology, the CRTP layer reduces that pattern match to static casts. An ontology compliant wrapper of existing code gains distribution over all platforms ETCS supports, including the ETCS kernel when it releases, unless platform specific types are declared in the modules type contract declaration (the auto generated header via ace tool's module setup, Contract_XXXXXProvider.h where you can typecast unify your types for every supported system).
 
 To build, pull ACE-Build-Tools in one folder and ETCS in another. ETCS-Commons is the `modules/` submodule of ETCS, and the vendored sources (sqlite, mbedtls, glfw, stb, ...) are submodules of it, so one recursive init fetches everything, shallow:
 
@@ -112,31 +112,33 @@ are the proofs.
 
 TODO:
 - Identity system (over the state hash). Binary signatures are built
-  (`core/Trust.h`, `Run_ModuleSignatureTesterLoader`); still to come: the ACE
-  root's key (the ceremony and its place are built: `root_ceremony.etcs`,
-  `ace pin`),
-  loader-key registration, entitlement.
-- Merge the Local/Remote Database ontology types
+  (`core/Trust.h`, `Run_ModuleSignatureTesterLoader`), and so is loader-key
+  registration (`CryptProvider::Registrar`, served at `/pki` by
+  `scripts/site_pki.etcs`); still to come: the ACE root's key (the ceremony
+  and its place are built: `root_ceremony.etcs`, `ace identity`), entitlement.
 - Every module's verb-set state on the value surface. Scene3D is done; the
   other Set* verbs (Paint, Render's 2D types, Network, Chess, Layout, Window)
   still keep some state in members that a resume does not see.
 
-Example graphical_script.etcs:
+Example scripts/graphical_script.etcs (its comments left out):
 ```
 #!/usr/bin/env etcs
+#IMPORT ACE_ROOT/modules
 
 spawn WindowProvider::Window main
-
-detach window_events.etcs window=main
+detach WindowProvider/scripts/window_events.etcs window=main
 main.Run(600, 600, 'GraphicalLoader Test GUI') 
 main.Delete()
 ```
 
-Where window_events.etcs:
+Where modules/WindowProvider/scripts/window_events.etcs:
 ```
 #!/usr/bin/env etcs
+#IMPORT ACE_ROOT/modules
 
 requires window [Window]
+
+detach window_pointer.etcs window=window
 
 window.ProduceEvents() -> window.ConsumeEvents()
 window.Close()
@@ -145,15 +147,26 @@ window.Close()
 You can use 'ace script print xxx.etcs' to get an expanded script printed like:
 ```
 #!/usr/bin/env etcs
+#IMPORT ACE_ROOT/modules
 
 spawn WindowProvider::Window main
-
-detach window_events.etcs window=main
+detach WindowProvider/scripts/window_events.etcs window=main
 {
 	#!/usr/bin/env etcs
-	
+	#IMPORT ACE_ROOT/modules
+
 	requires window [Window]
-	
+
+	detach window_pointer.etcs window=window
+	{
+		#!/usr/bin/env etcs
+		#IMPORT ACE_ROOT/modules
+
+		requires window [Window]
+
+		window.ProducePointer() -> window.ConsumePointer()
+	}
+
 	window.ProduceEvents() -> window.ConsumeEvents()
 	window.Close()
 }
@@ -161,7 +174,7 @@ main.Run(600, 600, 'GraphicalLoader Test GUI')
 main.Delete()
 ```
 
-Notice how the above script uses the detached window_events.etcs script targeting the same main window to create a stream, from the event producing pump to the windows own event consuming buffer, which others can subscribe to for a event stream. The instance in WindowProvider is currently implemented via GLFW, the first detached script is the first thread of the loader so it's a valid event pump - for programs that are windowed and want input you must detach window_events.etcs first so that the input pump captures the first thread, this is an OS requirement... will not be a limitation within future ETCS kernel. Useful place to learn about the thread affinity ordering though, in case it matters to you.
+Notice how the above script uses the detached window_events.etcs script targeting the same main window to create a stream, from the event producing pump to the window's own event consuming buffer, which others can subscribe to for an event stream. Keys and pointer are separate rings and separate streams, and a stream edge blocks the thread that states it, so the pointer half is detached onto its own thread (window_pointer.etcs). The instance in WindowProvider is currently implemented via GLFW, the first detached script is the first thread of the loader so it's a valid event pump - for programs that are windowed and want input you must detach window_events.etcs first so that the input pump captures the first thread, this is an OS requirement... will not be a limitation within future ETCS kernel. Useful place to learn about the thread affinity ordering though, in case it matters to you.
 
 The best way to think about the ETCS scripting language is as a schema for the structure of your control threads. The actual work occurs within the work functions (hence the name), ETCS scripts are called on state transitions via work functions to trigger control flow changes in the event graph. Scripts are not general programs: they declare how work functions attach to entities and how control moves on the event graph—bindings, ordering, and streaming links such as Produce -> Consume.
 ETCS scripts are a non-Turing-complete description of the nameable environment under the modules currently loadable on the substrate. They are not primarily meant to be written by hand as large control-flow programs. They are meant to be assembled by naming fragments, including fragments auto-generated in bulk by causal exhaustion on the ACE build server (Target — see the whitepaper). Human authorship sits mainly at the construction layer: which pieces to attach, under which names. Where to call them, how to order the execution of scripts. Boundaries are explicit (export horizon, MirrorBuffer, one content channel). The exhaustive resolver that generates the full fragment set is work in progress.

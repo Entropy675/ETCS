@@ -1,0 +1,20 @@
+#!/usr/bin/env etcs
+#IMPORT ACE_ROOT/modules
+
+# GOLF, IN A WINDOW.
+#
+#     ./bin/etcs scripts/golf.etcs
+#
+# Runs the boot the browser page runs (GolfProvider/scripts/www/boot_golf.etcs)
+# on the OS runtime, then what the page does once you are named: a match of
+# your own. There is no copy of the boot here.
+#
+# `game` is made HERE and taken by the boot (`ensure` there), so it is this
+# script's global and answers at the prompt beside the window (game.Status(),
+# game.Scores()). Hosting and joining are the session scripts the page fills in
+# (NetworkProvider/scripts/session_host.etcs, session_join.etcs), run from that
+# prompt.
+
+spawn GolfProvider::GolfMatch game
+run GolfProvider/scripts/www/boot_golf.etcs
+game.Practice(golfer)

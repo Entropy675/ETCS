@@ -296,6 +296,87 @@ int main(int, char**)
     verb(m, "PaintModeler.SetAxis", "none");
     check(verb(m, "PaintModeler.Report", "0") == home && status(m).undo == 1, "...and all of that undone is the part as it was made");
 
+    // -- the arrows: a handle each way along each axis -----------------------
+    std::cout << "\n-- the arrows --\n";
+    {
+        ETCS::Entity* arrow[6] = {};
+        for (int k = 0; k < 6; ++k)
+        {
+            arrow[k] = ETCS::spawn_entity("RenderProvider", "Scene3D", env, loader);
+            verb(arrow[k], "Scene3D.Create", "0.1, 1, 0.1");
+            verb(m, "PaintModeler.BindAxis", std::to_string(k) + ", " + std::to_string(arrow[k]->getRID()));
+        }
+        auto handles = [&]() { return verb(m, "PaintModeler.Handles"); };
+        verb(m, "PaintModeler.SetTool", "select");
+        press(20, 20); release(20, 20);
+        press(400, 300); release(400, 300);
+        check(status(m).sel == 0 && !hidden(arrow[0]) && !hidden(arrow[3]) && handles() == "-1 -1",
+              "a press on the middle of a part chooses it, not the arrows inside it, and shows its six");
+        drag(500, 300);
+        check(handles() == "0 -1", "the pointer at rest on the +x arrow: that arrow is under it");
+        drag(320, 300);
+        check(handles() == "3 -1", "...on the -x arrow, the other one");
+        drag(20, 20);
+        check(handles() == "-1 -1", "...and off them, none");
+
+        // Select, axis free: a drag on the +x arrow up and to the right goes along x only.
+        drag(500, 300);
+        press(500, 300);
+        check(handles() == "0 0" && status(m).axis == "none", "a press on it takes hold of x, the axis cell untouched");
+        drag(540, 260); drag(560, 240);
+        check(handles() == "0 0", "...and holds it for the drag");
+        release(560, 240);
+        {
+            const Part p = part(m, 0);
+            check(p.x > 0.4 && near(p.y, 0.5, 1e-9) && near(p.z, 0, 1e-9) && status(m).undo == 2 && handles().substr(2) == "-1",
+                  "select on an arrow moves along it and nowhere else, one line, and lets go on release");
+        }
+        verb(m, "PaintModeler.Undo");
+
+        // Move, axis set to y: the -x arrow still holds the drag to x.
+        verb(m, "PaintModeler.SetTool", "move");
+        verb(m, "PaintModeler.SetAxis", "y");
+        gesture(320, 300, 260, 250);
+        {
+            const Part p = part(m, 0);
+            check(p.x < -0.4 && near(p.y, 0.5, 1e-9) && near(p.z, 0, 1e-9), "move on the -x arrow keeps to x whatever the axis cell says");
+        }
+        verb(m, "PaintModeler.Undo");
+        verb(m, "PaintModeler.SetAxis", "none");
+
+        // Size on the +y arrow: taller only.
+        verb(m, "PaintModeler.SetTool", "size");
+        gesture(400, 215, 400, 115);
+        {
+            const Part p = part(m, 0);
+            check(near(p.h, std::exp(1.0), 2e-3) && near(p.w, 1) && near(p.d, 1), "size on the +y arrow grows it along y alone");
+        }
+        verb(m, "PaintModeler.Undo");
+
+        // Turn on the +x arrow: about x, not the up axis.
+        verb(m, "PaintModeler.SetTool", "turn");
+        gesture(500, 300, 600, 300);
+        {
+            ETCS::Entity* shown = nullptr;
+            for (ETCS::Entity* n : pool_of(a.parts)) if (!hidden(n)) shown = n;
+            auto* c = shown ? static_cast<Causal_*>(shown->getInterfacePointer(ETCS::Buffer("Causal"))) : nullptr;
+            double qx = 0, qy = 1, qz = 1;
+            if (c) { std::lock_guard<std::recursive_mutex> lk(c->TreeMutex()); qx = c->Order4().qx.ToDouble(); qy = c->Order4().qy.ToDouble(); qz = c->Order4().qz.ToDouble(); }
+            check(c && near(std::fabs(qx), std::sin(0.3), 2e-3) && near(qy, 0, 1e-4) && near(qz, 0, 1e-4), "turn on the +x arrow turns about x");
+        }
+        verb(m, "PaintModeler.Undo");
+
+        // A tool that does not move takes no arrow: add puts a part there.
+        verb(m, "PaintModeler.SetTool", "paint");
+        drag(500, 300);
+        check(handles() == "-1 -1", "paint, add and delete draw no arrow under the pointer thick");
+        verb(m, "PaintModeler.SetTool", "select");
+        press(20, 20); release(20, 20);
+        check(hidden(arrow[0]) && hidden(arrow[5]), "nothing chosen, no arrows");
+        for (int k = 0; k < 6; ++k) verb(m, "PaintModeler.BindAxis", std::to_string(k) + ", 0");
+        check(verb(m, "PaintModeler.Report", "0") == home && status(m).undo == 1, "...and the part is as it was made");
+    }
+
     // Add, paint and delete take their colour from the page's brush.
     ETCS::Entity* brush = ETCS::spawn_entity("PaintProvider", "PaintTool", env, loader);
     verb(brush, "PaintTool.SetColor", "0.9, 0.2, 0.1, 1.0");

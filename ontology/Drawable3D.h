@@ -7,24 +7,17 @@
 #include "Drawable2D.h"
 #include <cstdint>
 
-// The camera is named here but not included: it is only ever a pointer in
-// this file, and Camera.h includes THIS header for Point3D. The dependency
-// runs one way -- a scene knows nothing about cameras except that one can
-// be handed to it, while a camera is defined in terms of the scene it
-// views. Including Camera.h here would make that a cycle and, worse, would
-// say the two families are mutually defined, which they are not.
+// Named, not included: Camera.h includes this header (for Point3D). A scene knows
+// only that a camera can be handed to it; a camera is defined by the scene.
 class Camera_;
 
 // ---------------------------------------------------------------
 // Point3D / Box3D / DepthSpan
 // ---------------------------------------------------------------
 //
-// Float, where the 2D geometry is integral, and the difference is
-// real rather than stylistic: 2D coordinates address PIXELS, which
-// are countable and land on a grid, while 3D coordinates address a
-// scene, which does not have one. The projection is exactly the step
-// where the second becomes the first, and it is the only place a
-// rounding rule belongs.
+// Float where 2D is integral: 2D addresses PIXELS, on a grid; 3D addresses a
+// scene, with none. Projection is where one becomes the other, and the only
+// place a rounding rule belongs.
 
 struct Point3D
 {
@@ -40,167 +33,107 @@ struct Box3D
     Point3D max;
 };
 
-// How far a thing is, from nearest to furthest, along a camera's view.
-//
-// Scene units, not clip space and not a normalised 0..1: normalised depth
-// is a fact about one renderer's projection matrix, and two nodes rendered
-// by two different modules could not be compared through it. A distance
-// can be compared by anything.
-//
-// Spelled `nearest`/`furthest` rather than near/far because near and far
-// are macros in the Windows headers, and a struct field that only compiles
-// on some platforms is not a portable ontology.
+// How far a thing is, nearest to furthest, along a camera's view. Scene units,
+// not clip space or 0..1 -- normalised depth belongs to one renderer's matrix,
+// and two modules' nodes couldn't be compared through it. `nearest`/`furthest`
+// because near and far are macros in the Windows headers.
 struct DepthSpan
 {
     float nearest;
     float furthest;
 };
 
+// WHERE A NODE IS DRAWN, when that is not where it is: a position (in the
+// parent's space, as the node's own) and a facing (a unit quaternion, w x y
+// z), or `on` false for the node's own. Floats: it is a picture's number,
+// never a state's -- nothing reads it back, nothing hashes it.
+struct ShownPose
+{
+    bool  on = false;
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+    float qw = 1.0f, qx = 0.0f, qy = 0.0f, qz = 0.0f;
+};
+
 // ---------------------------------------------------------------
 // Drawable3D
 // ---------------------------------------------------------------
 //
-// A Drawable whose addressable space is three-dimensional, and which
-// therefore cannot be drawn until something says from WHERE.
+// A Drawable whose space is three-dimensional, and so can't be drawn until
+// something says from WHERE. A Drawable2D knows where its pixels go; this
+// doesn't, and only a camera supplies it. So this family carries what the 2D
+// one has no use for: given a camera, produce its projected frame, and say
+// how deep this node is in it.
 //
-// That is the entire difference between the two leaves, and it is
-// why they are siblings rather than one being a special case of the
-// other. A Drawable2D already knows where its pixels go; a
-// Drawable3D does not, and no amount of information inside the node
-// itself supplies it. A camera does. So this family carries the
-// constraints the 2D one has no use for: given a camera, produce
-// that camera's projected frame, and answer how deep this node is
-// in it.
+// DEPTH LIVES HERE AND ONLY HERE: it is what a third dimension means. A 2D node
+// with a depth method would be a 3D node that lost a coordinate. Depth is also
+// what resolves occlusion between nodes with no tree relation, and it is the
+// ORDER of a 3D node: Orderable (SurfaceBase.h) needs one comparison, and here
+// it is depth against the camera being drawn -- Reorder after a camera moves is
+// the same cascade as after a hash moves.
 //
-// DEPTH LIVES HERE AND ONLY HERE. Depth is what having a third
-// dimension MEANS, so the family that has one owns it -- not the
-// plane it projects onto, which is flat by definition and would be
-// carrying an answer it cannot derive. That asymmetry is the whole
-// reason the leaves are separate, and it is load-bearing: a
-// Drawable2D with a depth method would be a 3D node that had lost
-// its third coordinate, and every compositor would then have to ask
-// which of the two answers it was looking at.
+// A DEPTH BUFFER IS ORDERABLE AT A FINER GRAIN. Painter's order in 2D
+// (collectDrawableChildren, by operator<) and a depth buffer are one relation at
+// two granularities. In 3D "in front of" isn't constant over a node -- two boxes
+// can each be in front at different pixels, three can cycle -- so the finest
+// grain where it is still a total order is the pixel. 2D orders by node because
+// a flat node's depth IS constant over it.
 //
-// It is also what resolves occlusion between parts of a scene with
-// no tree relationship at all. Two nodes in different subtrees have
-// nothing to compare in the graph; along a camera's view they have
-// exactly one thing to compare, and it is this.
+// THE PROJECTED FRAME IS THE CAMERA. Project fills the camera's own image plane,
+// an ordinary Drawable2D like a canvas or a window root; displaying it is what
+// showing a camera view is (Surface.h reserved the slot, Camera.h fills it).
+// Its identity is stable for free -- the plane is the camera -- so a frame edge,
+// a nested UI or a compositor can hold it. Two cameras, two planes: a split view
+// is two children, not a mode.
 //
-// AND IT IS WHAT ORDERS A 3D NODE. Orderable sits at the top of this
-// lineage (SurfaceBase.h) and requires exactly one comparison
-// operator, with the rest derived. For a scene node that operator is
-// depth against the camera being drawn -- so DepthFor is not an
-// accessory to the ordering, it is the quantity the ordering is on,
-// and Reorder after a camera moves is the same cascade as Reorder
-// after a hash moves along a seam.
-//
-// SO A DEPTH BUFFER IS ORDERABLE AT A FINER GRAIN, and saying so is
-// the useful part rather than the analogy. Painter's order in 2D
-// (Drawable_::collectDrawableChildren, sorted by the leaf's own
-// operator<) and a depth buffer in 3D are the SAME relation resolved
-// at two different granularities: one answer per node, or one answer
-// per sample. What forces the second is that in three dimensions the
-// relation is not constant over a node -- two boxes can each be in
-// front of the other at different pixels, and three can cycle -- so
-// no ordering OF THE NODES reproduces the picture, and the finest
-// grain at which "in front of" is still a total order is the pixel.
-//
-// That is the whole content of the distinction, and it cuts both
-// ways: 2D can order by node because a flat node's depth IS constant
-// over it, which is why the 2D leaf has no depth method and needs
-// none. A Drawable2D_ carrying one would be a 3D node that had lost
-// its third coordinate. Orderable claims one answer per node; where
-// that claim is true, it is enough, and where it is false, the buffer
-// below is what the claim becomes.
-//
-// THE PROJECTED FRAME IS THE CAMERA, LITERALLY. Project does not
-// return a picture of the scene; it fills the camera's own image
-// plane, which is an ordinary Drawable2D -- indistinguishable from
-// the editor's canvas or a window's root, differing only in what
-// fills it. Displaying it is what "showing a camera view" IS.
-// Surface.h reserved the slot for this before there was anything to
-// put in it; Camera.h is the thing that goes there.
-//
-// STABLE IDENTITY comes free from that. A frame edge presenting the
-// view holds its RID, a UI nests children inside it, a compositor
-// blits from it -- all of which break the instant the identity
-// moves. It cannot move: the plane is the camera, and the camera
-// outlives the frame. Two cameras are two planes, which is how a
-// split view is two children rather than a special mode.
-//
-// EXCLUSIVE WITH Drawable2D. Siblings under Drawable, so a type may
-// hold one or the other and never both -- enforced by the compiler,
-// see Drawable.h. A node that is both "in the scene" and "on the
-// screen" is not a node with two memberships, it is two nodes: the
-// 3D one and the camera its projection lands on.
+// EXCLUSIVE WITH Drawable2D (Drawable.h). A node both in the scene and on the
+// screen is two nodes: the 3D one and the camera it lands on.
 
 class Drawable3D_ : virtual public ETCS::Entity
 {
 public:
     virtual ~Drawable3D_() = default;
 
-    // Where this node sits in its PARENT's space, and how much of it it
-    // occupies. Same parent-relative rule as the 2D leaf, one dimension
-    // up: a scene node addresses the space its container gave it, never
-    // world space, so moving a container moves its subtree with nothing
-    // to recompute.
+    // Where this node sits in its PARENT's space and how much it occupies --
+    // never world space, so moving a container moves its subtree for free.
     virtual Box3D Bounds3D() = 0;
 
-    // Is this point, in THIS node's own local space, inside the node's
-    // actual volume? The 3D counterpart of ContainsLocal, and the same
-    // distinction: Bounds3D gives the enclosing box, this gives the
-    // occupancy.
+    // Is this point, in this node's own space, inside its actual volume?
+    // Bounds3D is the box; this is the occupancy (as ContainsLocal in 2D).
     virtual bool ContainsLocal3D(Point3D p) = 0;
 
-    // DEPTH, WHOLE-NODE -- how far this node's nearest and furthest points
-    // are along that camera's view, in scene units.
-    //
-    // Takes the camera rather than reading a stored one because depth is
-    // not a property of the node: the same node is near from one view and
-    // far from another, and a node holding "its depth" would be holding
-    // one camera's answer where every camera needs its own. This is the
-    // ordering key (see above), and it is a span rather than a point
-    // because two nodes can overlap in depth -- a fact a single number
-    // silently discards and every sorted-by-centre renderer then has to
-    // discover again as an artefact.
-    //
-    // A node entirely behind the camera reports a negative span, which is
-    // the same "not in this view" answer DepthAt gives per pixel.
+    // DEPTH, WHOLE-NODE: nearest and furthest along that camera's view, in scene
+    // units. Takes the camera because depth isn't the node's -- the same node is
+    // near from one view and far from another. The ordering key (above); a span,
+    // not a point, because two nodes can overlap in depth. Wholly behind the
+    // camera: a negative span, DepthAt's "not in this view".
     virtual DepthSpan DepthFor(Camera_* camera) = 0;
 
-    // DEPTH, PER PIXEL -- how far the surface visible at that pixel of the
-    // camera's frame is, in the same scene units.
-    //
-    // Coordinates are the camera's own, because the camera IS the frame;
-    // there is no third space to convert through. Negative means nothing
-    // of this node occupies that pixel -- unambiguous, since a distance
-    // along the view direction cannot be, whereas returning the far plane
-    // would be indistinguishable from something genuinely sitting on it.
-    //
-    // This is what lets a second view, a UI element, or another scene's
-    // projection be composited INTO the frame at the right depth rather
-    // than simply on top of it.
+    // DEPTH, PER PIXEL: how far the surface visible at that pixel is. Camera
+    // coordinates, since the camera IS the frame. Negative: nothing of this node
+    // there -- unambiguous, where the far plane would look like something on it.
+    // What lets another view, a UI or a second scene composite INTO the frame at
+    // the right depth instead of on top.
     virtual float DepthAt(Camera_* camera, int32_t x, int32_t y) = 0;
 
-    // THE PROJECTION CONSTRAINT -- the seam between the two leaves, and
-    // the only method in this family a 2D node has no analogue for.
-    //
-    // Fills that camera's image plane with this node's view and returns
-    // it as the Drawable2D it already is, so the caller draws, nests or
-    // presents it with no knowledge that a scene was ever involved. The
-    // return value saves a cross-family resolve; it is not a second
-    // plane, and there is never more than one.
-    //
-    // The frame's SIZE is the camera's size, read off the camera as a
-    // surface. That is the payoff of the camera being one: "what would
-    // this look like at this size" -- a shadow map, a reflection, a
-    // thumbnail -- is answered by making a camera that size, not by
-    // passing dimensions alongside a pose and hoping the two agree.
-    //
-    // nullptr when the camera cannot be realised (a degenerate frustum, a
-    // zero-sized frame). A caller that gets one has asked for a view that
-    // does not exist, which is a different thing from an empty one.
+    // THE PROJECTION -- the seam between the leaves, the one method 2D has no
+    // analogue for. Fills the camera's image plane and returns it as the
+    // Drawable2D it already is (saving the caller a resolve; never a second
+    // plane). The frame's size is the camera's, so "this view at that size" (a
+    // shadow map, a thumbnail) is a camera of that size. Null when the camera
+    // can't be realised (degenerate frustum, zero size): a view that doesn't
+    // exist, not an empty one.
     virtual Drawable2D_* Project(Camera_* camera) = 0;
+
+    // DRAWN HERE, NOT WHERE THE RECORD SAYS -- until told `on` false.
+    //
+    // A world stepped at a fixed rate is a pose a step, and a picture made
+    // more often than that shows some poses twice and jumps between others:
+    // fast motion judders. Whatever steps the world knows the poses either
+    // side of the moment a frame is for, and can blend them; the blend is
+    // where the node is DRAWN, so it goes here rather than into the node's
+    // rows, which are the record and stay exactly what the step made them.
+    // Its children are drawn about it, as about the node itself.
+    virtual void ShowAt(ShownPose pose) = 0;
 };
 
 #endif

@@ -408,6 +408,41 @@ are the first three entries below.
 
 ---
 
+## 15. A still subtree is skipped, and that is exact
+
+**Constraint.** A pass over an anchored subtree that changed no rows in it
+and made no crossing leaves it as it found it, and the next pass over the
+same spans does the same: an anchored body takes no field and steps nowhere
+(§12), a body at rest hands nothing across a contact (§8), and nothing shed
+at a span is nothing shed at it again (§6). So the subtree is not stepped
+again until something changes it, and the rows, the clocks and the hash are
+what the skipped passes would have left.
+
+**What ends it.** Three things, each seen by the subtree's root without
+walking it:
+
+- **a write** -- a verb, a membership, or a write to the rows said with
+  `RowsWritten` -- climbs the tree (`Entity::markStateChange`, §14's "how it
+  spreads") and moves the root's epoch;
+- **a crossing** from a sibling lands in the root's own rows;
+- **a span** other than the one it fell still at is a different pass.
+
+Its members are reached only through it, so a member nothing climbed from is
+still. A container is still when it is and every member is (`StillUnder`).
+A write to the rows that is not said is the one way to change a still
+subtree unseen, which is why every writer outside an interaction says it.
+
+**What it buys.** A world of anchored scenery held in containers costs one
+check a container a pass, and what is drawn of it is kept as long as it is
+still (RenderProvider's Scene3D, a still container's picture).
+
+**Check.** `CausalTester` §11 (a room of anchored bodies beside a mover,
+stepped with skipping on and off: the same hash after every tick; the room
+skipped while still, woken by the mover's warmth and by a teleport and a
+push into it, each the tick it is made).
+
+---
+
 ## Not promised (yet)
 
 - **The smear, past one cut a pair.** Two solids meet on their smears (§13),

@@ -1,0 +1,13 @@
+#!/usr/bin/env etcs
+#IMPORT ACE_ROOT/modules
+
+# THE PAINT PAGE, IN A WINDOW.
+#
+#     ./bin/etcs scripts/paint.etcs
+#
+# Runs the boot the browser page runs (PaintProvider/scripts/www/boot_paint_panels.etcs)
+# on the OS runtime: one window, the same scene and panes. There is no copy of
+# it here. The boot holds this script until the window closes, then the prompt
+# comes back. paint_editor.etcs beside this is a different, smaller editor.
+
+run PaintProvider/scripts/www/boot_paint_panels.etcs

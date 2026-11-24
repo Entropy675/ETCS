@@ -68,16 +68,26 @@ public:
     Body()  { ++s_alive; }
     ~Body() { --s_alive; }
 
+    uint64_t steps = 0;   // section 11: the passes that ran
     void AdvanceConcrete(Fixed dt) override
     {
+        ++steps;
         Rows().Dissipate((-(damping * dt)).Exp());
         Rows().Advance(dt, mass);
     }
     Fixed MassConcrete() const override { return mass; }
     bool  DeleteConcrete() override { return true; }
 
-    void Place(double x, double y, double z) { std::lock_guard<std::recursive_mutex> lk(TreeMutex()); Rows().PlaceAt(Fixed::From(x), Fixed::From(y), Fixed::From(z)); }
-    void Reach(double r) { std::lock_guard<std::recursive_mutex> lk(TreeMutex()); Rows().radius = Fixed::From(r); }
+    void Place(double x, double y, double z)
+    {
+        { std::lock_guard<std::recursive_mutex> lk(TreeMutex()); Rows().PlaceAt(Fixed::From(x), Fixed::From(y), Fixed::From(z)); }
+        RowsWritten();
+    }
+    void Reach(double r)
+    {
+        { std::lock_guard<std::recursive_mutex> lk(TreeMutex()); Rows().radius = Fixed::From(r); }
+        RowsWritten();
+    }
 };
 
 // The whole tree's energy, ordered energy, and whether every row holds.
@@ -521,6 +531,78 @@ int main()
         check(Body::s_alive == before2 - 2, "deleting where it went takes it with it");
         arena.deleteEntity(a.world, true);
         arena.deleteEntity(b.world, true);
+    }
+
+    {
+        std::cout << "\n-- 11. a still subtree is skipped, and that is exact --\n";
+        // A room of anchored bodies, some touching, beside a mover aimed at the
+        // room's own reach; a push and a teleport into the room on the way.
+        struct Still { Body* world; Body* room; Body* mover; std::vector<Body*> in; };
+        auto still = [&]() -> Still {
+            Still s;
+            s.world = arena.allocate<Body>();
+            s.world->SetEmissivity(Fixed::From(0.2));
+            s.room = s.world->addTag<Body>();
+            s.room->Place(0, 0, 0); s.room->Reach(2.0); s.room->SetAnchored(true);
+            s.room->SetEmissivity(Fixed::From(0.5));
+            for (int i = 0; i < 24; ++i)
+            {
+                Body* b = s.room->addTag<Body>();
+                b->Place(0.3 * i, 0.1 * (i % 3), 0); b->Reach(0.25); b->SetAnchored(true);
+                b->SetEmissivity(Fixed::From(0.4));
+                s.in.push_back(b);
+            }
+            s.mover = s.world->addTag<Body>();
+            s.mover->Place(-12, 0, 0); s.mover->Reach(0.5); s.mover->damping = Fixed::Zero();
+            s.mover->Impulse(Fixed::One(), Fixed::Zero(), Fixed::Zero(), Fixed::From(2.0));
+            // ...and in the world itself, a mover and a cluster of thirty anchored
+            // bodies, all touching, ordered after it (the order is by flags: a
+            // stated light speed puts them there, and on a member that holds
+            // nothing it changes nothing else). What the mover hands one is
+            // handed on to the next within the same pass, to bodies that were
+            // still: the broadphase's walk, past sixteen members.
+            Body* up = s.world->addTag<Body>();
+            up->Place(30, -6, 0); up->Reach(0.5); up->damping = Fixed::Zero();
+            up->Impulse(Fixed::Zero(), Fixed::One(), Fixed::Zero(), Fixed::From(2.0));
+            for (int k = 0; k < 30; ++k)
+            {
+                Body* b = s.world->addTag<Body>();
+                b->Place(30 + 0.1 * (k % 5 - 2), 0.1 * (k / 5), 0.1 * (k % 3 - 1)); b->Reach(0.3); b->SetAnchored(true);
+                b->SetLightSpeed(Fixed::FromInt(1000));
+            }
+            return s;
+        };
+        struct Ran { uint64_t room = 0, all = 0; bool pushed = false, placed = false; };
+        auto run = [&](bool on, std::vector<uint64_t>& hashes, Ran& ran) {
+            CausalBase<Body>::SleepOn() = on;
+            Still s = still();
+            for (int i = 0; i < 600; ++i)
+            {
+                if (i == 250) s.in[5]->Place(0.3 * 5, 0.5, 0);                                                   // a teleport, said
+                if (i == 400) s.in[9]->Impulse(Fixed::Zero(), Fixed::One(), Fixed::Zero(), Fixed::From(0.5));   // a push, said
+                const uint64_t p5 = s.in[5]->steps, p9 = s.in[9]->steps;
+                s.world->Interact(dt);
+                if (i == 250) ran.placed = s.in[5]->steps == p5 + 1;
+                if (i == 400) ran.pushed = s.in[9]->steps == p9 + 1;
+                hashes.push_back(s.world->CausalHash());
+            }
+            ran.room = s.room->steps;
+            for (Body* b : s.in) ran.all += b->steps;
+            arena.deleteEntity(s.world, true);
+            CausalBase<Body>::SleepOn() = true;
+        };
+        std::vector<uint64_t> on_h, off_h;
+        Ran on, off;
+        run(true, on_h, on);
+        run(false, off_h, off);
+        size_t first_diff = on_h.size();
+        for (size_t i = 0; i < on_h.size(); ++i) if (on_h[i] != off_h[i]) { first_diff = i; break; }
+        check(first_diff == on_h.size(), "the same tree stepped with and without skipping: the same hash after every one of 600 ticks");
+        check(off.room == 600 && on.room < 400 && on.all * 10 < off.all, "...and the room was skipped while still, its bodies with it: the mover warmed it, and it ran until it had shed that");
+        check(on.placed && on.pushed, "a teleport and a push into a still body are each seen the tick they are made (RowsWritten)");
+        std::printf("        (the room's passes: %llu of 600; its bodies': %llu of %llu)\n", static_cast<unsigned long long>(on.room),
+                    static_cast<unsigned long long>(on.all), static_cast<unsigned long long>(off.all));
+        if (first_diff != on_h.size()) std::printf("        (first difference at tick %zu)\n", first_diff);
     }
 
     std::printf("\n%s (%d failure%s)\n", g_fail ? "FAILED" : "PASSED", g_fail, g_fail == 1 ? "" : "s");
