@@ -149,6 +149,13 @@ public:
     // motion the container's own rows do not show. Read without the lock.
     virtual bool Moving() const = 0;
 
+    // A write to the rows from outside an interaction -- a teleport, a pose, a
+    // push -- said once it is made: the change climbs the tree as every other
+    // state change does (Entity::markStateChange). What keeps an answer until
+    // its subtree changes reads that climb, so a write not said is a write it
+    // does not see (CausalBase, A STILL SUBTREE).
+    virtual void RowsWritten() = 0;
+
     // ── the environment ─────────────────────────────────────────────────
     //
     // EVERY CAUSAL THING IS AN ENVIRONMENT for what fits in it, and what holds
@@ -215,6 +222,10 @@ public:
     // an observer measures the two with different ceilings), the members,
     // the contacts.
     virtual void InteractUnder(Fixed commit_dt, Fixed step_dt) = 0;
+    // Did this entity's last interaction leave it and everything under it as
+    // it found them, with nothing written into it or crossed into its rows
+    // since? From under the lock: what a container's own stillness is made of.
+    virtual bool StillUnder() = 0;
     // A crossing arriving from under the lock.
     virtual void AbsorbUnder(const OrderVector& crossing) = 0;
     // The contact crossing this entity hands a neighbour along n, from under

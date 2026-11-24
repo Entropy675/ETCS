@@ -4,6 +4,7 @@
 #include "RelationalBase.h"
 #include <algorithm>
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <utility>
@@ -111,6 +112,10 @@ ETCS_SUPERTYPE_BASE(Causal), public RelationalBase<Derived>
     // leaf says otherwise.
     virtual Fixed MassConcrete() const { return Fixed::One(); }
 
+    // Does this leaf's step leave a body at rest where it is? A leaf whose
+    // step pushes on its own (a held key) says no while it does.
+    virtual bool StillConcrete() const { return true; }
+
     // What a solid of this leaf is shaped as until SetShape says (a box for a
     // leaf with extents), and its half extents. The base's default is the
     // reach: a sphere, or the cube about it.
@@ -151,7 +156,16 @@ ETCS_SUPERTYPE_BASE(Causal), public RelationalBase<Derived>
 
     void InteractUnder(Fixed commit_dt, Fixed step_dt) override final
     {
+        if (m_still && SleepOn() && commit_dt == m_still_commit && step_dt == m_still_step && StillUnder()
+            && static_cast<Derived*>(this)->StillConcrete())
+        {
+            Slept().fetch_add(1, ::std::memory_order_relaxed);
+            return;
+        }
+        m_still = false;
+        const uint32_t epoch0 = this->hashEpoch();
         refreshIdentityLocked();
+        const uint64_t rows0 = m_ov.Hash(), ticks0 = m_ticks;
         OrderVector e;
         if (commitLocked(commit_dt, e)) crossTo(container(), e);
         // Pegged where the last interaction left it: the step's smear starts here.
@@ -165,7 +179,12 @@ ETCS_SUPERTYPE_BASE(Causal), public RelationalBase<Derived>
         }
         const auto& now = kidsLocked();
         bool moving = m_ov.KineticEnergy().IsPositive();
-        if (now->empty()) { m_moving.store(moving, ::std::memory_order_relaxed); return; }   // a leaf: nothing below to step, touch or fit
+        if (now->empty())   // a leaf: nothing below to step, touch or fit
+        {
+            m_moving.store(moving, ::std::memory_order_relaxed);
+            settleLocked(commit_dt, step_dt, epoch0, rows0, ticks0, nullptr);
+            return;
+        }
         // The tree lock is held: the list is not copied, only kept -- a move
         // below changes the membership, and the list in hand must outlive it.
         const auto held = now;
@@ -177,7 +196,39 @@ ETCS_SUPERTYPE_BASE(Causal), public RelationalBase<Derived>
         // member fit moved elsewhere is its new container's to report.
         for (Causal_* c : kids) moving = moving || c->Order4().KineticEnergy().IsPositive() || c->Moving();
         m_moving.store(moving, ::std::memory_order_relaxed);
+        settleLocked(commit_dt, step_dt, epoch0, rows0, ticks0, &kids);
     }
+
+    /*
+     * A STILL SUBTREE. A pass over an anchored subtree that changed no rows in
+     * it and made no crossing -- nothing shed, nothing stepped, nothing met --
+     * leaves it exactly as it found it, and the next pass over the same spans
+     * would do the same: an anchored body takes no field and steps nowhere, a
+     * body at rest hands nothing across a contact (OrderVector::CrossToward),
+     * and nothing shed at a span is nothing shed at it again. So the subtree
+     * is skipped, and that is exact: the rows, the clocks and the hash are
+     * what the passes it skipped would have left.
+     *
+     * Only three things end it, and each is seen. A write into it climbs the
+     * tree (Entity::markStateChange: a verb, a membership, RowsWritten) and
+     * moves its epoch. A crossing from a sibling lands in its own rows. A span
+     * other than the one it fell still at is a different pass. Its members
+     * are reached only through it, so a member nothing climbed from is still.
+     * The test is per subtree and composes: a container is still when it is
+     * and every member is (StillUnder).
+     */
+    bool StillUnder() override final
+    {
+        return m_still && this->hashEpoch() == m_still_epoch && m_ov.Hash() == m_still_rows;
+    }
+    void RowsWritten() override final
+    {
+        Derived* self = static_cast<Derived*>(this);
+        ETCS::Entity::markStateChange(self, self->getRID());
+    }
+    // Off steps a tree whole, for a test to compare against; per leaf type.
+    static bool& SleepOn() { static bool on = true; return on; }
+    static ::std::atomic<uint64_t>& Slept() { static ::std::atomic<uint64_t> n{ 0 }; return n; }   // passes skipped
 
     bool Moving() const override final { return m_moving.load(::std::memory_order_relaxed); }
 
@@ -214,14 +265,14 @@ ETCS_SUPERTYPE_BASE(Causal), public RelationalBase<Derived>
 
     void Impulse(Fixed dx, Fixed dy, Fixed dz, Fixed joules) override final
     {
-        ::std::lock_guard<::std::recursive_mutex> lk(TreeMutex());
-        m_ov.Impulse(dx, dy, dz, joules);
+        { ::std::lock_guard<::std::recursive_mutex> lk(TreeMutex()); m_ov.Impulse(dx, dy, dz, joules); }
+        RowsWritten();
     }
 
     void Absorb(const OrderVector& crossing) override final
     {
-        ::std::lock_guard<::std::recursive_mutex> lk(TreeMutex());
-        m_ov.Absorb(crossing);
+        { ::std::lock_guard<::std::recursive_mutex> lk(TreeMutex()); m_ov.Absorb(crossing); }
+        RowsWritten();
     }
     void AbsorbUnder(const OrderVector& crossing) override final { m_ov.Absorb(crossing); }
 
@@ -634,6 +685,19 @@ private:
         m_id_pepoch = pepoch;
     }
 
+    // The end of a pass: still if it changed nothing here and left every
+    // member still (A STILL SUBTREE).
+    void settleLocked(Fixed commit_dt, Fixed step_dt, uint32_t epoch0, uint64_t rows0, uint64_t ticks0,
+                      const ::std::vector<Causal_*>* kids)
+    {
+        if (!SleepOn() || !m_anchored || m_ticks != ticks0 || this->hashEpoch() != epoch0 || m_ov.Hash() != rows0) return;
+        if (!static_cast<Derived*>(this)->StillConcrete()) return;
+        if (kids) for (Causal_* c : *kids) if (!c->StillUnder()) return;
+        m_still = true;
+        m_still_epoch = epoch0; m_still_rows = rows0;
+        m_still_commit = commit_dt; m_still_step = step_dt;
+    }
+
     // The emission owed for dt, taken out of the rows. Under the tree lock.
     bool commitLocked(Fixed dt, OrderVector& e)
     {
@@ -709,6 +773,20 @@ private:
             m_sweeps[i] = Fixed::Length(r.x - px, r.y - py, r.z - pz);
             swept = true;
         }
+        // Two still members are a pair that does nothing while both are at
+        // rest: neither hands the other anything, and two anchored solids hold
+        // (A STILL SUBTREE). So such a pair is not looked for -- until one of
+        // them is handed something earlier in the pass and so may hand it on
+        // to the next in the order (1: still, 2: still and since handed).
+        m_quiet.assign(n, 0);
+        bool quiet = false;
+        if (!plane) for (size_t i = 0; i < n; ++i) if (kids[i]->StillUnder()) { m_quiet[i] = 1; quiet = true; }
+        auto live = [&](size_t i) { return m_quiet[i] != 1; };
+        auto handed = [&](size_t i) {
+            if (m_quiet[i] != 1 || !kids[i]->Order4().KineticEnergy().IsPositive()) return false;
+            m_quiet[i] = 2;
+            return true;
+        };
         m_solid_pairs.clear();
         auto pair = [&](size_t i, size_t j) {
             if (contactLocked(kids[i], kids[j], any ? &m_solids[i] : nullptr, any ? &m_solids[j] : nullptr, span,
@@ -718,13 +796,49 @@ private:
         if (n < BroadphaseFrom())
         {
             for (size_t i = 0; i + 1 < n; ++i)
-                for (size_t j = i + 1; j < n; ++j) pair(i, j);
+                for (size_t j = i + 1; j < n; ++j)
+                    if (live(i) || live(j)) { pair(i, j); handed(i); handed(j); }
         }
         else
         {
             if (!m_broad) m_broad.reset(new Broadphase);
-            const auto& found = m_broad->pairs(kids, swept ? &m_sweeps : nullptr);
-            if (!plane) for (const auto& [i, j] : found) pair(i, j);
+            const auto& found = m_broad->pairs(kids, swept ? &m_sweeps : nullptr, quiet ? &m_quiet : nullptr);
+            if (quiet)
+            {
+                // The pairs with a member not still, in order, merged with the
+                // pairs a still member handed something brings in after it.
+                using Pair = ::std::pair<uint32_t, uint32_t>;
+                ::std::vector<Pair> later;   // a min-heap
+                auto bring = [&](size_t x, const Pair& at) {
+                    for (const auto& h : m_broad->within(x, m_broad->reachOf(x)))
+                    {
+                        const size_t q = h.first;
+                        if (q == x || m_quiet[q] != 1) continue;
+                        const Pair p(static_cast<uint32_t>(x < q ? x : q), static_cast<uint32_t>(x < q ? q : x));
+                        if (at < p) { later.push_back(p); ::std::push_heap(later.begin(), later.end(), ::std::greater<Pair>()); }
+                    }
+                };
+                size_t f = 0;
+                bool any_done = false;
+                Pair done(0, 0);
+                while (f < found.size() || !later.empty())
+                {
+                    Pair p;
+                    if (!later.empty() && (f >= found.size() || later.front() < found[f]))
+                    {
+                        ::std::pop_heap(later.begin(), later.end(), ::std::greater<Pair>());
+                        p = later.back(); later.pop_back();
+                    }
+                    else p = found[f++];
+                    if (any_done && p == done) continue;
+                    any_done = true; done = p;
+                    if (!live(p.first) && !live(p.second)) continue;
+                    pair(p.first, p.second);
+                    if (handed(p.first))  bring(p.first, p);
+                    if (handed(p.second)) bring(p.second, p);
+                }
+            }
+            else if (!plane) for (const auto& [i, j] : found) pair(i, j);
             else
             {
                 // A half-space has no reach to find it by: it meets every
@@ -1146,6 +1260,7 @@ private:
 
         Cloud cloud;
         ::std::vector<double> reach;
+        double longest = 0.0;   // the longest reach of the last pairs()
         ::std::vector<nanoflann::ResultItem<uint32_t, double>> hits;
         ::std::vector<::std::pair<uint32_t, uint32_t>> out;
         Tree tree{ 3, cloud, nanoflann::KDTreeSingleIndexAdaptorParams(16, nanoflann::KDTreeSingleIndexAdaptorFlags::SkipInitialBuildIndex) };
@@ -1153,7 +1268,12 @@ private:
         // `sweeps`: how far the step moved each member (contactsLocked), when
         // any solid moved -- its reach is as much longer, twice over, as the
         // swept gate allows it.
-        const ::std::vector<::std::pair<uint32_t, uint32_t>>& pairs(const ::std::vector<Causal_*>& kids, const ::std::vector<Fixed>* sweeps = nullptr)
+        // `quiet`: the members that are still; a pair of two is not looked for,
+        // so the tree is asked only from the others, each as far as its reach
+        // and the longest one together could meet -- every pair with one of
+        // them is then found from it, once.
+        const ::std::vector<::std::pair<uint32_t, uint32_t>>& pairs(const ::std::vector<Causal_*>& kids, const ::std::vector<Fixed>* sweeps = nullptr,
+                                                                    const ::std::vector<char>* quiet = nullptr)
         {
             const size_t n = kids.size();
             cloud.xyz.resize(n * 3);
@@ -1166,6 +1286,26 @@ private:
             }
             tree.buildIndex();
             out.clear();
+            longest = 0.0;
+            for (double r : reach) longest = ::std::max(longest, r);
+            if (quiet)
+            {
+                for (size_t i = 0; i < n; ++i)
+                {
+                    if ((*quiet)[i]) continue;
+                    const double r = (reach[i] + longest) * (1.0 + 1e-9) + 1e-3;
+                    hits.clear();
+                    (void)tree.radiusSearch(&cloud.xyz[i * 3], r * r, hits, nanoflann::SearchParameters(0, false));
+                    for (const auto& h : hits)
+                    {
+                        const size_t j = h.first;
+                        if (j == i || (!(*quiet)[j] && j < i)) continue;   // two that are not still: from the lower index
+                        out.emplace_back(static_cast<uint32_t>(i < j ? i : j), static_cast<uint32_t>(i < j ? j : i));
+                    }
+                }
+                ::std::sort(out.begin(), out.end());
+                return out;
+            }
             for (size_t i = 0; i < n; ++i)
             {
                 const double r = 2.0 * reach[i] * (1.0 + 1e-9) + 1e-3;
@@ -1182,6 +1322,10 @@ private:
             ::std::sort(out.begin(), out.end());
             return out;
         }
+
+        // How far member i and the longest reach together could meet, as a
+        // radius for within(): every member i can touch is inside it.
+        Fixed reachOf(size_t i) const { return Fixed::From(reach[i] + longest); }
 
         // The members whose position is within `r` of member b's, from the tree
         // the last pairs() built: fitness's candidates, the exact test after.
@@ -1259,7 +1403,13 @@ private:
     bool        m_resting = false;
     Fixed       m_snx, m_sny, m_snz;
     ::std::atomic<bool> m_moving{ false };   // Moving(): written under the lock, read by observers
+    // A STILL SUBTREE: still since the pass at these spans, at this epoch and rows.
+    bool        m_still = false;
+    uint32_t    m_still_epoch = 0;
+    uint64_t    m_still_rows = 0;
+    Fixed       m_still_commit, m_still_step;
     ::std::vector<CausalSolid> m_solids;                      // contactsLocked's per-pass copy
+    ::std::vector<char>        m_quiet;                       // and which members are still
     ::std::vector<Fixed>       m_sweeps;                      // and how far each solid's step moved it
     ::std::vector<::std::pair<uint32_t, uint32_t>> m_solid_pairs;
     uint64_t    m_ticks = 0;
