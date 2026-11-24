@@ -14,99 +14,78 @@
  * ── CAUSAL ───────────────────────────────────────────────────────────────
  *
  * A THING THAT HAS AN ORDER VECTOR: a place, an energy with a direction, a
- * reach, a facing -- and therefore a history, because every interaction it
- * has is a change to those rows and every change is one the rows can be
- * hashed over (ontology/OrderVector.h). This is the physics as a trait, and
- * it is claimed the way Animated or Drawable are: an entity says it is one,
- * and nothing else about it has to be true.
+ * reach, a facing -- and so a history, since every interaction changes rows the
+ * hash runs over (ontology/OrderVector.h). The physics as a trait, claimed like
+ * Animated or Drawable.
  *
- * NOT A DRAWING RELATION, and that is the point of it being its own family.
- * The rows are the constraint; a picture of them is a PROJECTION -- a camera
- * on a scene, a mesh on a device -- and a projection is something a runtime
- * can decline to make. A world of Causal entities with no camera on it runs
- * every interaction it would have run on screen, at whatever rate the machine
- * manages, and lands on the same rows. What is drawn is derived from what is
- * here, never the other way round.
+ * NOT A DRAWING RELATION. The rows are the constraint; a picture is a
+ * PROJECTION (a camera on a scene, a mesh on a device) a runtime may decline to
+ * make. With no camera, a world runs every interaction it would on screen and
+ * lands on the same rows. What is drawn derives from what is here.
  *
  * ONE RELATION: ADJACENCY, AND ONE EVENT: A CROSSING. Two Causal entities are
- * adjacent when a crossing can pass between them, and a crossing is an
- * OrderVector -- a quantity of energy, at a place, from an identity, with or
- * without a direction -- that leaves one and lands in the other, exactly.
- * There are two ways to be adjacent and nothing else:
+ * adjacent when a crossing can pass between them; a crossing is an OrderVector
+ * (energy, at a place, from an identity, with or without a direction) that
+ * leaves one and lands in the other, exactly. Two ways to be adjacent:
  *
- *   standing    a member and its container, which is its Causal parent in
- *               the entity tree. What a member sheds as entropy crosses up
- *               into its container's rows, always. Containment is this
- *               adjacency and no other fact: a container is an entity whose
- *               adjacency set includes its members, and it emits upward in
- *               its turn exactly as they do. At the root there is no parent;
- *               that is the open boundary, and what crosses it is counted
- *               out (CausalBase::EmittedOut) rather than lost.
+ *   standing    a member and its container (its Causal parent). What a member
+ *               sheds as entropy crosses up into its container's rows, always;
+ *               containment is this adjacency and nothing more, and a container
+ *               emits upward in turn. The root's open boundary counts what
+ *               crosses it out (CausalBase::EmittedOut).
  *
  *   discovered  two members of one container whose reaches touch
- *               (OrderVector::GapTo <= 0): a contact. Each hands the other
- *               the part of its ordered energy headed along the line between
- *               them (OrderVector::CrossToward), and absorbs what the other
- *               handed it. Decided only by the rows, every interaction, in
- *               the container's frame -- a member's rows are in its
- *               container's frame, which is what makes siblings comparable.
+ *               (OrderVector::GapTo <= 0): a contact. Each hands the other the
+ *               part of its ordered energy headed along the line between them
+ *               (OrderVector::CrossToward) and absorbs what it is handed. Decided
+ *               by the rows alone, in the container's frame -- which is what
+ *               makes siblings comparable.
  *
- * A crossing is the one event between two identities: it carries its own
- * uncertainty (OrderVector::derive_uncertainty), the emitter's clock ticks
- * for it, and a draw nested in it reads it.
+ * A crossing carries its own uncertainty (OrderVector::derive_uncertainty); the
+ * emitter's clock ticks for it, and a draw nested in it reads it.
  *
  * THE FAMILY SAYS FIVE THINGS.
  *
- *   Order4    the record, read: where and how this thing is. The one
- *             authoritative statement; a reader holding a copy is wrong, and
- *             a reader is of ONE state only under TreeMutex() -- outside it
- *             a read may straddle a step.
- *   Interact  one causal interaction over a stated span: settle the entropy
- *             owed for the interval that just ended, then advance the motion
- *             for the one that starts, then the members, then the contacts
- *             among them. In that order (CausalBase says why), on this
- *             entity and everything Causal under it.
+ *   Order4    the record: where and how this thing is. The one authoritative
+ *             statement; a copy is wrong, and a read is of ONE state only under
+ *             TreeMutex() -- outside it, it may straddle a step.
+ *   Interact  one interaction over a stated span: settle the entropy owed for
+ *             the interval just ended, advance the motion for the next, then the
+ *             members, then their contacts -- in that order (CausalBase says
+ *             why), here and everything Causal below.
  *   Impulse   work done on it from outside -- the only way |K| rises.
  *   Absorb    a crossing that landed here from an adjacent entity. Heat as
  *             heat, an ordered part as a push.
  *   CausalHash / CausalTicks   the history: the rows of this tree as one
  *             number, and this entity's own clock.
  *
- * WHO CALLS Interact IS NOT STATED HERE, on purpose, and the two callers
- * this tree has are both right: a camera projecting a scene calls it with
- * the intervals since it last looked (being observed is an interaction), and
- * a driver stepping a world calls it with a fixed span, a thousand times,
- * with no clock read. The arithmetic is the same; only what the spans ARE
- * differs. What is KEPT of either history is the rows: they are on the tag
- * surface as the value behind "Causal" (CausalBase, Entity::bindValue), so
- * a store keeps them and a resume puts them back -- the family has no
- * record of its own.
+ * WHO CALLS Interact IS NOT STATED HERE, on purpose. A camera calls it with
+ * the intervals since it last looked (being observed is an interaction); a
+ * driver calls it with a fixed span a thousand times, reading no clock. Same
+ * arithmetic, different spans. What is KEPT is the rows: the value behind
+ * "Causal" on the tag surface (Entity::bindValue), so a store keeps them and a
+ * resume puts them back -- the family keeps no record of its own.
  *
- * THE PROTOCOL BELOW THE LINE is the base's, not the family's vocabulary: how
- * one history is kept (one lock per tree, taken at every entry) and how a
- * container that already holds it reaches its members and their crossings.
- * It is on the interface because the hop crosses providers through this
- * vtable; nothing outside CausalBase calls it. What it upholds -- every
- * write to any rows in a tree is in one total order -- is the invariant;
- * the mutex is one way to have it.
+ * THE PROTOCOL BELOW THE LINE is the base's, not the family's vocabulary: one
+ * lock per tree taken at every entry, and how a container holding it reaches
+ * its members and their crossings. On the interface only because the hop
+ * crosses providers through this vtable. The invariant is that every write to
+ * any rows in a tree is in one total order; the mutex is one way to have it.
  */
 /*
- * A SOLID: what a body is when it is not only a reach. Off by default -- a
- * body is a sphere set that exchanges energy along the line between centres
- * and passes through what it touches (the contact above). A body made solid
- * (CausalBase::SetSolid) meets another solid by its shape instead: pushed out
- * of it, the motion along the contact normal bounced (restitution), the motion
- * across it rubbed (friction); an anchored one never moves. The shape is a
- * set of planes (ontology/Plane.h), and a solid meets only solids: what is
- * not solid passes through it. The shape: a sphere (the reach), a box (six planes
- * about the centre, row 3 facing it), or a half-space (one plane through the
- * centre, facing row 3's up; solid below).
+ * A SOLID: a body that is more than a reach. Off by default -- a body is a set
+ * of spheres that exchanges energy along the line between centres and passes
+ * through what it touches. A solid (CausalBase::SetSolid) meets another solid
+ * by shape: pushed out, normal motion bounced (restitution), tangential motion
+ * rubbed (friction); an anchored one never moves. Shapes are plane sets
+ * (Plane.h): a sphere (the reach), a box (six planes about the centre, row 3
+ * facing it), or a half-space (one plane through the centre facing row 3's up;
+ * solid below). Only solids meet solids.
  */
 struct CausalStream;   // a tree's own order, below the family
 
-// The speed of light where no space states one: 2^16 units a second, far
-// enough off that a scene only meets it by approaching it on purpose. A power
-// of two: a multiple of it is a shift.
+// The speed of light where no space states one: 2^16 units a second, met only
+// on purpose. A power of two, so a multiple of it is a shift.
 inline Fixed DefaultLightSpeed() { return Fixed::FromInt(int64_t(1) << 16); }
 
 struct CausalSolid
@@ -134,19 +113,16 @@ public:
     // A crossing from an adjacent entity, arriving.
     virtual void Absorb(const OrderVector& crossing) = 0;
 
-    // This entity's own clock: crossings committed (OrderVector.h, "emission
-    // is the clock"). Not a count of visits.
+    // This entity's own clock: crossings committed ("emission is the clock"), not visits.
     virtual uint64_t CausalTicks() const = 0;
 
-    // The rows of this entity and everything Causal under it, as one number:
-    // what two runtimes compare. The members compose in canonical order --
-    // by what they are, then creation order between twins -- which is the
-    // order the step walks them (CausalBase::kidsLocked).
+    // The rows of this entity and everything Causal under it, as one number --
+    // what two runtimes compare. Members compose in canonical order (by kind,
+    // then creation order between twins), the order the step walks them.
     virtual uint64_t CausalHash() = 0;
 
-    // Was anything in this subtree moving when the last interaction ended?
-    // For an observer deciding whether to look again: a member in flight is
-    // motion the container's own rows do not show. Read without the lock.
+    // Was anything in this subtree moving when the last interaction ended? A
+    // member in flight is motion the container's rows don't show. Lock-free.
     virtual bool Moving() const = 0;
 
     // A write to the rows from outside an interaction -- a teleport, a pose, a
@@ -158,47 +134,37 @@ public:
 
     // ── the environment ─────────────────────────────────────────────────
     //
-    // EVERY CAUSAL THING IS AN ENVIRONMENT for what fits in it, and what holds
-    // a thing is decided by fit, not by who made it: the universe holds the
-    // earth, which holds the person, which holds the pen in their pocket. A
-    // member is in its container while its reach lies inside the space the
-    // container provides (Space; zero, solid, holds nothing); after the
-    // contacts each interaction, a member that no longer fits moves to its
-    // container's container, and one that fits inside a sibling's space
-    // moves into the smallest such sibling (CausalBase::fitLocked); an
-    // anchored member is held where it was put, and fit moves it nowhere. A
-    // move is the entity changing parents (Entity::moveTo), its position
-    // restated in the new frame -- frames are translations: a member's
-    // position is relative to its container's.
+    // EVERY CAUSAL THING IS AN ENVIRONMENT for what fits in it, and fit -- not
+    // who made it -- decides what holds a thing (universe, earth, person, pen in
+    // a pocket). A member stays while its reach lies inside its container's Space
+    // (zero: solid, holds nothing). After the contacts each interaction, a member
+    // that no longer fits moves up a level, and one that fits inside a sibling's
+    // space moves into the smallest such sibling (CausalBase::fitLocked); an
+    // anchored member stays put. A move is a reparent (Entity::moveTo) with the
+    // position restated: frames are translations, positions relative.
 
-    // The environment this one is in: its container, or null at the open
-    // boundary.
+    // The container, or null at the open boundary.
     virtual Causal_* Environment() = 0;
-    // The origin of the frame this entity's rows are stated in, in the
-    // topmost environment's frame: every container's position, summed. A
-    // member's place in the world is Basis + its own position.
+    // The origin of this entity's frame in the topmost frame: every container's
+    // position, summed. A member's world place is Basis + its own position.
     virtual void Basis(Fixed& x, Fixed& y, Fixed& z) = 0;
     // The interior this provides, as a radius about its own position.
     virtual Fixed Space() const = 0;
 
     // ── the space's parameters ──────────────────────────────────────────
     //
-    // A CONTAINER STATES WHAT ITS SPACE IS LIKE, and what is inside is subject
-    // to it: the radius above is one parameter (what fits), the field is
-    // another (what everything inside falls along). They are cumulative down
-    // the tree by DEFAULT -- a container that states no field passes on the
-    // one it is in, so the earth's gravity reaches the pen in the pocket --
-    // and only by default: a container may state its own, zero included,
-    // whatever its parent's is, and may provide more room than it takes up in
-    // its parent. A pocket dimension is a parameter, not a contradiction.
+    // A CONTAINER STATES WHAT ITS SPACE IS LIKE: the radius (what fits), the
+    // field (what everything inside falls along). Cumulative down the tree by
+    // DEFAULT -- unstated, the field above passes on, so the earth's gravity
+    // reaches the pen -- but a container may state its own, zero included, and
+    // provide more room than it takes up. A pocket dimension is a parameter.
     //
-    // The field this one's members feel, and the container that states it
-    // (null: no field anywhere above). The work it does is counted there.
+    // The field this one's members feel, and the container stating it (null:
+    // none above). Its work is counted there.
     virtual Causal_* FieldUnder(Fixed& gx, Fixed& gy, Fixed& gz) = 0;
     virtual void CountFieldWorkUnder(Fixed joules) = 0;
-    // The speed of light in this space: the fastest anything inside it moves
-    // (CausalBase::SetLightSpeed) -- stated here, else the container's, else
-    // DefaultLightSpeed at the open boundary.
+    // The speed of light here: the fastest anything inside moves -- stated here
+    // (SetLightSpeed), else the container's, else DefaultLightSpeed.
     virtual Fixed LightUnder() = 0;
     // What this body is when it touches another solid (CausalSolid).
     virtual CausalSolid Solid() = 0;
@@ -208,19 +174,17 @@ public:
     // The members of this one's environment whose reach touches this one's
     // (the contact gate), in canonical order.
     virtual void Adjacent(::std::vector<Causal_*>& out) = 0;
-    // Take `member` in, from wherever it is: a move, its position restated
-    // in this frame. False when it cannot move (not movable, a module
-    // apart, or this is inside it).
+    // Take `member` in from wherever it is: a move, its position restated here.
+    // False when it can't (not movable, a module apart, or this is inside it).
     virtual bool Contain(Causal_* member) = 0;
 
     // ── the protocol (see above) ────────────────────────────────────────
     virtual ::std::recursive_mutex& TreeMutex() = 0;
     // The tree's stream (CausalStream): the topmost entity's, as the lock is.
     virtual CausalStream& TreeStream() = 0;
-    // The interaction for a caller holding the tree's lock: the entropy owed
-    // over `commit_dt`, the motion over `step_dt` (one span for a driver;
-    // an observer measures the two with different ceilings), the members,
-    // the contacts.
+    // Interact for a caller holding the lock: entropy over `commit_dt`, motion
+    // over `step_dt` (one span for a driver; an observer caps them apart), the
+    // members, the contacts.
     virtual void InteractUnder(Fixed commit_dt, Fixed step_dt) = 0;
     // Did this entity's last interaction leave it and everything under it as
     // it found them, with nothing written into it or crossed into its rows
@@ -228,50 +192,41 @@ public:
     virtual bool StillUnder() = 0;
     // A crossing arriving from under the lock.
     virtual void AbsorbUnder(const OrderVector& crossing) = 0;
-    // The contact crossing this entity hands a neighbour along n, from under
-    // the lock: OrderVector::CrossToward, with this entity's clock ticked for
-    // it. Zero energy when nothing was headed that way.
+    // The contact crossing handed to a neighbour along n (CrossToward), this
+    // clock ticked for it. Zero energy when nothing headed that way.
     virtual OrderVector CrossTowardUnder(Fixed nx, Fixed ny, Fixed nz, Fixed span) = 0;
-    // Row 0's position, set from under the lock: a move's restatement in the
-    // new frame (Contain).
+    // Row 0's position: a move's restatement in the new frame (Contain).
     virtual void PlaceUnder(Fixed x, Fixed y, Fixed z) = 0;
-    // A solid contact, from under the container's lock: the rows to move and
-    // the mass that reads them, and the surface this body rests on after it
-    // (a resting body feels only the field's part along that surface).
+    // A solid contact, under the container's lock: the rows to move, the mass
+    // that reads them, and the surface it rests on after (resting, a body feels
+    // only the field's part along that surface).
     virtual OrderVector& RowsUnder() = 0;
     virtual Fixed MassUnder() = 0;
     virtual void SupportUnder(bool resting, Fixed nx, Fixed ny, Fixed nz) = 0;
-    // THE PEG: where this body was when the interaction in hand began, in its
-    // container's frame. From it to where the step put the body is its smear
-    // (etcs_causal_constraints.md §14), which is what a solid contact is
-    // found on; a contact that cuts the smear pegs the body again where it
-    // was cut, so what is left of the smear starts there.
+    // THE PEG: where this body was when the interaction began, in its
+    // container's frame. Peg to step result is its smear (etcs_causal_constraints
+    // §14), where a solid contact is found; a contact that cuts it re-pegs there.
     virtual void PegUnder(Fixed& x, Fixed& y, Fixed& z) = 0;
     virtual void RepegUnder(Fixed x, Fixed y, Fixed z) = 0;
-    // The field as a relation (Causal is Relational: every space is a law for
-    // what is in it). FieldOnUnder is the space's half: resolve the field
-    // (FieldUnder), hand it to the member, count the work where it is stated.
-    // AccelerateUnder is the body's half: what it lets through (resting takes
-    // only the part along its surface), returning the work done. Both from
-    // under the lock.
+    // The field as a relation (Causal is Relational: a space is a law for what is
+    // in it). FieldOnUnder is the space's half: resolve the field, hand it to the
+    // member, count the work where stated. AccelerateUnder is the body's half:
+    // what it lets through (resting: along its surface); returns the work.
     virtual void FieldOnUnder(Causal_& member, Fixed dt) = 0;
     virtual Fixed AccelerateUnder(Fixed gx, Fixed gy, Fixed gz, Fixed dt) = 0;
 };
 
 /*
- * A TREE'S OWN ORDER. An interaction is an event in the stream of the tree it
- * is in -- the topmost entity's, started by the first one posted -- and the
- * stream has no thread: whoever observes the tree runs its loop
- * (ETCS::EventStream::drive), one at a time. A driver waiting on its own line
- * is one such observer; a frame edge stepping what its pictures looked at is
- * another. Every event meets every other (the stream's default mask): one
- * history a tree.
+ * A TREE'S OWN ORDER. An interaction is an event in its tree's stream -- the
+ * topmost entity's, started by the first post -- and the stream has no thread:
+ * whoever observes the tree runs its loop (EventStream::drive), one at a time
+ * (a driver waiting on its own line, a frame edge stepping what it looked at).
+ * Every event meets every other (the default mask): one history per tree.
  *
- * THE LOCK IS STILL WHAT EXCLUDES. Verbs and readers are not on the stream
- * yet, and a foreign type steps a tree from inside its lock
- * (KartBattle::stepLocked), so the consumer takes the lock around an event and
- * a poster takes it before it drives: a driver waiting on a poster's event
- * would otherwise wait on the lock that poster holds.
+ * THE LOCK STILL EXCLUDES: verbs and readers aren't on the stream yet, and a
+ * foreign type steps a tree inside its lock (KartBattle::stepLocked). So the
+ * consumer locks around an event and a poster locks before it drives -- else a
+ * driver could wait on the lock its poster holds.
  */
 struct CausalEvent
 {
@@ -280,8 +235,7 @@ struct CausalEvent
     uint32_t            ticks = 1;
     ::std::atomic<bool> done{ false };  // the commit; its poster's frame is free after
 };
-// The event stays in its poster's frame, which waits on it: only the pointer
-// rides the ring.
+// Only the pointer rides the ring; the event waits in its poster's frame.
 struct CausalEventPtr { CausalEvent* ptr; };
 struct CausalState {};
 
@@ -305,9 +259,8 @@ struct CausalStream : ETCS::EventStream<CausalStream, CausalState, CausalEventPt
             e->done.store(true, ::std::memory_order_release);
     }
 
-    // Is the calling thread inside one of this stream's events? An interaction
-    // asked for from inside a step is part of that step: posted, it would
-    // wait behind the event it was asked from.
+    // Is this thread inside one of this stream's events? An interaction asked for
+    // from inside a step is part of it: posted, it would wait behind itself.
     bool Inside() const { return m_in.load(::std::memory_order_acquire) == ::std::this_thread::get_id(); }
 
 private:
