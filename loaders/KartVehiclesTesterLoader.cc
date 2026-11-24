@@ -20,6 +20,11 @@
 //      is W; half of it pushes about half as hard; all of it the other way
 //      reverses. Its wheel (Wheel 8) is D; half of it turns half as far; -8
 //      turns the other way as far.
+//   3c. DRAWN BETWEEN TICKS. Frames at twice the tick rate: the rows move on
+//      every other frame, the drawn kart (Drawn) on every one, behind the rows
+//      by a tick at most; a guest draws it moving on every frame too.
+//   3d. THE EYE AND A BLOCK. A turned block behind the kart, taller than the
+//      eye rides: the eye comes in in front of it.
 //   4. THE TYRES. Off the pedal at 12 u/s, a wheel held half a second: the
 //      kart and both trucks grip (nothing across is left) and both bikes
 //      slide, leaning into the turn and the other way for the other turn; the
@@ -146,6 +151,8 @@ int main(int, char**)
     {
         verb(b, "KartBattle.AddMap", "strip");
         verb(b, "KartBattle.AddSpawn", "-85, -85");
+        // Behind the host's spawn, turned, taller than the eye rides: for 3d.
+        verb(b, "KartBattle.AddBlock", "-90.5, -90.5, 3, 3, 6, 45");
         verb(b, "KartBattle.AddSpawn", "80, -80");
         verb(b, "KartBattle.AddSpawn", "-80, 80");
     }
@@ -288,6 +295,89 @@ int main(int, char**)
     check(wd > 0.0f && std::fabs(w8 - wd) < 1e-4f, "the whole wheel is a key's");
     check(std::fabs(w4 - wd * 0.5f) < 0.02f, "half of it turns half as far");
     check(std::fabs(wl + wd) < 1e-4f, "...and the other way, the other way as far");
+
+    // -- 3c. drawn between ticks -------------------------------------------------
+    std::cout << "\n-- 3c. drawn between ticks --\n";
+    // The host's kart at speed, then frames of 10 ms -- two to a tick: the
+    // rows move only on the frames a tick falls in, the drawn kart on every
+    // frame, about half a tick's way each, never ahead of the rows. On a
+    // guest, whose ticks come two at a time, the same kart is drawn moving on
+    // every frame too.
+    {
+        auto xz = [](const std::string& t, float& x, float& z) {
+            std::istringstream in(t); float y; return static_cast<bool>(in >> x >> y >> z); };
+        start();
+        run(2);
+        key(host, 'W', true);
+        run(100);
+        int rowStill = 0, drawnStill = 0, drawnMoved = 0, ahead = 0, guestStill = 0, guestMoved = 0, guestNone = 0;
+        float rowMost = 0.0f, drawnMost = 0.0f, lagMost = 0.0f;
+        Kart was = where(host, "host");
+        float dx0 = 0.0f, dz0 = 0.0f, gx0 = 0.0f, gz0 = 0.0f;
+        bool first = true;
+        for (int i = 0; i < 40; ++i)
+        {
+            verb(host, "KartBattle.Frame", "10");
+            settle();
+            verb(g1, "KartBattle.Frame", "10");
+            const Kart now = where(host, "host");
+            float dx, dz, gx, gz;
+            const bool drawn = xz(verb(host, "KartBattle.Drawn", "host"), dx, dz);
+            const bool gdrawn = xz(verb(g1, "KartBattle.Drawn", "host"), gx, gz);
+            if (!gdrawn) ++guestNone;
+            if (!first && drawn)
+            {
+                const float row = std::hypot(now.x - was.x, now.z - was.z), step = std::hypot(dx - dx0, dz - dz0);
+                if (row < 1e-4f) ++rowStill;
+                rowMost = std::max(rowMost, row);
+                if (step < 1e-4f) ++drawnStill; else ++drawnMoved;
+                drawnMost = std::max(drawnMost, step);
+                // Behind the rows, along the way the kart goes, by a tick at most.
+                const float vx = now.x - was.x, vz = now.z - was.z, lag = std::hypot(now.x - dx, now.z - dz);
+                if ((now.x - dx) * vx + (now.z - dz) * vz < -1e-3f) ++ahead;
+                lagMost = std::max(lagMost, lag);
+                if (gdrawn) { if (std::hypot(gx - gx0, gz - gz0) < 1e-4f) ++guestStill; else ++guestMoved; }
+            }
+            was = now; first = !drawn;
+            if (drawn) { dx0 = dx; dz0 = dz; }
+            if (gdrawn) { gx0 = gx; gz0 = gz; }
+        }
+        key(host, 'W', false);
+        verb(host, "KartBattle.Abandon");
+        run(2);
+        std::printf("        (40 frames of 10 ms: the rows still on %d, a tick's step %.3f at most; drawn still on %d, moved on %d, a frame's "
+                    "step %.3f at most, %.3f behind the rows at most, ahead %d; on g1 drawn still on %d, moved on %d, not drawn on %d)\n",
+                    rowStill, rowMost, drawnStill, drawnMoved, drawnMost, lagMost, ahead, guestStill, guestMoved, guestNone);
+        check(rowStill >= 15 && drawnStill == 0 && drawnMoved >= 35, "the rows move on every other frame, the drawn kart on every frame");
+        check(drawnMost < 0.75f * rowMost && lagMost <= rowMost * 1.05f + 1e-3f && ahead == 0,
+              "...about half a tick's way a frame, behind the rows and never by more than a tick");
+        check(guestNone == 0 && guestStill <= 4 && guestMoved >= 30, "a guest, its ticks two at a time, draws it moving on (almost) every frame too");
+    }
+
+    // -- 3d. the eye and a block ---------------------------------------------------
+    std::cout << "\n-- 3d. the eye and a block --\n";
+    // The host at its spawn, a turned block behind it on its boom, taller
+    // than the eye: the eye comes in to this side of the block.
+    {
+        verb(host, "KartBattle.Ride", "kart");
+        rides(host, "host", "kart");
+        start();
+        run(2);
+        for (int i = 0; i < 20; ++i) verb(host, "KartBattle.Frame", "100");
+        std::istringstream in(verb(host, "KartBattle.Eye"));
+        float ex, ey, ez;
+        in >> ex >> ey >> ez;
+        const Kart k = where(host, "host");
+        const float boom = std::hypot(ex - k.x, ez - k.z);
+        // The block, turned 45: |u| and |v| in its frame, against its half 1.5.
+        const float dx = ex + 90.5f, dz = ez + 90.5f, c = 0.70710678f;
+        const float u = std::fabs(dx * c - dz * c), v = std::fabs(dx * c + dz * c);
+        std::printf("        (the kart at %.2f %.2f, its eye at %.2f %.2f %.2f: %.2f behind it, %.2f %.2f off the block's middle in its frame)\n",
+                    k.x, k.z, ex, ey, ez, boom, u, v);
+        check(boom < 7.0f && (u > 1.5f || v > 1.5f), "a block behind the kart, taller than the eye: the eye comes in in front of it (short of its 7.5), not inside it");
+        verb(host, "KartBattle.Abandon");
+        run(2);
+    }
 
     // -- 4. the tyres ------------------------------------------------------------
     std::cout << "\n-- 4. the tyres --\n";

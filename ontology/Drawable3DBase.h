@@ -23,7 +23,8 @@
 // answers have to agree. That is why depth is dispatched here beside the
 // projection rather than through an optional depth base a leaf could
 // compose separately: composing it separately is exactly how the three
-// answers come from three places and stop matching.
+// answers come from three places and stop matching. ShowAt is where the
+// picture puts the node, when a stepper has blended it between two steps.
 ETCS_SUPERTYPE_BASE(Drawable3D), public DrawableBase<Derived>
 {
     ETCS_MAKE_INSTANCE(Drawable3D)
@@ -32,6 +33,10 @@ ETCS_SUPERTYPE_BASE(Drawable3D), public DrawableBase<Derived>
     ETCS_DISPATCH_METHOD(DepthSpan,    DepthFor,        (Camera_*, camera));
     ETCS_DISPATCH_METHOD(float,        DepthAt,         (Camera_*, camera), (int32_t, x), (int32_t, y));
     ETCS_DISPATCH_METHOD(Drawable2D_*, Project,         (Camera_*, camera));
+    // Not a dispatch: a leaf that is never drawn between steps need not say
+    // so, and is drawn at its rows -- this does nothing until it is given.
+    virtual void ShowAtConcrete(ShownPose) {}
+    void ShowAt(ShownPose pose) override { static_cast<Derived*>(this)->ShowAtConcrete(pose); }
 };
 
 #endif

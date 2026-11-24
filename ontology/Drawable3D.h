@@ -56,6 +56,17 @@ struct DepthSpan
     float furthest;
 };
 
+// WHERE A NODE IS DRAWN, when that is not where it is: a position (in the
+// parent's space, as the node's own) and a facing (a unit quaternion, w x y
+// z), or `on` false for the node's own. Floats: it is a picture's number,
+// never a state's -- nothing reads it back, nothing hashes it.
+struct ShownPose
+{
+    bool  on = false;
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+    float qw = 1.0f, qx = 0.0f, qy = 0.0f, qz = 0.0f;
+};
+
 // ---------------------------------------------------------------
 // Drawable3D
 // ---------------------------------------------------------------
@@ -201,6 +212,17 @@ public:
     // zero-sized frame). A caller that gets one has asked for a view that
     // does not exist, which is a different thing from an empty one.
     virtual Drawable2D_* Project(Camera_* camera) = 0;
+
+    // DRAWN HERE, NOT WHERE THE RECORD SAYS -- until told `on` false.
+    //
+    // A world stepped at a fixed rate is a pose a step, and a picture made
+    // more often than that shows some poses twice and jumps between others:
+    // fast motion judders. Whatever steps the world knows the poses either
+    // side of the moment a frame is for, and can blend them; the blend is
+    // where the node is DRAWN, so it goes here rather than into the node's
+    // rows, which are the record and stay exactly what the step made them.
+    // Its children are drawn about it, as about the node itself.
+    virtual void ShowAt(ShownPose pose) = 0;
 };
 
 #endif
