@@ -44,6 +44,12 @@
 //   6. THE SAME BATTLE. With guests on a moto and a truck driving and
 //      turning, and the weight's crash, each guest at the host's tick has its
 //      hash.
+//   7. A LATE ARENA. A guest that joins before its arena is made (a slow
+//      page) holds the host's lines until it is: then it has the others on
+//      their moto and truck, and the host's hash.
+//   7b. PUT RIGHT. A guest knocked out of step (its arena made again under
+//      the round, every kart back at a spawn) differs at the host's next
+//      hash, replays its trace, and is the host's again, and says so.
 //
 //   ./Run_KartVehiclesTesterLoader
 //
@@ -54,6 +60,8 @@
 #include <chrono>
 #include <algorithm>
 #include <cmath>
+#include <fstream>
+#include <iterator>
 #include <cstdio>
 #include <sstream>
 #include <string>
@@ -601,13 +609,98 @@ int main(int, char**)
     const std::string h = verb(host, "KartBattle.Hash");
     check(h == verb(g1, "KartBattle.Hash") && h == verb(g2, "KartBattle.Hash"), "each guest at the host's tick has its hash");
 
+    // -- 7. a late arena -------------------------------------------------------------
+    std::cout << "\n-- 7. a late arena --\n";
+    // g3 joins and follows before its arena script has run, as a slow page
+    // does; its lines wait for Ready, and then it is the same battle.
+    ETCS::Entity* g3 = nullptr;
+    {
+        ETCS::Entity* world = ETCS::spawn_entity("RenderProvider", "Scene3D", env, loader);
+        g3 = ETCS::spawn_entity("KartProvider", "KartBattle", env, loader);
+        verb(world, "Scene3D.Create", "1, 1, 1");
+        verb(world, "Scene3D.SetVisible", "0");
+        verb(g3, "KartBattle.Create");
+        verb(g3, "KartBattle.BindWorld", std::to_string(world->getRID()));
+        verb(g3, "KartBattle.Join", "g3 host");
+        ETCS::ExecutionContext wire(&root, &ctx);
+        wire.names["host"] = ETCS::NameBinding{ host->getRID(), "KartProvider", "KartBattle" };
+        wire.names["g3"] = ETCS::NameBinding{ g3->getRID(), "KartProvider", "KartBattle" };
+        std::istringstream lines("detach NetworkProvider/scripts/session_follow.etcs src=host dst=g3\n"
+                                 "detach NetworkProvider/scripts/session_emit.etcs src=g3 dst=host\n");
+        ETCS::run_script(lines, std::string(ETCS_ACE_ROOT) + "/modules/kart_wiring.etcs", wire);
+        key(host, 'W', true);
+        run(40);
+        const Status early = status(g3);
+        // ...and only now its arena, maps and vehicles -- with what the others
+        // were given here (the test vehicle, the tunes, the strip) before its
+        // Ready, the arena script's last line, as a page's scripts would.
+        ETCS::ExecutionContext arena(&root, &ctx);
+        arena.names["anchor"] = ETCS::NameBinding{ world->getRID(), "RenderProvider", "Scene3D" };
+        arena.names["battle"] = ETCS::NameBinding{ g3->getRID(), "KartProvider", "KartBattle" };
+        const std::string path = std::string(ETCS_ACE_ROOT) + "/modules/KartProvider/scripts/kart_arena.etcs";
+        std::ifstream file(path);
+        std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+        const size_t ready = text.rfind("battle.Ready()");
+        if (ready != std::string::npos) text.erase(ready, std::string("battle.Ready()").size());
+        std::istringstream in(text);
+        bool made = ready != std::string::npos && ETCS::run_script(in, path, arena);
+        made = made && verb(g3, "KartBattle.AddVehicle", "test") == "ok" && verb(g3, "KartBattle.Tune", "top 30") == "ok"
+                    && verb(g3, "KartBattle.Tune", "slide 0.5 1") == "ok" && verb(g3, "KartBattle.Tune", "tyres 2 0 0.75") == "ok";
+        verb(g3, "KartBattle.AddMap", "strip");
+        verb(g3, "KartBattle.AddSpawn", "-85, -85");
+        verb(g3, "KartBattle.AddBlock", "-90.5, -90.5, 3, 3, 6, 45");
+        verb(g3, "KartBattle.AddSpawn", "80, -80");
+        verb(g3, "KartBattle.AddSpawn", "-80, 80");
+        verb(g3, "KartBattle.Ready");
+        // To the host's next hash and past it, g3 caught up.
+        const uint64_t past = (status(host).tick / 250 + 1) * 250 + 5;
+        run(static_cast<uint32_t>(past - status(host).tick));
+        key(host, 'W', false);
+        run(2);
+        for (int i = 0; i < 400 && status(g3).tick != status(host).tick; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        const std::string note = verb(g3, "KartBattle.Note");
+        std::printf("        (before its arena: g3 at tick %llu with %llu lines; after: tick %llu, g1 on %s, g2 on %s; note \"%s\")\n",
+                    static_cast<unsigned long long>(early.tick), static_cast<unsigned long long>(early.lines),
+                    static_cast<unsigned long long>(status(g3).tick), where(g3, "g1").vehicle.c_str(), where(g3, "g2").vehicle.c_str(), note.c_str());
+        check(made && early.tick == 0, "a guest whose arena is not made yet applies none of the host's lines");
+        check(where(g3, "g1").vehicle == "truck" && where(g3, "g2").vehicle == "moto" && verb(g3, "KartBattle.Hash") == verb(host, "KartBattle.Hash"),
+              "...and once it is, it has the others on their moto and truck, and the host's hash");
+    }
+
+    // -- 7b. put right ---------------------------------------------------------------
+    std::cout << "\n-- 7b. put right --\n";
+    // Ready again on g1 under the round: the first map put back, every kart
+    // at a spawn -- what a slow page's arena did to it before the lines waited.
+    {
+        key(host, 'W', true);
+        run(20);
+        verb(g1, "KartBattle.Ready");
+        const Kart moved = where(g1, "host"), real = where(host, "host");
+        const bool knocked = std::hypot(moved.x - real.x, moved.z - real.z) > 1.0f;
+        const uint64_t past = (status(host).tick / 250 + 1) * 250 + 5;
+        const auto t0 = std::chrono::steady_clock::now();
+        run(static_cast<uint32_t>(past - status(host).tick));
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        key(host, 'W', false);
+        run(2);
+        const Kart after = where(g1, "host"), truth = where(host, "host");
+        const std::string note = verb(g1, "KartBattle.Note");
+        std::printf("        (knocked %.1f off; at tick %llu of %llu lines, %.0f ms to the hash and past it; then %.3f off; note \"%s\")\n",
+                    std::hypot(moved.x - real.x, moved.z - real.z), static_cast<unsigned long long>(status(host).tick),
+                    static_cast<unsigned long long>(status(host).lines), ms, std::hypot(after.x - truth.x, after.z - truth.z), note.c_str());
+        check(knocked && verb(g1, "KartBattle.Hash") == verb(host, "KartBattle.Hash") && std::hypot(after.x - truth.x, after.z - truth.z) < 1e-3f
+              && note.find("put right") != std::string::npos,
+              "a guest knocked out of step replays its trace at the host's next hash, is the host's again, and says so");
+    }
+
     // Wound up as a closing script winds up what it detached.
     auto& detached = ETCS::DetachedRegistry::getInstance();
     for (auto& [id, script] : detached.list()) detached.interrupt(id);
     for (int i = 0; i < 2500 && !detached.all_finished(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(2));
-    check(detached.all_finished(), "the four streams end when told to");
+    check(detached.all_finished(), "the streams end when told to");
     detached.join_all();
     for (ETCS::Entity* b : battle) verb(b, "KartBattle.Delete");
+    if (g3) verb(g3, "KartBattle.Delete");
     ETCS::PendingUnloadRegistry::getInstance().join_all();
     std::printf("\n%s (%d failure%s)\n", g_fail ? "FAILED" : "PASSED", g_fail, g_fail == 1 ? "" : "s");
     return g_fail ? 1 : 0;

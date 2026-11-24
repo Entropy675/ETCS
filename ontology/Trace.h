@@ -49,9 +49,12 @@
 // The authority says where it stands every so often, as a line --
 // `hash <at> <hash>`, the leaf's hash of what it holds, at a point (a
 // sequence; a tick, for Lockstep) -- and a mirror reaching that line
-// hashes itself: one that differs is REPORTED (DiffersConcrete), not
-// negotiated. `hash` and `seat` are the family's words; a leaf's lines
-// never use them.
+// hashes itself. One that differs is not negotiated: it has every line,
+// so it begins again as made and replays them (ResyncedConcrete); only
+// if it still differs is it REPORTED (DiffersConcrete). A mirror whose
+// leaf is not ready for lines yet (ReadyConcrete) holds them until it
+// is. `hash` and `seat` are the family's words; a leaf's lines never use
+// them.
 //
 // A TRACE IS A SESSION'S. Every stream takes the GENERATION when it
 // starts, and ends once the copy has begun another session rather than
