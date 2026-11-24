@@ -181,6 +181,28 @@ int main(int, char**)
     // drawn); here, one draw of it.
     ETCS::Entity* garage = ETCS::etcs_resolve_rid_anywhere(&ETCS::getLoader(), page.names["garage"].rid);
     if (garage) verb(garage, "CompositeDrawable2D.Draw", std::to_string(view->getRID()));
+    {
+        // The hint: the strip is at the top, so it shows under the cell hovered.
+        ETCS::Entity* hint = page.names.count("garage_hint") ? ETCS::etcs_resolve_rid_anywhere(&ETCS::getLoader(), page.names["garage_hint"].rid) : nullptr;
+        auto shown = [&](Rect2D& r) {
+            auto* d = hint ? static_cast<Drawable2D_*>(hint->getInterfacePointer(ETCS::Buffer("Drawable2D"))) : nullptr;
+            auto* h = hint ? static_cast<Drawable_*>(hint->getInterfacePointer(ETCS::Buffer("Drawable"))) : nullptr;
+            if (!d || !h || h->Hidden()) return false;
+            r = d->Bounds();
+            return true;
+        };
+        Rect2D r0{}, r1{}, r2{};
+        check(hint && !shown(r0), "the hint is hidden until something is hovered");
+        verb(b, "KartBattle.PointerEvent", "2, 0, 0, 210, 20");
+        const bool on_undo = shown(r0);
+        verb(b, "KartBattle.PointerEvent", "2, 0, 0, 40, 20");
+        const bool on_done = shown(r1);
+        std::printf("        (on undo at %d,%d %ux%u; on done at %d,%d %ux%u)\n", r0.x, r0.y, r0.w, r0.h, r1.x, r1.y, r1.w, r1.h);
+        check(on_undo && r0.x == 160 && r0.y == 42, "over undo, its hint, under its cell -- no room above it");
+        check(on_done && r1.x == 0 && r1.y == 42 && r1.w > r0.w, "over done, the longer sentence, under that cell");
+        verb(b, "KartBattle.PointerEvent", "2, 0, 0, 400, 300");
+        check(!shown(r2), "off the strip, none");
+    }
     verb(b, "KartBattle.PointerEvent", "2, 0, 0, 40, 20");
     verb(b, "KartBattle.PointerEvent", "3, 0, 0, 40, 20");
     verb(b, "KartBattle.PointerEvent", "4, 0, 0, 40, 20");
