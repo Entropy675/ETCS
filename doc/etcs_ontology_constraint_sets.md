@@ -116,17 +116,109 @@ each family**:
 A valid leaf might compose one pick from each bracket — e.g. `Y + B + C + D`
 — but never two picks from the same bracket (`Y + Z` is invalid).
 
+### Where a lineage is declared — two spellings, one meaning
+
+A refinement can be stated in either of two places, and both are load-bearing:
+
+```
+class Pixels_ : virtual public Raster_           on the INTERFACE
+DrawableBase : public SurfaceBase<Derived>       on the BASE
+```
+
+The second is not a shorthand for the first; for most of the ontology it is
+the only spelling available. `ETCS_SUPERTYPE_BASE` inherits its interface
+**non-virtually**, so an interface that also inherited its parent interface
+would be reached twice — once through the interface, once through the composed
+Base — and every inherited call would be ambiguous. The rule the ontology
+settled on, stated in `Drawable.h`, is therefore:
+
+> an interface declares only its own **increment**,
+> a Base carries the **lineage**.
+
+`Raster` can use the interface spelling because it has no `RasterBase.h` at
+all — nothing composes it, so nothing reaches it twice. Every family that
+*does* have a Base uses the second spelling. The entire `Resizable → Surface →
+Drawable → {Drawable2D, Drawable3D} → Camera` lineage is declared this way, and
+a reader (or a tool) that inspects only interface inheritance sees six
+unrelated families sitting flat beside each other.
+
+That second spelling is also where the **exclusivity** lives, and where it is
+mechanically enforced. Because `Drawable2DBase` and `Drawable3DBase` both
+compose `DrawableBase` non-virtually, a leaf inheriting both acquires two
+`Drawable_` subobjects and every call through them is ambiguous — the
+incoherent claim is a compile error rather than something a reviewer has to
+catch. `ace ontology` reads both spellings and prints the resulting forest,
+with the exclusive sets named and every module's leaves audited against them.
+
+Using bracket notation for illustration: given families rooted at `X`, `A`,
+`C`, and `D` respectively, a leaf type may draw **at most one member from
+each family**:
+
+```
+[X, Y, Z]   [A, B]   [C]   [D]
+```
+
+A valid leaf might compose one pick from each bracket — e.g. `Y + B + C + D`
+— but never two picks from the same bracket (`Y + Z` is invalid).
+
+---
+
+### A worked lineage: `Threaded → Thread`
+
+The concurrency axis is a lineage in exactly this sense, and it is worth
+stating because the two names differ by one letter while the claim differs a
+great deal.
+
+`Threaded` is *"I own a body that runs and can be asked to stop"* — Shape,
+Halt, Halted, and no more. Its own header draws the boundary explicitly:
+
+> No priority, no affinity — those are policy, and policy belongs to whatever
+> schedules.
+
+`Thread` is whatever schedules. It is *"I AM a control thread"*: an actor
+holding its own signal authority, carrying a closure of bound inputs, able to
+detach children. So `ThreadBase` composes `ThreadedBase`, the Base spelling
+above, and the refinement is a genuine is-a — every Thread owns a body that
+can be halted, and the reverse does not hold.
+
+The reverse mattering is the point. The window surface (`HostSurface`) is `Threaded` and is
+deliberately **not** a `Thread`: it has a frame loop, it is not an actor
+running scripts. A family that collapsed the two would force every entity with
+a loop to also claim signal authority and a closure it has no use for.
+
+Being a lineage rather than a sibling pair, the relation is **cumulative, not
+exclusive** — there is no `Thread | Threaded` bracket, because claiming
+`Thread` already claims `Threaded`. A leaf that names both `Bases` gets two
+`Threaded_` subobjects and every `Halt()` through them is ambiguous, but that
+is the same compile error a leaf naming `DrawableBase` and `Drawable2DBase`
+would get: redundancy caught mechanically, not an incoherent claim about what
+the entity is.
+
 ---
 
 ## 4. Orthogonal composition via fold-in at the `Base` layer
 
 Distinct from sibling exclusivity within one family is **deliberate
 composition across independent families**. When a leaf's `Base<Derived>`
-template inherits from more than one family's `Base` (e.g.
-`ConnectionStateBase<Derived>` composing `EphemeralBase<Derived>` alongside
-`ConnectionState_`), that is a single, coherent choice: "one pick from the
+template inherits from more than one family's `Base` (e.g. NetworkProvider's
+`SocketConnectionState`, which composes `ConnectionStateBase` and
+`EphemeralBase`), that is a single, coherent choice: "one pick from the
 domain-role family, bundled with one pick from the lifecycle family." This is
 not exclusivity being violated — it's exclusivity being correctly scoped.
+
+Note the tension with §3: composition at the `Base` layer is
+how refinement is declared **and** how orthogonal axes are folded in, so the
+spelling alone does not distinguish them. What distinguishes them is whether
+the composing family's own header claims the relationship as an *is-a*.
+`Drawable.h` does — "This is a refinement of Surface, not a sibling of it.
+Every Drawable is a Surface" — and `SurfaceBase` composing `ResizableBase` and
+`LayerBase` (a refinement of Orderable) is the same claim made twice (every
+surface has a size and a place in a stack). A family may therefore refine more than one parent; `ace
+ontology` renders it under the first and cross-references it under the rest.
+
+A leaf-level fold-in of two unrelated axes is a different act from a
+family-level refinement even though both are written `public XBase<Derived>`,
+and the difference is in the interface header's own claim, not in the syntax.
 Exclusivity applies *within* a family (siblings), never *across* independent
 families (orthogonal axes). Folding two orthogonal families together at the
 `Base` declaration is the intended mechanism for building a leaf's full,
