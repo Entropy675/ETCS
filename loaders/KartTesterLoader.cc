@@ -223,6 +223,24 @@ int main(int, char**)
         // (This test's own maps are bare ground by design, and are told so too -- after what is wrong.)
         check(faults.compare(0, 38, "course: pit 0 15: a spawn at its edge\n") == 0, "...and a map with a spawn put at a pit's edge is told so");
     }
+    // An eleventh, bends: an arc too steep at its inside edge for a kart to
+    // climb, and a deck turned over a ramp, with no room left under it.
+    for (ETCS::Entity* b : battle)
+    {
+        verb(b, "KartBattle.AddMap", "bends");
+        verb(b, "KartBattle.AddArc", "0, 0, 10, 0, 1, 8, 4, 0, 0, 2.4");
+        verb(b, "KartBattle.AddRamp", "40, 0, 45, 4, 20, 0, 0, 2.5");
+        verb(b, "KartBattle.AddDeckAt", "40, 0, 45, 4, 20, 3");
+        verb(b, "KartBattle.AddSpawn", "0, -50");
+        verb(b, "KartBattle.AddSpawn", "30, -50");
+        verb(b, "KartBattle.AddSpawn", "0, 50");
+    }
+    {
+        const std::string faults = verb(host, "KartBattle.Faults");
+        check(faults.find("bends: arc 0 0: its inside edge too steep to climb") != std::string::npos
+              && faults.find("bends: deck 40 0: no room to drive under it") != std::string::npos,
+              "...and an arc too steep inside, or a turned deck over a ramp, is told so");
+    }
 
     // A seat and a mirror per guest, wired as the page wires them -- with the
     // page's own stream scripts.
