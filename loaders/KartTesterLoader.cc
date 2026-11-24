@@ -246,6 +246,14 @@ int main(int, char**)
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
     };
     auto run = [&](uint32_t ticks) { verb(host, "KartBattle.Run", std::to_string(ticks)); settle(); };
+    // A round waits for every seated driver to lock in: each says so, and the
+    // host starts once its trace has them all.
+    auto start = [&]() {
+        for (ETCS::Entity* b : battle) verb(b, "KartBattle.LockIn", "1");
+        std::string r = verb(host, "KartBattle.StartRound");
+        for (int i = 0; i < 1000 && r != "ok"; ++i) { std::this_thread::sleep_for(std::chrono::milliseconds(2)); r = verb(host, "KartBattle.StartRound"); }
+        return r;
+    };
     auto key = [&](ETCS::Entity* b, int k, bool down) {
         verb(b, "KartBattle.Key", std::to_string(k) + " " + (down ? "1" : "0"));
     };
@@ -327,7 +335,7 @@ int main(int, char**)
           "...set on one runtime, and on that one alone");
     // -- 2. a round, abandoned ------------------------------------------------
     std::cout << "\n-- 2. a round, abandoned --\n";
-    check(verb(host, "KartBattle.StartRound") == "ok", "the host starts a round on the bowl");
+    check(start() == "ok", "the host starts a round on the bowl");
     run(2);
     check(status(g1).phase == "playing" && status(g2).phase == "playing", "...on every runtime");
     check(verb(host, "KartBattle.Configure", "crossroads 60") == "refused" && status(host).map == "bowl",
@@ -453,7 +461,7 @@ int main(int, char**)
 
     // -- 4. a round, abandoned with a score, then one completed ---------------
     std::cout << "\n-- 4. a round, abandoned with a score, then one completed --\n";
-    verb(host, "KartBattle.StartRound");
+    start();
     run(2);
     verb(host, "KartBattle.Give", "host sniper");
     fire(host);
@@ -535,7 +543,7 @@ int main(int, char**)
     std::printf("        (an elimination counted: %d; after the abandon: %d)\n", counted, score(g2, "host").elims);
     check(counted == 1 && status(g2).phase == "lobby" && score(g2, "host").elims == 0 && score(g2, "g1").deaths == 0,
           "an abandoned round's elimination is discarded with it, on every runtime");
-    check(verb(host, "KartBattle.StartRound") == "ok", "the host starts the round again");
+    check(start() == "ok", "the host starts the round again");
     run(2);
     const Status s4 = status(g1);
     check(s4.phase == "playing" && s4.left == 30, "...on every runtime: playing, thirty seconds left");
@@ -614,7 +622,7 @@ int main(int, char**)
     run(302);
     check(status(g2).phase == "lobby" && score(g2, "host").elims == 1,
           "...then the lobby, which keeps the round's scores (an abandoned one's it did not)");
-    verb(host, "KartBattle.StartRound");
+    start();
     run(2);
     const Score e7 = score(g1, "host"), d7 = score(g1, "g1");
     check(e7.elims == 0 && d7.deaths == 0 && status(g1).phase == "playing", "the next round starts the scores afresh");
@@ -623,7 +631,7 @@ int main(int, char**)
 
     // -- 5. the ground ---------------------------------------------------------
     std::cout << "\n-- 5. the ground --\n";
-    check(verb(host, "KartBattle.Configure", "skatepark 60") == "ok" && verb(host, "KartBattle.StartRound") == "ok",
+    check(verb(host, "KartBattle.Configure", "skatepark 60") == "ok" && start() == "ok",
           "a round on the skatepark: two jumps down the middle");
     run(2);
     const Kart h5 = where(host, "host");
@@ -711,7 +719,7 @@ int main(int, char**)
               && blocks + ramps + hills >= 3 && grounded,
               "...with things on it -- pads, springs and a deck too -- eight spawns, and every kart on level ground at one");
     }
-    check(verb(host, "KartBattle.StartRound") == "ok", "a round on it");
+    check(start() == "ok", "a round on it");
     proposed(g1, 'W', true);
     proposed(g2, 'D', true);
     proposed(g2, 'W', true);
@@ -726,7 +734,7 @@ int main(int, char**)
     std::cout << "\n-- 7. the levels --\n";
     verb(host, "KartBattle.Abandon");
     run(2);
-    check(verb(host, "KartBattle.Configure", "course 60") == "ok" && verb(host, "KartBattle.StartRound") == "ok",
+    check(verb(host, "KartBattle.Configure", "course 60") == "ok" && start() == "ok",
           "a round on the course: a spring, a pit, a deck to drive under, a deck to land on and a storey up a ramp");
     run(2);
     {
@@ -859,7 +867,7 @@ int main(int, char**)
     std::cout << "\n-- 8. the edges --\n";
     verb(host, "KartBattle.Abandon");
     run(2);
-    check(verb(host, "KartBattle.Configure", "edges 60") == "ok" && verb(host, "KartBattle.StartRound") == "ok",
+    check(verb(host, "KartBattle.Configure", "edges 60") == "ok" && start() == "ok",
           "a round on the edges: lava, a spring by the wall, a pad on a bank");
     run(2);
     {
@@ -913,7 +921,7 @@ int main(int, char**)
     // g1 bursts within its old reach of g1, and the block between keeps it off.
     verb(host, "KartBattle.Abandon");
     run(2);
-    check(verb(host, "KartBattle.Configure", "cover 60") == "ok" && verb(host, "KartBattle.StartRound") == "ok",
+    check(verb(host, "KartBattle.Configure", "cover 60") == "ok" && start() == "ok",
           "a round on cover: g1 behind a block down the host's lane");
     run(2);
     {
@@ -943,7 +951,7 @@ int main(int, char**)
     run(2);
     check(verb(g1, "KartBattle.Recolour", "3") == "ok", "back in the lobby a look can change again");
     run(4);
-    check(verb(host, "KartBattle.Configure", "range 60") == "ok" && verb(host, "KartBattle.StartRound") == "ok", "a round on the range");
+    check(verb(host, "KartBattle.Configure", "range 60") == "ok" && start() == "ok", "a round on the range");
     run(2);
     check(verb(g1, "KartBattle.Recolour", "4") == "refused" && verb(g1, "KartBattle.Rename", "late") == "refused", "...and not in a round");
     {

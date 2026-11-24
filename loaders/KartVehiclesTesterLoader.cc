@@ -169,6 +169,14 @@ int main(int, char**)
         for (int i = 0; i < 400 && (behind(g1) || behind(g2)); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(5));
     };
     auto run = [&](uint32_t ticks) { verb(host, "KartBattle.Run", std::to_string(ticks)); settle(); };
+    // A round waits for every seated driver to lock in: each says so, and the
+    // host starts once its trace has them all.
+    auto start = [&]() {
+        for (ETCS::Entity* b : battle) verb(b, "KartBattle.LockIn", "1");
+        std::string r = verb(host, "KartBattle.StartRound");
+        for (int i = 0; i < 1000 && r != "ok"; ++i) { std::this_thread::sleep_for(std::chrono::milliseconds(2)); r = verb(host, "KartBattle.StartRound"); }
+        return r;
+    };
     auto key = [&](ETCS::Entity* b, int k, bool down) {
         const uint64_t before = status(host).lines;
         verb(b, "KartBattle.Key", std::to_string(k) + " " + (down ? "1" : "0"));
@@ -214,7 +222,7 @@ int main(int, char**)
         Pace p;
         verb(host, "KartBattle.Ride", v);
         rides(host, "host", v);
-        verb(host, "KartBattle.StartRound");
+        start();
         run(2);
         key(host, 'W', true);
         run(100); p.at2 = where(host, "host").speed;
@@ -232,7 +240,7 @@ int main(int, char**)
               && std::fabs(pickup.at8 - 17.0f) < 0.2f,
           "each at its own top by 8 s: the kart 22, the moto 34, the bike 26, the pickup 17");
     check(truck.at8 > 16.0f && truck.at8 < 17.0f, "...and the truck, on the softest push, not yet at its 17");
-    check(verb(host, "KartBattle.StartRound") == "ok" && (run(2), verb(host, "KartBattle.Ride", "kart")) == "refused",
+    check(start() == "ok" && (run(2), verb(host, "KartBattle.Ride", "kart")) == "refused",
           "no ride outside the lobby");
     verb(host, "KartBattle.Abandon");
     run(2);
@@ -242,7 +250,7 @@ int main(int, char**)
     // A touch pad's pedal: Pedal <level>, -8..8, a `drive` line like a key's.
     // The kart from the strip's spawn a second on the whole pedal, then on half.
     auto second = [&](const char* how) {
-        verb(host, "KartBattle.StartRound");
+        start();
         run(2);
         if (std::string(how) == "W") key(host, 'W', true); else verb(host, "KartBattle.Pedal", how);
         run(50);
@@ -262,7 +270,7 @@ int main(int, char**)
     // The wheel the same way: Wheel <level>, a touch stick's. Rolling at 6
     // u/s, held a fifth of a second: D, Wheel 8, Wheel 4, Wheel -8.
     auto turned = [&](const char* how) {
-        verb(host, "KartBattle.StartRound");
+        start();
         run(2);
         key(host, 'W', true);
         for (int i = 0; i < 300 && where(host, "host").speed < 6; ++i) run(1);
@@ -290,7 +298,7 @@ int main(int, char**)
         Turn t;
         verb(host, "KartBattle.Ride", v);
         rides(host, "host", v);
-        verb(host, "KartBattle.StartRound");
+        start();
         run(2);
         key(host, 'W', true);
         for (int i = 0; i < 600 && where(host, "host").speed < speed; ++i) run(1);
@@ -334,7 +342,7 @@ int main(int, char**)
         Lean l;
         verb(host, "KartBattle.Ride", v);
         rides(host, "host", v);
-        verb(host, "KartBattle.StartRound");
+        start();
         run(2);
         key(host, 'W', true);
         for (int i = 0; i < 600 && where(host, "host").speed < 18; ++i) run(1);
@@ -369,7 +377,7 @@ int main(int, char**)
     {
         verb(host, "KartBattle.Ride", "kart");
         rides(host, "host", "kart");
-        verb(host, "KartBattle.StartRound");
+        start();
         run(2);
         key(host, 'W', true); run(40); key(host, 'W', false);
         key(host, 'S', true);
@@ -409,7 +417,7 @@ int main(int, char**)
     rides(host, "g2", "bike");
     verb(host, "KartBattle.Ride", "kart");
     rides(host, "host", "kart");
-    verb(host, "KartBattle.StartRound");
+    start();
     run(2);
     // The truck's way: from its corner, whichever the seats gave it, to the middle.
     const Kart ts = where(host, "g1");
@@ -434,7 +442,7 @@ int main(int, char**)
     std::cout << "\n-- 6. the same battle --\n";
     verb(g2, "KartBattle.Ride", "moto");
     rides(host, "g2", "moto");
-    verb(host, "KartBattle.StartRound");
+    start();
     run(2);
     key(g1, 'W', true); key(g2, 'W', true); key(host, 'W', true);
     run(120);
