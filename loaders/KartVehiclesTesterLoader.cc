@@ -16,8 +16,10 @@
 //   3. THE PEDAL. The same driver, the same keys, from the same spawn: the
 //      moto is the quickest off the line and to the highest top, then the
 //      bike, the kart, the pickup and the truck, slowest of all.
-//   3b. THE PEDAL BY LEVEL. A touch pad's pedal (Pedal 8) is W; half of it
-//      pushes about half as hard; all of it the other way reverses.
+//   3b. THE PEDAL AND THE WHEEL BY LEVEL. A touch stick's pedal (Pedal 8)
+//      is W; half of it pushes about half as hard; all of it the other way
+//      reverses. Its wheel (Wheel 8) is D; half of it turns half as far; -8
+//      turns the other way as far.
 //   4. THE TYRES. Off the pedal at 12 u/s, a wheel held half a second: the
 //      kart and both trucks grip (nothing across is left) and both bikes
 //      slide, leaning into the turn and the other way for the other turn; the
@@ -63,7 +65,7 @@ static std::string verb(ETCS::Entity* e, const std::string& action, const std::s
 
 // KartBattle.Kart: "<slot> <x> <z> <hx> <hz> <speed> <hp> <weapon> <ammo> <y> <air|ground> <wheel> <slide>
 // <spare> <spare ammo> <oil ticks> <dagger ticks> <vehicle> <lean> <oiled, a digit a tyre>".
-struct Kart { int slot = -1; float x = 0, z = 0, speed = 0, y = 0, slide = 0, lean = 0; int oil = 0; std::string vehicle, oiled; };
+struct Kart { int slot = -1; float x = 0, z = 0, speed = 0, y = 0, slide = 0, lean = 0, wheel = 0; int oil = 0; std::string vehicle, oiled; };
 static Kart where(ETCS::Entity* b, const std::string& who)
 {
     Kart k;
@@ -73,7 +75,7 @@ static Kart where(ETCS::Entity* b, const std::string& who)
     std::string w;
     float f;
     int n;
-    in >> k.slot >> k.x >> k.z >> f >> f >> k.speed >> n >> w >> n >> k.y >> w >> f >> k.slide >> w >> n >> k.oil >> n >> k.vehicle >> k.lean >> k.oiled;
+    in >> k.slot >> k.x >> k.z >> f >> f >> k.speed >> n >> w >> n >> k.y >> w >> k.wheel >> k.slide >> w >> n >> k.oil >> n >> k.vehicle >> k.lean >> k.oiled;
     return k;
 }
 // KartBattle.Tyres: per tyre (fr fl rr rl) "<heat> <rope> <shown> <darkest>".
@@ -235,8 +237,8 @@ int main(int, char**)
     verb(host, "KartBattle.Abandon");
     run(2);
 
-    // -- 3b. the pedal by level ----------------------------------------------------
-    std::cout << "\n-- 3b. the pedal by level --\n";
+    // -- 3b. the pedal and the wheel by level -------------------------------------
+    std::cout << "\n-- 3b. the pedal and the wheel by level --\n";
     // A touch pad's pedal: Pedal <level>, -8..8, a `drive` line like a key's.
     // The kart from the strip's spawn a second on the whole pedal, then on half.
     auto second = [&](const char* how) {
@@ -257,6 +259,27 @@ int main(int, char**)
     check(std::fabs(eight - whole) < 0.01f, "the whole pedal is a key's");
     check(half > 0.3f * whole && half < 0.6f * whole, "half of it pushes about half as hard (less, low down: the pedal's curve climbs with the speed)");
     check(back > 4.0f, "...and all of it down the other way, from a stand, reverses (the speed is its size)");
+    // The wheel the same way: Wheel <level>, a touch stick's. Rolling at 6
+    // u/s, held a fifth of a second: D, Wheel 8, Wheel 4, Wheel -8.
+    auto turned = [&](const char* how) {
+        verb(host, "KartBattle.StartRound");
+        run(2);
+        key(host, 'W', true);
+        for (int i = 0; i < 300 && where(host, "host").speed < 6; ++i) run(1);
+        key(host, 'W', false);
+        if (std::string(how) == "D") key(host, 'D', true); else verb(host, "KartBattle.Wheel", how);
+        run(10);
+        const float w = where(host, "host").wheel;
+        if (std::string(how) == "D") key(host, 'D', false); else verb(host, "KartBattle.Wheel", "0");
+        verb(host, "KartBattle.Abandon");
+        run(2);
+        return w;
+    };
+    const float wd = turned("D"), w8 = turned("8"), w4 = turned("4"), wl = turned("-8");
+    std::printf("        (the wheel after a fifth of a second: D %.3f, Wheel 8 %.3f, Wheel 4 %.3f, Wheel -8 %.3f rad)\n", wd, w8, w4, wl);
+    check(wd > 0.0f && std::fabs(w8 - wd) < 1e-4f, "the whole wheel is a key's");
+    check(std::fabs(w4 - wd * 0.5f) < 0.02f, "half of it turns half as far");
+    check(std::fabs(wl + wd) < 1e-4f, "...and the other way, the other way as far");
 
     // -- 4. the tyres ------------------------------------------------------------
     std::cout << "\n-- 4. the tyres --\n";
