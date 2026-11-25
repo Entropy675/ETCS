@@ -42,7 +42,21 @@ struct ViewFrustum
     float fov_y_radians;
     float near_plane;
     float far_plane;
+
+    // The frame shape the lens is cut for, width over height. A frame at it
+    // or wider keeps fov_y and sees more to the sides; a narrower one keeps
+    // that shape's width of view and sees more above and below. 0: fov_y at
+    // every shape. Read through LensTanHalf, never fov_y alone.
+    float fit_aspect = 0.0f;
 };
+
+// tan(half the vertical angle) for a frame of this aspect: the one number a
+// projection and a pointer's ray must agree on.
+inline float LensTanHalf(const ViewFrustum& v, float aspect)
+{
+    const float t = ::std::tan(v.fov_y_radians * 0.5f);
+    return (v.fit_aspect > 0.0f && aspect > 0.0f && aspect < v.fit_aspect) ? t * v.fit_aspect / aspect : t;
+}
 
 /*
  * THE LINE THROUGH A POINT OF THE IMAGE: where a pointer on a camera's frame
@@ -71,7 +85,7 @@ inline bool ViewRay(const ViewFrustum& v, float fx, float fy, float aspect, Poin
     Point3D r = cross(v.up, f);
     if (!norm(r)) return false;
     const Point3D u = cross(f, r);
-    const float t  = ::std::tan(v.fov_y_radians * 0.5f);
+    const float t  = LensTanHalf(v, aspect);
     const float nx = (fx * 2.0f - 1.0f) * t * aspect;
     const float ny = (1.0f - fy * 2.0f) * t;
     dir = Point3D{ f.x + r.x * nx + u.x * ny, f.y + r.y * nx + u.y * ny, f.z + r.z * nx + u.z * ny };

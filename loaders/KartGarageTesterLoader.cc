@@ -112,13 +112,16 @@ int main(int, char**)
     // its names (the modeller, the router) are the test's to look at.
     ETCS::Entity* view = ETCS::spawn_entity("RenderProvider", "ImageSurface", env, loader);
     ETCS::Entity* eye = ETCS::spawn_entity("RenderProvider", "Camera3D", env, loader);
-    if (!view || !eye) { std::printf("FAILED (could not spawn the surface)\n"); return 1; }
+    ETCS::Entity* layout = ETCS::spawn_entity("LayoutProvider", "Layout", env, loader);
+    if (!view || !eye || !layout) { std::printf("FAILED (could not spawn the surface)\n"); return 1; }
     verb(view, "ImageSurface.Create", "1024, 768");
     verb(eye, "Camera3D.Create", "1024, 768");
+    verb(layout, "Layout.Create", "1024, 768");
     ETCS::ExecutionContext page(&root, &ctx);
     page.names["battle"] = ETCS::NameBinding{ b->getRID(), "KartProvider", "KartBattle" };
     page.names["view"]   = ETCS::NameBinding{ view->getRID(), "RenderProvider", "ImageSurface" };
     page.names["eye"]    = ETCS::NameBinding{ eye->getRID(), "RenderProvider", "Camera3D" };
+    page.names["layout"] = ETCS::NameBinding{ layout->getRID(), "LayoutProvider", "Layout" };
     {
         const std::string path = std::string(ETCS_ACE_ROOT) + "/modules/KartProvider/scripts/kart_garage.etcs";
         std::ifstream in(path);
