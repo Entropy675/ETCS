@@ -2064,20 +2064,22 @@ inline bool registration_request(const std::string& dir, const sig::Key& registr
 }
 
 // A member's word about an account, or a key's agreeing to join one
-// (sig::join_statement, admit_statement, retire_statement), signed by this
-// loader's key: "<key> <signature>", hex. `kind` is 'j', 'a' or 'r'; `other`
-// is the member joined, the key admitted, or the key retired.
+// (sig::join_statement, admit_statement, retire_statement, portal_statement),
+// signed by this loader's key: "<key> <signature>", hex. `kind` is 'j', 'a',
+// 'r' or 'p'; `other` is the member joined, the key admitted, the key retired,
+// or the code a browser shows.
 inline bool account_word(const std::string& dir, char kind, const sig::Key& registrar, const sig::Key& other,
                          std::string& out, std::string& why)
 {
-    if (kind != 'j' && kind != 'a' && kind != 'r') { why = "no such word"; return false; }
+    if (kind != 'j' && kind != 'a' && kind != 'r' && kind != 'p') { why = "no such word"; return false; }
     uint8_t secret[64], s[sig::kSigBytes];
     sig::Key pub{};
     if (!loader_key(dir, secret, pub, why)) return false;
-    if (kind != 'r' && other == pub) { mc::crypto_wipe(secret, 64); why = "a key does not join itself"; return false; }
+    if ((kind == 'j' || kind == 'a') && other == pub) { mc::crypto_wipe(secret, 64); why = "a key does not join itself"; return false; }
     const std::string m = kind == 'j' ? sig::join_statement(pub, other, registrar, loader_epoch())
                         : kind == 'a' ? sig::admit_statement(pub, other, registrar, loader_epoch())
-                                      : sig::retire_statement(pub, other, registrar);
+                        : kind == 'r' ? sig::retire_statement(pub, other, registrar)
+                                      : sig::portal_statement(pub, registrar, other);
     mc::crypto_ed25519_sign(s, secret, reinterpret_cast<const uint8_t*>(m.data()), m.size());
     mc::crypto_wipe(secret, 64);
     out = hex(pub.data(), 32) + " " + hex(s, sizeof s);
@@ -2209,8 +2211,9 @@ inline bool recognize(char side, const std::string& word, const std::string& tra
  * epoch, or (op 0 with b = "next") for the successor put in place; a re-sync
  * (op 4) ends this session and starts the successor in its place. A link's
  * word (ops 5 and 6), and what this loader is (op 10: "<head> <epoch>"), are
- * asked of a browser loader too. An account's words (ops 7 to 9) take the
- * registrar's key in `a` and the other key in `b`.
+ * asked of a browser loader too. An account's words (ops 7 to 9, and 11 for
+ * the portal) take the registrar's key in `a` and the other key, or the
+ * portal's code, in `b`.
  */
 inline bool answer(uint8_t op, const std::string& name, const std::string& a, const std::string& b, std::string& out)
 {
@@ -2247,12 +2250,12 @@ inline bool answer(uint8_t op, const std::string& name, const std::string& a, co
             ok = registration_request(dir, registrar, out, why, b == "next");
             break;
         }
-        case 7: case 8: case 9:
+        case 7: case 8: case 9: case 11:
         {
             sig::Key registrar{}, other{};
             if (!unhex(a, registrar.data(), registrar.size())) { why = "not a registrar's key"; break; }
-            if (!unhex(b, other.data(), other.size())) { why = "not a loader's key"; break; }
-            ok = account_word(dir, op == 7 ? 'j' : op == 8 ? 'a' : 'r', registrar, other, out, why);
+            if (!unhex(b, other.data(), other.size())) { why = op == 11 ? "not a portal's code" : "not a loader's key"; break; }
+            ok = account_word(dir, op == 7 ? 'j' : op == 8 ? 'a' : op == 9 ? 'r' : 'p', registrar, other, out, why);
             break;
         }
         case 1:
@@ -2702,6 +2705,8 @@ inline bool consensus(const std::vector<std::string>& texts, const std::vector<s
  *   etcs --join <registrar> <member key>            "<key> <signature>": this key agrees to join member's account
  *   etcs --admit <registrar> <joining key>          "<key> <signature>": this member admits it
  *   etcs --retire <registrar> <key>                 "<key> <signature>": this member retires a key of its account
+ *   etcs --portal <registrar> <code>                "<key> <signature>": this member lets the browser showing
+ *                                                   <code> act for its account until it signs out or times out
  *   etcs --manifest <dir> <out>                     the marketplace's signed list of what <dir> serves
  *   etcs --survey <list>                            what that list has moved past, here
  *   etcs --attest                                   what this loader says of itself; 0 only if it attests
@@ -2861,13 +2866,16 @@ inline int cli(int argc, char** argv)
         std::printf("%s\n", line.c_str());
         return 0;
     }
-    if ((verb == "--join" || verb == "--admit" || verb == "--retire") && argc == 4)
+    if ((verb == "--join" || verb == "--admit" || verb == "--retire" || verb == "--portal") && argc == 4)
     {
         sig::Key registrar{}, other{};
         std::string line;
         if (!unhex(argv[2], registrar.data(), registrar.size()) || !unhex(argv[3], other.data(), other.size()))
-        { std::fprintf(stderr, "usage: etcs %s <registrar key hex> <key hex>\n", verb.c_str()); return 2; }
+        { std::fprintf(stderr, "usage: etcs %s <registrar key hex> <%s hex>\n", verb.c_str(), verb == "--portal" ? "code" : "key"); return 2; }
         if (!account_word(dir, verb[2], registrar, other, line, why)) { std::fprintf(stderr, "etcs: %s\n", why.c_str()); return 2; }
+        if (verb == "--portal")
+            std::fprintf(stderr, "etcs: this lets the browser showing that code act for your account -- see who is in it, admit and "
+                                 "retire keys -- until it signs out or times out. Paste it only into a page you opened yourself.\n");
         std::printf("%s\n", line.c_str());
         return 0;
     }

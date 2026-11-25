@@ -315,6 +315,8 @@ inline std::string link_statement(char side, const uint8_t transcript[kLinkTrans
  *   "ETCSJON2" | joining | member | registrar | epoch  a key agrees to join member's account
  *   "ETCSADM2" | member | joining | registrar | epoch  a member admits it
  *   "ETCSRET1" | member | target | registrar           a member retires a key of its account
+ *   "ETCSPRT1" | member | registrar | code             a member lets the browser showing `code` act
+ *                                                      for its account, for a while (the portal)
  *
  * A key is admitted only with both words, its own and a member's: a member
  * alone could otherwise claim any key it has seen, and every key is public.
@@ -342,6 +344,10 @@ inline std::string admit_statement(const Key& member, const Key& joining, const 
 inline std::string retire_statement(const Key& member, const Key& target, const Key& registrar)
 {
     return statement("ETCSRET1", { &member, &target, &registrar });
+}
+inline std::string portal_statement(const Key& member, const Key& registrar, const Key& code)
+{
+    return statement("ETCSPRT1", { &member, &registrar, &code });
 }
 
 /*

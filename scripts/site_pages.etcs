@@ -13,7 +13,9 @@
 #
 #   /chess-classic   the server-played chess page (ChessProvider)
 #   /forum.html      the forum (ForumWebsiteProvider)
+#   /account         the account portal (CryptProvider; the registrar at /pki answers it)
 
 requires tree [FileHtmlPage]
 tree.MountFile(chess-classic.html ACE_ROOT/modules/ChessProvider/scripts/www/chess-classic.html)
 tree.MountFile(forum.html ACE_ROOT/modules/ForumWebsiteProvider/scripts/www/forum.html)
+tree.MountFile(account.html ACE_ROOT/modules/CryptProvider/scripts/www/account.html)

@@ -454,9 +454,11 @@ struct PairMaskEvent : Event
 //   Admit    b = the other key, hex              that it joins b's account, admits b to its
 //   Retire                                       own, or retires b from it (sig::*_statement)
 //   Identify (nothing)                         out = "<head> <epoch>": what this loader is
+//   Portal   a = the registrar's key, hex      out = "<this loader's key> <signature>": its word
+//            b = the code a browser shows        letting that browser act for its account
 struct TrustEvent : Event
 {
-    enum class Op : uint8_t { Request, Install, Survey, Replace, Resync, Vouch, Recognize, Join, Admit, Retire, Identify };
+    enum class Op : uint8_t { Request, Install, Survey, Replace, Resync, Vouch, Recognize, Join, Admit, Retire, Identify, Portal };
     Op                  op;
     ::std::string       name, a, b, out;
     bool                ok = false;

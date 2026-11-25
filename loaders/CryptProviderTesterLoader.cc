@@ -52,6 +52,11 @@
 //      is then registered no more and has no word; a new epoch closes the
 //      oldest; the rows name no key, and are read back as left -- epochs too --
 //      under the same secret and refused under another.
+//  12. THE PORTAL. A browser's session: a code shown and a token kept; only a
+//      current member's word on that code signs it in, once; it sees its own
+//      account's keys and no other's; with a key's own word to join, it stands
+//      for the member's admission, and for its retirement of the account's
+//      keys; it ends when closed, when its member is retired, or in time.
 //
 //   ./Run_CryptProviderTesterLoader
 //
@@ -917,10 +922,82 @@ int main(int, char**)
               && reg(ask(C, registrar, head, E3)).rfind("refused", 0) != 0,
               "given a new epoch it serves that one and the last: the oldest closes");
 
+        // -- 12. the portal --
+        std::cout << "\n-- 12. the portal --\n";
+        auto portal = [&](const std::string& verb, const std::string& words) { return route(pki, "pki/portal/" + verb, words, "POST"); };
+        auto open = [&](std::string& code, std::string& token) {
+            const std::string o = portal("open", "");
+            const size_t sp = o.find(' ');
+            if (o.size() != 64 + 1 + 64 + 1 || sp != 64) return false;
+            code = o.substr(0, 64); token = o.substr(65, 64);
+            return true;
+        };
+        auto word = [&](const Loader& m, const std::string& code) {
+            sig::Key c{};
+            unhex(code, c.data(), 32);
+            return hex(m.pub.data(), 32) + " " + sign(m, sig::portal_statement(m.pub, registrar, c));
+        };
+        std::string code, token, code2, token2;
+        check(pki && open(code, token) && open(code2, token2) && code != code2 && token != token2,
+              "a portal opens with a code to show and a token to keep, new each time");
+        check(portal("state", token) == "pending\n" && portal("members", token) == "refused: the session is not signed in\n",
+              "until a member's word comes, it is pending and sees nothing");
+        Loader X = fresh();
+        check(portal("signin", code + " " + word(X, code)) == "refused: that key is not a current member of any account\n"
+              && portal("signin", code + " " + word(B, code)) == "refused: that key is not a current member of any account\n",
+              "no word but a current member's signs it in: a stranger's or a retired key's");
+        check(portal("signin", code + " " + word(A, code2)).rfind("refused: the word does not verify", 0) == 0,
+              "a member's word on another code does not");
+        check(portal("signin", code + " " + word(A, code)) == "signed in\n"
+              && portal("state", token) == "signed in " + hex(A.pub.data(), 32) + "\n"
+              && portal("signin", code + " " + word(A, code)) == "refused: no portal is waiting on that code\n",
+              "a member's word on its code signs it in, once");
+        const std::string listed = portal("members", token);
+        auto line_of = [&](const sig::Key& k) {
+            const std::string h = hex(k.data(), 32);
+            const size_t at = listed.find(h);
+            return at == std::string::npos ? std::string() : listed.substr(at, listed.find('\n', at) - at);
+        };
+        check(line_of(A.pub) == hex(A.pub.data(), 32) + " current " + hex(E2.data(), 32) + " you"
+              && line_of(P.pub) == hex(P.pub.data(), 32) + " current -"
+              && line_of(B.pub).rfind(hex(B.pub.data(), 32) + " retired ", 0) == 0
+              && line_of(C.pub).empty() && line_of(D.pub).empty(),
+              "it sees its account's keys -- current, retired, where each was last registered -- and no other account's");
+        Loader N = fresh();
+        auto joins = [&](const Loader& k, const Loader& m, const sig::Epoch& e) {
+            return hex(k.pub.data(), 32) + " " + sign(k, sig::join_statement(k.pub, m.pub, registrar, e));
+        };
+        check(portal("admit", token + " " + joins(N, P, E3)).rfind("refused: that key's word does not name this member", 0) == 0
+              && portal("admit", token + " " + joins(N, A, E)).rfind("refused: that key's word does not name this member", 0) == 0,
+              "a key's word to join someone else, or in an epoch no longer served, admits nothing");
+        check(portal("admit", token + " " + joins(N, A, E3)) == "admitted\n"
+              && portal("members", token).find(hex(N.pub.data(), 32) + " current -") != std::string::npos,
+              "with the key's own word naming this member, the session stands for the member's: the key joins");
+        check(portal("retire", token + " " + hex(N.pub.data(), 32)) == "retired\n"
+              && portal("members", token).find(hex(N.pub.data(), 32) + " retired") != std::string::npos
+              && portal("retire", token + " " + hex(D.pub.data(), 32)) == "refused: not keys of one account\n",
+              "and for its word to retire one of the account's keys, and no other's");
+        Loader F = fresh();
+        std::string code3, token3;
+        reg(ask(F, registrar, head, E3));
+        check(open(code3, token3) && portal("signin", code3 + " " + word(F, code3)) == "signed in\n"
+              && portal("retire", token3 + " " + hex(F.pub.data(), 32)) == "retired\n"
+              && portal("state", token3) == "refused: no such session\n",
+              "a session that retires its own member ends with it");
+        check(portal("close", token) == "closed\n" && portal("members", token) == "refused: no such session\n"
+              && portal("state", std::string(64, '0')) == "refused: no such session\n",
+              "closed, a session is gone; a token never opened is none");
+        check(yes(verb(pki, "Registrar.SessionLife", "1")) && open(code3, token3)
+              && (::usleep(1200 * 1000), portal("state", token3) == "refused: no such session\n")
+              && yes(verb(pki, "Registrar.SessionLife", "900")),
+              "a session runs out after its life");
+        mc::crypto_wipe(X.secret, 64); mc::crypto_wipe(N.secret, 64); mc::crypto_wipe(F.secret, 64);
+
         const std::string rows = slurp(dir + "/accounts.db");
         const auto has = [&](const sig::Key& k) { return rows.find(std::string(reinterpret_cast<const char*>(k.data()), 32)) != std::string::npos; };
         check(!rows.empty() && !has(A.pub) && !has(B.pub) && !has(P.pub) && !has(K),
-              "the rows hold no loader's key and no ACE identity: nothing in them says whose keys share an account");
+              "the rows hold no loader's key and no ACE identity -- the keys the portal lists are sealed: "
+              "nothing in them says whose keys share an account");
 
         check(run("spawn DatabaseProvider::LocalDatabase reg_db2\nreg_db2.Connect(" + dir + "/accounts.db)\n"
                   "spawn DatabaseProvider::LocalDatabase reg_db3\nreg_db3.Connect(" + dir + "/accounts.db)\n"
