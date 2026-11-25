@@ -113,8 +113,9 @@ are the proofs.
 TODO:
 - Identity system (over the state hash). Binary signatures are built
   (`core/Trust.h`, `Run_ModuleSignatureTesterLoader`), and so is loader-key
-  registration (`CryptProvider::Registrar`, served at `/pki` by
-  `scripts/site_pki.etcs`); still to come: the ACE root's key (the ceremony
+  registration through ACE identities, with accounts of them
+  (`CryptProvider::Registrar`, served at `/pki` by `scripts/site_pki.etcs`);
+  still to come: the ACE root's key (the ceremony
   and its place are built: `root_ceremony.etcs`, `ace identity`), entitlement.
 - Every module's verb-set state on the value surface. Scene3D is done; the
   other Set* verbs (Paint, Render's 2D types, Network, Chess, Layout, Window)

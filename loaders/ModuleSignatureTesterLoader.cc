@@ -671,6 +671,54 @@ int main(int, char**)
         check(identity_of(dstore) == DI, "and its identity is the fold along it, down to its key");
         const auto D = tr::establish(dstore, true, DI);
         check(D->role == sig::Role::Loader && D->proven && D->reg.size() == 4, "its loader is joined to the half above it");
+
+        // The same key through an ACE identity: a registration for the epoch it
+        // names alone, and one for the successor this store put in place,
+        // installed ahead of the swap and taken up by that successor.
+        {
+            Keys gkeys{}, K = fresh_key();
+            tr::loader_key(gstore, gkeys.secret, gkeys.pub, why);
+            auto through = [&](const sig::Epoch& e) {
+                std::vector<sig::Certificate> c{ issue(K, sig::Role::Loader, dk, {}), issue(gkeys, sig::Role::Identity, K.pub, { e }) };
+                c.insert(c.end(), G->reg.begin(), G->reg.end());
+                return c;
+            };
+            sig::Epoch next{};
+            next[0] = 0x6e;
+            const auto now = through(E), ahead = through(next);
+            check(tr::registration_valid(now, dk) && tr::registration_current(now, E) && !tr::registration_current(ahead, E),
+                  "an ACE identity's registration holds in the epoch it names, and in no other");
+            std::remove((dstore + "/successor").c_str());
+            check(join(dstore, now) && !join(dstore, ahead)
+                  && why == "a registration for an epoch neither this loader nor its successor runs in",
+                  "one for this epoch is installed; one for another is not");
+            std::string line;
+            check(!tr::registration_request(dstore, gk, line, why, true) && why == "no successor is in place to register for",
+                  "nor asked for, with no successor in place");
+            tr::successor_placed(dstore, next, DI);
+            sig::Key asked{}, h{};
+            sig::Epoch e{};
+            uint8_t s2[64];
+            const bool req = tr::registration_request(dstore, gk, line, why, true) && line.size() == 3 * 65 + 128
+                             && tr::unhex(line.substr(0, 64), asked.data(), 32) && tr::unhex(line.substr(65, 64), h.data(), 32)
+                             && tr::unhex(line.substr(130, 64), e.data(), 32) && tr::unhex(line.substr(195), s2, 64);
+            const std::string st = sig::registration_statement(asked, gk, h, e);
+            check(req && asked == dk && h == DI && e == next
+                  && mc::crypto_ed25519_check(s2, dk.data(), reinterpret_cast<const uint8_t*>(st.data()), st.size()) == 0,
+                  "with a successor in place, the key asks for the successor's epoch and identity, on its own word");
+            std::vector<sig::Certificate> got;
+            bool stale = false;
+            check(join(dstore, ahead) && tr::current_registration(dstore, dk, E, got, stale) && got.size() == 5 && got[1].epochs[0] == E,
+                  "the successor's is installed beside this epoch's, which this loader keeps");
+            check(tr::current_registration(dstore, dk, next, got, stale) && got.size() == 5 && got[1].epochs[0] == next
+                  && !std::ifstream(dstore + "/loader.chain.next")
+                  && !tr::current_registration(dstore, dk, E, got, stale) && stale,
+                  "the successor takes it up as its own; this epoch's is then another epoch's, dropped");
+            std::remove((dstore + "/successor").c_str());
+            check(join(dstore, dreg), "(the developer's registration put back)");
+            mc::crypto_wipe(gkeys.secret, 64);
+            mc::crypto_wipe(K.secret, 64);
+        }
         write_bytes(dir + "/Dev.wasm", tiny_wasm());
         Session Dt = attested(dstore, DI);
         const std::string d1b = sign_as(Dt.id, Dt.secret, "Probe", tiny_wasm(), E, false);
@@ -1204,14 +1252,38 @@ int main(int, char**)
         sig::Key reg{}; reg[0] = 7;
         ETCS::TrustEvent q(ETCS::TrustEvent::Op::Request);
         q.a = tr::hex(reg.data(), 32);
-        sig::Key asked{};
+        sig::Key asked{}, qhead{};
+        sig::Epoch qepoch{};
         uint8_t qs[64];
-        const bool answered = q() && q.out.size() == 64 + 1 + 128 && tr::unhex(q.out.substr(0, 64), asked.data(), 32)
-                              && tr::unhex(q.out.substr(65), qs, 64);
-        const std::string stmt = sig::registration_statement(asked, reg);
-        check(answered && asked == A.pub
+        const bool answered = q() && q.out.size() == 3 * 65 + 128 && tr::unhex(q.out.substr(0, 64), asked.data(), 32)
+                              && tr::unhex(q.out.substr(65, 64), qhead.data(), 32) && tr::unhex(q.out.substr(130, 64), qepoch.data(), 32)
+                              && tr::unhex(q.out.substr(195), qs, 64);
+        const std::string stmt = sig::registration_statement(asked, reg, qhead, qepoch);
+        check(answered && asked == A.pub && qhead == tr::ace_identity() && qepoch == tr::loader_epoch()
               && mc::crypto_ed25519_check(qs, asked.data(), reinterpret_cast<const uint8_t*>(stmt.data()), stmt.size()) == 0,
-              "a module's ask (TrustEvent) is signed by this loader's key, in the registration's form, on the ordering thread");
+              "a module's ask (TrustEvent) is signed by this loader's key, naming the identity it was built for and its epoch");
+        ETCS::TrustEvent who(ETCS::TrustEvent::Op::Identify);
+        check(who() && who.out == tr::hex(tr::ace_identity().data(), 32) + " " + tr::hex(tr::loader_epoch().data(), 32),
+              "and what this loader is: its identity and epoch");
+        const sig::Key other = fresh_key().pub;
+        bool words = true;
+        const ETCS::TrustEvent::Op ops[3] = { ETCS::TrustEvent::Op::Join, ETCS::TrustEvent::Op::Admit, ETCS::TrustEvent::Op::Retire };
+        for (int i = 0; i < 3; ++i)
+        {
+            ETCS::TrustEvent w(ops[i]);
+            w.a = tr::hex(reg.data(), 32); w.b = tr::hex(other.data(), 32);
+            uint8_t ws[64];
+            const std::string m = i == 0 ? sig::join_statement(A.pub, other, reg, E)
+                                : i == 1 ? sig::admit_statement(A.pub, other, reg, E) : sig::retire_statement(A.pub, other, reg);
+            words = words && w() && w.out.size() == 65 + 128 && w.out.substr(0, 64) == tr::hex(A.pub.data(), 32)
+                    && tr::unhex(w.out.substr(65), ws, 64)
+                    && mc::crypto_ed25519_check(ws, A.pub.data(), reinterpret_cast<const uint8_t*>(m.data()), m.size()) == 0;
+        }
+        ETCS::TrustEvent self_join(ETCS::TrustEvent::Op::Join);
+        self_join.a = tr::hex(reg.data(), 32); self_join.b = tr::hex(A.pub.data(), 32);
+        check(words && !self_join() && self_join.out == "a key does not join itself",
+              "an account's words -- join, admit, retire -- are this key's, each in its own form, join and admit in this epoch; "
+              "a key joins no account through itself");
         ETCS::TrustEvent sv(ETCS::TrustEvent::Op::Survey);
         sv.a = list;
         check(!sv() && (sv.out.rfind("no identity is built into", 0) == 0 || sv.out == "the list is not signed by the marketplace of this loader's identity"),

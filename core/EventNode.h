@@ -436,7 +436,8 @@ struct PairMaskEvent : Event
 // thread like PairMask's. Blocking; `out` and `ok` are the handler's, published
 // by on_emit.
 //
-//   Request  a = the registrar's key, hex      out = "<this loader's key> <signature>"
+//   Request  a = the registrar's key, hex      out = "<this loader's key> <head> <epoch> <signature>"
+//            b = "next": for the successor a Replace put in place, not this loader
 //   Install  a = a chain, binary or hex        out = what it registered as
 //   Survey   a = the site's list               out = the report, "fetch <name> <file>" lines
 //   Replace  a = the site's list, b = bytes    out = the path written
@@ -449,9 +450,13 @@ struct PairMaskEvent : Event
 //   Recognize a = "<key> <chain|-> <signature>"   out = "<identity> <registered> <guild>":
 //            b = the transcript, hex             the far side's word, checked here
 //            name = the far side's 'd' or 'a'
+//   Join     a = the registrar's key, hex      out = "<this loader's key> <signature>": its word
+//   Admit    b = the other key, hex              that it joins b's account, admits b to its
+//   Retire                                       own, or retires b from it (sig::*_statement)
+//   Identify (nothing)                         out = "<head> <epoch>": what this loader is
 struct TrustEvent : Event
 {
-    enum class Op : uint8_t { Request, Install, Survey, Replace, Resync, Vouch, Recognize };
+    enum class Op : uint8_t { Request, Install, Survey, Replace, Resync, Vouch, Recognize, Join, Admit, Retire, Identify };
     Op                  op;
     ::std::string       name, a, b, out;
     bool                ok = false;

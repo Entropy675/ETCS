@@ -6,7 +6,8 @@
 #     run site_pki.etcs web=web tree=tree
 #
 #   /pki    the registrar (CryptProvider::Registrar): a loader's key, proven,
-#           gets a Loader certificate and the chain above it
+#           gets its ACE identity's certificate for the epoch and the chain
+#           above; accounts gather ACE identities
 #   /dist   the binaries a download takes, and the marketplace's signed list
 #           of them (`ace publish` writes ACE_ROOT/dist)
 #
@@ -15,6 +16,13 @@
 # it are ACE_ROOT/pki/{registrar,active,root}.cert, as the authority left them.
 # Without them the registrar answers that it is not set up, and the rest of
 # the site runs.
+#
+# ACE identities are derived under a second secret, `ace-identity`
+# (site_identity_secret.etcs makes it once), and accounts are kept in
+# ACE_ROOT/pki/accounts.db. The registrar takes registrations from loaders of
+# this loader's identity, in its epoch and the one before (kept with the
+# accounts, pki.Window to change): a release runs the site on its own loader
+# first, and the last epoch's loaders register for the new one as they heal.
 
 requires web [HttpServer]
 requires tree [FileHtmlPage]
@@ -44,9 +52,19 @@ spawn CryptProvider::Certificate pki_root_cert
 pki_files.Recall(root @pki_root_cert)
 pki_embassy.Close()
 
+spawn DatabaseProvider::Keystore ace_secret
+ace_secret.Connect(ace-identity)
+spawn CryptProvider::Keypair ace_derive
+ace_derive.LoadFrom(@ace_secret)
+spawn DatabaseProvider::LocalDatabase ace_accounts
+ace_accounts.Connect(ACE_ROOT/pki/accounts.db)
+
 spawn CryptProvider::Registrar pki
 pki.Use(@pki_key)
 pki.Above(@pki_registrar_cert)
 pki.Above(@pki_active_cert)
 pki.Above(@pki_root_cert)
-web.AddRoute(@pki Request @pki Filter)
+pki.Derive(@ace_derive)
+pki.Accounts(@ace_accounts)
+pki.Current()
+web.AddRequestRoute(@pki Request @pki Filter)

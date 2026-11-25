@@ -34,8 +34,10 @@
  * A CHAIN IS TWO HALVES (core/Signature.h). The local half -- this loader's key
  * and what it signs -- is taken by nothing but that loader. The half above is
  * joined on by a registration, and is what lets anyone else take what the key
- * signs. A root attesting another root continues a chain the same way: adding
- * to the chain is trusting it as a remote.
+ * signs: through this key's ACE identity, certified for the epoch it was
+ * registered in, so a registration is this epoch's and is asked for again in
+ * the next (registration_current). A root attesting another root continues a
+ * chain the same way: adding to the chain is trusting it as a remote.
  *
  * THE IDENTITY is built in (ace: -DETCS_IDENTITY): the checksum folded along a
  * chain from a root down to the key that built this loader -- the minting
@@ -190,7 +192,7 @@ inline sig::Role above(sig::Role r)
     {
         case sig::Role::Root: case sig::Role::Intermediate:                          return sig::Role::Root;
         case sig::Role::Marketplace: case sig::Role::Release: case sig::Role::Registrar: return sig::Role::Intermediate;
-        case sig::Role::Loader:                                                     return sig::Role::Registrar;
+        case sig::Role::Loader: case sig::Role::Identity:                           return sig::Role::Registrar;
         case sig::Role::Module:                                                     return sig::Role::Loader;
     }
     return sig::Role::Loader;
@@ -940,6 +942,16 @@ inline bool registration_valid(const std::vector<sig::Certificate>& reg, const s
     return head_meets(p, head) == long(p.size()) - 1;
 }
 
+// Whether a registration holds in `epoch`: every certificate bounded by epochs
+// (an ACE identity's) names it. One that does not was this key's in another
+// epoch, and is asked for again.
+inline bool registration_current(const std::vector<sig::Certificate>& reg, const sig::Epoch& epoch)
+{
+    for (const sig::Certificate& c : reg)
+        if (!c.epochs.empty() && !has_epoch(c, epoch)) return false;
+    return true;
+}
+
 #if !defined(__EMSCRIPTEN__)
 inline bool make_dirs(const std::string& dir)
 {
@@ -1026,15 +1038,58 @@ inline bool loader_key(const std::string& dir, uint8_t secret[64], sig::Key& pub
     return true;
 }
 
+/*
+ * THE LOADER BINARY PUT IN PLACE FOR A LATER SESSION (replace, "etcs"): its
+ * epoch and the identity it is built for, so this loader can register its key
+ * for that epoch before the swap (registration_request, `next`), and the
+ * successor starts registered.
+ */
+inline void successor_placed(const std::string& store, const sig::Epoch& epoch, const sig::Key& head)
+{
+    if (store.empty()) return;
+    std::ofstream f(store + "/successor", std::ios::trunc);
+    f << "epoch=" << hex(epoch.data(), 32) << " head=" << hex(head.data(), 32) << "\n";
+}
+
+inline bool successor(const std::string& store, sig::Epoch& epoch, sig::Key& head)
+{
+    std::ifstream f(store + "/successor");
+    std::string e, h;
+    return !store.empty() && f >> e >> h && e.rfind("epoch=", 0) == 0 && h.rfind("head=", 0) == 0
+        && unhex(e.substr(6), epoch.data(), 32) && unhex(h.substr(5), head.data(), 32);
+}
+
+/*
+ * This key's registration for `epoch`: loader.chain, or the one installed
+ * ahead of a swap (loader.chain.next) once this loader is the successor it was
+ * for -- which then takes loader.chain's place. `stale` says one of another
+ * epoch was found and dropped.
+ */
+inline bool current_registration(const std::string& dir, const sig::Key& pub, const sig::Epoch& epoch,
+                                 std::vector<sig::Certificate>& reg, bool& stale)
+{
+    stale = false;
+    for (const bool ahead : { false, true })
+    {
+        const std::string path = dir + (ahead ? "/loader.chain.next" : "/loader.chain");
+        std::vector<uint8_t> raw;
+        reg.clear();
+        if (!read_file(path, raw) || !sig::decode_chain(raw.data(), raw.size(), reg) || !registration_valid(reg, pub)) continue;
+        if (!registration_current(reg, epoch)) { stale = true; continue; }
+        if (ahead) { std::error_code ec; std::filesystem::rename(path, dir + "/loader.chain", ec); }
+        return true;
+    }
+    reg.clear();
+    return false;
+}
+
 // The key, and the half above it when there is one: what a signer needs.
 inline bool identity(const std::string& dir, uint8_t secret[64], sig::Key& pub,
                      std::vector<sig::Certificate>& reg, std::string& why)
 {
     if (!loader_key(dir, secret, pub, why)) return false;
-    std::vector<uint8_t> raw;
-    if (!read_file(dir + "/loader.chain", raw) || !sig::decode_chain(raw.data(), raw.size(), reg)
-        || !registration_valid(reg, pub))
-        reg.clear();
+    bool stale = false;
+    current_registration(dir, pub, loader_epoch(), reg, stale);
     return true;
 }
 
@@ -1089,7 +1144,13 @@ inline bool install_registration(const std::string& dir, const std::vector<sig::
     mc::crypto_wipe(secret, 64);
     if (reg.empty() || reg.back().role != sig::Role::Root) { why = "the chain does not end at a root certificate"; return false; }
     if (!registration_valid(reg, pub)) { why = "not a registration of this loader's key"; return false; }
-    if (!write_public(dir + "/loader.chain", sig::encode_chain(reg))) { why = "cannot write " + dir + "/loader.chain"; return false; }
+    sig::Epoch next{};
+    sig::Key head{};
+    const bool ahead = !registration_current(reg, loader_epoch());
+    if (ahead && !(successor(dir, next, head) && registration_current(reg, next)))
+    { why = "a registration for an epoch neither this loader nor its successor runs in"; return false; }
+    const std::string path = dir + (ahead ? "/loader.chain.next" : "/loader.chain");
+    if (!write_public(path, sig::encode_chain(reg))) { why = "cannot write " + path; return false; }
     return true;
 }
 
@@ -1251,10 +1312,9 @@ inline std::shared_ptr<const Identity> establish(const std::string& dir, bool pr
     if (!load_public(dir, id->pub)) id->unproven = "this store has no loader key yet";
     else
     {
-        std::vector<uint8_t> raw;
-        if (!read_file(dir + "/loader.chain", raw) || !sig::decode_chain(raw.data(), raw.size(), id->reg)
-            || !registration_valid(id->reg, id->pub))
-            id->reg.clear();
+        bool stale = false;
+        if (!current_registration(dir, id->pub, loader_epoch(), id->reg, stale) && stale)
+            trust_warn("this loader's registration is for another epoch: it runs unregistered until it registers again");
         if (!id->reg.empty()) id->role = id->reg[0].role;
     }
     if (!prove) return id;
@@ -1502,6 +1562,7 @@ inline int issue(const std::string& dir, sig::Role role, const sig::Key& subject
     const std::shared_ptr<const Identity> id = establish(dir, true, built_in);
     auto refused = [&](const std::string& w) { mc::crypto_wipe(secret, 64); why = w; return 2; };
     if (reg.empty()) return refused("this loader is not registered, so it certifies no one");
+    if (role == sig::Role::Identity) return refused("an ACE identity is derived by a registrar's route, for an epoch; none is issued by hand");
     if (!sig::may_issue(reg[0].role, role))
         return refused(std::string("a ") + sig::role_name(reg[0].role) + " does not certify a " + sig::role_name(role));
     if (!id->proven) return refused("this loader has not proven its key: " + id->unproven);
@@ -1908,6 +1969,7 @@ inline bool replace(const std::string& text, const std::string& name, const std:
     fs::rename(beside, path, ec);
     if (ec) { fs::remove(beside, ec); why = "cannot put it at " + path; return false; }
     out = path;
+    if (kernel) successor_placed(store, d.epoch, d.head);
     if (d.sibling && !store.empty())
     {
         std::ofstream r(store + "/resync", std::ios::trunc);
@@ -1981,15 +2043,44 @@ inline void resync_exec()
 #endif
 }
 
-// What a loader signs to ask a registrar for the half above its key (sig::registration_statement).
-inline bool registration_request(const std::string& dir, const sig::Key& registrar, sig::Key& pub,
-                                 uint8_t s[sig::kSigBytes], std::string& why)
+// What a loader signs to ask a registrar for the half above its key, as a
+// loader of the identity built in, running in this epoch -- or, `next`, as
+// the successor it put in place (sig::registration_statement):
+// "<key> <head> <epoch> <signature>", hex.
+inline bool registration_request(const std::string& dir, const sig::Key& registrar, std::string& out, std::string& why,
+                                 bool next = false)
 {
-    uint8_t secret[64];
+    sig::Key head = ace_identity();
+    sig::Epoch epoch = loader_epoch();
+    if (next && !successor(dir, epoch, head)) { why = "no successor is in place to register for"; return false; }
+    uint8_t secret[64], s[sig::kSigBytes];
+    sig::Key pub{};
     if (!loader_key(dir, secret, pub, why)) return false;
-    const std::string m = sig::registration_statement(pub, registrar);
+    const std::string m = sig::registration_statement(pub, registrar, head, epoch);
     mc::crypto_ed25519_sign(s, secret, reinterpret_cast<const uint8_t*>(m.data()), m.size());
     mc::crypto_wipe(secret, 64);
+    out = hex(pub.data(), 32) + " " + hex(head.data(), 32) + " " + hex(epoch.data(), 32) + " " + hex(s, sizeof s);
+    return true;
+}
+
+// A member's word about an account, or a key's agreeing to join one
+// (sig::join_statement, admit_statement, retire_statement), signed by this
+// loader's key: "<key> <signature>", hex. `kind` is 'j', 'a' or 'r'; `other`
+// is the member joined, the key admitted, or the key retired.
+inline bool account_word(const std::string& dir, char kind, const sig::Key& registrar, const sig::Key& other,
+                         std::string& out, std::string& why)
+{
+    if (kind != 'j' && kind != 'a' && kind != 'r') { why = "no such word"; return false; }
+    uint8_t secret[64], s[sig::kSigBytes];
+    sig::Key pub{};
+    if (!loader_key(dir, secret, pub, why)) return false;
+    if (kind != 'r' && other == pub) { mc::crypto_wipe(secret, 64); why = "a key does not join itself"; return false; }
+    const std::string m = kind == 'j' ? sig::join_statement(pub, other, registrar, loader_epoch())
+                        : kind == 'a' ? sig::admit_statement(pub, other, registrar, loader_epoch())
+                                      : sig::retire_statement(pub, other, registrar);
+    mc::crypto_ed25519_sign(s, secret, reinterpret_cast<const uint8_t*>(m.data()), m.size());
+    mc::crypto_wipe(secret, 64);
+    out = hex(pub.data(), 32) + " " + hex(s, sizeof s);
     return true;
 }
 #endif // !__EMSCRIPTEN__
@@ -2078,6 +2169,7 @@ inline bool vouch(char side, const std::string& transcript_hex, std::string& out
 }
 
 // Recognize: the far side's word on the same transcript -> "<identity> <registered> <guild>".
+// A registration for another epoch is none here.
 inline bool recognize(char side, const std::string& word, const std::string& transcript_hex, std::string& out, std::string& why)
 {
     uint8_t t[sig::kLinkTranscript], s[sig::kSigBytes];
@@ -2098,6 +2190,7 @@ inline bool recognize(char side, const std::string& word, const std::string& tra
         if (c.size() % 2 || raw.empty() || !unhex(c, reinterpret_cast<uint8_t*>(&raw[0]), raw.size())
             || !sig::decode_chain(raw.data(), raw.size(), reg) || !registration_valid(reg, pub))
         { why = "its chain is not a registration of its key"; return false; }
+        if (!registration_current(reg, loader_epoch())) reg.clear();
     }
     const std::vector<Step> p = path_of(reg, pub);
     const sig::Key ident = identity_of(p);
@@ -2112,9 +2205,12 @@ inline bool recognize(char side, const std::string& word, const std::string& tra
  * WHAT A MODULE MAY ASK (TrustEvent, core/EventNode.h), on the loader's
  * ordering thread, of this loader as it runs: its store, its session's
  * identity, its own directory and binary, its epoch. `op` in TrustEvent::Op's
- * order. A registration installed now is the next session's; a re-sync
+ * order. A registration installed now is the next session's -- for this
+ * epoch, or (op 0 with b = "next") for the successor put in place; a re-sync
  * (op 4) ends this session and starts the successor in its place. A link's
- * word (ops 5 and 6) is asked of a browser loader too.
+ * word (ops 5 and 6), and what this loader is (op 10: "<head> <epoch>"), are
+ * asked of a browser loader too. An account's words (ops 7 to 9) take the
+ * registrar's key in `a` and the other key in `b`.
  */
 inline bool answer(uint8_t op, const std::string& name, const std::string& a, const std::string& b, std::string& out)
 {
@@ -2126,6 +2222,11 @@ inline bool answer(uint8_t op, const std::string& name, const std::string& a, co
         const bool ok = op == 5 ? vouch(side, a, out, why) : recognize(side, a, b, out, why);
         if (!ok) out = why;
         return ok;
+    }
+    if (op == 10)
+    {
+        out = hex(ace_identity().data(), 32) + " " + hex(loader_epoch().data(), 32);
+        return true;
     }
 #if defined(__EMSCRIPTEN__)
     (void)op; (void)name; (void)a; (void)b;
@@ -2141,10 +2242,17 @@ inline bool answer(uint8_t op, const std::string& name, const std::string& a, co
     {
         case 0:
         {
-            sig::Key registrar{}, pub{};
-            uint8_t s[sig::kSigBytes];
+            sig::Key registrar{};
             if (!unhex(a, registrar.data(), registrar.size())) { why = "not a registrar's key"; break; }
-            if ((ok = registration_request(dir, registrar, pub, s, why))) out = hex(pub.data(), 32) + " " + hex(s, sizeof s);
+            ok = registration_request(dir, registrar, out, why, b == "next");
+            break;
+        }
+        case 7: case 8: case 9:
+        {
+            sig::Key registrar{}, other{};
+            if (!unhex(a, registrar.data(), registrar.size())) { why = "not a registrar's key"; break; }
+            if (!unhex(b, other.data(), other.size())) { why = "not a loader's key"; break; }
+            ok = account_word(dir, op == 7 ? 'j' : op == 8 ? 'a' : 'r', registrar, other, out, why);
             break;
         }
         case 1:
@@ -2152,7 +2260,8 @@ inline bool answer(uint8_t op, const std::string& name, const std::string& a, co
             std::vector<sig::Certificate> reg;
             if (!parse_certificates(a, reg)) { why = "not a chain of certificates"; break; }
             if ((ok = install_registration(dir, reg, why)))
-                out = std::string("registered as ") + sig::role_name(reg[0].role) + "; the next session is it";
+                out = std::string("registered as ") + sig::role_name(reg[0].role)
+                    + (registration_current(reg, loader_epoch()) ? "; the next session is it" : "; the successor in place is it");
             break;
         }
         case 2: ok = survey(a, out, why, id, loader_epoch(), bin, self, dir); break;
@@ -2588,7 +2697,11 @@ inline bool consensus(const std::vector<std::string>& texts, const std::vector<s
  *   etcs --succeed <name> <file> <epoch hex> <out>  the same, for a loader binary: passes it off, and logs the edge
  *   etcs --registration <cert>...                   install the half above this key, leaf first; prints the identity
  *   etcs --issue <role> <key hex> <out>             a registrar certifies another loader's key; writes its chain
- *   etcs --request <registrar key hex>              "<this loader's key> <signature>": a registration's ask
+ *   etcs --request <registrar key hex> [next]       "<key> <head> <epoch> <signature>": a registration's ask, for
+ *                                                   this loader or the successor it put in place
+ *   etcs --join <registrar> <member key>            "<key> <signature>": this key agrees to join member's account
+ *   etcs --admit <registrar> <joining key>          "<key> <signature>": this member admits it
+ *   etcs --retire <registrar> <key>                 "<key> <signature>": this member retires a key of its account
  *   etcs --manifest <dir> <out>                     the marketplace's signed list of what <dir> serves
  *   etcs --survey <list>                            what that list has moved past, here
  *   etcs --attest                                   what this loader says of itself; 0 only if it attests
@@ -2739,13 +2852,23 @@ inline int cli(int argc, char** argv)
                     hex(reg.back().subject.data(), 32).c_str(), hex(head.data(), 32).c_str());
         return 0;
     }
-    if (verb == "--request" && argc == 3)
+    if (verb == "--request" && (argc == 3 || (argc == 4 && std::string(argv[3]) == "next")))
     {
-        sig::Key registrar{}, pub{};
-        uint8_t s[sig::kSigBytes];
+        sig::Key registrar{};
+        std::string line;
         if (!unhex(argv[2], registrar.data(), registrar.size())) { std::fprintf(stderr, "etcs: not a registrar's key\n"); return 2; }
-        if (!registration_request(dir, registrar, pub, s, why)) { std::fprintf(stderr, "etcs: %s\n", why.c_str()); return 2; }
-        std::printf("%s %s\n", hex(pub.data(), 32).c_str(), hex(s, sizeof s).c_str());
+        if (!registration_request(dir, registrar, line, why, argc == 4)) { std::fprintf(stderr, "etcs: %s\n", why.c_str()); return 2; }
+        std::printf("%s\n", line.c_str());
+        return 0;
+    }
+    if ((verb == "--join" || verb == "--admit" || verb == "--retire") && argc == 4)
+    {
+        sig::Key registrar{}, other{};
+        std::string line;
+        if (!unhex(argv[2], registrar.data(), registrar.size()) || !unhex(argv[3], other.data(), other.size()))
+        { std::fprintf(stderr, "usage: etcs %s <registrar key hex> <key hex>\n", verb.c_str()); return 2; }
+        if (!account_word(dir, verb[2], registrar, other, line, why)) { std::fprintf(stderr, "etcs: %s\n", why.c_str()); return 2; }
+        std::printf("%s\n", line.c_str());
         return 0;
     }
     if (verb == "--manifest" && argc == 4)

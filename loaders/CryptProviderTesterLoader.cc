@@ -40,9 +40,18 @@
 //      and the root's: three registrations the loader accepts, each for its
 //      own key and no other, from two keys that do not outlive the script.
 //  10. THE REGISTRAR, as a site's route: it takes only a chain that certifies
-//      its own key up to a root; a loader's ask, signed, gets a Loader
-//      certificate the loader accepts; an unsigned ask, or one made of another
-//      registrar, is refused.
+//      its own key up to a root; a loader's ask, signed and naming an identity
+//      and epoch it serves, gets the key certified by its ACE identity and that
+//      identity certified for the epoch -- one ACE identity per key, the same in
+//      every epoch -- which the loader accepts for that epoch alone; an
+//      unsigned ask, an outsider's, or one made of another registrar is refused.
+//  11. ACCOUNTS. A key joins with its own word and a member's, in one epoch
+//      the registrar serves, never one alone; a key holding a registration
+//      moves only at its next one, in a later epoch; one sharing another
+//      account does not move; a member retires a key of its own account, which
+//      is then registered no more and has no word; a new epoch closes the
+//      oldest; the rows name no key, and are read back as left -- epochs too --
+//      under the same secret and refused under another.
 //
 //   ./Run_CryptProviderTesterLoader
 //
@@ -52,6 +61,7 @@
 #include "../ETCS.h"
 #include "../libs/monocypher.h"
 #include "../core/Signature.h"
+#include "../modules/NetworkProvider/NetworkProvider/RouteRequest.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -80,10 +90,15 @@ static std::string verb(ETCS::Entity* e, const std::string& action, const std::s
     return d.toString();
 }
 static bool yes(const std::string& s) { return s.find('1') != std::string::npos; }
-// A route's answer, inline or by reference (NetworkProvider's RouteRef frame).
-static std::string route(ETCS::Entity* e, const std::string& path)
+// A request route's answer, inline or by reference (NetworkProvider's RouteRef
+// frame): a GET, or a POST of `words`.
+static std::string route(ETCS::Entity* e, const std::string& path, const std::string& words = "", const char* method = nullptr)
 {
-    ETCS::Buffer a("Registrar.Request"), d(path.c_str());
+    const RouteRequest req = RouteRequest::Parse("/" + path, method ? method : words.empty() ? "GET" : "POST",
+                                                 words.data(), words.size());
+    const uint64_t at = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&req));
+    ETCS::Buffer a("Registrar.Request"), d;
+    d.writeRaw(&at, sizeof at);
     e->call(a, d);
     if (d.written == 64 && std::memcmp(d.buf, "ETCSREF\0", 8) == 0)
     {
@@ -756,11 +771,14 @@ int main(int, char**)
         check(run("spawn CryptProvider::Keypair reg_root\nreg_root.Generate()\n"
                   "spawn CryptProvider::Keypair reg_active\nreg_active.Generate()\n"
                   "spawn CryptProvider::Keypair reg_key\nreg_key.Generate()\n"
+                  "spawn CryptProvider::Keypair reg_secret\nreg_secret.Generate()\n"
+                  "spawn CryptProvider::Keypair reg_other_secret\nreg_other_secret.Generate()\n"
                   "spawn CryptProvider::Certificate reg_rc\nreg_rc.Issue(@reg_root root @reg_root)\n"
                   "spawn CryptProvider::Certificate reg_ic\nreg_ic.Issue(@reg_root intermediate @reg_active)\n"
                   "spawn CryptProvider::Certificate reg_gc\nreg_gc.Issue(@reg_active registrar @reg_key)\n"
                   "spawn CryptProvider::Certificate reg_mc\nreg_mc.Issue(@reg_active marketplace @reg_key)\n"
-                  "spawn CryptProvider::Registrar pki\n"), "a registrar, its key, and an authority above it");
+                  "spawn DatabaseProvider::LocalDatabase reg_db\nreg_db.Connect(" + dir + "/accounts.db)\n"
+                  "spawn CryptProvider::Registrar pki\n"), "a registrar, its key, its secret, its accounts, and an authority above it");
         ETCS::Entity* pki = entity("pki");
         auto rid = [&](const char* n) { return entity(n) ? std::to_string(entity(n)->getRID()) : std::string("0"); };
         check(pki && !yes(verb(pki, "Registrar.Above", rid("reg_gc"))), "nothing goes above it before it uses a key");
@@ -775,38 +793,157 @@ int main(int, char**)
         check(pki && key.size() == 64 && route(pki, "pki/registrar") == key + "\n"
               && key == verb(entity("reg_key"), "Keypair.PublicKey"), "it says its key");
 
-        uint8_t seed[32], secret[64], sg[64];
-        sig::Key loader{}, registrar{}, root{}, other{};
-        tr::random_bytes(seed, 32);
-        mc::crypto_ed25519_key_pair(secret, loader.data(), seed);
+        struct Loader { uint8_t secret[64]; sig::Key pub{}; };
+        auto fresh = [&] { Loader l; uint8_t seed[32]; tr::random_bytes(seed, 32); mc::crypto_ed25519_key_pair(l.secret, l.pub.data(), seed); return l; };
+        auto sign = [&](const Loader& l, const std::string& m) {
+            uint8_t sg[64];
+            mc::crypto_ed25519_sign(sg, l.secret, reinterpret_cast<const uint8_t*>(m.data()), m.size());
+            return hex(sg, 64);
+        };
+        Loader A = fresh();
+        sig::Key registrar{}, root{}, other{}, head{}, stranger{};
+        sig::Epoch E = tr::loader_epoch(), E2{};
         unhex(key, registrar.data(), 32);
         unhex(verb(entity("reg_root"), "Keypair.PublicKey"), root.data(), 32);
-        auto ask = [&](const sig::Key& of) {
-            const std::string m = sig::registration_statement(loader, of);
-            mc::crypto_ed25519_sign(sg, secret, reinterpret_cast<const uint8_t*>(m.data()), m.size());
-            return "pki/register/" + hex(loader.data(), 32) + "/" + hex(sg, 64);
+        head[0] = 0x4a; stranger[0] = 0x5b; E2[0] = 0x6c;
+        auto ask = [&](const Loader& l, const sig::Key& of, const sig::Key& h, const sig::Epoch& e) {
+            return hex(l.pub.data(), 32) + " " + hex(h.data(), 32) + " " + hex(e.data(), 32) + " "
+                   + sign(l, sig::registration_statement(l.pub, of, h, e));
         };
-        const std::string path = ask(registrar);
-        const std::string answer = pki ? route(pki, path) : "";
+        auto reg = [&](const std::string& words) { return route(pki, "pki/register", words); };
+        const std::string words = ask(A, registrar, head, E);
+        check(pki && reg(words).find("not set up for accounts") != std::string::npos,
+              "it registers no one before it has a secret, accounts, and the identity and epoch it serves");
+        check(pki && !yes(verb(pki, "Registrar.Accounts", rid("reg_db"))), "accounts are kept only under a secret");
+        check(pki && !yes(verb(pki, "Registrar.Derive", rid("reg_key"))) && yes(verb(pki, "Registrar.Derive", rid("reg_secret"))),
+              "the secret is another key than the one it signs with");
+        check(pki && yes(verb(pki, "Registrar.Accounts", rid("reg_db"))), "its accounts are kept in a database");
+        const bool built_in = tr::ace_identity() != sig::Key{};
+        check(pki && yes(verb(pki, "Registrar.Current")) == built_in,
+              built_in ? "Current takes this loader's own identity and epoch"
+                       : "Current is refused by a loader with no identity built in");
+        check(pki && yes(verb(pki, "Registrar.Head", hex(head.data(), 32))) && yes(verb(pki, "Registrar.Epoch", hex(E.data(), 32)))
+              && !yes(verb(pki, "Registrar.Epoch", "nothing")), "it takes the identity and epoch it serves");
+
+        const std::string answer = pki ? reg(words) : "";
         std::vector<sig::Certificate> chain;
-        check(tr::parse_certificates(answer, chain) && chain.size() == 4 && chain[0].role == sig::Role::Loader
-              && chain[0].subject == loader && chain[1].role == sig::Role::Registrar,
-              "a loader's signed ask gets a Loader certificate and the chain above it");
-        check(!chain.empty() && tr::registration_valid(chain, loader) && chain.back().subject == root,
+        check(tr::parse_certificates(answer, chain) && chain.size() == 5
+              && chain[0].role == sig::Role::Loader && chain[0].subject == A.pub
+              && chain[1].role == sig::Role::Identity && chain[0].issuer == chain[1].subject && chain[1].issuer == registrar
+              && chain[1].epochs.size() == 1 && chain[1].epochs[0] == E && chain[2].role == sig::Role::Registrar,
+              "a loader's signed ask gets its key certified by its ACE identity, and that identity certified for the epoch");
+        const sig::Key K = chain.size() == 5 ? chain[1].subject : sig::Key{};
+        check(chain.size() == 5 && tr::registration_valid(chain, A.pub) && chain.back().subject == root,
               "which the loader takes as its registration under that root");
-        check(pki && route(pki, path) == answer, "the same ask gets the same answer");
-        std::string bad = path;
+        check(chain.size() == 5 && tr::registration_current(chain, E) && !tr::registration_current(chain, E2),
+              "and holds in that epoch, and in no other");
+        check(pki && reg(words) == answer, "the same ask gets the same answer");
+        check(pki && reg(ask(A, registrar, stranger, E)) == "refused: a loader of an identity or epoch this registrar does not serve\n"
+              && reg(ask(A, registrar, head, E2)).rfind("refused: a loader of an identity", 0) == 0,
+              "a loader of an identity or an epoch it does not serve is an outsider, and refused");
+        std::vector<sig::Certificate> again;
+        verb(pki, "Registrar.Epoch", hex(E2.data(), 32));
+        const std::string answer2 = pki ? reg(ask(A, registrar, head, E2)) : "";
+        check(pki && tr::parse_certificates(answer2, again) && again.size() == 5
+              && again[1].subject == K && again[1].epochs[0] == E2,
+              "the same key, in another epoch it serves: the same ACE identity, certified for that epoch");
+        Loader B = fresh();
+        std::vector<sig::Certificate> theirs;
+        check(pki && tr::parse_certificates(reg(ask(B, registrar, head, E)), theirs) && theirs.size() == 5
+              && theirs[1].subject != K, "another key: another ACE identity -- one for one");
+        std::string bad = words;
         bad[bad.size() - 1] = bad.back() == '0' ? '1' : '0';
-        check(pki && route(pki, bad).rfind("refused", 0) == 0, "an ask the key did not sign is refused");
+        check(pki && reg(bad).rfind("refused", 0) == 0, "an ask the key did not sign is refused");
         other[0] = 1;
-        check(pki && route(pki, ask(other)).rfind("refused", 0) == 0, "an ask made of another registrar is refused here");
+        check(pki && reg(ask(A, other, head, E)).rfind("refused", 0) == 0, "an ask made of another registrar is refused here");
+        check(pki && route(pki, "pki/register/" + hex(A.pub.data(), 32) + "/" + std::string(128, '0')) == "refused: a word is POSTed to pki/register, as the loader said it\n"
+              && reg(hex(A.pub.data(), 32) + " " + std::string(128, '0')) == "refused: not the words register takes\n",
+              "an old loader's GET, or an ask without its identity and epoch, is refused and told why");
+        ETCS::Buffer pa("Registrar.Request"), pd("pki/registrar");
+        if (pki) pki->call(pa, pd);
+        check(pki && pd.toString() == "refused: a registrar is added with HttpServer.AddRequestRoute\n",
+              "added as a path route, it says how it is added");
         check(pki && route(pki, "pki/nothing") == "no such path\n" && route(pki, "chess/registrar") == "no such path\n",
               "a path it does not serve is answered as one");
         ETCS::Buffer fa("Registrar.Filter"), f1("pki/register/x"), f2("chess/pki");
         if (pki) { pki->call(fa, f1); pki->call(fa, f2); }
         check(pki && f1.toString() == "pki" && f2.written == 0, "its filter claims the paths under its mount and no others");
-        mc::crypto_wipe(secret, 64);
-        run("pki.Delete()\nreg_root.Delete()\nreg_active.Delete()\nreg_key.Delete()\n");
+
+        // -- 11. accounts --
+        std::cout << "\n-- 11. accounts --\n";
+        auto admit = [&](const Loader& m, const Loader& k, bool member_word = true, bool joining_word = true,
+                         const sig::Epoch* me = nullptr, const sig::Epoch* ke = nullptr) {
+            const std::string ms = member_word ? sign(m, sig::admit_statement(m.pub, k.pub, registrar, me ? *me : E)) : std::string(128, '0');
+            const std::string ks = joining_word ? sign(k, sig::join_statement(k.pub, m.pub, registrar, ke ? *ke : E)) : std::string(128, '0');
+            return route(pki, "pki/admit", hex(k.pub.data(), 32) + " " + ks + " " + hex(m.pub.data(), 32) + " " + ms);
+        };
+        auto retire = [&](const Loader& m, const Loader& k) {
+            return route(pki, "pki/retire", hex(k.pub.data(), 32) + " " + hex(m.pub.data(), 32) + " "
+                                            + sign(m, sig::retire_statement(m.pub, k.pub, registrar)));
+        };
+        sig::Epoch E3{};
+        E3[0] = 0x7d;
+        Loader P = fresh();                                             // a paper key: never a loader, only a member
+        check(pki && admit(A, P, true, false).rfind("refused: the joining key's word", 0) == 0,
+              "a member alone admits no key: every key is public, and a key agrees to join");
+        check(pki && admit(A, P, false, true).rfind("refused: the member's word does not verify", 0) == 0,
+              "nor does a key's wish to join admit it");
+        check(pki && admit(A, P, true, true, &E3, &E3).rfind("refused: the member's word does not verify", 0) == 0
+              && admit(A, P, true, true, &E, &E2).rfind("refused: the joining key's word", 0) == 0,
+              "words of an epoch it does not serve, or of two epochs, admit no one");
+        check(pki && admit(P, A).rfind("refused: the admitting key is not a current member", 0) == 0, "only a member admits");
+        check(pki && admit(A, P) == "admitted\n" && admit(A, P, true, true, &E2, &E2) == "admitted\n",
+              "with both words in one epoch it serves, a key holding no registration joins at once -- a paper key as well as a loader's");
+        check(pki && admit(A, B) == "admitted at its next registration\n",
+              "a key holding a registration moves only at its next one: an account holds still under a live certificate");
+        check(pki && retire(P, B) == "refused: not keys of one account\n" && reg(ask(B, registrar, head, E)).rfind("refused", 0) != 0
+              && retire(P, B) == "refused: not keys of one account\n",
+              "so until then it is not the account's, and registering again in the same epoch moves nothing");
+        check(pki && reg(ask(B, registrar, head, E2)).rfind("refused", 0) != 0 && retire(P, B) == "retired\n",
+              "its registration in a later epoch, on its own word, is where it moves");
+        Loader C = fresh(), D = fresh();
+        reg(ask(C, registrar, head, E));
+        check(pki && admit(C, D) == "admitted\n" && admit(A, D) == "refused: that key shares another account; a member there retires it first\n",
+              "a key that shares an account with another does not move");
+        check(pki && retire(C, A) == "refused: not keys of one account\n", "a member retires only within its own account");
+        check(pki && retire(P, B) == "retired\n", "retiring twice changes nothing");
+        check(pki && reg(ask(B, registrar, head, E2)) == "refused: this key was retired from its account\n",
+              "a retired key is registered no more");
+        check(pki && retire(B, A) == "refused: the retiring key is not a current member\n" && admit(B, C).rfind("refused", 0) == 0,
+              "and has no word in its account");
+        check(pki && admit(A, B) == "refused: that key was retired, and comes back to no account\n", "nor comes back to it");
+        check(pki && reg(words) == answer, "the members still current are registered as before");
+        check(pki && yes(verb(pki, "Registrar.Epoch", hex(E3.data(), 32))) && reg(ask(C, registrar, head, E)).rfind("refused: a loader of an identity", 0) == 0
+              && reg(ask(C, registrar, head, E3)).rfind("refused", 0) != 0,
+              "given a new epoch it serves that one and the last: the oldest closes");
+
+        const std::string rows = slurp(dir + "/accounts.db");
+        const auto has = [&](const sig::Key& k) { return rows.find(std::string(reinterpret_cast<const char*>(k.data()), 32)) != std::string::npos; };
+        check(!rows.empty() && !has(A.pub) && !has(B.pub) && !has(P.pub) && !has(K),
+              "the rows hold no loader's key and no ACE identity: nothing in them says whose keys share an account");
+
+        check(run("spawn DatabaseProvider::LocalDatabase reg_db2\nreg_db2.Connect(" + dir + "/accounts.db)\n"
+                  "spawn DatabaseProvider::LocalDatabase reg_db3\nreg_db3.Connect(" + dir + "/accounts.db)\n"
+                  "spawn CryptProvider::Registrar pki2\npki2.Use(@reg_key)\n"
+                  "pki2.Above(@reg_gc)\npki2.Above(@reg_ic)\npki2.Above(@reg_rc)\n"
+                  "spawn CryptProvider::Registrar pki3\npki3.Use(@reg_key)\n"), "another registrar on the same accounts");
+        ETCS::Entity* pki2 = entity("pki2");
+        ETCS::Entity* pki3 = entity("pki3");
+        check(pki3 && yes(verb(pki3, "Registrar.Derive", rid("reg_other_secret"))) && !yes(verb(pki3, "Registrar.Accounts", rid("reg_db3"))),
+              "accounts kept under one secret are not read under another");
+        check(pki2 && yes(verb(pki2, "Registrar.Derive", rid("reg_secret"))) && yes(verb(pki2, "Registrar.Accounts", rid("reg_db2")))
+              && yes(verb(pki2, "Registrar.Head", hex(head.data(), 32))),
+              "under the same secret they are read back");
+        std::swap(pki, pki2);
+        check(pki && reg(ask(A, registrar, head, E2)) == answer2 && reg(ask(B, registrar, head, E2)) == "refused: this key was retired from its account\n"
+              && admit(A, P, true, true, &E2, &E2) == "admitted\n" && admit(A, D, true, true, &E3, &E3).rfind("refused: that key shares", 0) == 0
+              && reg(words).rfind("refused: a loader of an identity", 0) == 0,
+              "as they were left: the same ACE identities, members, retirements, and epochs served");
+        std::swap(pki, pki2);
+        mc::crypto_wipe(A.secret, 64); mc::crypto_wipe(B.secret, 64); mc::crypto_wipe(P.secret, 64);
+        mc::crypto_wipe(C.secret, 64); mc::crypto_wipe(D.secret, 64);
+        run("pki.Delete()\npki2.Delete()\npki3.Delete()\nreg_db.Delete()\nreg_db2.Delete()\nreg_db3.Delete()\n"
+            "reg_root.Delete()\nreg_active.Delete()\nreg_key.Delete()\nreg_secret.Delete()\nreg_other_secret.Delete()\n");
     }
 
     ETCS::PendingUnloadRegistry::getInstance().join_all();

@@ -4,6 +4,7 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <initializer_list>
 #include <string>
 #include <vector>
 
@@ -35,10 +36,19 @@ using Epoch = std::array<uint8_t, 32>;
  * A CHAIN IS TWO HALVES joined at a loader's key. ACE's half is a tree: the
  * root certifies the active key, and the active key the keys that share it as
  * parent -- one per loader that acts for ACE (the minting server's, the site's
- * registrar). The local half is a loader's own key and what it signs. A
- * registrar's certificate for a loader's key is the join. Release stays in the
- * table and is held by no one: the minting server's marketplace key signs
- * loader binaries as well as modules.
+ * registrar). The local half is a loader's own key and what it signs. Release
+ * stays in the table and is held by no one: the minting server's marketplace
+ * key signs loader binaries as well as modules.
+ *
+ * THE JOIN IS ONE TO ONE. A loader's ACE IDENTITY is ACE's key for that one
+ * loader key: derived by the registrar from the loader's public key under a
+ * secret only ACE holds, so ACE re-derives it whenever it is asked and keeps
+ * none. The registrar certifies the ACE identity, for the epoch it registered
+ * in; the ACE identity certifies the loader's key. An ACCOUNT is ACE's set of
+ * ACE identities, and is no key: who admits a key to it, or retires one, is a
+ * member's word to the registrar (the statements at the end of this file). A
+ * registrar may still certify a key as Loader directly -- a ceremony's
+ * authority, not an account.
  *
  * Who may certify whom is the table below, and nothing else: a key holds one
  * role, and two roles are two keys under one parent.
@@ -50,10 +60,10 @@ using Epoch = std::array<uint8_t, 32>;
  */
 enum class Role : uint8_t
 {
-    Root = 1, Intermediate = 2, Marketplace = 3, Loader = 4, Module = 5, Release = 6, Registrar = 7
+    Root = 1, Intermediate = 2, Marketplace = 3, Loader = 4, Module = 5, Release = 6, Registrar = 7, Identity = 8
 };
 
-inline bool role_valid(uint8_t r) { return r >= 1 && r <= 7; }
+inline bool role_valid(uint8_t r) { return r >= 1 && r <= 8; }
 
 inline bool may_issue(Role issuer, Role subject)
 {
@@ -62,7 +72,8 @@ inline bool may_issue(Role issuer, Role subject)
         case Role::Root:         return subject == Role::Root || subject == Role::Intermediate;
         case Role::Intermediate: return subject == Role::Marketplace || subject == Role::Release
                                      || subject == Role::Registrar;
-        case Role::Registrar:    return subject == Role::Loader;
+        case Role::Registrar:    return subject == Role::Loader || subject == Role::Identity;
+        case Role::Identity:     return subject == Role::Loader;
         case Role::Marketplace:
         case Role::Release:
         case Role::Loader:       return subject == Role::Module;
@@ -82,12 +93,13 @@ inline const char* role_name(Role r)
         case Role::Module:       return "module";
         case Role::Release:      return "release";
         case Role::Registrar:    return "registrar";
+        case Role::Identity:     return "identity";
     }
     return "?";
 }
 inline bool role_from_name(const std::string& s, Role& out)
 {
-    for (uint8_t r = 1; r <= 7; ++r)
+    for (uint8_t r = 1; r <= 8; ++r)
         if (s == role_name(static_cast<Role>(r))) { out = static_cast<Role>(r); return true; }
     return false;
 }
@@ -295,19 +307,41 @@ inline std::string link_statement(char side, const uint8_t transcript[kLinkTrans
 }
 
 /*
- * WHAT A LOADER SIGNS TO ASK FOR ACE'S HALF, and what a registrar checks:
+ * WHAT A LOADER SIGNS TO A REGISTRAR, each a fixed form, so a loader's key
+ * signs nothing else this way and a word to one registrar is none to another:
  *
- *   "ETCSREG1" | the loader's key | the registrar's key
+ *   "ETCSREG2" | loader | registrar | head | epoch     register: ACE's half for this key, as a
+ *                                                      loader built for `head`, running in `epoch`
+ *   "ETCSJON2" | joining | member | registrar | epoch  a key agrees to join member's account
+ *   "ETCSADM2" | member | joining | registrar | epoch  a member admits it
+ *   "ETCSRET1" | member | target | registrar           a member retires a key of its account
  *
- * A fixed form, so a loader's key signs nothing else this way, and a request
- * made of one registrar is no request of another.
+ * A key is admitted only with both words, its own and a member's: a member
+ * alone could otherwise claim any key it has seen, and every key is public.
+ * Both name the epoch they are said in, so neither is good in a later one.
+ * A retirement is for good, and names none.
  */
-inline std::string registration_statement(const Key& loader, const Key& registrar)
+inline std::string statement(const char magic[9], std::initializer_list<const std::array<uint8_t, 32>*> parts)
 {
-    std::string out("ETCSREG1", 8);
-    out.append(reinterpret_cast<const char*>(loader.data()), loader.size());
-    out.append(reinterpret_cast<const char*>(registrar.data()), registrar.size());
+    std::string out(magic, 8);
+    for (const auto* k : parts) out.append(reinterpret_cast<const char*>(k->data()), k->size());
     return out;
+}
+inline std::string registration_statement(const Key& loader, const Key& registrar, const Key& head, const Epoch& epoch)
+{
+    return statement("ETCSREG2", { &loader, &registrar, &head, &epoch });
+}
+inline std::string join_statement(const Key& joining, const Key& member, const Key& registrar, const Epoch& epoch)
+{
+    return statement("ETCSJON2", { &joining, &member, &registrar, &epoch });
+}
+inline std::string admit_statement(const Key& member, const Key& joining, const Key& registrar, const Epoch& epoch)
+{
+    return statement("ETCSADM2", { &member, &joining, &registrar, &epoch });
+}
+inline std::string retire_statement(const Key& member, const Key& target, const Key& registrar)
+{
+    return statement("ETCSRET1", { &member, &target, &registrar });
 }
 
 /*
