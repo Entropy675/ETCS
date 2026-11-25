@@ -24,7 +24,8 @@
 //      authority: the same tick, the same state, the same snapshot -- having
 //      checked itself at every `hash` line. A mirror is itself followable.
 //   5. DRIFT. A mirror whose state is not the authority's where a `hash` line
-//      says it is told, once.
+//      says replays its trace and is the authority again, untold; one the
+//      lines do not decide (a leaf that is not deterministic) is told, once.
 //   6. PRESENT. A seat arrives when it sits and departs when its stream ends;
 //      the stream ending is also its leaving line. Here while any stream of
 //      it is open; a departure from a session gone is nobody's.
@@ -90,9 +91,10 @@ public:
         (void)mine; (void)theirs;
         differed.push_back(at);
     }
+    void ResyncedConcrete(uint64_t at) override { resynced.push_back(at); }
 
     // ── Lockstep ────────────────────────────────────────────────────────
-    void StepConcrete() override { value += rate; }
+    void StepConcrete() override { value += rate + (noisy ? 1 : 0); }
     Rate RateConcrete() const override { return { 50, 5, 2, 10 }; }
 
     // ── Present ─────────────────────────────────────────────────────────
@@ -107,11 +109,12 @@ public:
     void Frame(double ms)              { std::lock_guard<std::mutex> g(m_mu); clockLocked(ms); }
     std::string State()                { std::lock_guard<std::mutex> g(m_mu); return std::to_string(m_tick) + " " + HashConcrete(); }
     void Tamper()                      { std::lock_guard<std::mutex> g(m_mu); value += 1000; }
+    void Noisy(bool on)                { std::lock_guard<std::mutex> g(m_mu); noisy = on; }
 
     long value = 0, rate = 1;
     std::vector<std::string> seats, arrived, departed;
-    std::vector<uint64_t> differed;
-    bool ended = false;
+    std::vector<uint64_t> differed, resynced;
+    bool ended = false, noisy = false;   // noisy: a step the lines do not decide
 };
 
 // A seat's stream, by hand: its messages in order, then its end.
@@ -225,9 +228,16 @@ int main()
     guest->Tamper();
     host->Run(10);
     follow();
+    check(guest->resynced.size() == 1 && guest->resynced[0] == 30 && guest->differed.empty() && guest->State() == host->State(),
+          "a mirror not the authority where a `hash` line says replays its trace and is the authority again, untold");
+    guest->Noisy(true);
     host->Run(10);
     follow();
-    check(guest->differed.size() == 1 && guest->differed[0] == 30, "a mirror not the authority where a `hash` line says is told, once");
+    host->Run(10);
+    follow();
+    check(guest->differed.size() == 1 && guest->differed[0] == 40 && guest->resynced.size() == 1,
+          "...one the lines do not decide is told, once");
+    guest->Noisy(false);
 
     // 6. Present: the host's seat stream for g, by hand (etcs_trace_take).
     std::printf("\n-- 6. present --\n");
