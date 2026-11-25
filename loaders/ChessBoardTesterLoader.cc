@@ -8,6 +8,9 @@
 // squares are the two colours, a piece is drawn where the FEN has one and not
 // where it has none, a move moves the picture, the picked square and the last
 // move are tinted, and a flipped board is the same picture the other way up.
+// Then CChess's piece pictures (LoadSet, Skin): a piece keeps the picture of
+// the half it started on; review shows a past ply and a press returns to live;
+// a pawn reaching the last rank asks which piece, on the board.
 //
 //   ./Run_ChessBoardTesterLoader [out.ppm]
 //
@@ -128,6 +131,94 @@ int main(int argc, char** argv)
     visit(board);
     check(inked(px, 3, 3, SQ, light, dark) > 20, "flipped, the e4 pawn is drawn at the fourth row from the top, fourth file");
     check(inked(px, 3, 0, SQ, light, dark) > 20, "and the white king at the top");
+
+    std::printf("\n-- the piece pictures --------------------------------------------\n");
+    board->call("ChessBoard.SetFlip", "0", ctx);
+    game->call("ChessGame.Act", "white reset", ctx);
+    visit(board);
+    auto sum = [&](int file, int row) { long t = 0; for (int y = row * SQ; y < (row + 1) * SQ; ++y) for (int x = file * SQ; x < (file + 1) * SQ; ++x) { const Px c = at(px, x, y); t += c.r * 3 + c.g * 5 + c.b * 7; } return t; };
+    const long king_bitmap = sum(4, 7);
+    std::string took;
+    {
+        ETCS::Buffer d("white ChessProvider/ChessProvider/CChess/piece_images/white");
+        board->call("ChessBoard.LoadSet", d, ctx); took = d.toString();
+    }
+    check(took == "10", "the white set: all ten pictures");
+    {
+        ETCS::Buffer d("brown ChessProvider/ChessProvider/CChess/piece_images/brown");
+        board->call("ChessBoard.LoadSet", d, ctx); took = d.toString();
+    }
+    check(took == "10", "the brown set, spelled in either case: all ten");
+    {
+        ETCS::Buffer d("none ChessProvider/no/such/dir");
+        board->call("ChessBoard.LoadSet", d, ctx); took = d.toString();
+    }
+    check(took == "0", "a directory with no pictures is no set");
+    std::string skin;
+    { ETCS::Buffer d("white brown"); board->call("ChessBoard.Skin", d, ctx); skin = d.toString(); }
+    check(skin == "ok", "white is drawn in the white set, black in the brown");
+    { ETCS::Buffer d("white beige"); board->call("ChessBoard.Skin", d, ctx); skin = d.toString(); }
+    check(skin == "no such set", "a set not loaded is refused");
+    visit(board);
+    check(inked(px, 4, 7, SQ, light, dark) > 20 && sum(4, 7) != king_bitmap, "e1 carries the king's picture, not the bitmap");
+    auto picture = [&](const char* sq) { ETCS::Buffer d(sq); board->call("ChessBoard.PictureAt", d, ctx); return d.toString(); };
+    check(picture("b1") == "N L" && picture("g1") == "N R" && picture("e1") == "K R" && picture("d8") == "q L", "a piece takes the half it starts on");
+    game->call("ChessGame.Act", "white move b1c3", ctx);
+    game->call("ChessGame.Act", "black move a7a6", ctx);
+    game->call("ChessGame.Act", "white move c3e4", ctx);
+    game->call("ChessGame.Act", "black move a6a5", ctx);
+    game->call("ChessGame.Act", "white move g1f3", ctx);
+    game->call("ChessGame.Act", "black move a5a4", ctx);
+    game->call("ChessGame.Act", "white move e2e3", ctx);
+    game->call("ChessGame.Act", "black move a4a3", ctx);
+    game->call("ChessGame.Act", "white move f1e2", ctx);
+    game->call("ChessGame.Act", "black move b7b6", ctx);
+    game->call("ChessGame.Act", "white move e1g1", ctx);
+    visit(board);
+    check(picture("e4") == "N L" && picture("f3") == "N R", "a knight that crossed the middle keeps its picture");
+    check(picture("g1") == "K R" && picture("f1") == "R R", "castled: the rook keeps the right-hand picture");
+
+    std::printf("\n-- review ------------------------------------------------------\n");
+    ETCS::Entity* table = ETCS::spawn_entity("ChessProvider", "ChessTable", env, loader);
+    check(table != nullptr, "a table spawns");
+    if (table)
+    {
+        table->call("ChessTable.Create", "", ctx);
+        table->call("ChessTable.BindGame", rid_arg(game).c_str(), ctx);
+        table->call("ChessTable.BindBoard", rid_arg(board).c_str(), ctx);
+        auto view = [&]() { ETCS::Buffer d(""); table->call("ChessTable.View", d, ctx); return d.toString(); };
+        check(view() == "11 11 0 live", "eleven plies, the last one shown");
+        table->call("ChessTable.Do", "/back", ctx);
+        table->call("ChessTable.Do", "/back", ctx);
+        visit(board);
+        check(view() == "9 11 0 review", "two back: ply 9 under review");
+        check(picture("e1") == "K R" && picture("g1") == "-", "the board shows the king before it castled");
+        table->call("ChessTable.Do", "/at 2w", ctx);
+        check(view() == "3 11 0 review", "/at 2w: the board after white's second move");
+        table->call("ChessTable.Key", "268", ctx);
+        check(view() == "0 11 0 review", "Home: the start");
+        table->call("ChessTable.Click", "72 72", ctx);
+        check(view() == "11 11 0 live", "a press on the board while reviewing: live again");
+        table->call("ChessTable.Key", "263", ctx);
+        table->call("ChessTable.Keys", "0", ctx);
+        table->call("ChessTable.Key", "263", ctx);
+        check(view() == "10 11 0 review", "the left arrow steps back -- and not while the page's field has the keys");
+        table->call("ChessTable.Keys", "1", ctx);
+        table->call("ChessTable.Key", "256", ctx);
+        check(view() == "11 11 0 live", "Esc: live");
+
+        std::printf("\n-- promotion ---------------------------------------------------\n");
+        table->call("ChessTable.Do", "/fen 8/4P1k1/8/8/8/8/6K1/8 w - - 0 1", ctx);
+        table->call("ChessTable.Click", "72 24", ctx);
+        table->call("ChessTable.Click", "72 8", ctx);
+        visit(board);
+        check(picture("e8") == "-" && picture("e7") == "P R", "a pawn to the last rank is not moved yet: the picker asks first");
+        table->call("ChessTable.Click", "72 40", ctx);
+        std::string fen;
+        { ETCS::Buffer d(""); game->call("ChessGame.Fen", d, ctx); fen = d.toString(); }
+        check(fen.compare(0, 13, "4R3/6k1/8/8/8") == 0, "the third piece down is a rook, and the pawn becomes one");
+        table->call("ChessTable.Delete", "", ctx);
+    }
 
     if (argc > 1)
     {
