@@ -1185,6 +1185,13 @@ namespace ETCS
 #endif
     }
     inline void* etcs_find_loader_manifest_getter() { return etcs_find_loader_symbol("ETCS_GetLoaderManifest"); }
+    // Before this module's first line: its manifest check natively (dlopen's
+    // static init), RegisterDynamicLoader on the web, whichever comes first.
+    inline void etcs_adopt_loader_quiet()
+    {
+        if (void* g = etcs_find_loader_symbol("ETCS_GetLoaderLogEnabled"))
+            ETCS::set_log_enabled(reinterpret_cast<bool (*)()>(g)());
+    }
 }
 /**
  * ETCS_MODULE_EXPORT_MAIN
@@ -1261,6 +1268,7 @@ namespace ETCS
      * written today (this macro goes last), and load-bearing either way, \
      * since the map is read once rather than watched. */ \
     static void Name##_check_loader_manifest_() { \
+        ETCS::etcs_adopt_loader_quiet(); \
         void* getterAddr = ETCS::etcs_find_loader_manifest_getter(); \
         if (!getterAddr) return; \
         using LoaderManifestGetter = void* (*)(); \

@@ -11,6 +11,7 @@ ETCS_LOADER_1.0 {
     global:
         ETCS_GetLoaderManifest;
         ETCS_GetLoaderEpoch;
+        ETCS_GetLoaderLogEnabled;
     local:
         *;
 };

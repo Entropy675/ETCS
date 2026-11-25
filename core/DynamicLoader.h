@@ -3081,6 +3081,20 @@ const unsigned char* ETCS_GetLoaderEpoch()
 {
     return ETCS::trust::loader_epoch().data();
 }
+
+// ETCS_GetLoaderLogEnabled - whether the loader is quiet (`etcs -q`), exported
+// the same way: a module's log flag is its own (Log.h), and this is where a
+// loading module takes it from (etcs_adopt_loader_quiet).
+extern "C"
+#ifdef _WIN32
+__declspec(dllexport)
+#else
+__attribute__((visibility("default")))
+#endif
+bool ETCS_GetLoaderLogEnabled()
+{
+    return ETCS::get_log_enabled();
+}
 #endif // ETCS_LOADER
 
 /*
@@ -3109,10 +3123,12 @@ const unsigned char* ETCS_GetLoaderEpoch()
  * side has already verified the other independently (the loader's half is
  * Module::registerLoader's validateManifest, before it calls this).
  */
+namespace ETCS { inline void etcs_adopt_loader_quiet(); }   // ETCS_API.h, after this header
 extern "C" ETCS_API ETCS::EventNode* RegisterDynamicLoader(void* ptr)
 {
     try
     {
+        ETCS::etcs_adopt_loader_quiet();
         // Module receives the loader's root EventNode and wires its ModuleProxy to it
         ETCS_LOG("DynamicLoader", "Parsing input EventNode pointer... " << ptr);
         dynamicLoader.node = static_cast<ETCS::EventNode*>(ptr);

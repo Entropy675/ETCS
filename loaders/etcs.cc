@@ -19,6 +19,7 @@
 #undef ETCS_PRODUCTION_BUILD
 #if defined(__EMSCRIPTEN__)
 #include <emscripten.h>
+#include <emscripten/threading.h>
 #endif
 #include "../ETCS.h"
 #include <fstream>
@@ -330,54 +331,50 @@ void etcs_web_call_async(int handle, const char* name, const char* work, const c
  * terminal in one go, so a hundred lines that arrive inside one frame are one
  * postMessage and one reflow instead of a hundred of each.
  *
- * AND IT STILL PUSHES IF NOBODY PULLS. A page that does not drain -- an older
- * copy of the shell page, or one whose timer has stopped -- would otherwise
- * accumulate silently, so a write that finds no recent pull falls back to the
- * old proxied push. That is the only path that still pays per write, and only
- * for as long as nothing is draining.
- *
- * THE LOCK IS NEVER HELD ACROSS THE PROXY. MAIN_THREAD_EM_ASM waits for the
- * main thread, and the main thread's drain wants this same mutex: holding it
- * over the push is a deadlock with a real path to it. The chunk is swapped out
- * under the lock and pushed after it is released.
+ * NOTHING PUSHES PER WRITE, so the drain is the only way out and order holds.
+ * A writer that finds no recent pull (a page that does not drain, a drain
+ * starved by a busy main thread, or the hard cap) queues ONE drain on the main
+ * thread and returns: an async request, never a wait -- a worker parked on a
+ * busy main thread is the stall this buffer exists to remove. A writer ON the
+ * main thread queues nothing; main() writes the whole module handshake before
+ * it returns, and the page's timer drains it the moment it does.
  */
 namespace {
 std::mutex  g_shell_out_mu;
 std::string g_shell_out;
 double      g_shell_last_pull = 0.0;   // emscripten_get_now() of the last drain
+bool        g_shell_pull_queued = false;
 
-// How stale a pull has to be before a writer decides nobody is draining, and
-// how much may pile up before it pushes anyway (a hidden tab's timers are
-// throttled, not stopped, so this is a ceiling and not the usual path).
+// How stale a pull has to be before a writer asks for one, and how much may
+// pile up before it asks anyway (a hidden tab's timers are throttled, not
+// stopped, so this is a ceiling and not the usual path).
 constexpr double  SHELL_PULL_STALE_MS = 750.0;
 constexpr size_t  SHELL_HARD_CAP      = 1u << 20;
 }
 
 namespace {
-/*
- * Append, and push only if nobody is draining. The one place that decides,
- * shared by the stdout redirect and by etcs_web_shell_write -- two callers
- * with the same question.
- */
+// The one place that decides, shared by the stdout redirect and by
+// etcs_web_shell_write.
 void shell_out_append(const char* text, size_t n)
 {
     if (!text || n == 0) return;
-    std::string chunk;
     {
         std::lock_guard<std::mutex> lock(g_shell_out_mu);
         g_shell_out.append(text, n);
-        const double now = emscripten_get_now();
-        const bool nobody_pulling = (now - g_shell_last_pull) > SHELL_PULL_STALE_MS;
+        if (g_shell_pull_queued || emscripten_is_main_browser_thread()) return;
+        const bool nobody_pulling = (emscripten_get_now() - g_shell_last_pull) > SHELL_PULL_STALE_MS;
         if (!nobody_pulling && g_shell_out.size() < SHELL_HARD_CAP) return;
-        chunk.swap(g_shell_out);
+        g_shell_pull_queued = true;
     }
-    MAIN_THREAD_EM_ASM({
-        var t = UTF8ToString($0);
+    // Queued after the lock is released: the drain takes it.
+    MAIN_THREAD_ASYNC_EM_ASM({
+        var t = UTF8ToString(_etcs_web_shell_drain());
+        if (!t) return;
         if (typeof window.etcsTermWrite === 'function')
             window.etcsTermWrite(t);
         else if (typeof Module !== 'undefined' && Module.print)
             Module.print(t);
-    }, chunk.c_str());
+    });
 }
 
 /*
@@ -457,16 +454,15 @@ const char* etcs_web_shell_drain()
     held.swap(g_shell_out);
     g_shell_out.clear();
     g_shell_last_pull = emscripten_get_now();
+    g_shell_pull_queued = false;
     return held.c_str();
 }
 
 /*
- * The explicit write, through the same buffer as everything else. The fallback
- * push inside shell_out_append is MAIN_THREAD_EM_ASM and not EM_ASM for the
- * reason it always was: callers include the REPL thread, EM_ASM runs in the
- * CALLING thread's JS scope, and a Worker's scope has no document, no window
- * and no etcsTermWrite -- output would land in a Worker console nobody reads
- * while the terminal sat empty.
+ * The explicit write, through the same buffer as everything else. The drain
+ * request inside shell_out_append is a MAIN_THREAD_ form because callers
+ * include the REPL thread, and a Worker's JS scope has no window and no
+ * etcsTermWrite.
  */
 EMSCRIPTEN_KEEPALIVE
 void etcs_web_shell_write(const char* text)
@@ -494,6 +490,15 @@ int main(int argc, char* argv[])
     // anything starts: they load no module and print one answer.
     if (const int rc = ETCS::trust::cli(argc, argv); rc >= 0) return rc;
 #endif
+    // -q before anything logs: the modules take it as they load
+    // (ETCS_GetLoaderLogEnabled), and on the web they load before the flag's
+    // own parse below. A flag counts only ahead of the script.
+    for (int i = 1; i < argc; ++i)
+    {
+        const std::string_view a(argv[i]);
+        if (a == "-q" || a == "--quiet") { ETCS::set_log_enabled(false); break; }
+        if (a.size() > 5 && a.substr(a.size() - 5) == ".etcs") break;
+    }
     shell_startup();
     ETCS::trust::untrusted_banner();                // an untrusted build says so first (core/Trust.h)
 #if defined(__EMSCRIPTEN__)
@@ -608,7 +613,6 @@ int main(int argc, char* argv[])
             std::cerr << COLOR_WARN << "etcs: -q requires a script file argument" << COLOR_RESET << "\n";
             return 1;
         }
-        ETCS::log_enabled.store(false, std::memory_order_relaxed);
         // Shift args down
         argv++;
         argc--;
