@@ -440,10 +440,10 @@ struct PairMaskEvent : Event
 //            b = "next": for the successor a Replace put in place, not this loader
 //   Install  a = a chain, binary or hex        out = what it registered as
 //   Survey   a = the site's list               out = the report, "fetch <name> <file>" lines
-//   Replace  a = the site's list, b = bytes    out = the path written
+//   Replace  a = the site's list, b = bytes    out = the path staged
 //            name = which entry b is
 //   Resync   (nothing)                         out = what happens: the session ends,
-//            and the successor a Replace placed starts in its place, resuming
+//            and the successor a Replace placed or staged starts in its place, resuming
 //   Vouch    a = a link's transcript, hex      out = "<key> <chain|-> <signature>": this
 //            name = 'd' (dialled) or 'a'         loader's word on that link, and only
 //                                                on one (sig::link_statement)
@@ -456,9 +456,12 @@ struct PairMaskEvent : Event
 //   Identify (nothing)                         out = "<head> <epoch>": what this loader is
 //   Portal   a = the registrar's key, hex      out = "<this loader's key> <signature>": its word
 //            b = the code a browser shows        letting that browser act for its account
+//   Heal     (nothing)                         out = the modules refused for another epoch of
+//                                                this identity since last asked, or ""
 struct TrustEvent : Event
 {
-    enum class Op : uint8_t { Request, Install, Survey, Replace, Resync, Vouch, Recognize, Join, Admit, Retire, Identify, Portal };
+    enum class Op : uint8_t { Request, Install, Survey, Replace, Resync, Vouch, Recognize, Join, Admit, Retire, Identify, Portal,
+                              Heal };
     Op                  op;
     ::std::string       name, a, b, out;
     bool                ok = false;

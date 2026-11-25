@@ -296,8 +296,9 @@ int main(int, char**)
               "one flipped mapped byte is refused");
         check(!ok_as("WindowProvider", chess, E, A, &why) && why == "signed for other bytes, or another name",
               "the same bytes under another name are refused");
-        check(!ok_as("ChessProvider", chess, other, A, &why) && why == "not witnessed under this epoch",
+        check(!ok_as("ChessProvider", chess, other, A, &why) && why.rfind("not witnessed under this epoch", 0) == 0,
               "another epoch is refused");
+        tr::take_heal();
         tr::Identity other_head = A; other_head.head[0] ^= 0x01; other_head.reg.clear();   // as establish leaves it
         {
             bool local = false;
@@ -1102,6 +1103,44 @@ int main(int, char**)
                   "after which the list from before is refused, surveyed or fetched from: it cannot be replayed");
         }
 
+        // The order epochs come in under one kernel: the marketplace's count, signed into the list.
+        {
+            auto headed = [&](const std::string& header) {
+                const size_t eol = list.find('\n');
+                return relist_of(header + list.substr(eol), ms, tr::kernel_text(tr::kernel_version()));
+            };
+            const std::string K = tr::kernel_text(tr::kernel_version());
+            auto at = [&](const sig::Epoch& e, const std::string& seq) {
+                return headed(std::string(sig::kDistMagic) + "epoch=" + tr::hex(e.data(), 32) + " seq=" + seq);
+            };
+            check(tr::dist_read(list, d, w2, MI) && d.seq == 1, "the first epoch a marketplace publishes is the first in its order");
+            sig::Epoch O{}, X{};
+            O[0] = 0x0e; X[0] = 0x0f;
+            const std::string seen = dir + "/s-order", shere = dir + "/order-here/";
+            ::mkdir(seen.c_str(), 0700);
+            ::mkdir(shere.c_str(), 0700);
+            tr::Identity dl; dl.head = MI;
+            std::string rep2, put2;
+            const std::string nb(probe_new.begin(), probe_new.end());
+            check(tr::survey(at(E, "1"), rep2, w2, dl, E, shere, shere + "etcs", seen)
+                  && tr::survey(at(O, "2"), rep2, w2, dl, E, shere, shere + "etcs", seen)
+                  && slurp(seen + "/epoch.seen") == K + " 2 " + tr::hex(O.data(), 32) + "\n",
+                  "a later epoch is taken, and the store keeps its place in the order");
+            check(!tr::survey(at(E, "1"), rep2, w2, dl, E, shere, shere + "etcs", seen) && w2.find("a rollback") != std::string::npos
+                  && !tr::replace(at(E, "1"), "Probe", nb, put2, w2, dl, shere, shere + "etcs", seen),
+                  "an epoch the marketplace really signed before, served again, is a rollback: refused, surveyed or fetched from");
+            check(!tr::survey(at(X, "2"), rep2, w2, dl, E, shere, shere + "etcs", seen)
+                  && w2 == "the list names another epoch at a place in the order already taken"
+                  && tr::survey(at(O, "2"), rep2, w2, dl, E, shere, shere + "etcs", seen),
+                  "nor another epoch at the same place; the same list again is taken");
+            check(!tr::dist_read(headed(std::string(sig::kDistMagic) + "epoch=" + tr::hex(E.data(), 32)), d, w2, MI)
+                  && w2 == "the list names no place in the marketplace's order", "a list with no place in the order is no list");
+            std::string l2, l3;
+            check(tr::publish(ms, dist, E, l2, why, nullptr, MI) && tr::dist_read(l2, d, w2, MI) && d.seq == 1
+                  && tr::publish(ms, dist, O, l3, why, nullptr, MI) && tr::dist_read(l3, d, w2, MI) && d.seq == 2,
+                  "the marketplace counts its epochs: the same one again keeps its place, another takes the next");
+        }
+
         // RE-SYNC: the marketplace key retired. A sibling marketplace under the
         // same active key mints the successor, a release key under that same
         // active key countersigns it, and a loader of the old identity takes
@@ -1236,17 +1275,33 @@ int main(int, char**)
               "bytes the list does not name are not put in place");
         check(!tr::replace(list, "Nothing", new_bytes, put, why, download, here, self) && why == "the list has no 'Nothing'",
               "nor a name it does not list");
-        check(tr::replace(list, "Probe", new_bytes, put, why, download, here, self) && put == here + "Probe.wasm"
-              && bytes_of(here + "Probe.wasm") == probe_new, "the listed bytes are put where the loader reads them");
-        check(tr::survey(list, report, why, download, E, here, self) && report.find("Probe current\n") != std::string::npos,
-              "and are then current");
+        check(tr::replace(list, "Probe", new_bytes, put, why, download, here, self) && put == here + "next/Probe.wasm"
+              && bytes_of(here + "next/Probe.wasm") == probe_new && bytes_of(here + "Probe.wasm") == probe_old,
+              "the listed bytes are staged beside what the loader reads, which stays as it was: two epochs never meet");
+        check(tr::survey(list, report, why, download, E, here, self) && report.find("Probe staged\n") != std::string::npos
+              && report.find("fetch Probe") == std::string::npos, "and are then staged, not fetched again");
         const std::string rel_bytes(minted.begin(), minted.end());
-        std::remove(self.c_str());
-        check(tr::replace(list, "etcs", rel_bytes, put, why, download, here, self) && bytes_of(self) == minted,
-              "the minted loader is put in place of the loader's own binary");
+        write_bytes(self, probe_old);
+        tr::Dist sd;
+        check(!tr::staged_ready("", here, self, download, sd, why) && why == "etcs is not staged yet"
+              && !tr::take_staged("", here, self, download, sd, why) && bytes_of(here + "Probe.wasm") == probe_old,
+              "a set not yet whole goes nowhere");
+        check(tr::replace(list, "etcs", rel_bytes, put, why, download, here, self) && put == here + "next/etcs"
+              && bytes_of(self) == probe_old, "the minted loader is staged too, the running one left as it is");
+        check(tr::staged_ready("", here, self, download, sd, why) && sd.epoch == E
+              && tr::take_staged("", here, self, download, sd, why) && bytes_of(here + "Probe.wasm") == probe_new
+              && bytes_of(self) == minted && ::access((here + "next").c_str(), F_OK) != 0,
+              "whole, the set goes in place at once -- the loader's own binary among it -- and the stage is gone");
+        check(tr::survey(list, report, why, download, E, here, self) && report.find("Probe current\n") != std::string::npos
+              && report.find("etcs current\n") != std::string::npos, "and is then current");
         tr::Identity wrong = download; wrong.head = fresh_key().pub;
         check(!tr::replace(list, "Probe", new_bytes, put, why, wrong, here, self),
               "a loader of another identity takes nothing from this list");
+        tr::take_heal();
+        check(!ok_as("Probe", probe_new, other, download, &why)
+              && why.rfind("not witnessed under this epoch: this identity's marketplace signed it for another", 0) == 0
+              && tr::take_heal() == "Probe" && tr::take_heal().empty(),
+              "a module of this identity signed for another epoch is refused and wanted healed, said once to whoever asks");
 
         // The same questions, asked of this loader through its ordering thread.
         sig::Key reg{}; reg[0] = 7;

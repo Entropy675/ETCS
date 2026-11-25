@@ -353,17 +353,19 @@ inline std::string portal_statement(const Key& member, const Key& registrar, con
 /*
  * THE SITE'S LIST OF WHAT IT SERVES (core/Trust.h publish, survey):
  *
- *   etcs-dist 2 epoch=<hex> kernel=<ETCS_Kernel_v...>
+ *   etcs-dist 3 epoch=<hex> seq=<n> kernel=<ETCS_Kernel_v...>
  *   <name> <file> <digest hex> <epoch hex>[,<epoch hex>...]
  *   ...
  *   etcs-dist-sig <signer's chain, hex> <signature hex>
  *
  * The signature is the marketplace's, over "ETCSDST1" and every byte before
- * the last line. `kernel` is the ABI's version the list was published under
- * (BASE_SOURCE_STRING, core/ETCS_API.h): the order lists come in. A loader
- * takes no list older than the newest it has taken, or than itself.
+ * the last line. The order lists come in is (kernel, seq): `kernel` is the
+ * ABI's version the list was published under (BASE_SOURCE_STRING,
+ * core/ETCS_API.h), `seq` the marketplace's count of the epochs it has
+ * published under it. A loader takes no list older than the newest it has
+ * taken, or than itself.
  */
-constexpr char kDistMagic[] = "etcs-dist 2 ";
+constexpr char kDistMagic[] = "etcs-dist 3 ";
 constexpr char kDistSig[]   = "etcs-dist-sig ";
 
 /*

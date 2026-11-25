@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
 #include <string>
 #include <utility>
 #include <vector>
@@ -145,7 +146,7 @@ struct ActionScope
 
 /*
  * Where this runtime keeps what outlives it (Persistence, DatabaseProvider):
- * ETCS_STORE if set, else $XDG_DATA_HOME/etcs, else ~/.local/share/etcs; on
+ * ETCS_STORE if set (absolute, lexically normal), else $XDG_DATA_HOME/etcs, else ~/.local/share/etcs; on
  * Windows, which sets no HOME, %LOCALAPPDATA%\etcs; in a browser, the
  * IndexedDB-backed /persist. One answer, so the loader and the store agree on
  * it without either asking the other. The last resort, .etcs, is relative to
@@ -156,7 +157,15 @@ inline std::string etcs_store_dir()
 #if defined(__EMSCRIPTEN__)
     return "/persist";
 #else
-    if (const char* s = std::getenv("ETCS_STORE"); s && *s) return s;
+    // One store, one spelling: the keystore names this store's key by it.
+    if (const char* s = std::getenv("ETCS_STORE"); s && *s)
+    {
+        std::error_code ec;
+        const std::filesystem::path p = std::filesystem::absolute(s, ec);
+        std::string out = (ec ? std::filesystem::path(s) : p).lexically_normal().string();
+        while (out.size() > 1 && (out.back() == '/' || out.back() == '\\')) out.pop_back();
+        return out;
+    }
 #if defined(_WIN32)
     if (const char* l = std::getenv("LOCALAPPDATA"); l && *l) return std::string(l) + "\\etcs";
 #endif

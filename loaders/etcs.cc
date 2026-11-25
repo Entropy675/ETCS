@@ -493,6 +493,7 @@ int main(int argc, char* argv[])
     // ace's questions for the loader that holds the key (core/Trust.h). Before
     // anything starts: they load no module and print one answer.
     if (const int rc = ETCS::trust::cli(argc, argv); rc >= 0) return rc;
+    ETCS::trust::swap_at_start(argv);               // a staged epoch goes in place before anything loads
 #endif
     shell_startup();
     ETCS::trust::untrusted_banner();                // an untrusted build says so first (core/Trust.h)

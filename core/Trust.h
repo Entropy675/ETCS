@@ -567,6 +567,36 @@ protected:
     void refuse(MBuffer& io, const std::string& reason) { why = reason; wire_refuse(io); }
 };
 
+/*
+ * A MODULE OF THIS IDENTITY, SIGNED FOR ANOTHER EPOCH: the site has moved past
+ * this loader (or it past the site). The load is refused, and the name kept
+ * here as a heal wanted -- what holds the site (Upstream.Heal, TrustEvent
+ * Heal) asks for it, and updates.
+ */
+struct HealWanted
+{
+    std::mutex  mu;
+    std::string names;      // space-separated
+};
+inline HealWanted& heal_state() { static HealWanted h; return h; }
+
+inline void want_heal(const std::string& name)
+{
+    HealWanted& h = heal_state();
+    std::lock_guard<std::mutex> l(h.mu);
+    if ((" " + h.names + " ").find(" " + name + " ") == std::string::npos) h.names += (h.names.empty() ? "" : " ") + name;
+}
+
+// The names wanted since last asked, forgotten as they are given.
+inline std::string take_heal()
+{
+    HealWanted& h = heal_state();
+    std::lock_guard<std::mutex> l(h.mu);
+    std::string out;
+    out.swap(h.names);
+    return out;
+}
+
 struct SignatureStage : Stage
 {
     // Present only where the key is (etcs --sign); a loader that loads has none.
@@ -596,7 +626,16 @@ struct SignatureStage : Stage
         if (leaf.role != sig::Role::Module) return refuse(io, "leaf is not a module certificate");
         if (!digest(f.name, f.bytes, f.len, L, d) || leaf.subject != d)
             return refuse(io, "signed for other bytes, or another name");
-        if (!has_epoch(leaf, f.epoch)) return refuse(io, "not witnessed under this epoch");
+        if (!has_epoch(leaf, f.epoch))
+        {
+            if (chain.size() > 1 && head_meets(path_of(chain), id->head) >= 0 && check(leaf))
+            {
+                want_heal(f.name);
+                return refuse(io, "not witnessed under this epoch: this identity's marketplace signed it for another, so the "
+                                  "site and this loader are in two epochs (Upstream.Heal updates)");
+            }
+            return refuse(io, "not witnessed under this epoch");
+        }
         if (!check(leaf)) return refuse(io, "bad signature");
         f.signer = leaf.issuer;
         f.signer_role = 0;
@@ -1062,8 +1101,8 @@ inline bool successor(const std::string& store, sig::Epoch& epoch, sig::Key& hea
 /*
  * This key's registration for `epoch`: loader.chain, or the one installed
  * ahead of a swap (loader.chain.next) once this loader is the successor it was
- * for -- which then takes loader.chain's place. `stale` says one of another
- * epoch was found and dropped.
+ * for -- which then takes loader.chain's place, and the successor's record
+ * goes. `stale` says one of another epoch was found and dropped.
  */
 inline bool current_registration(const std::string& dir, const sig::Key& pub, const sig::Epoch& epoch,
                                  std::vector<sig::Certificate>& reg, bool& stale)
@@ -1076,7 +1115,12 @@ inline bool current_registration(const std::string& dir, const sig::Key& pub, co
         reg.clear();
         if (!read_file(path, raw) || !sig::decode_chain(raw.data(), raw.size(), reg) || !registration_valid(reg, pub)) continue;
         if (!registration_current(reg, epoch)) { stale = true; continue; }
-        if (ahead) { std::error_code ec; std::filesystem::rename(path, dir + "/loader.chain", ec); }
+        if (ahead)
+        {
+            std::error_code ec;
+            std::filesystem::rename(path, dir + "/loader.chain", ec);
+            std::remove((dir + "/successor").c_str());
+        }
         return true;
     }
     reg.clear();
@@ -1596,6 +1640,7 @@ struct DistEntry
 struct Dist
 {
     sig::Epoch             epoch{};
+    uint64_t               seq = 0;         // the marketplace's count of its epochs, under that kernel
     std::vector<uint32_t>  kernel;          // the ABI's version it was published under
     bool                   sibling = false; // a marketplace of this loader's parent, not its own
     sig::Key               head{};          // the identity whose marketplace signed it
@@ -1666,6 +1711,25 @@ inline void kernel_taken(const std::string& store, const std::vector<uint32_t>& 
     f << kernel_text(v) << "\n";
 }
 
+/*
+ * THE ORDER EPOCHS COME IN, under one kernel: the marketplace's count of the
+ * epochs it has published (publish keeps it beside its key, dist.seq), signed
+ * into the list. A loader keeps the newest it has taken (epoch.seen) and takes
+ * no list under it -- an epoch the marketplace really signed, served again, is
+ * a rollback -- nor another epoch at the same count. A newer kernel starts the
+ * count again: kernels are ordered first (kernel_floor).
+ */
+struct Seen { std::vector<uint32_t> kernel; uint64_t seq = 0; sig::Epoch epoch{}; };
+
+inline bool epoch_seen(const std::string& store, Seen& s)
+{
+    std::ifstream f(store + "/epoch.seen");
+    std::string k, n, e;
+    return !store.empty() && f >> k >> n >> e && kernel_version_of(k, s.kernel)
+        && n.find_first_not_of("0123456789") == std::string::npos && n.size() <= 18 && (s.seq = std::stoull(n)) > 0
+        && unhex(e, s.epoch.data(), 32);
+}
+
 inline bool plain_file(const std::string& f)
 {
     if (f.empty() || f.size() > 128 || f[0] == '.') return false;
@@ -1728,8 +1792,14 @@ inline bool dist_read(const std::string& text, Dist& d, std::string& why, const 
     if (!std::getline(in, line) || line.compare(0, first.size(), first) != 0
         || line.size() < first.size() + 64 || !unhex(line.substr(first.size(), 64), d.epoch.data(), d.epoch.size()))
     { why = "the list names no epoch"; return false; }
-    const std::string kv = line.substr(first.size() + 64);
-    if (kv.compare(0, 8, " kernel=") != 0 || !kernel_version_of(kv.substr(8), d.kernel))
+    std::istringstream kv(line.substr(first.size() + 64));
+    std::string seq, kernel;
+    kv >> seq >> kernel;
+    d.seq = 0;
+    if (seq.size() < 5 || seq.size() > 4 + 18 || seq.compare(0, 4, "seq=") != 0
+        || seq.find_first_not_of("0123456789", 4) != std::string::npos || (d.seq = std::stoull(seq.substr(4))) == 0)
+    { why = "the list names no place in the marketplace's order"; return false; }
+    if (kernel.compare(0, 7, "kernel=") != 0 || !kernel_version_of(kernel.substr(7), d.kernel))
     { why = "the list names no kernel version"; return false; }
     if (d.kernel < floor)
     { why = "the list is of " + kernel_text(d.kernel) + ", older than " + kernel_text(floor) + " here: a rollback"; return false; }
@@ -1757,6 +1827,28 @@ inline bool dist_read(const std::string& text, Dist& d, std::string& why, const 
         d.entries.push_back(e);
     }
     return true;
+}
+
+inline bool epoch_in_order(const std::string& store, const Dist& d, std::string& why)
+{
+    Seen s;
+    if (!epoch_seen(store, s) || s.kernel != d.kernel) return true;
+    if (d.seq < s.seq)
+    {
+        why = "the list is the marketplace's epoch " + std::to_string(d.seq) + ", older than " + std::to_string(s.seq)
+            + " taken here: a rollback";
+        return false;
+    }
+    if (d.seq == s.seq && d.epoch != s.epoch) { why = "the list names another epoch at a place in the order already taken"; return false; }
+    return true;
+}
+
+inline void epoch_taken(const std::string& store, const Dist& d)
+{
+    Seen s;
+    if (store.empty() || (epoch_seen(store, s) && !(s.kernel < d.kernel) && !(s.kernel == d.kernel && s.seq < d.seq))) return;
+    std::ofstream f(store + "/epoch.seen", std::ios::trunc);
+    f << kernel_text(d.kernel) << " " << d.seq << " " << hex(d.epoch.data(), 32) << "\n";
 }
 
 /*
@@ -1789,7 +1881,16 @@ inline bool publish(const std::string& store, const std::string& dir, const sig:
 
     Identity download;                                   // what takes these: the identity, nothing else
     download.head = built_in;
-    std::string body = std::string(sig::kDistMagic) + "epoch=" + hex(epoch.data(), 32)
+    // This marketplace's count of its epochs: the same epoch published again
+    // keeps its place, a new one takes the next.
+    uint64_t seq = 1;
+    {
+        std::ifstream f(store + "/dist.seq");
+        std::string n, e;
+        if (f >> n >> e && n.size() <= 18 && n.find_first_not_of("0123456789") == std::string::npos && !n.empty())
+            seq = std::stoull(n) + (e == hex(epoch.data(), 32) ? 0 : 1);
+    }
+    std::string body = std::string(sig::kDistMagic) + "epoch=" + hex(epoch.data(), 32) + " seq=" + std::to_string(seq)
                      + " kernel=" + kernel_text(kernel_version()) + "\n";
     for (const std::string& f : files)
     {
@@ -1814,6 +1915,9 @@ inline bool publish(const std::string& store, const std::string& dir, const sig:
     mc::crypto_wipe(secret, 64);
     const std::string chain = sig::encode_chain(reg);
     out = body + sig::kDistSig + hex(reinterpret_cast<const uint8_t*>(chain.data()), chain.size()) + " " + hex(s, sizeof s) + "\n";
+    std::ofstream f(store + "/dist.seq", std::ios::trunc);
+    f << seq << " " << hex(epoch.data(), 32) << "\n";
+    if (!f.flush()) { why = "cannot keep the epoch's place in " + store + "/dist.seq"; return false; }
     return true;
 }
 
@@ -1875,12 +1979,50 @@ inline Resync resync_state(const std::string& store, const Identity& id, const s
 }
 
 /*
+ * WHAT A BINARY ON DISK IS, against the list's entry: current (the same
+ * bytes, signed for the list's epoch), this loader's own key's ("yours"), or
+ * neither.
+ */
+enum class OnDisk { Other, Current, Yours };
+
+inline OnDisk on_disk(const std::string& path, const DistEntry& e, const Dist& d, const Identity& id)
+{
+    std::vector<uint8_t> b;
+    if (!read_file(path, b)) return OnDisk::Other;
+    sig::Layout L;
+    sig::Key dg{};
+    std::vector<sig::Certificate> c;
+    std::string w;
+    const bool sealed = sig::layout(b.data(), b.size(), L, w) && L.has_chain
+                        && sig::decode_chain(b.data() + L.chain.at, L.chain.len, c) && !c.empty()
+                        && digest(e.name, b.data(), b.size(), L, dg);
+    if (sealed && dg == e.digest && has_epoch(c[0], d.epoch)) return OnDisk::Current;
+    if (sealed && !zero(id.pub) && c[0].issuer == id.pub) return OnDisk::Yours;
+    return OnDisk::Other;
+}
+
+/*
+ * STAGED, NOT PUT IN PLACE: what a list fetches goes to `<bin>/next/`, with the
+ * list beside it (next/manifest), while this loader keeps reading the binaries
+ * of its own epoch -- a module and a loader of two epochs never meet. The set
+ * goes in place whole, only once every entry is current or staged
+ * (staged_ready): at the swap that restarts this session on it (request_swap,
+ * resync_exec), or at the next start (swap_at_start).
+ */
+inline std::string staged_dir(const std::string& bin_dir) { return bin_dir + "next/"; }
+
+inline std::string live_path(const DistEntry& e, const std::string& bin_dir, const std::string& self_path)
+{
+    return e.name == "etcs" ? self_path : bin_dir + e.file;
+}
+
+/*
  * WHAT THE SITE HAS MOVED PAST, here: each entry against the binary this
- * loader would read under that name (its own, for "etcs"). Current is the same
- * bytes, signed for the site's epoch. A binary this loader's own key signed is
- * the developer's and is never fetched over. Anything else not current is
- * fetched -- all of it, when the site is in another epoch. A sibling's list
- * names one thing to do: "resync etcs <file>".
+ * loader would read under that name (its own, for "etcs"), then against what
+ * is staged for it. A binary this loader's own key signed is the developer's
+ * and is never fetched over. Anything else not current or staged is fetched
+ * -- all of it, when the site is in another epoch. A sibling's list names one
+ * thing to do: "resync etcs <file>".
  */
 inline bool survey(const std::string& text, std::string& report, std::string& why, const Identity& id,
                    const sig::Epoch& local, const std::string& bin_dir, const std::string& self_path,
@@ -1904,23 +2046,20 @@ inline bool survey(const std::string& text, std::string& report, std::string& wh
     }
     if (head_retired(store, id.head))
     { why = "this loader's identity was retired by a re-sync: the loader it re-synced to is the one to run"; return false; }
+    if (!epoch_in_order(store, d, why)) return false;
     kernel_taken(store, d.kernel);
+    epoch_taken(store, d);
     const bool moved = d.epoch != local;
-    report = "site epoch " + hex(d.epoch.data(), 32) + (moved ? ", and this loader is in " + hex(local.data(), 32)
-                                                              : ", this loader's") + "\n";
+    report = "site epoch " + hex(d.epoch.data(), 32) + " (" + std::to_string(d.seq) + ")"
+           + (moved ? ", and this loader is in " + hex(local.data(), 32) : ", this loader's") + "\n";
     for (const DistEntry& e : d.entries)
     {
-        std::vector<uint8_t> b;
-        if (!read_file(e.name == "etcs" ? self_path : bin_dir + e.file, b)) { report += e.name + " not here\n"; continue; }
-        sig::Layout L;
-        sig::Key dg{};
-        std::vector<sig::Certificate> c;
-        std::string w;
-        const bool sealed = sig::layout(b.data(), b.size(), L, w) && L.has_chain
-                            && sig::decode_chain(b.data() + L.chain.at, L.chain.len, c) && !c.empty()
-                            && digest(e.name, b.data(), b.size(), L, dg);
-        if (sealed && dg == e.digest && has_epoch(c[0], d.epoch)) { report += e.name + " current\n"; continue; }
-        if (sealed && !zero(id.pub) && c[0].issuer == id.pub) { report += e.name + " yours, not fetched\n"; continue; }
+        std::error_code ec;
+        if (!std::filesystem::exists(live_path(e, bin_dir, self_path), ec)) { report += e.name + " not here\n"; continue; }
+        const OnDisk live = on_disk(live_path(e, bin_dir, self_path), e, d, id);
+        if (live == OnDisk::Current) { report += e.name + " current\n"; continue; }
+        if (live == OnDisk::Yours)   { report += e.name + " yours, not fetched\n"; continue; }
+        if (on_disk(staged_dir(bin_dir) + e.file, e, d, id) == OnDisk::Current) { report += e.name + " staged\n"; continue; }
         report += e.name + (moved ? " behind\n" : " differs\n");
         report += "fetch " + e.name + " " + e.file + "\n";
     }
@@ -1929,10 +2068,10 @@ inline bool survey(const std::string& text, std::string& report, std::string& wh
 
 /*
  * Takes `bytes` as the list's entry `name` only if they are that entry's and
- * pass this loader's own stages in the site's epoch, then puts them where this
- * loader reads them: beside, then over. The process keeps what it mapped; the
- * next load, or start, reads these. From a sibling's list only "etcs", bridged,
- * and placing it is the re-sync: this identity retired, `resync` written.
+ * pass this loader's own stages in the site's epoch, then stages them
+ * (staged_dir): beside, then over. From a sibling's list only "etcs", bridged,
+ * put in place of this loader's own binary at once -- placing it is the
+ * re-sync: this identity retired, `resync` written.
  */
 inline bool replace(const std::string& text, const std::string& name, const std::string& bytes, std::string& out,
                     std::string& why, const Identity& id, const std::string& bin_dir, const std::string& self_path,
@@ -1943,7 +2082,8 @@ inline bool replace(const std::string& text, const std::string& name, const std:
     if (d.sibling && name != "etcs") { why = "from a list of the identity this loader moves to, it takes only its successor"; return false; }
     if (!d.sibling && head_retired(store, id.head))
     { why = "this loader's identity was retired by a re-sync: the loader it re-synced to is the one to run"; return false; }
-    if (!d.sibling) kernel_taken(store, d.kernel);
+    if (!d.sibling && !epoch_in_order(store, d, why)) return false;
+    if (!d.sibling) { kernel_taken(store, d.kernel); epoch_taken(store, d); }
     const DistEntry* e = nullptr;
     for (const DistEntry& x : d.entries) if (x.name == name) e = &x;
     if (!e) { why = "the list has no '" + name + "'"; return false; }
@@ -1957,13 +2097,30 @@ inline bool replace(const std::string& text, const std::string& name, const std:
     if (!verify(name, b, bytes.size(), d.epoch, id, w, kernel)) { why = w; return false; }
 
     namespace fs = std::filesystem;
-    const std::string path = kernel ? self_path : bin_dir + e->file, beside = path + ".fetched";
-    const sig::Key was = file_hash(path);
+    std::error_code ec;
+    if (!d.sibling)
+    {
+        // One list's set at a time: what another list staged goes.
+        const std::string next = staged_dir(bin_dir);
+        std::string staged_list;
+        {
+            std::ifstream f(next + "manifest");
+            std::getline(f, staged_list);
+        }
+        std::string first;
+        std::istringstream lines(text);
+        std::getline(lines, first);
+        if (staged_list != first) fs::remove_all(next, ec);
+        fs::create_directories(next, ec);
+        std::ofstream m(next + "manifest", std::ios::trunc);
+        if (!m.write(text.data(), std::streamsize(text.size())) || !m.flush()) { why = "cannot write " + next + "manifest"; return false; }
+    }
+    const std::string path = d.sibling ? self_path : staged_dir(bin_dir) + e->file, beside = path + ".fetched";
+    const sig::Key was = file_hash(self_path);
     {
         std::ofstream o(beside, std::ios::binary | std::ios::trunc);
         if (!o.write(bytes.data(), std::streamsize(bytes.size())) || !o.flush()) { why = "cannot write " + beside; return false; }
     }
-    std::error_code ec;
     fs::permissions(beside, fs::perms::owner_all | fs::perms::group_read | fs::perms::group_exec
                             | fs::perms::others_read | fs::perms::others_exec, ec);
     fs::rename(beside, path, ec);
@@ -1978,6 +2135,57 @@ inline bool replace(const std::string& text, const std::string& name, const std:
         retire_head(store, id.head);
         kernel_taken(store, d.kernel);
     }
+    return true;
+}
+
+// The identity a download is: what a list's binaries are checked against
+// before anything is loaded (swap_at_start).
+inline Identity download_identity(const std::string& store)
+{
+    Identity id;
+    id.head = ace_identity();
+    id.head_parent = ace_identity_parent();
+    load_public(store, id.pub);
+    return id;
+}
+
+// Whether the staged set is whole: every entry of the staged list this loader
+// has is current where it reads it, its own, or staged -- and one is staged.
+inline bool staged_ready(const std::string& store, const std::string& bin_dir, const std::string& self_path,
+                         const Identity& id, Dist& d, std::string& why)
+{
+    std::vector<uint8_t> raw;
+    if (!read_file(staged_dir(bin_dir) + "manifest", raw)) { why = "nothing is staged"; return false; }
+    if (!dist_read(std::string(raw.begin(), raw.end()), d, why, id.head, kernel_floor(store)) || !epoch_in_order(store, d, why))
+        return false;
+    bool any = false;
+    for (const DistEntry& e : d.entries)
+    {
+        std::error_code ec;
+        if (!std::filesystem::exists(live_path(e, bin_dir, self_path), ec)) continue;
+        if (on_disk(live_path(e, bin_dir, self_path), e, d, id) != OnDisk::Other) continue;
+        if (on_disk(staged_dir(bin_dir) + e.file, e, d, id) != OnDisk::Current) { why = e.name + " is not staged yet"; return false; }
+        any = true;
+    }
+    if (!any) { why = "nothing is staged"; return false; }
+    return true;
+}
+
+// The staged set put in place, whole: true if it was.
+inline bool take_staged(const std::string& store, const std::string& bin_dir, const std::string& self_path,
+                        const Identity& id, Dist& d, std::string& why)
+{
+    namespace fs = std::filesystem;
+    if (!staged_ready(store, bin_dir, self_path, id, d, why)) return false;
+    std::error_code ec;
+    for (const DistEntry& e : d.entries)
+    {
+        const std::string from = staged_dir(bin_dir) + e.file;
+        if (!fs::exists(from, ec)) continue;
+        fs::rename(from, live_path(e, bin_dir, self_path), ec);
+        if (ec) { why = "cannot put " + e.file + " in place: " + ec.message(); return false; }
+    }
+    fs::remove_all(staged_dir(bin_dir), ec);
     return true;
 }
 
@@ -2001,6 +2209,8 @@ inline std::string resync_target(const std::string& store)
  * interactive one asks whether to resume the session or go to the menu, and
  * the place stays in the store either way. A loader with no prompt starts as
  * it was launched, the place kept. A browser's re-sync is its page's reload.
+ * An update of this identity's epoch restarts the same way (request_swap),
+ * putting the staged set in place first.
  */
 inline void resync_notice(const std::string& text);
 
@@ -2019,11 +2229,26 @@ inline void request_resync(const std::string& to_kernel)
     g_sig_term.store(1, std::memory_order_release);
 }
 
+// The same restart for a staged epoch of this identity: the hot swap.
+inline void request_swap(const sig::Epoch& epoch)
+{
+    resync_kernel() = "the site's epoch " + hex(epoch.data(), 32).substr(0, 12);
+    resync_notice("updating to " + resync_kernel() + ": saving your place, then restarting on its loader.");
+    resync_flag().store(true);
+    g_sig_term.store(1, std::memory_order_release);
+}
+
 inline void resync_exec()
 {
 #if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
     if (!resync_pending()) return;
     const std::string self = own_path();
+    {
+        const std::string store = etcs_store_dir(), bin = self.substr(0, self.find_last_of('/') + 1);
+        std::string why;
+        Dist d;
+        take_staged(store, bin, self, download_identity(store), d, why);
+    }
     std::vector<std::string> args{ self, "--resynced", resync_kernel() };
 #if !defined(ETCS_REPL_SHELL)
     // No prompt and no menu: it runs again as it was launched.
@@ -2040,6 +2265,31 @@ inline void resync_exec()
     std::fflush(nullptr);
     ::execv(self.c_str(), argv.data());
     std::fprintf(stderr, "etcs: the successor did not start (%s); start it again to finish the re-sync\n", std::strerror(errno));
+#endif
+}
+
+// At start, before anything loads: a staged set that is whole goes in place,
+// and the loader it brought starts in this one's place, as launched.
+inline void swap_at_start(char** argv)
+{
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
+    if (untrusted_build) return;
+    const std::string self = own_path(), bin = self.substr(0, self.find_last_of('/') + 1), store = etcs_store_dir();
+    std::error_code ec;
+    if (!std::filesystem::exists(staged_dir(bin) + "manifest", ec)) return;
+    std::string why;
+    Dist d;
+    if (!take_staged(store, bin, self, download_identity(store), d, why))
+    {
+        std::fprintf(stderr, "etcs: what is staged in %s does not go in place yet: %s\n", staged_dir(bin).c_str(), why.c_str());
+        return;
+    }
+    std::fprintf(stderr, "etcs: the site's epoch %s was staged; starting on its loader\n", hex(d.epoch.data(), 32).substr(0, 12).c_str());
+    std::fflush(nullptr);
+    ::execv(self.c_str(), argv);
+    std::fprintf(stderr, "etcs: the staged loader did not start (%s)\n", std::strerror(errno));
+#else
+    (void)argv;
 #endif
 }
 
@@ -2209,7 +2459,9 @@ inline bool recognize(char side, const std::string& word, const std::string& tra
  * identity, its own directory and binary, its epoch. `op` in TrustEvent::Op's
  * order. A registration installed now is the next session's -- for this
  * epoch, or (op 0 with b = "next") for the successor put in place; a re-sync
- * (op 4) ends this session and starts the successor in its place. A link's
+ * (op 4) ends this session and starts the successor in its place -- a sibling's
+ * placed loader, or this identity's staged epoch. Op 12 gives the modules
+ * refused for another epoch of this identity since it was last asked. A link's
  * word (ops 5 and 6), and what this loader is (op 10: "<head> <epoch>"), are
  * asked of a browser loader too. An account's words (ops 7 to 9, and 11 for
  * the portal) take the registrar's key in `a` and the other key, or the
@@ -2273,12 +2525,24 @@ inline bool answer(uint8_t op, const std::string& name, const std::string& a, co
         {
             const Resync rs = resync_state(dir, id, self);
             if (rs == Resync::Stuck) { why = "a re-sync was placed and this is still the loader before it: reinstall from the site"; break; }
-            if (rs != Resync::Placed) { why = "no successor is placed to re-sync to"; break; }
+            if (rs == Resync::Placed)
+            {
+                ok = true;
+                out = "this loader's identity moved; restarting on its successor";
+                request_resync(resync_target(dir));
+                break;
+            }
+            Dist d;
+            if (!staged_ready(dir, bin, self, id, d, why)) { why = "nothing to restart on: " + why; break; }
             ok = true;
-            out = "this loader's identity moved; restarting on its successor";
-            request_resync(resync_target(dir));
+            out = "the site's epoch " + hex(d.epoch.data(), 32).substr(0, 12) + " is staged; restarting on it";
+            request_swap(d.epoch);
             break;
         }
+        case 12:
+            ok = true;
+            out = take_heal();
+            break;
         default: why = "no such question";
     }
     if (!ok) out = why;
