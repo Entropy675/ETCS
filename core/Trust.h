@@ -570,8 +570,10 @@ protected:
 /*
  * A MODULE OF THIS IDENTITY, SIGNED FOR ANOTHER EPOCH: the site has moved past
  * this loader (or it past the site). The load is refused, and the name kept
- * here as a heal wanted -- what holds the site (Upstream.Heal, TrustEvent
- * Heal) asks for it, and updates.
+ * here as a heal wanted. The loader heals itself at its next quiet point
+ * (heal_at_quiet_point, core/CommandExecutor.h), from a remote built into
+ * it (remotes): two loaders of one identity in two epochs cannot be one
+ * causal history, so the heal is the loader's, not a module's.
  */
 struct HealWanted
 {
@@ -585,6 +587,13 @@ inline void want_heal(const std::string& name)
     HealWanted& h = heal_state();
     std::lock_guard<std::mutex> l(h.mu);
     if ((" " + h.names + " ").find(" " + name + " ") == std::string::npos) h.names += (h.names.empty() ? "" : " ") + name;
+}
+
+inline bool heal_wanted()
+{
+    HealWanted& h = heal_state();
+    std::lock_guard<std::mutex> l(h.mu);
+    return !h.names.empty();
 }
 
 // The names wanted since last asked, forgotten as they are given.
@@ -632,7 +641,7 @@ struct SignatureStage : Stage
             {
                 want_heal(f.name);
                 return refuse(io, "not witnessed under this epoch: this identity's marketplace signed it for another, so the "
-                                  "site and this loader are in two epochs (Upstream.Heal updates)");
+                                  "site and this loader are in two epochs (the loader heals when it is next quiet)");
             }
             return refuse(io, "not witnessed under this epoch");
         }
@@ -2149,6 +2158,94 @@ inline Identity download_identity(const std::string& store)
     return id;
 }
 
+/*
+ * THE REMOTES THIS LOADER HEALS FROM ARE BUILT INTO IT, as its identity is and
+ * by the same hand: whoever builds a loader says where it heals from (ace
+ * remotes: -DETCS_REMOTES=<host>[:<port>][+<ca pem path>][,...]), so no header
+ * names one and no epoch depends on it. A marketplace's loaders carry its
+ * own; a loader built with none heals from nowhere. Which loader to run is its
+ * owner's choice, made before the runtime reaches past the loader, and
+ * nothing a running runtime can reach names another. A remote is https, so
+ * only its host is written. They are tried in the order built: the first is
+ * its default.
+ */
+#define ETCS_TRUST_STRV2(...) #__VA_ARGS__
+#define ETCS_TRUST_STRV(...)  ETCS_TRUST_STRV2(__VA_ARGS__)
+
+struct Remote { std::string origin, ca; };
+
+// A remote's host and its CA path go into a script line: plain characters only.
+inline bool remote_host(const std::string& w)
+{
+    const size_t colon = w.find(':');
+    const std::string host = w.substr(0, colon), port = colon == std::string::npos ? std::string("443") : w.substr(colon + 1);
+    return !host.empty() && host.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.-") == std::string::npos
+        && !port.empty() && port.size() <= 5 && port.find_first_not_of("0123456789") == std::string::npos;
+}
+inline bool remote_path(const std::string& w)
+{
+    return !w.empty() && w[0] == '/'
+        && w.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.:/_-") == std::string::npos;
+}
+
+// "<host>[:<port>][+<ca>][,...]" as built in; a word that is not plain names no remote.
+inline void remotes_of(const std::string& built, std::vector<Remote>& out)
+{
+    std::string word;
+    for (size_t i = 0; i <= built.size(); ++i)
+    {
+        if (i < built.size() && built[i] != ',') { word += built[i]; continue; }
+        word.erase(0, word.find_first_not_of(' '));
+        word.erase(word.find_last_not_of(' ') + 1);
+        const size_t plus = word.find('+');
+        const Remote r{ "https://" + word.substr(0, plus), plus == std::string::npos ? std::string() : word.substr(plus + 1) };
+        const bool plain = remote_host(word.substr(0, plus)) && (plus == std::string::npos || remote_path(r.ca));
+        bool have = false;
+        for (const Remote& o : out) have = have || o.origin == r.origin;
+        if (plain && !have) out.push_back(r);
+        word.clear();
+    }
+}
+
+inline const std::vector<Remote>& remotes()
+{
+    static const std::vector<Remote> all = [] {
+        std::vector<Remote> v;
+#if defined(ETCS_REMOTES)
+        remotes_of(ETCS_TRUST_STRV(ETCS_REMOTES), v);
+#endif
+        return v;
+    }();
+    return all;
+}
+inline size_t remote_count() { return remotes().size(); }
+inline std::string remote_origin(size_t i) { return i < remotes().size() ? remotes()[i].origin : std::string(); }
+
+// What the loader runs to heal from one of them: through the modules of its
+// own epoch (CryptProvider's Upstream over NetworkProvider's HttpsRelation),
+// as Update does -- staged, registered ahead, then the swap. `n` keeps one
+// run's names from another's.
+inline std::string heal_script(const Remote& r, int n)
+{
+    const std::string h = "__heal" + std::to_string(n), to = h + "_to", emb = h + "_embassy";
+    std::string s;
+    s += "spawn CryptProvider::Upstream " + h + "\n";
+    s += "spawn NetworkProvider::HttpsRelation " + to + "\n";
+    s += to + ".Origin(" + r.origin + ")\n";
+    if (!r.ca.empty()) s += to + ".SetCaFile(" + r.ca + ")\n";
+    s += to + ".Target(Directory)\n";
+    s += to + ".Activate(@" + h + ")\n";
+    s += "spawn NetworkProvider::Embassy " + emb + "\n";
+    s += emb + ".Advertise(remote https @" + to + ")\n";
+    s += emb + ".Open()\n";
+    s += h + ".SetEmbassy(@" + emb + ")\n";
+    s += h + ".SetRelation(remote)\n";
+    s += h + ".Update()\n";
+    s += emb + ".Close()\n";
+    return s;
+}
+inline std::string heal_script(size_t i, int n) { return i < remotes().size() ? heal_script(remotes()[i], n) : std::string(); }
+
 // Whether the staged set is whole: every entry of the staged list this loader
 // has is current where it reads it, its own, or staged -- and one is staged.
 inline bool staged_ready(const std::string& store, const std::string& bin_dir, const std::string& self_path,
@@ -2229,9 +2326,67 @@ inline void request_resync(const std::string& to_kernel)
     g_sig_term.store(1, std::memory_order_release);
 }
 
-// The same restart for a staged epoch of this identity: the hot swap.
+// When <store>/scene was last written; 0 if it never was.
+inline long long scene_time(const std::string& store)
+{
+    std::error_code ec;
+    const auto t = std::filesystem::last_write_time(store + "/scene", ec);
+    return ec ? 0 : static_cast<long long>(t.time_since_epoch().count());
+}
+
+inline std::atomic<bool>& swap_flag() { static std::atomic<bool> f{ false }; return f; }
+
+// The scene is this session's if it replayed it, or saved one since it started;
+// only then does the successor replay it.
+inline long long& start_scene_time() { static long long t = 0; return t; }
+inline std::atomic<bool>& scene_resumed() { static std::atomic<bool> f{ false }; return f; }
+inline bool scene_is_this_sessions()
+{
+    return scene_resumed().load() || scene_time(etcs_store_dir()) != start_scene_time();
+}
+
+/*
+ * A script stopped by a refusal that asked to heal is wound back to the line
+ * it stopped at: the successor replays the scene, then runs the script again
+ * from that line (etcs --from <line> <script>). What came before it is in the
+ * scene; the line itself is what the heal was for.
+ */
+struct Place { std::string script; int line = 0; };
+inline Place& heal_place() { static Place p; return p; }        // where this session stopped
+inline Place& continue_place() { static Place p; return p; }    // where this one goes on from
+
+inline std::string place_path(const std::string& script)
+{
+    std::error_code ec;
+    const std::filesystem::path p = std::filesystem::weakly_canonical(std::filesystem::absolute(script, ec), ec);
+    return ec ? script : p.string();
+}
+
+inline void stopped_for_heal(const std::string& origin, int line)
+{
+    if (origin.empty() || origin[0] == '(' || !heal_wanted() || !heal_place().script.empty()) return;
+    const std::string at = place_path(origin);
+    if (at == place_path(etcs_store_dir() + "/resume.etcs")) return;   // the scene's own replay runs whole, every time
+    heal_place() = Place{ at, line };
+}
+
+inline void forget_heal_place() { heal_place() = Place{}; }
+
+// The line a script starts at: 1 unless it is the one a heal stopped.
+inline int continue_from(const std::string& origin)
+{
+    Place& c = continue_place();
+    if (c.line <= 0 || origin.empty() || origin[0] == '(' || place_path(origin) != c.script) return 1;
+    const int line = c.line;
+    c = Place{};
+    return line;
+}
+
+// The same restart for a staged epoch of this identity: the hot swap. It
+// winds back where it was (resync_exec).
 inline void request_swap(const sig::Epoch& epoch)
 {
+    swap_flag().store(true);
     resync_kernel() = "the site's epoch " + hex(epoch.data(), 32).substr(0, 12);
     resync_notice("updating to " + resync_kernel() + ": saving your place, then restarting on its loader.");
     resync_flag().store(true);
@@ -2250,15 +2405,32 @@ inline void resync_exec()
         take_staged(store, bin, self, download_identity(store), d, why);
     }
     std::vector<std::string> args{ self, "--resynced", resync_kernel() };
-#if !defined(ETCS_REPL_SHELL)
-    // No prompt and no menu: it runs again as it was launched.
-    const std::vector<std::string>& was = launch_args();
-    for (size_t i = 1; i < was.size(); ++i)
-    {
-        if (was[i] == "--resynced") { ++i; continue; }
-        if (was[i] != "--resume" && was[i] != "--fresh") args.push_back(was[i]);
-    }
+    const bool swap = swap_flag().load();
+#if defined(ETCS_REPL_SHELL)
+    const bool prompt = true;
+#else
+    const bool prompt = false;                      // no prompt and no menu: it runs again as it was launched
 #endif
+    // Where a swap winds back to. With a scene of this session's: the scene,
+    // then the script a heal stopped, from its line; at a prompt the script it
+    // was launched with is in that scene, and is not run again. With no scene
+    // nothing of the session survives, and it runs again as it was launched.
+    const bool scene = swap && scene_is_this_sessions();
+    const Place at = scene ? heal_place() : Place{};
+    const bool wound = scene && (at.line > 0 || prompt);
+    if (swap) args.push_back(wound ? "--resume" : "--fresh");
+    if (at.line > 0) args.insert(args.end(), { "--from", std::to_string(at.line) });
+    const std::vector<std::string>& was = launch_args();
+    bool same = false;                              // it was launched with the script that stopped
+    for (size_t i = 1; (swap || !prompt) && i < was.size(); ++i)
+    {
+        if (was[i] == "--resynced" || was[i] == "--from") { ++i; continue; }
+        if (was[i] == "--resume" || was[i] == "--fresh") continue;
+        const bool script = was[i].size() > 5 && was[i].compare(was[i].size() - 5, 5, ".etcs") == 0;
+        if (script && wound && !same && !(same = at.line > 0 && place_path(was[i]) == at.script)) break;
+        args.push_back(was[i]);
+    }
+    if (at.line > 0 && !same) args.push_back(at.script);
     std::vector<char*> argv;
     for (std::string& a : args) argv.push_back(&a[0]);
     argv.push_back(nullptr);
@@ -2460,8 +2632,7 @@ inline bool recognize(char side, const std::string& word, const std::string& tra
  * order. A registration installed now is the next session's -- for this
  * epoch, or (op 0 with b = "next") for the successor put in place; a re-sync
  * (op 4) ends this session and starts the successor in its place -- a sibling's
- * placed loader, or this identity's staged epoch. Op 12 gives the modules
- * refused for another epoch of this identity since it was last asked. A link's
+ * placed loader, or this identity's staged epoch. A link's
  * word (ops 5 and 6), and what this loader is (op 10: "<head> <epoch>"), are
  * asked of a browser loader too. An account's words (ops 7 to 9, and 11 for
  * the portal) take the registrar's key in `a` and the other key, or the
@@ -2539,10 +2710,6 @@ inline bool answer(uint8_t op, const std::string& name, const std::string& a, co
             request_swap(d.epoch);
             break;
         }
-        case 12:
-            ok = true;
-            out = take_heal();
-            break;
         default: why = "no such question";
     }
     if (!ok) out = why;
@@ -2964,6 +3131,7 @@ inline bool consensus(const std::vector<std::string>& texts, const std::vector<s
  *   etcs --succeed <name> <file> <epoch hex> <out>  the same, for a loader binary: passes it off, and logs the edge
  *   etcs --registration <cert>...                   install the half above this key, leaf first; prints the identity
  *   etcs --issue <role> <key hex> <out>             a registrar certifies another loader's key; writes its chain
+ *   etcs --remotes                                  the remotes built into this loader, in the order it heals from them
  *   etcs --request <registrar key hex> [next]       "<key> <head> <epoch> <signature>": a registration's ask, for
  *                                                   this loader or the successor it put in place
  *   etcs --join <registrar> <member key>            "<key> <signature>": this key agrees to join member's account
@@ -2990,6 +3158,7 @@ inline bool consensus(const std::vector<std::string>& texts, const std::vector<s
 inline int cli(int argc, char** argv)
 {
     launch_args().assign(argv, argv + argc);        // what a re-sync starts the successor with
+    start_scene_time() = scene_time(etcs_store_dir());
     if (argc < 2) return -1;
     const std::string verb = argv[1];
     if (untrusted_build)
@@ -3119,6 +3288,11 @@ inline int cli(int argc, char** argv)
         store_identity(dir, head, why);
         std::printf("registered as %s under root %s\nidentity %s\n", sig::role_name(reg[0].role),
                     hex(reg.back().subject.data(), 32).c_str(), hex(head.data(), 32).c_str());
+        return 0;
+    }
+    if (verb == "--remotes" && argc == 2)
+    {
+        for (const Remote& r : remotes()) std::printf("%s%s%s\n", r.origin.c_str(), r.ca.empty() ? "" : " ca=", r.ca.c_str());
         return 0;
     }
     if (verb == "--request" && (argc == 3 || (argc == 4 && std::string(argv[3]) == "next")))

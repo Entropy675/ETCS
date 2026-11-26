@@ -456,12 +456,9 @@ struct PairMaskEvent : Event
 //   Identify (nothing)                         out = "<head> <epoch>": what this loader is
 //   Portal   a = the registrar's key, hex      out = "<this loader's key> <signature>": its word
 //            b = the code a browser shows        letting that browser act for its account
-//   Heal     (nothing)                         out = the modules refused for another epoch of
-//                                                this identity since last asked, or ""
 struct TrustEvent : Event
 {
-    enum class Op : uint8_t { Request, Install, Survey, Replace, Resync, Vouch, Recognize, Join, Admit, Retire, Identify, Portal,
-                              Heal };
+    enum class Op : uint8_t { Request, Install, Survey, Replace, Resync, Vouch, Recognize, Join, Admit, Retire, Identify, Portal };
     Op                  op;
     ::std::string       name, a, b, out;
     bool                ok = false;

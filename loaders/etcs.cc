@@ -539,15 +539,32 @@ int main(int argc, char* argv[])
     // takes ctx explicitly now rather than closing over it, since it no
     // longer lives here as a local lambda.
     // ── Continue where you left off ──────────────────────────────────────
-    // etcs [--resume | --fresh] ...
+    // etcs [--resume | --fresh] [--from <line>] ...
     //
     // Flag-first, like -q. An interactive start with no script asks
     // (offer_resume, CommandExecutor.h); a script, or a build with no prompt,
     // starts fresh unless told --resume, which replays the last scene BEFORE
     // the script runs, so the script can use what it brings back.
     while (argc >= 2 && (std::string_view(argv[1]) == "--resume" || std::string_view(argv[1]) == "--fresh"
-                         || std::string_view(argv[1]) == "--resynced"))
+                         || std::string_view(argv[1]) == "--resynced" || std::string_view(argv[1]) == "--from"))
     {
+        if (std::string_view(argv[1]) == "--from")
+        {
+            // A heal's wind-back (core/Trust.h, heal_place): the script given
+            // runs from this line, after the scene it left is replayed.
+            const int line = argc >= 3 ? std::atoi(argv[2]) : 0;
+            for (int i = 3; line > 0 && i < argc; ++i)
+                if (std::string_view(argv[i]).size() > 5
+                    && std::string_view(argv[i]).substr(std::string_view(argv[i]).size() - 5) == ".etcs")
+                {
+                    ETCS::trust::continue_place() = ETCS::trust::Place{ ETCS::trust::place_path(argv[i]), line };
+                    break;
+                }
+            const int used = argc >= 3 ? 2 : 1;
+            argv += used;
+            argc -= used;
+            continue;
+        }
         if (std::string_view(argv[1]) == "--resynced")
         {
             // A re-sync's restart (core/Trust.h): asks resume or menu; with no
@@ -583,6 +600,7 @@ int main(int argc, char* argv[])
         if (resume_choice().load() == 1)
         {
             resume_choice().store(-1);
+            announce_resync();                      // a swap's successor says what it became, then winds back
             resume_last_scene(ctx);
         }
 #endif
@@ -774,6 +792,7 @@ int main(int argc, char* argv[])
     }
 #else
     ETCS::run_script(file, filepath, script_ctx);
+    heal_at_quiet_point(ctx);                       // the script is done: a heal it asked for happens now
 #endif
     // Clear the interrupt flag so the following loop doesn't instantly exit
     g_sig_int = 0;

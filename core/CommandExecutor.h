@@ -2239,6 +2239,23 @@ inline size_t dissolve_closure(ExecutionContext& ctx, const ExecSource& src)
 }
 #endif // ETCS_EXECUTOR_HOST
 
+// A root script stopped by a refusal that asked to heal: where it stopped,
+// and in the successor, where it goes on (core/Trust.h, heal_place).
+#if defined(ETCS_LOADER) && !defined(__EMSCRIPTEN__) && !defined(ETCS_UNTRUSTED)
+namespace trust {
+inline void stopped_for_heal(const ::std::string& origin, int line);
+inline int continue_from(const ::std::string& origin);
+inline ::std::atomic<bool>& scene_resumed();
+}
+inline void heal_stopped_at(const ::std::string& origin, int line) { trust::stopped_for_heal(origin, line); }
+inline int heal_continue_from(const ::std::string& origin) { return trust::continue_from(origin); }
+inline void heal_scene_resumed() { trust::scene_resumed().store(true); }
+#else
+inline void heal_stopped_at(const ::std::string&, int) {}
+inline int heal_continue_from(const ::std::string&) { return 1; }
+inline void heal_scene_resumed() {}
+#endif
+
 // ===========================================================================
 // run_script
 // ===========================================================================
@@ -2285,9 +2302,11 @@ inline bool run_script(::std::istream& in,
     // A closure ends once -- see the block below.
     bool closure_ended = false;
 #endif
+    const int first_line = ctx.is_root ? heal_continue_from(origin) : 1;
 
     for (const auto& sl : lines)
     {
+        if (sl.number < first_line) continue;       // done before a heal: in the scene now
         ExecSource src{origin, sl.number};
         ExecuteResult result = execute_command(sl.cmd, ctx, src);
  
@@ -2298,6 +2317,8 @@ inline bool run_script(::std::istream& in,
          || result.status == ExecuteStatus::Vanished
          || result.status == ExecuteStatus::Error)
         {
+            if (result.status != ExecuteStatus::Exit && ctx.is_root)
+                heal_stopped_at(origin, sl.number);
             if (result.status != ExecuteStatus::Exit)
             {
                 exec_warn(src, ::std::string("stopping: ")
@@ -4208,10 +4229,13 @@ inline void repl_shell_tag_loop(const ::std::string& mod_name, ETCS::Root& nav_r
 // script verbs, which was always wrong: a script launches work with
 // detach/run, it does not administer it afterward. Administration is what a
 // prompt is for.
+inline bool heal_at_quiet_point(ETCS::SignalContext& sig);
+
 inline void repl_shell_loop_with(ETCS::SignalContext& sig, ReplLineSource& in)
 {
     while (!(sig.isInterrupted() || sig.isTerminated()))
     {
+        if (heal_at_quiet_point(sig)) break;            // between lines: the last one finished
         ::std::vector<::std::string> available_mods;
         ::std::vector<ReplMenuItem> menu;
         repl_shell_print_dir(available_mods, &menu);
@@ -4725,7 +4749,69 @@ inline bool resume_last_scene(ETCS::SignalContext& sig)
     ETCS::run_root_script(script, rc);
     ::std::istringstream finish("__resume.Finish()\n");
     ETCS::run_script(finish, "(resume)", rc);
+    ETCS::heal_scene_resumed();                         // a swap from this session takes it on
     return true;
+}
+
+/*
+ * THE LOADER HEALS ITSELF, at a quiet point: after what it was doing has
+ * finished -- the script it ran, or the line the prompt was given -- never in
+ * the middle of it. A module of this identity refused for another epoch asked
+ * for it (core/Trust.h, want_heal). From the remotes built into it, in their
+ * order, through the modules of its own epoch, the newer set is staged and
+ * this loader's key registered for it; then the session winds down as a
+ * terminate does (its scene saved), the set goes in place, and the successor
+ * winds back to where this one was (request_swap, resync_exec). Its entities
+ * are its own root's, so nothing of the heal is in the scene. True if the
+ * swap is under way.
+ */
+#if defined(ETCS_LOADER) && !defined(__EMSCRIPTEN__) && !defined(ETCS_UNTRUSTED)
+namespace ETCS { namespace trust {
+inline ::std::string take_heal();
+inline size_t remote_count();
+inline ::std::string remote_origin(size_t i);
+inline ::std::string heal_script(size_t i, int n);
+inline bool resync_pending();
+inline void forget_heal_place();
+} }
+#endif
+
+inline bool heal_at_quiet_point(ETCS::SignalContext& sig)
+{
+#if !defined(ETCS_LOADER) || defined(__EMSCRIPTEN__) || defined(ETCS_UNTRUSTED)
+    (void)sig;
+    return false;                                   // a page heals by its reload; an untrusted build checks nothing
+#else
+    const ::std::string wanted = ETCS::trust::take_heal();
+    if (wanted.empty()) return false;
+    static ETCS::Root heal_root(sig);
+    static int runs = 0;
+    // The remotes had nothing newer a moment ago: a refusal met again so soon
+    // does not hold the session on them again.
+    static ::std::chrono::steady_clock::time_point again{};
+    if (::std::chrono::steady_clock::now() < again) { ETCS::trust::forget_heal_place(); return false; }
+    if (ETCS::trust::remote_count() == 0)
+        repl_err() << COLOR_WARN << "etcs: " << wanted << " refused for another epoch, and this loader was built with no "
+                   << "remote to heal from" << COLOR_RESET << "\n";
+    for (size_t i = 0; i < ETCS::trust::remote_count() && !(sig.isInterrupted() || sig.isTerminated()); ++i)
+    {
+        const ::std::string origin = ETCS::trust::remote_origin(i);
+        repl_err() << COLOR_WARN << "etcs: " << wanted << " refused for another epoch: healing from " << origin
+                   << COLOR_RESET << "\n";
+        ETCS::ExecutionContext hc;
+        hc.sig         = &sig;
+        hc.root_entity = &heal_root;
+        hc.is_root     = true;
+        ::std::istringstream text(ETCS::trust::heal_script(i, runs++));
+        ETCS::run_script(text, "(heal)", hc);
+        if (ETCS::trust::resync_pending()) return true;
+        repl_err() << COLOR_WARN << "etcs: " << origin << " gave this loader nothing newer to restart on (see the log)"
+                   << COLOR_RESET << "\n";
+    }
+    ETCS::trust::forget_heal_place();
+    again = ::std::chrono::steady_clock::now() + ::std::chrono::seconds(60);
+    return false;
+#endif
 }
 
 // Asks once, before the prompt; the answer is the session's.

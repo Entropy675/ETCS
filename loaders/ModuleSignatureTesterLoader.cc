@@ -1297,11 +1297,65 @@ int main(int, char**)
         tr::Identity wrong = download; wrong.head = fresh_key().pub;
         check(!tr::replace(list, "Probe", new_bytes, put, why, wrong, here, self),
               "a loader of another identity takes nothing from this list");
+        {
+            // The remotes a loader heals from are built into it.
+            std::vector<tr::Remote> built;
+#if defined(ETCS_REMOTES)
+            tr::remotes_of(ETCS_TRUST_STRV(ETCS_REMOTES), built);
+#endif
+            bool as_built = tr::remote_count() == built.size() && tr::remote_origin(tr::remote_count()).empty();
+            for (size_t i = 0; as_built && i < built.size(); ++i) as_built = tr::remote_origin(i) == built[i].origin;
+            check(as_built, "a loader's remotes are the ones it was built with, in their order -- none, if it was built with none: "
+                            "no header names one");
+            std::vector<tr::Remote> v;
+            tr::remotes_of("anticurrententropy.com", v);
+            tr::remotes_of("localhost:8443+/etc/ssl/test-ca.pem, mirror.example.org,localhost:8443", v);
+            check(v.size() == 3 && v[0].origin == "https://anticurrententropy.com" && v[0].ca.empty()
+                  && v[1].origin == "https://localhost:8443" && v[1].ca == "/etc/ssl/test-ca.pem"
+                  && v[2].origin == "https://mirror.example.org",
+                  "more are built in beside it, each with its CA if it has one, in their order and once each");
+            std::vector<tr::Remote> bad;
+            tr::remotes_of("a b)x,host/path,host:99999x,:443,host+relative.pem,x)\nspawn Evil::Thing y,host+/a b,,+/ca.pem", bad);
+            check(bad.empty(), "a word that is not a plain host, port and path names no remote: nothing else reaches a script line");
+            const std::string h = tr::heal_script(v[1], 4);
+            check(h.find("__heal4_to.Origin(https://localhost:8443)\n") != std::string::npos
+                  && h.find("__heal4_to.SetCaFile(/etc/ssl/test-ca.pem)\n") != std::string::npos
+                  && h.find("__heal4.Update()\n") != std::string::npos
+                  && tr::heal_script(v[0], 0).find("SetCaFile") == std::string::npos,
+                  "and the loader heals through one: Update, against that remote");
+            const std::string rst = dir + "/s-remote";
+            ::mkdir(rst.c_str(), 0700);
+            write_bytes(rst + "/remote", { 'o', 'r', 'i', 'g', 'i', 'n', '=', 'h', 't', 't', 'p', 's', ':', '/', '/', 'e', 'v', 'i', 'l', '\n' });
+            bool named = false;
+            for (const tr::Remote& r : tr::remotes()) named = named || r.origin == "https://evil";
+            check(!named, "nothing in a store names a remote");
+        }
         tr::take_heal();
         check(!ok_as("Probe", probe_new, other, download, &why)
               && why.rfind("not witnessed under this epoch: this identity's marketplace signed it for another", 0) == 0
               && tr::take_heal() == "Probe" && tr::take_heal().empty(),
               "a module of this identity signed for another epoch is refused and wanted healed, said once to whoever asks");
+        {
+            // Where a script stopped for the heal, and where its successor goes on.
+            const std::string script = dir + "/work.etcs";
+            write_bytes(script, { '\n' });
+            tr::forget_heal_place();
+            tr::stopped_for_heal(script, 7);
+            check(tr::heal_place().line == 0, "a stop with no heal wanted is no place to wind back to");
+            ok_as("Probe", probe_new, other, download, &why);
+            tr::stopped_for_heal("(resume)", 3);
+            tr::stopped_for_heal(script, 7);
+            tr::stopped_for_heal(dir + "/outer.etcs", 2);
+            check(tr::heal_place().line == 7 && tr::heal_place().script == tr::place_path(script),
+                  "a refusal that wants healing marks the line its script stopped at, the first stop only");
+            tr::take_heal();
+            tr::forget_heal_place();
+            tr::continue_place() = tr::Place{ tr::place_path(dir + "/./work.etcs"), 7 };
+            check(tr::continue_from(dir + "/resume.etcs") == 1 && tr::continue_from("(resume)") == 1,
+                  "the successor's replay of its scene runs whole");
+            check(tr::continue_from(script) == 7 && tr::continue_from(script) == 1,
+                  "the script stopped goes on from the line it stopped at, once");
+        }
 
         // The same questions, asked of this loader through its ordering thread.
         sig::Key reg{}; reg[0] = 7;
