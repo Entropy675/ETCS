@@ -577,8 +577,10 @@ protected:
  */
 struct HealWanted
 {
-    std::mutex  mu;
-    std::string names;      // space-separated
+    std::mutex              mu;
+    std::string             names;      // space-separated
+    std::vector<sig::Epoch> peers;      // epochs a peer of this guild was met in (want_heal_for)
+    std::vector<sig::Epoch> met;        // ...every one this session, so each asks once
 };
 inline HealWanted& heal_state() { static HealWanted h; return h; }
 
@@ -589,11 +591,32 @@ inline void want_heal(const std::string& name)
     if ((" " + h.names + " ").find(" " + name + " ") == std::string::npos) h.names += (h.names.empty() ? "" : " ") + name;
 }
 
+// A peer registered in this loader's guild, met running another epoch
+// (recognize): one of the two is behind, and its remotes say which. Each
+// epoch asks once a session, so a peer kept back cannot keep this loader asking.
+inline void want_heal_for(const sig::Epoch& far)
+{
+    HealWanted& h = heal_state();
+    std::lock_guard<std::mutex> l(h.mu);
+    if (std::find(h.met.begin(), h.met.end(), far) != h.met.end()) return;
+    h.met.push_back(far);
+    h.peers.push_back(far);
+}
+
 inline bool heal_wanted()
 {
     HealWanted& h = heal_state();
     std::lock_guard<std::mutex> l(h.mu);
-    return !h.names.empty();
+    return !h.names.empty() || !h.peers.empty();
+}
+
+inline std::vector<sig::Epoch> take_heal_peers()
+{
+    HealWanted& h = heal_state();
+    std::lock_guard<std::mutex> l(h.mu);
+    std::vector<sig::Epoch> out;
+    out.swap(h.peers);
+    return out;
 }
 
 // The names wanted since last asked, forgotten as they are given.
@@ -2285,6 +2308,8 @@ inline std::string heal_reason()
 {
     std::string why = take_heal();
     if (!why.empty()) why += " refused for another epoch";
+    for (const sig::Epoch& e : take_heal_peers())
+        why += std::string(why.empty() ? "" : "; ") + "a peer of this guild runs epoch " + hex(e.data(), 32).substr(0, 12);
     if (heal_asked().exchange(false)) why += std::string(why.empty() ? "" : "; ") + "asked for";
     static std::atomic<bool> looked{ false };
     if (!looked.exchange(true) && !untrusted_build && !remotes().empty() && !holds_registration())
@@ -2507,21 +2532,27 @@ inline void resync_exec()
     // was launched with is in that scene, and is not run again. With no scene
     // nothing of the session survives, and it runs again as it was launched.
     const bool scene = swap && scene_is_this_sessions();
-    const Place at = scene ? heal_place() : Place{};
+    const Place stopped = swap ? heal_place() : Place{};
+    const Place at = scene ? stopped : Place{};
     const bool wound = scene && (at.line > 0 || prompt);
     if (swap) args.push_back(wound ? "--resume" : "--fresh");
     if (at.line > 0) args.insert(args.end(), { "--from", std::to_string(at.line) });
     const std::vector<std::string>& was = launch_args();
     bool same = false;                              // it was launched with the script that stopped
+    bool launched = false;                          // it was launched with a script at all
     for (size_t i = 1; (swap || !prompt) && i < was.size(); ++i)
     {
         if (was[i] == "--resynced" || was[i] == "--from") { ++i; continue; }
         if (was[i] == "--resume" || was[i] == "--fresh" || was[i] == "--heal") continue;
         const bool script = was[i].size() > 5 && was[i].compare(was[i].size() - 5, 5, ".etcs") == 0;
         if (script && wound && !same && !(same = at.line > 0 && place_path(was[i]) == at.script)) break;
+        launched = launched || script;
         args.push_back(was[i]);
     }
     if (at.line > 0 && !same) args.push_back(at.script);
+    // No scene, and a script given at the prompt was stopped: nothing of it
+    // survives, so it is what runs again, whole.
+    if (!scene && !launched && stopped.line > 0) args.push_back(stopped.script);
     std::vector<char*> argv;
     for (std::string& a : args) argv.push_back(&a[0]);
     argv.push_back(nullptr);
@@ -2668,7 +2699,7 @@ inline bool link_secret(uint8_t secret[64], sig::Key& pub, std::vector<sig::Cert
 #endif
 }
 
-// Vouch: "<key> <chain|-> <signature>" for this end of the link.
+// Vouch: "<key> <chain|-> <epoch> <signature>" for this end of the link.
 inline bool vouch(char side, const std::string& transcript_hex, std::string& out, std::string& why)
 {
     uint8_t t[sig::kLinkTranscript], secret[64], s[sig::kSigBytes];
@@ -2676,28 +2707,37 @@ inline bool vouch(char side, const std::string& transcript_hex, std::string& out
     sig::Key pub{};
     std::vector<sig::Certificate> reg;
     if (!link_secret(secret, pub, reg, why)) return false;
-    const std::string m = sig::link_statement(side, t);
+    const std::string m = sig::link_statement(side, t, loader_epoch());
     mc::crypto_ed25519_sign(s, secret, reinterpret_cast<const uint8_t*>(m.data()), m.size());
     mc::crypto_wipe(secret, 64);
     const std::string chain = reg.empty() ? std::string() : sig::encode_chain(reg);
     out = hex(pub.data(), 32) + " " + (chain.empty() ? "-" : hex(reinterpret_cast<const uint8_t*>(chain.data()), chain.size()))
-        + " " + hex(s, sizeof s);
+        + " " + hex(loader_epoch().data(), 32) + " " + hex(s, sizeof s);
     return true;
 }
 
-// Recognize: the far side's word on the same transcript -> "<identity> <registered> <guild>".
-// A registration for another epoch is none here.
-inline bool recognize(char side, const std::string& word, const std::string& transcript_hex, std::string& out, std::string& why)
+/*
+ * Recognize: the far side's word on the same transcript -> "<identity>
+ * <registered> <guild>". A LINK IS BETWEEN RUNTIMES OF ONE EPOCH
+ * (ontology/Epoch.h): a word said in another is refused, "another epoch ...".
+ * When its key is registered in this loader's guild for the epoch it says,
+ * that is ACE's word that the two have parted, and this loader heals
+ * (want_heal_for): the one behind finds the newer set, the one ahead nothing.
+ * `here`, `head` and `parent` are this loader's epoch, identity and its parent.
+ */
+inline bool recognize_in(char side, const std::string& word, const std::string& transcript_hex, std::string& out, std::string& why,
+                         const sig::Epoch& here, const sig::Key& head, const sig::Key& parent)
 {
     uint8_t t[sig::kLinkTranscript], s[sig::kSigBytes];
     sig::Key pub{};
+    sig::Epoch far{};
     std::istringstream in(word);
-    std::string k, c, g;
-    in >> k >> c >> g;
+    std::string k, c, e, g;
+    in >> k >> c >> e >> g;
     if ((side != 'd' && side != 'a') || !unhex(transcript_hex, t, sizeof t) || !unhex(k, pub.data(), pub.size())
-        || !unhex(g, s, sizeof s) || c.empty())
+        || !unhex(e, far.data(), far.size()) || !unhex(g, s, sizeof s) || c.empty())
     { why = "not a link's word"; return false; }
-    const std::string m = sig::link_statement(side, t);
+    const std::string m = sig::link_statement(side, t, far);
     if (mc::crypto_ed25519_check(s, pub.data(), reinterpret_cast<const uint8_t*>(m.data()), m.size()) != 0)
     { why = "its signature on this link does not verify"; return false; }
     std::vector<sig::Certificate> reg;
@@ -2707,15 +2747,31 @@ inline bool recognize(char side, const std::string& word, const std::string& tra
         if (c.size() % 2 || raw.empty() || !unhex(c, reinterpret_cast<uint8_t*>(&raw[0]), raw.size())
             || !sig::decode_chain(raw.data(), raw.size(), reg) || !registration_valid(reg, pub))
         { why = "its chain is not a registration of its key"; return false; }
-        if (!registration_current(reg, loader_epoch())) reg.clear();
     }
+    const auto in_guild = [&](const std::vector<sig::Certificate>& r) {
+        const std::vector<Step> q = path_of(r, pub);
+        return !r.empty() && (head_meets(q, parent) >= 0 || head_meets(q, head) >= 0);
+    };
+    if (far != here)
+    {
+        const bool parted = registration_current(reg, far) && in_guild(reg);
+        if (parted) want_heal_for(far);
+        why = "another epoch (" + hex(far.data(), 32).substr(0, 12) + "; this loader's is " + hex(here.data(), 32).substr(0, 12)
+            + "): a link is between runtimes of one epoch"
+            + (parted ? ", and this loader asks its remotes which of the two is behind" : "");
+        return false;
+    }
+    if (!registration_current(reg, here)) reg.clear();
     const std::vector<Step> p = path_of(reg, pub);
     const sig::Key ident = identity_of(p);
     // In this loader's guild: under its identity's parent (the same active
     // key), or under the identity itself.
-    const bool guild = !reg.empty() && (head_meets(p, ace_identity_parent()) >= 0 || head_meets(p, ace_identity()) >= 0);
-    out = hex(ident.data(), 32) + " " + (reg.empty() ? "0" : "1") + " " + (guild ? "1" : "0");
+    out = hex(ident.data(), 32) + " " + (reg.empty() ? "0" : "1") + " " + (in_guild(reg) ? "1" : "0");
     return true;
+}
+inline bool recognize(char side, const std::string& word, const std::string& transcript_hex, std::string& out, std::string& why)
+{
+    return recognize_in(side, word, transcript_hex, out, why, loader_epoch(), ace_identity(), ace_identity_parent());
 }
 
 /*

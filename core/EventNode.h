@@ -444,11 +444,11 @@ struct PairMaskEvent : Event
 //            name = which entry b is
 //   Resync   (nothing)                         out = what happens: the session ends,
 //            and the successor a Replace placed or staged starts in its place, resuming
-//   Vouch    a = a link's transcript, hex      out = "<key> <chain|-> <signature>": this
+//   Vouch    a = a link's transcript, hex      out = "<key> <chain|-> <epoch> <signature>": this
 //            name = 'd' (dialled) or 'a'         loader's word on that link, and only
 //                                                on one (sig::link_statement)
-//   Recognize a = "<key> <chain|-> <signature>"   out = "<identity> <registered> <guild>":
-//            b = the transcript, hex             the far side's word, checked here
+//   Recognize a = the far side's word           out = "<identity> <registered> <guild>", or
+//            b = the transcript, hex             "another epoch ...": a link is one epoch's
 //            name = the far side's 'd' or 'a'
 //   Identify (nothing)                         out = "<head> <epoch>": what this loader is
 struct TrustEvent : Event

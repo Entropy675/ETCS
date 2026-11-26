@@ -319,6 +319,12 @@ int main(int, char**)
         check(vouched && ETCS::trust::recognize('d', word, th, out, why) && out.compare(0, 64, mine.substr(65, 64)) == 0
               && !ETCS::trust::recognize('a', word, th, out, why) && !ETCS::trust::recognize('d', word, uh, out, why),
               "a loader's word on a link is taken for that link and that side, not for another or the other side");
+        ETCS::sig::Epoch elsewhere = ETCS::trust::loader_epoch();
+        elsewhere[0] ^= 1;
+        check(vouched && !ETCS::trust::recognize_in('d', word, th, out, why, elsewhere, ETCS::trust::ace_identity(),
+                                                    ETCS::trust::ace_identity_parent())
+              && why.compare(0, 13, "another epoch") == 0,
+              "and for its own epoch: a loader running another refuses the link");
 
         // Altered on the way: the guest's answer does not open, the link closes.
         check(mirror3 && verb(mirror3, "Ledger.Head") == head, "...and the surface over it reads the host's record");

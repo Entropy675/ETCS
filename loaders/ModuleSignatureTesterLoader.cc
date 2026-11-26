@@ -1358,6 +1358,51 @@ int main(int, char**)
                   "the script stopped goes on from the line it stopped at, once");
         }
 
+        {
+            // A link's word says its epoch; a guild peer met in another is why this loader heals.
+            const Keys far = fresh_key(), gate = fresh_key(), ace = fresh_key();
+            sig::Epoch E9 = E;
+            E9[5] ^= 0x40;
+            uint8_t t[32];
+            for (int i = 0; i < 32; ++i) t[i] = uint8_t(0xA0 + i);
+            const std::string th = tr::hex(t, 32);
+            const sig::Key parent = head_of({ { sig::Role::Root, R }, { sig::Role::Intermediate, active.pub } });
+            auto word = [&](const sig::Epoch& said, const sig::Epoch* registered) {
+                uint8_t s[64];
+                const std::string m = sig::link_statement('d', t, said);
+                mc::crypto_ed25519_sign(s, far.secret, reinterpret_cast<const uint8_t*>(m.data()), m.size());
+                std::string chain = "-";
+                if (registered)
+                {
+                    const std::string c = sig::encode_chain({ issue(ace, sig::Role::Loader, far.pub, {}),
+                        issue(gate, sig::Role::Identity, ace.pub, { *registered }), issue(active, sig::Role::Registrar, gate.pub, {}), ic, rc });
+                    chain = tr::hex(reinterpret_cast<const uint8_t*>(c.data()), c.size());
+                }
+                return tr::hex(far.pub.data(), 32) + " " + chain + " " + tr::hex(said.data(), 32) + " " + tr::hex(s, 64);
+            };
+            std::string out, wy;
+            tr::take_heal();
+            tr::take_heal_peers();
+            check(tr::recognize_in('d', word(E, &E), th, out, wy, E, MI, parent) && out.size() == 64 + 4 && out.substr(65) == "1 1",
+                  "a guild peer's word in this epoch is recognised: registered, of this guild");
+            check(!tr::recognize_in('a', word(E, &E), th, out, wy, E, MI, parent) && wy == "its signature on this link does not verify",
+                  "its epoch is under its signature, with the side and the link");
+            check(!tr::recognize_in('d', word(E9, nullptr), th, out, wy, E, MI, parent) && wy.rfind("another epoch", 0) == 0
+                  && !tr::heal_wanted(),
+                  "a word said in another epoch is refused -- a link is between runtimes of one epoch -- and an unregistered "
+                  "key's is no one's word that this loader is behind");
+            check(!tr::recognize_in('d', word(E9, &E), th, out, wy, E, MI, parent) && !tr::heal_wanted(),
+                  "nor is a key's registered for another epoch than the one it says");
+            check(!tr::recognize_in('d', word(E9, &E9), th, out, wy, E, MI, fresh_key().pub) && !tr::heal_wanted(),
+                  "nor one registered elsewhere");
+            check(!tr::recognize_in('d', word(E9, &E9), th, out, wy, E, MI, parent) && wy.find("asks its remotes") != std::string::npos
+                  && tr::heal_wanted()
+                  && tr::heal_reason().find("a peer of this guild runs epoch " + tr::hex(E9.data(), 32).substr(0, 12)) != std::string::npos,
+                  "a guild peer registered in the epoch it says is ACE's word that the two have parted: this loader heals");
+            check(!tr::recognize_in('d', word(E9, &E9), th, out, wy, E, MI, parent) && !tr::heal_wanted(),
+                  "once a session for that epoch: a peer kept back does not keep this loader asking");
+        }
+
         // The same questions, asked of this loader through its ordering thread.
         sig::Key reg{}; reg[0] = 7;
         // What only the loader's own heal asks is answered under its grant, and to no one else.

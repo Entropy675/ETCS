@@ -291,18 +291,21 @@ inline bool decode(const void* q, size_t len, Countersign& c)
 }
 
 /*
- * A LINK'S WORD: what a loader signs to say that one link is its own --
- * "ETCSLNK1" | 'd' (it dialled) or 'a' (it accepted) | the transcript, a hash
- * of both sides' names and fresh exchange keys. Nothing else is ever signed
+ * A LINK'S WORD: what a loader signs to say that one link is its own, and the
+ * epoch it runs in -- "ETCSLNK3" | 'd' (it dialled) or 'a' (it accepted) |
+ * the transcript, a hash of both sides' names and fresh exchange keys | its
+ * epoch. A link is between runtimes of one epoch (ontology/Epoch.h), so each
+ * side says its own and the other checks it. Nothing else is ever signed
  * after this prefix, so a module asking the loader for it can be given no
  * module's, list's or registration's signature by asking.
  */
 constexpr size_t kLinkTranscript = 32;
-inline std::string link_statement(char side, const uint8_t transcript[kLinkTranscript])
+inline std::string link_statement(char side, const uint8_t transcript[kLinkTranscript], const Epoch& epoch)
 {
-    std::string m("ETCSLNK1");
+    std::string m("ETCSLNK3");
     m.push_back(side);
     m.append(reinterpret_cast<const char*>(transcript), kLinkTranscript);
+    m.append(reinterpret_cast<const char*>(epoch.data()), epoch.size());
     return m;
 }
 
