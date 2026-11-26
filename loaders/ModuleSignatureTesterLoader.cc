@@ -1317,12 +1317,13 @@ int main(int, char**)
             std::vector<tr::Remote> bad;
             tr::remotes_of("a b)x,host/path,host:99999x,:443,host+relative.pem,x)\nspawn Evil::Thing y,host+/a b,,+/ca.pem", bad);
             check(bad.empty(), "a word that is not a plain host, port and path names no remote: nothing else reaches a script line");
-            const std::string h = tr::heal_script(v[1], 4);
+            const std::string h = tr::heal_script(v[1], 4, "ab12", true);
             check(h.find("__heal4_to.Origin(https://localhost:8443)\n") != std::string::npos
                   && h.find("__heal4_to.SetCaFile(/etc/ssl/test-ca.pem)\n") != std::string::npos
-                  && h.find("__heal4.Update()\n") != std::string::npos
-                  && tr::heal_script(v[0], 0).find("SetCaFile") == std::string::npos,
-                  "and the loader heals through one: Update, against that remote");
+                  && h.find("__heal4.Grant(ab12)\n__heal4.Register()\n__heal4.Update()\n") != std::string::npos
+                  && tr::heal_script(v[0], 0, "ab12", false).find("SetCaFile") == std::string::npos
+                  && tr::heal_script(v[0], 0, "ab12", false).find("Register") == std::string::npos,
+                  "and the loader heals through one, under its grant: registered first if it is not, then Update");
             const std::string rst = dir + "/s-remote";
             ::mkdir(rst.c_str(), 0700);
             write_bytes(rst + "/remote", { 'o', 'r', 'i', 'g', 'i', 'n', '=', 'h', 't', 't', 'p', 's', ':', '/', '/', 'e', 'v', 'i', 'l', '\n' });
@@ -1359,7 +1360,29 @@ int main(int, char**)
 
         // The same questions, asked of this loader through its ordering thread.
         sig::Key reg{}; reg[0] = 7;
+        // What only the loader's own heal asks is answered under its grant, and to no one else.
+        {
+            bool none = true;
+            for (uint8_t op = 0; op <= 4; ++op)
+            {
+                ETCS::TrustEvent w(static_cast<ETCS::TrustEvent::Op>(op));
+                w.a = tr::hex(reg.data(), 32);
+                none = none && !w() && w.out.rfind("asked only by this loader's own heal", 0) == 0;
+            }
+            const std::string old_grant = tr::open_grant();
+            tr::close_grant();
+            ETCS::TrustEvent late(ETCS::TrustEvent::Op::Request), wrong(ETCS::TrustEvent::Op::Request);
+            late.a = wrong.a = tr::hex(reg.data(), 32);
+            late.grant = old_grant;
+            const std::string live = tr::open_grant();
+            wrong.grant = std::string(64, '0');
+            check(none && old_grant.size() == 64 && live.size() == 64 && live != old_grant && !late() && !wrong(),
+                  "a registration's ask, an install, a survey, a staging and a restart are refused a module with no grant, "
+                  "one of a heal that is over, or one it made up");
+        }
+        const std::string grant = tr::open_grant();
         ETCS::TrustEvent q(ETCS::TrustEvent::Op::Request);
+        q.grant = grant;
         q.a = tr::hex(reg.data(), 32);
         sig::Key asked{}, qhead{};
         sig::Epoch qepoch{};
@@ -1375,32 +1398,55 @@ int main(int, char**)
         check(who() && who.out == tr::hex(tr::ace_identity().data(), 32) + " " + tr::hex(tr::loader_epoch().data(), 32),
               "and what this loader is: its identity and epoch");
         const sig::Key other = fresh_key().pub;
-        bool words = true;
-        const ETCS::TrustEvent::Op ops[3] = { ETCS::TrustEvent::Op::Join, ETCS::TrustEvent::Op::Admit, ETCS::TrustEvent::Op::Retire };
-        for (int i = 0; i < 3; ++i)
+        bool words = true, asked_none = true;
+        for (int i = 0; i < 4; ++i)
         {
-            ETCS::TrustEvent w(ops[i]);
-            w.a = tr::hex(reg.data(), 32); w.b = tr::hex(other.data(), 32);
+            const char kind = "jarp"[i];
+            std::string w, wy;
             uint8_t ws[64];
             const std::string m = i == 0 ? sig::join_statement(A.pub, other, reg, E)
-                                : i == 1 ? sig::admit_statement(A.pub, other, reg, E) : sig::retire_statement(A.pub, other, reg);
-            words = words && w() && w.out.size() == 65 + 128 && w.out.substr(0, 64) == tr::hex(A.pub.data(), 32)
-                    && tr::unhex(w.out.substr(65), ws, 64)
+                                : i == 1 ? sig::admit_statement(A.pub, other, reg, E)
+                                : i == 2 ? sig::retire_statement(A.pub, other, reg) : sig::portal_statement(A.pub, reg, other);
+            words = words && tr::account_word(ETCS::etcs_store_dir(), kind, reg, other, w, wy) && w.size() == 65 + 128
+                    && w.substr(0, 64) == tr::hex(A.pub.data(), 32) && tr::unhex(w.substr(65), ws, 64)
                     && mc::crypto_ed25519_check(ws, A.pub.data(), reinterpret_cast<const uint8_t*>(m.data()), m.size()) == 0;
         }
-        ETCS::TrustEvent self_join(ETCS::TrustEvent::Op::Join);
-        self_join.a = tr::hex(reg.data(), 32); self_join.b = tr::hex(A.pub.data(), 32);
-        check(words && !self_join() && self_join.out == "a key does not join itself",
-              "an account's words -- join, admit, retire -- are this key's, each in its own form, join and admit in this epoch; "
-              "a key joins no account through itself");
+        std::string self_join, self_why;
+        check(words && !tr::account_word(ETCS::etcs_store_dir(), 'j', reg, A.pub, self_join, self_why)
+              && self_why == "a key does not join itself",
+              "an account's words -- join, admit, retire, the portal's -- are this key's, each in its own form, join and admit in "
+              "this epoch; a key joins no account through itself");
+        for (uint8_t op = 8; op < 16; ++op)
+        {
+            ETCS::TrustEvent w(static_cast<ETCS::TrustEvent::Op>(op));
+            w.a = tr::hex(reg.data(), 32); w.b = tr::hex(other.data(), 32);
+            asked_none = asked_none && !w() && w.out == "no such question";
+        }
+        check(asked_none, "and no module is given one: they are said at the loader, by its owner");
         ETCS::TrustEvent sv(ETCS::TrustEvent::Op::Survey);
+        sv.grant = grant;
         sv.a = list;
         check(!sv() && (sv.out.rfind("no identity is built into", 0) == 0 || sv.out == "the list is not signed by the marketplace of this loader's identity"),
               "and a list of an identity this loader was not built with is refused there too");
         ETCS::TrustEvent bogus(ETCS::TrustEvent::Op::Install);
+        bogus.grant = grant;
         bogus.a = "not a chain";
         check(!bogus() && bogus.out == "not a chain of certificates", "an install of something that is not a chain is refused");
+        if (!tr::zero(tr::ace_identity_parent()))
+        {
+            // A whole, well-signed registration of this key -- under a root nobody here chose.
+            const Keys oroot = fresh_key(), oactive = fresh_key(), ogate = fresh_key();
+            const std::string elsewhere = sig::encode_chain({ issue(ogate, sig::Role::Loader, A.pub, {}),
+                issue(oactive, sig::Role::Registrar, ogate.pub, {}), issue(oroot, sig::Role::Intermediate, oactive.pub, {}),
+                issue(oroot, sig::Role::Root, oroot.pub, {}) });
+            ETCS::TrustEvent foreign(ETCS::TrustEvent::Op::Install);
+            foreign.grant = grant;
+            foreign.a = elsewhere;
+            check(!foreign() && foreign.out.rfind("a registration from outside this loader's identity", 0) == 0,
+                  "a module installs no registration from outside this loader's identity: another root's is its owner's to install");
+        }
 
+        tr::close_grant();
         for (const std::string& st : { ms, rs, ds }) ks::erase(st, "loader-key", kwhy);
     }
 

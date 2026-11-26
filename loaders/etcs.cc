@@ -539,15 +539,25 @@ int main(int argc, char* argv[])
     // takes ctx explicitly now rather than closing over it, since it no
     // longer lives here as a local lambda.
     // ── Continue where you left off ──────────────────────────────────────
-    // etcs [--resume | --fresh] [--from <line>] ...
+    // etcs [--resume | --fresh] [--from <line>] [--heal] ...
     //
     // Flag-first, like -q. An interactive start with no script asks
     // (offer_resume, CommandExecutor.h); a script, or a build with no prompt,
     // starts fresh unless told --resume, which replays the last scene BEFORE
     // the script runs, so the script can use what it brings back.
     while (argc >= 2 && (std::string_view(argv[1]) == "--resume" || std::string_view(argv[1]) == "--fresh"
-                         || std::string_view(argv[1]) == "--resynced" || std::string_view(argv[1]) == "--from"))
+                         || std::string_view(argv[1]) == "--resynced" || std::string_view(argv[1]) == "--from"
+                         || std::string_view(argv[1]) == "--heal"))
     {
+        if (std::string_view(argv[1]) == "--heal")
+        {
+            // Its owner asks: at its first quiet point this loader asks its
+            // remotes for what is newer (core/Trust.h, heal_reason).
+            ETCS::trust::heal_asked().store(true);
+            argv++;
+            argc--;
+            continue;
+        }
         if (std::string_view(argv[1]) == "--from")
         {
             // A heal's wind-back (core/Trust.h, heal_place): the script given

@@ -2221,11 +2221,82 @@ inline const std::vector<Remote>& remotes()
 inline size_t remote_count() { return remotes().size(); }
 inline std::string remote_origin(size_t i) { return i < remotes().size() ? remotes()[i].origin : std::string(); }
 
+/*
+ * WHAT ONLY THE LOADER'S OWN HEAL ASKS. Registering this key and taking a
+ * site's list -- surveying it, staging from it, restarting on it -- are the
+ * loader's acts, at a quiet point, against a remote built into it. It runs
+ * them through a module's type (CryptProvider's Upstream), so it lends that
+ * one entity a GRANT for the length of the heal: 32 random bytes the
+ * questions carry back (TrustEvent::grant; answer). With none, or one of a
+ * heal that is over, they are refused: an Upstream a script points at a site
+ * of its own choosing asks nothing.
+ */
+struct Grant { std::mutex mu; std::string hex; };
+inline Grant& grant_state() { static Grant g; return g; }
+
+inline std::string open_grant()
+{
+    uint8_t b[32];
+    Grant& g = grant_state();
+    std::lock_guard<std::mutex> l(g.mu);
+    g.hex = random_bytes(b, sizeof b) ? hex(b, sizeof b) : std::string();
+    return g.hex;
+}
+inline void close_grant()
+{
+    Grant& g = grant_state();
+    std::lock_guard<std::mutex> l(g.mu);
+    g.hex.clear();
+}
+inline bool granted(const std::string& said)
+{
+    Grant& g = grant_state();
+    std::lock_guard<std::mutex> l(g.mu);
+    if (g.hex.empty() || said.size() != g.hex.size()) return false;
+    unsigned char diff = 0;
+    for (size_t i = 0; i < said.size(); ++i) diff |= static_cast<unsigned char>(said[i] ^ g.hex[i]);
+    return diff == 0;
+}
+
+// Whether this loader's key holds a registration for its epoch, as its store has it now.
+inline bool holds_registration()
+{
+#if defined(__EMSCRIPTEN__)
+    return false;
+#else
+    const std::string dir = etcs_store_dir();
+    sig::Key pub{};
+    std::vector<sig::Certificate> reg;
+    bool stale = false;
+    return load_public(dir, pub) && current_registration(dir, pub, loader_epoch(), reg, stale);
+#endif
+}
+
+/*
+ * WHY THIS LOADER HEALS NOW, or "": a module of its identity was refused for
+ * another epoch (want_heal); its owner asked (etcs --heal); or, looked at
+ * once a session, its key holds no registration for its epoch -- a first
+ * start, or one after an epoch it was not running for. Registering is part
+ * of healing: the key's own word is enough, and the loader says it.
+ */
+inline std::atomic<bool>& heal_asked() { static std::atomic<bool> f{ false }; return f; }
+
+inline std::string heal_reason()
+{
+    std::string why = take_heal();
+    if (!why.empty()) why += " refused for another epoch";
+    if (heal_asked().exchange(false)) why += std::string(why.empty() ? "" : "; ") + "asked for";
+    static std::atomic<bool> looked{ false };
+    if (!looked.exchange(true) && !untrusted_build && !remotes().empty() && !holds_registration())
+        why += std::string(why.empty() ? "" : "; ") + "this key holds no registration for its epoch";
+    return why;
+}
+
 // What the loader runs to heal from one of them: through the modules of its
 // own epoch (CryptProvider's Upstream over NetworkProvider's HttpsRelation),
-// as Update does -- staged, registered ahead, then the swap. `n` keeps one
-// run's names from another's.
-inline std::string heal_script(const Remote& r, int n)
+// under its grant -- registered first if `reg`, then as Update does: staged,
+// registered ahead, the swap. `n` keeps one run's names from another's.
+inline std::string heal_script(const Remote& r, int n, const std::string& grant, bool reg)
 {
     const std::string h = "__heal" + std::to_string(n), to = h + "_to", emb = h + "_embassy";
     std::string s;
@@ -2240,11 +2311,16 @@ inline std::string heal_script(const Remote& r, int n)
     s += emb + ".Open()\n";
     s += h + ".SetEmbassy(@" + emb + ")\n";
     s += h + ".SetRelation(remote)\n";
+    s += h + ".Grant(" + grant + ")\n";
+    if (reg) s += h + ".Register()\n";
     s += h + ".Update()\n";
     s += emb + ".Close()\n";
     return s;
 }
-inline std::string heal_script(size_t i, int n) { return i < remotes().size() ? heal_script(remotes()[i], n) : std::string(); }
+inline std::string heal_script(size_t i, int n, const std::string& grant, bool reg)
+{
+    return i < remotes().size() ? heal_script(remotes()[i], n, grant, reg) : std::string();
+}
 
 // Whether the staged set is whole: every entry of the staged list this loader
 // has is current where it reads it, its own, or staged -- and one is staged.
@@ -2393,6 +2469,21 @@ inline void request_swap(const sig::Epoch& epoch)
     g_sig_term.store(1, std::memory_order_release);
 }
 
+// What this process holds open is its own: only its terminal goes on to the
+// loader that takes its place. A port left open here could not be bound there.
+inline void leave_descriptors()
+{
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
+    long max = ::sysconf(_SC_OPEN_MAX);
+    if (max <= 0 || max > (1L << 20)) max = 1L << 20;
+    for (int fd = 3; fd < max; ++fd)
+    {
+        const int f = ::fcntl(fd, F_GETFD);
+        if (f >= 0) ::fcntl(fd, F_SETFD, f | FD_CLOEXEC);
+    }
+#endif
+}
+
 inline void resync_exec()
 {
 #if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
@@ -2425,7 +2516,7 @@ inline void resync_exec()
     for (size_t i = 1; (swap || !prompt) && i < was.size(); ++i)
     {
         if (was[i] == "--resynced" || was[i] == "--from") { ++i; continue; }
-        if (was[i] == "--resume" || was[i] == "--fresh") continue;
+        if (was[i] == "--resume" || was[i] == "--fresh" || was[i] == "--heal") continue;
         const bool script = was[i].size() > 5 && was[i].compare(was[i].size() - 5, 5, ".etcs") == 0;
         if (script && wound && !same && !(same = at.line > 0 && place_path(was[i]) == at.script)) break;
         args.push_back(was[i]);
@@ -2435,6 +2526,7 @@ inline void resync_exec()
     for (std::string& a : args) argv.push_back(&a[0]);
     argv.push_back(nullptr);
     std::fflush(nullptr);
+    leave_descriptors();
     ::execv(self.c_str(), argv.data());
     std::fprintf(stderr, "etcs: the successor did not start (%s); start it again to finish the re-sync\n", std::strerror(errno));
 #endif
@@ -2458,6 +2550,7 @@ inline void swap_at_start(char** argv)
     }
     std::fprintf(stderr, "etcs: the site's epoch %s was staged; starting on its loader\n", hex(d.epoch.data(), 32).substr(0, 12).c_str());
     std::fflush(nullptr);
+    leave_descriptors();
     ::execv(self.c_str(), argv);
     std::fprintf(stderr, "etcs: the staged loader did not start (%s)\n", std::strerror(errno));
 #else
@@ -2629,18 +2722,28 @@ inline bool recognize(char side, const std::string& word, const std::string& tra
  * WHAT A MODULE MAY ASK (TrustEvent, core/EventNode.h), on the loader's
  * ordering thread, of this loader as it runs: its store, its session's
  * identity, its own directory and binary, its epoch. `op` in TrustEvent::Op's
- * order. A registration installed now is the next session's -- for this
+ * order. Ops 0 to 4 are answered only under the grant of the loader's own
+ * heal (granted). A registration installed now is the next session's -- for this
  * epoch, or (op 0 with b = "next") for the successor put in place; a re-sync
  * (op 4) ends this session and starts the successor in its place -- a sibling's
  * placed loader, or this identity's staged epoch. A link's
- * word (ops 5 and 6), and what this loader is (op 10: "<head> <epoch>"), are
- * asked of a browser loader too. An account's words (ops 7 to 9, and 11 for
- * the portal) take the registrar's key in `a` and the other key, or the
- * portal's code, in `b`.
+ * word (ops 5 and 6), and what this loader is (op 7: "<head> <epoch>"), are
+ * asked of a browser loader too.
+ *
+ * NOT ASKED HERE: an account's words (join, admit, retire, the portal's).
+ * They lend this key's standing in its account past the session -- a portal
+ * word lets a browser admit and retire keys -- so they are its owner's, said
+ * at the loader (etcs --join, --admit, --retire, --portal) and by no module.
  */
-inline bool answer(uint8_t op, const std::string& name, const std::string& a, const std::string& b, std::string& out)
+inline bool answer(uint8_t op, const std::string& name, const std::string& a, const std::string& b, std::string& out,
+                   const std::string& grant = std::string())
 {
     out.clear();
+    if (op <= 4 && !granted(grant))
+    {
+        out = "asked only by this loader's own heal, of a remote built into it (etcs --heal)";
+        return false;
+    }
     if (op == 5 || op == 6)
     {
         std::string why;
@@ -2649,7 +2752,7 @@ inline bool answer(uint8_t op, const std::string& name, const std::string& a, co
         if (!ok) out = why;
         return ok;
     }
-    if (op == 10)
+    if (op == 7)
     {
         out = hex(ace_identity().data(), 32) + " " + hex(loader_epoch().data(), 32);
         return true;
@@ -2673,18 +2776,15 @@ inline bool answer(uint8_t op, const std::string& name, const std::string& a, co
             ok = registration_request(dir, registrar, out, why, b == "next");
             break;
         }
-        case 7: case 8: case 9: case 11:
-        {
-            sig::Key registrar{}, other{};
-            if (!unhex(a, registrar.data(), registrar.size())) { why = "not a registrar's key"; break; }
-            if (!unhex(b, other.data(), other.size())) { why = op == 11 ? "not a portal's code" : "not a loader's key"; break; }
-            ok = account_word(dir, op == 7 ? 'j' : op == 8 ? 'a' : op == 9 ? 'r' : 'p', registrar, other, out, why);
-            break;
-        }
         case 1:
         {
             std::vector<sig::Certificate> reg;
             if (!parse_certificates(a, reg)) { why = "not a chain of certificates"; break; }
+            // What a module brings is ACE's half for this loader, or nothing:
+            // another root's is its owner's to install (etcs --registration).
+            if (!zero(ace_identity_parent()) && !reg.empty()
+                && head_meets(path_of(reg, reg[0].subject), ace_identity_parent()) < 0)
+            { why = "a registration from outside this loader's identity: its owner installs one by hand (etcs --registration)"; break; }
             if ((ok = install_registration(dir, reg, why)))
                 out = std::string("registered as ") + sig::role_name(reg[0].role)
                     + (registration_current(reg, loader_epoch()) ? "; the next session is it" : "; the successor in place is it");

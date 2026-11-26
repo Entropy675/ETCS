@@ -1703,7 +1703,7 @@ ETCS::DispatchResult ETCS::EventNode::LoaderStream::on_event(
  * load reads. No sendAckIfNeeded, as PairMask.
  */
             if (ETCS::TrustEvent* t = evt.trust)
-                t->ok = ETCS::trust::answer(static_cast<uint8_t>(t->op), t->name, t->a, t->b, t->out);
+                t->ok = ETCS::trust::answer(static_cast<uint8_t>(t->op), t->name, t->a, t->b, t->out, t->grant);
             return {ETCS::DispatchKind::Inline, &evt};
         }
         case DLInEvent::Kind::RequestUnload:

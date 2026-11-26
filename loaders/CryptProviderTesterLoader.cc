@@ -991,6 +991,31 @@ int main(int, char**)
               && (::usleep(1200 * 1000), portal("state", token3) == "refused: no such session\n")
               && yes(verb(pki, "Registrar.SessionLife", "900")),
               "a session runs out after its life");
+        {
+            // A member's ninth session drops its first; a full table gives way rather than shut.
+            Loader S = fresh();
+            reg(ask(S, registrar, head, E3));
+            std::string c[9], t[9];
+            bool in = true;
+            for (int i = 0; i < 9; ++i) in = in && open(c[i], t[i]) && portal("signin", c[i] + " " + word(S, c[i])) == "signed in\n";
+            check(in && portal("state", t[0]) == "refused: no such session\n" && portal("state", t[1]).rfind("signed in ", 0) == 0
+                  && portal("state", t[8]).rfind("signed in ", 0) == 0,
+                  "a member holds eight sessions: a ninth takes the place of its first");
+            std::string first_code, first_token, cx, tx;
+            bool opened = open(first_code, first_token);
+            for (int i = 0; i < 1100 && opened; ++i) opened = open(cx, tx);
+            check(opened && portal("state", first_token) == "refused: no such session\n" && portal("state", tx) == "pending\n"
+                  && portal("state", t[8]).rfind("signed in ", 0) == 0,
+                  "opening sessions without end shuts no one out: the oldest still waiting goes first, and one signed in stays");
+            check(reg(hex(B.pub.data(), 32) + " " + hex(head.data(), 32) + " " + hex(E3.data(), 32) + " " + std::string(128, '0'))
+                  == "refused: not a loader key's registration with this registrar\n",
+                  "whether a key was retired is told to its own word only");
+            mc::crypto_wipe(S.secret, 64);
+        }
+        Loader U = fresh(), V = fresh();
+        reg(ask(U, registrar, head, E2)); reg(ask(U, registrar, head, E3)); reg(ask(V, registrar, head, E3));
+        check(pki && admit(V, U, true, true, &E3, &E3) == "admitted at its next registration\n",
+              "a key registered in the newest epoch, admitted elsewhere, waits for a later one");
         mc::crypto_wipe(X.secret, 64); mc::crypto_wipe(N.secret, 64); mc::crypto_wipe(F.secret, 64);
 
         const std::string rows = slurp(dir + "/accounts.db");
@@ -1016,6 +1041,14 @@ int main(int, char**)
               && admit(A, P, true, true, &E2, &E2) == "admitted\n" && admit(A, D, true, true, &E3, &E3).rfind("refused: that key shares", 0) == 0
               && reg(words).rfind("refused: a loader of an identity", 0) == 0,
               "as they were left: the same ACE identities, members, retirements, and epochs served");
+        sig::Epoch E4{};
+        E4[0] = 0x7e;
+        check(pki && reg(ask(U, registrar, head, E2)).rfind("refused", 0) != 0 && retire(V, U) == "refused: not keys of one account\n",
+              "asked again in an earlier epoch still served -- of a registrar that has answered nothing yet -- its registration moves nothing");
+        check(pki && yes(verb(pki, "Registrar.Epoch", hex(E4.data(), 32))) && reg(ask(U, registrar, head, E4)).rfind("refused", 0) != 0
+              && retire(V, U) == "retired\n",
+              "the later epoch's is where it moves");
+        mc::crypto_wipe(U.secret, 64); mc::crypto_wipe(V.secret, 64);
         std::swap(pki, pki2);
         mc::crypto_wipe(A.secret, 64); mc::crypto_wipe(B.secret, 64); mc::crypto_wipe(P.secret, 64);
         mc::crypto_wipe(C.secret, 64); mc::crypto_wipe(D.secret, 64);

@@ -450,17 +450,13 @@ struct PairMaskEvent : Event
 //   Recognize a = "<key> <chain|-> <signature>"   out = "<identity> <registered> <guild>":
 //            b = the transcript, hex             the far side's word, checked here
 //            name = the far side's 'd' or 'a'
-//   Join     a = the registrar's key, hex      out = "<this loader's key> <signature>": its word
-//   Admit    b = the other key, hex              that it joins b's account, admits b to its
-//   Retire                                       own, or retires b from it (sig::*_statement)
 //   Identify (nothing)                         out = "<head> <epoch>": what this loader is
-//   Portal   a = the registrar's key, hex      out = "<this loader's key> <signature>": its word
-//            b = the code a browser shows        letting that browser act for its account
 struct TrustEvent : Event
 {
-    enum class Op : uint8_t { Request, Install, Survey, Replace, Resync, Vouch, Recognize, Join, Admit, Retire, Identify, Portal };
+    enum class Op : uint8_t { Request, Install, Survey, Replace, Resync, Vouch, Recognize, Identify };
     Op                  op;
     ::std::string       name, a, b, out;
+    ::std::string       grant;                      // the loader's, for its own heal: Request to Resync are answered under it
     bool                ok = false;
     ::std::atomic<bool> done{false};
     explicit TrustEvent(Op o) : Event(""), op(o) {}

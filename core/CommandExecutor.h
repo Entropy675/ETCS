@@ -4756,21 +4756,25 @@ inline bool resume_last_scene(ETCS::SignalContext& sig)
 /*
  * THE LOADER HEALS ITSELF, at a quiet point: after what it was doing has
  * finished -- the script it ran, or the line the prompt was given -- never in
- * the middle of it. A module of this identity refused for another epoch asked
- * for it (core/Trust.h, want_heal). From the remotes built into it, in their
- * order, through the modules of its own epoch, the newer set is staged and
- * this loader's key registered for it; then the session winds down as a
- * terminate does (its scene saved), the set goes in place, and the successor
- * winds back to where this one was (request_swap, resync_exec). Its entities
- * are its own root's, so nothing of the heal is in the scene. True if the
- * swap is under way.
+ * the middle of it. Why is the trust layer's to say (core/Trust.h,
+ * heal_reason): a module refused for another epoch, its owner's asking, a
+ * key with no registration for its epoch. From the remotes built into it, in
+ * their order, through the modules of its own epoch and under its own grant,
+ * the key is registered if it is not, and a newer set staged and the key
+ * registered for it; then the session winds down as a terminate does (its
+ * scene saved), the set goes in place, and the successor winds back to where
+ * this one was (request_swap, resync_exec). Its entities are its own root's,
+ * so nothing of the heal is in the scene. True if the swap is under way.
  */
 #if defined(ETCS_LOADER) && !defined(__EMSCRIPTEN__) && !defined(ETCS_UNTRUSTED)
 namespace ETCS { namespace trust {
-inline ::std::string take_heal();
+inline ::std::string heal_reason();
 inline size_t remote_count();
 inline ::std::string remote_origin(size_t i);
-inline ::std::string heal_script(size_t i, int n);
+inline ::std::string heal_script(size_t i, int n, const ::std::string& grant, bool reg);
+inline ::std::string open_grant();
+inline void close_grant();
+inline bool holds_registration();
 inline bool resync_pending();
 inline void forget_heal_place();
 } }
@@ -4782,8 +4786,8 @@ inline bool heal_at_quiet_point(ETCS::SignalContext& sig)
     (void)sig;
     return false;                                   // a page heals by its reload; an untrusted build checks nothing
 #else
-    const ::std::string wanted = ETCS::trust::take_heal();
-    if (wanted.empty()) return false;
+    const ::std::string why = ETCS::trust::heal_reason();
+    if (why.empty()) return false;
     static ETCS::Root heal_root(sig);
     static int runs = 0;
     // The remotes had nothing newer a moment ago: a refusal met again so soon
@@ -4791,20 +4795,25 @@ inline bool heal_at_quiet_point(ETCS::SignalContext& sig)
     static ::std::chrono::steady_clock::time_point again{};
     if (::std::chrono::steady_clock::now() < again) { ETCS::trust::forget_heal_place(); return false; }
     if (ETCS::trust::remote_count() == 0)
-        repl_err() << COLOR_WARN << "etcs: " << wanted << " refused for another epoch, and this loader was built with no "
-                   << "remote to heal from" << COLOR_RESET << "\n";
+        repl_err() << COLOR_WARN << "etcs: " << why << ", and this loader was built with no remote to heal from"
+                   << COLOR_RESET << "\n";
     for (size_t i = 0; i < ETCS::trust::remote_count() && !(sig.isInterrupted() || sig.isTerminated()); ++i)
     {
         const ::std::string origin = ETCS::trust::remote_origin(i);
-        repl_err() << COLOR_WARN << "etcs: " << wanted << " refused for another epoch: healing from " << origin
-                   << COLOR_RESET << "\n";
+        const bool reg = !ETCS::trust::holds_registration();
+        const ::std::string grant = ETCS::trust::open_grant();
+        if (grant.empty()) break;
+        repl_err() << COLOR_WARN << "etcs: healing from " << origin << " (" << why << ")" << COLOR_RESET << "\n";
         ETCS::ExecutionContext hc;
         hc.sig         = &sig;
         hc.root_entity = &heal_root;
         hc.is_root     = true;
-        ::std::istringstream text(ETCS::trust::heal_script(i, runs++));
+        ::std::istringstream text(ETCS::trust::heal_script(i, runs++, grant, reg));
         ETCS::run_script(text, "(heal)", hc);
+        ETCS::trust::close_grant();
         if (ETCS::trust::resync_pending()) return true;
+        if (reg && ETCS::trust::holds_registration())
+            repl_err() << COLOR_WARN << "etcs: this loader's key is registered with " << origin << COLOR_RESET << "\n";
         repl_err() << COLOR_WARN << "etcs: " << origin << " gave this loader nothing newer to restart on (see the log)"
                    << COLOR_RESET << "\n";
     }
