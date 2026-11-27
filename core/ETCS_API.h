@@ -275,9 +275,9 @@ inline size_t etcs_flush_deferred_rid_registrars()
  * failure). Measured: 3 shared is 9.2s to first frame, 4 is 8.8s, 6 is 9.2s.
  */
 #if defined(__EMSCRIPTEN__) && !ETCS_SHARED_THREAD_POOL
-#define DEFAULT_THREAD_POOL_THREADS  2
-#else
 #define DEFAULT_THREAD_POOL_THREADS  4
+#else
+#define DEFAULT_THREAD_POOL_THREADS  8
 #endif
 
 // default hash size/type
