@@ -275,9 +275,9 @@ inline size_t etcs_flush_deferred_rid_registrars()
  * failure). Measured: 3 shared is 9.2s to first frame, 4 is 8.8s, 6 is 9.2s.
  */
 #if defined(__EMSCRIPTEN__) && !ETCS_SHARED_THREAD_POOL
-#define DEFAULT_THREAD_POOL_THREADS  2
-#else
 #define DEFAULT_THREAD_POOL_THREADS  4
+#else
+#define DEFAULT_THREAD_POOL_THREADS  8
 #endif
 
 // default hash size/type
@@ -1185,6 +1185,13 @@ namespace ETCS
 #endif
     }
     inline void* etcs_find_loader_manifest_getter() { return etcs_find_loader_symbol("ETCS_GetLoaderManifest"); }
+    // Before this module's first line: its manifest check natively (dlopen's
+    // static init), RegisterDynamicLoader on the web, whichever comes first.
+    inline void etcs_adopt_loader_quiet()
+    {
+        if (void* g = etcs_find_loader_symbol("ETCS_GetLoaderLogEnabled"))
+            ETCS::set_log_enabled(reinterpret_cast<bool (*)()>(g)());
+    }
 }
 /**
  * ETCS_MODULE_EXPORT_MAIN
@@ -1261,6 +1268,7 @@ namespace ETCS
      * written today (this macro goes last), and load-bearing either way, \
      * since the map is read once rather than watched. */ \
     static void Name##_check_loader_manifest_() { \
+        ETCS::etcs_adopt_loader_quiet(); \
         void* getterAddr = ETCS::etcs_find_loader_manifest_getter(); \
         if (!getterAddr) return; \
         using LoaderManifestGetter = void* (*)(); \

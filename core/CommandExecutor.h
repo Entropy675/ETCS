@@ -4824,8 +4824,8 @@ inline int drive_main_loop_then_exit(ETCS::SignalContext& ctx, int code,
      * Safe here because this runs after preload_web_modules and
      * etcs_boot_runtime_threads: every module is open and the pool is armed. ctx
      * is static in the emscripten build of main() (loaders/etcs.cc) so that this
-     * thread may outlive it. Output crosses back through
-     * etcs_web_shell_write's MAIN_THREAD_EM_ASM.
+     * thread may outlive it. Output crosses back through the shell output
+     * buffer (loaders/etcs.cc), which the page drains.
      */
     {
         static bool web_repl_started = false;

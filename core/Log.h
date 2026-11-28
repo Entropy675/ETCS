@@ -129,6 +129,10 @@ namespace ETCS {
     // not the loader's.
     inline void set_log_to_file(bool on) { log_to_file.store(on, ::std::memory_order_relaxed); }
     inline bool get_log_to_file()        { return log_to_file.load(::std::memory_order_relaxed); }
+    // Quiet (`etcs -q`) has the same grain, but one source: a module takes the
+    // loader's value as it loads (etcs_adopt_loader_quiet, ETCS_API.h).
+    inline void set_log_enabled(bool on) { log_enabled.store(on, ::std::memory_order_relaxed); }
+    inline bool get_log_enabled()        { return log_enabled.load(::std::memory_order_relaxed); }
 
     // Thread-local ETCS_LOG redirect. Set via LogSinkGuard only -- direct
     // assignment skips the restore that nested guards rely on.
@@ -206,12 +210,13 @@ namespace ETCS {
 // write() against an O_APPEND descriptor, which the kernel does not split.
 // The cost is a syscall per line, paid on a path that was already doing file
 // I/O, to buy a transcript that can be trusted.
-// One branch now, on a relaxed atomic load. A thread-local sink still wins
-// over both -- it is a capture, and a capture that silently went to a file
-// would not be one.
+// A thread-local sink wins over everything -- it is a capture, and a capture
+// that silently went to a file, or nowhere under -q, would not be one. Quiet
+// is checked before the line is built, so a quiet line costs one load.
 #define ETCS_LOG_2(type, msg) \
     do { \
         if (ETCS::log_sink) ETCS_LOG_LINE(type, msg, *ETCS::log_sink, false); \
+        else if (!ETCS::log_enabled.load(::std::memory_order_relaxed)) {} \
         else if (ETCS::log_to_file.load(::std::memory_order_relaxed)) \
                           { ETCS_LOG_LINE(type, msg, getModuleLog(), true); getModuleLog().flush(); } \
         else              { ETCS_LOG_LINE(type, msg, ::std::cout, false); ::std::cout.flush(); } \

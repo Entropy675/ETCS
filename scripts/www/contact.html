@@ -36,6 +36,8 @@
        letter-spacing:.04em; }
   /* Body */
   p { margin:0 0 12px; }
+  ul { margin:0 0 12px; padding-left:1.2em; }
+  li { margin-bottom:8px; }
   a { color:var(--sel); text-decoration:none; }
   a:hover { text-decoration:underline; }
   /* Tables */
@@ -48,7 +50,7 @@
        word-break:break-word; }
   tr:hover td { background:#1e1f16; }
   table td:first-child { color:var(--sel); }
-  /* Code / Panel */
+  /* Code / pre */
   pre { background:var(--panel); border:1px solid var(--line); padding:12px 14px;
         overflow-x:auto; margin:12px 0 16px; font-size:12px; line-height:1.45; }
   pre code { background:none; border:none; padding:0; color:var(--light); }
@@ -65,14 +67,14 @@
   <span class="meta">Pre-Release — 2026</span>
 </header>
 <main>
-  <h1 class="doc-title">Contact & Governance Communications</h1>
+  <h1 class="doc-title">Contact &amp; Governance Communications</h1>
   <p class="doc-sub">Direct Channels for Technical, Licensing, and Platform Inquiries</p>
   <p class="doc-by"><span>Anticurrent Entropy Inc.</span> · Pre-Release — 2026</p>
   <hr class="rule">
-  
+
   <h1 id="executive-contact">1. Executive Contact</h1>
   <p>For executive inquiries, strategic partnerships, module licensing evaluations, and platform architecture alignment, contact the Founder &amp; CEO directly:</p>
-  
+
   <table>
     <thead>
       <tr>
@@ -90,13 +92,24 @@
     </tbody>
   </table>
 
-  <h1 id="communication-protocol">2. Communication Routing</h1>
+  <h1 id="engagements">2. Review, Consulting, and Rewrite</h1>
+  <p>The same channel is open for technical engagements:</p>
+  <ul>
+    <li><strong>Review</strong> — Causal reading of an existing codebase or architecture: where identity, capability, ordering, and trust actually live, including constraints enforced only by habit or institutional memory.</li>
+    <li><strong>Consulting</strong> — Design and boundary work while you keep ownership of the tree.</li>
+    <li><strong>Rewrite into ETCS</strong> — Re-express a stack so type identity, ABI, capability, and causal graph are one compile-time artifact, with determinism, cross-platform causal replay and interplay (Linux, Windows, WASM, future ETCS native kernel), and trust from structure and attestation rather than policy bolted on afterward. Size and complexity are not themselves a barrier; unclear questions are.</li>
+  </ul>
+  <p>Engagement is a two-way question channel. Unwritten constraints are hunted and named, not assumed away. Scope, price, and go/no-go follow from that process. If the honest result is not to rewrite, that is the result.</p>
+  <p>State the system, the outcome you care about, and any hard limits in the mail.</p>
+
+  <h1 id="communication-protocol">3. Communication Routing</h1>
   <p>To ensure proper routing across internal channels, please prefix subject lines according to the domain of inquiry:</p>
-  
-  <pre><code>[ETCS-CORE]      Inquiries regarding the LGPL headers, event & signal machinery, or loading contract.
+
+  <pre><code>[ETCS-CORE]      Inquiries regarding the LGPL headers, event &amp; signal machinery, or loading contract.
 [ETCS-ONTOLOGY]  Proposed extensions or queries regarding trait and type hierarchy lineages.
 [ETCS-RUNTIME]   Inquiries regarding the proprietary-but-free runtime loader or certification pipeline.
-[ACE-GUILD]      Worker-tier stock conversions, list price transactions, and governance queries.</code></pre>
+[ACE-GUILD]      Worker-tier stock conversions, list price transactions, and governance queries.
+[ETCS-ENGAGE]    Review, consulting, or rewrite engagements.</code></pre>
 
   <footer>
     <p>Contact — Anticurrent Entropy Inc. — 2026</p>

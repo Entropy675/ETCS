@@ -116,9 +116,15 @@ int main(int, char**)
         ETCS::ExecutionContext made(&root, &ctx);
         made.names["anchor"] = ETCS::NameBinding{ world->getRID(), "RenderProvider", "Scene3D" };
         made.names["eye"]    = ETCS::NameBinding{ eye->getRID(), "RenderProvider", "Camera3D" };
+        // The window's layout, as the boot makes it: the eye its root box.
+        ETCS::Entity* hud = ETCS::spawn_entity("LayoutProvider", "Layout", env, loader);
+        if (!hud) { std::printf("FAILED (could not spawn a layout)\n"); return 1; }
+        verb(hud, "Layout.Create", "1024, 768");
+        verb(hud, "Layout.AddBox", std::to_string(eye->getRID()) + ", 0, 1, 0.0, 1, 0.0");
+        made.names["hud"]    = ETCS::NameBinding{ hud->getRID(), "LayoutProvider", "Layout" };
         made.names["game"]   = ETCS::NameBinding{ g->getRID(), "GolfProvider", "GolfMatch" };
         std::istringstream in("run GolfProvider/scripts/golf_world.etcs anchor=anchor game=game\n"
-                              "run GolfProvider/scripts/golf_play.etcs game=game world=anchor eye=eye\n");
+                              "run GolfProvider/scripts/golf_play.etcs game=game world=anchor eye=eye layout=hud\n");
         if (!ETCS::run_script(in, std::string(ETCS_ACE_ROOT) + "/modules/golf_made.etcs", made)) { std::printf("FAILED (the course scripts)\n"); return 1; }
     }
 
